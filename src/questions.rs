@@ -15,6 +15,11 @@
 //!   lead that started that session. The message repeats the whole question and the asker's own
 //!   note to itself, so an agent with a new conversation can act on it.
 //! - A restart between storing and delivering is finished at the next start (`resume`).
+//! - The Questions tab (`answer_in_tab`, `question.answer`): the human answers with a click in
+//!   Muster's window. The answer waits `TAB_HOLD` before it goes (the human can take it back,
+//!   `undo`), then travels the same path as a recorded one, as the human's own message (origin
+//!   human, from `human`). `undo` also takes it back while it still waits in the asker's input
+//!   queue, until the asker has read it. Every change goes to the window as `question_upserted`.
 //!
 //! Fields for later steps of the Questions tab are kept now so their questions carry them:
 //! `passed_on_by` (a lead passing a session's question on), `area` (merges, money, public and
@@ -38,6 +43,11 @@ pub const MAX_OPEN_PER_ASKER: usize = 20;
 pub const MAX_OPEN: usize = 200;
 /// Most questions a listing returns.
 pub const LIST_MAX: usize = 200;
+/// How long an answer given in the Questions tab waits before it is sent: the human can take it
+/// back meanwhile (`undo`), whatever the asker is doing.
+pub const TAB_HOLD: std::time::Duration = std::time::Duration::from_secs(8);
+/// The sender label of an answer given in the Questions tab (as `ask` from the human's window).
+const HUMAN: &str = "human";
 const LETTERS: [&str; 6] = ["a", "b", "c", "d", "e", "f"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -147,7 +157,7 @@ pub struct Withdrawn {
 pub enum How {
     /// The human typed it in chat; a lead recorded it (`record_answer`).
     Chat,
-    /// Clicked or typed in the Questions tab (a later step).
+    /// Clicked or typed in the Questions tab, by the human (`answer_in_tab`).
     Tab,
     /// The asker's default, taken at its time (a later step).
     Default,
@@ -580,6 +590,9 @@ pub fn post(hub: &Hub, caller: SessionId, args: Value) -> anyhow::Result<Value> 
             "you have {n} open questions (at most {MAX_OPEN_PER_ASKER}); withdraw some with withdraw_question first"),
         Err(InsertRefusal::Full(n)) => anyhow::bail!("{n} questions are open in Muster (at most {MAX_OPEN}); try again once some are answered"),
     };
+    if let Ok(Some(stored)) = hub.store().question(id) {
+        publish(hub, &stored);
+    }
     let to = match (q.asker.agent_id, hub.agents().by_session(caller)) {
         (Some(_), Some(a)) => format!("you, the agent {}, by name: also after a restart or a fresh start", a.name),
         _ => match q.asker.parent_id {
@@ -610,7 +623,14 @@ pub fn withdraw(hub: &Hub, caller: SessionId, number: i64, reason: &str) -> anyh
         q.withdrawn = Some(Withdrawn { at: now_ms(), reason });
         Ok(())
     })?;
+    publish(hub, &q);
     Ok(json!({"number": q.id, "question": format!("Q{}", q.id), "status": q.status}))
+}
+
+/// Tell the human's windows that `q` changed (`question_upserted`, the whole question as
+/// `question.get` returns it). Devices don't get it (`rpc::forwarded`).
+pub fn publish(hub: &Hub, q: &Question) {
+    hub.emit(crate::hub::ServerEvent::QuestionUpserted(view(hub, q, true)));
 }
 
 // ----- answering -----
@@ -687,7 +707,7 @@ pub async fn record(hub: &Arc<Hub>, caller: SessionId, args: Record) -> anyhow::
         from_label: Some(agents::sender_label(hub.agents().by_session(caller).as_ref(), caller)),
         delivery: Delivery { status: DeliveryStatus::Pending, note: None, to: None, msg_id: None, session_id: None, at: None },
     };
-    hub.store().update_question(args.number, |q| {
+    let (stored, ()) = hub.store().update_question(args.number, |q| {
         match q.status {
             Status::Open => {}
             Status::Answered => {
@@ -712,6 +732,7 @@ pub async fn record(hub: &Arc<Hub>, caller: SessionId, args: Record) -> anyhow::
         q.answer = Some(answer.clone());
         Ok(())
     })?;
+    publish(hub, &stored);
     // In its own task, so a caller that goes away doesn't leave it half delivered.
     let h = hub.clone();
     let id = args.number;
@@ -724,6 +745,150 @@ pub async fn record(hub: &Arc<Hub>, caller: SessionId, args: Record) -> anyhow::
         "picked": a.picked,
         "delivery": a.delivery,
         "delivered": matches!(a.delivery.status, DeliveryStatus::Delivered | DeliveryStatus::NotNeeded),
+    }))
+}
+
+// ----- the Questions tab -----
+
+/// How the answer to a question already answered came, for a refusal.
+fn answered_by(a: Option<&Answer>) -> String {
+    match a {
+        Some(Answer { how: How::Tab, .. }) => " in the Questions tab".into(),
+        Some(Answer { how: How::Default, .. }) => " by its default".into(),
+        Some(Answer { recorded_by: Some(w), .. }) => format!(" (recorded by {} from your chat)", w.label),
+        _ => String::new(),
+    }
+}
+
+/// `question.answer`: the human's own answer, clicked or typed in the Questions tab (only a
+/// click in Muster's window gets here: `rpc::from_window`). Stored at once, then sent after
+/// `hold` unless the human takes it back meanwhile (`undo`), along the path a recorded answer
+/// takes (`finish`: the asking agent by name, else the session that asked, else its lead), as the
+/// human's own message (origin human, from `human`; no recorder, so no reach rule narrows it).
+pub async fn answer_in_tab(hub: &Arc<Hub>, number: i64, pick: Vec<String>, words: &str, hold: std::time::Duration)
+    -> anyhow::Result<Value> {
+    let words = clean(words);
+    anyhow::ensure!(words.chars().count() <= 4000, "your answer is too long (at most 4000 characters)");
+    let current = hub.store().question(number)?.with_context(|| format!("no question Q{number}"))?;
+    let picked = answer_letters(&current, Some(Letters::Many(pick)))?;
+    if current.kind == Kind::OwnWords {
+        anyhow::ensure!(!words.is_empty(), "Q{number} asks for your own words: type your answer first");
+    } else {
+        anyhow::ensure!(!picked.is_empty() || !words.is_empty(), "pick an option or type your answer first");
+    }
+    let at = now_ms();
+    let answer = Answer {
+        picked, words, how: How::Tab, recorded_by: None, at, prov: None, from_label: Some(HUMAN.into()),
+        into: Conversation::Current,
+        delivery: Delivery { status: DeliveryStatus::Pending, note: Some(format!("sent in {} s unless you undo it", hold.as_secs())),
+            to: None, msg_id: None, session_id: None, at: None },
+    };
+    let (q, ()) = hub.store().update_question(number, |q| {
+        match q.status {
+            Status::Open => {}
+            Status::Answered => anyhow::bail!("Q{} was answered already{}", q.id, answered_by(q.answer.as_ref())),
+            Status::Withdrawn => anyhow::bail!("Q{} was withdrawn by {}{}", q.id, q.asker.label,
+                q.withdrawn.as_ref().map(|w| format!(": {}", w.reason)).unwrap_or_default()),
+        }
+        q.status = Status::Answered;
+        q.answer = Some(answer.clone());
+        Ok(())
+    })?;
+    publish(hub, &q);
+    let h = hub.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(hold).await;
+        // Not taken back (nor taken back and answered again) meanwhile.
+        let still = h.store().question(number).ok().flatten().is_some_and(|q| q.answer.as_ref()
+            .is_some_and(|a| a.how == How::Tab && a.at == at && a.delivery.status == DeliveryStatus::Pending));
+        if still && let Err(e) = finish(&h, number).await {
+            tracing::warn!(question = number, "sending an answer from the Questions tab: {e:#}");
+        }
+    });
+    Ok(view(hub, &q, true))
+}
+
+/// The start of an answer typed into a session that isn't a named agent (`answer_envelope`).
+fn session_prefix(number: i64) -> String {
+    format!("[muster answer to question Q{number} from ")
+}
+
+/// May the human still take back `q`'s answer? Only one given in the tab, until the asker has
+/// read it: still waiting to be sent, waiting in the asker's input queue (not being typed), or
+/// never delivered (refused or undeliverable).
+pub fn can_undo(hub: &Hub, q: &Question) -> bool {
+    let Some(a) = q.answer.as_ref().filter(|a| q.status == Status::Answered && a.how == How::Tab) else { return false };
+    match a.delivery.status {
+        DeliveryStatus::Pending | DeliveryStatus::Refused | DeliveryStatus::Undelivered => true,
+        DeliveryStatus::Delivered => match (a.delivery.msg_id, a.delivery.session_id) {
+            (Some(m), _) => crate::inject::waits_message(hub, m),
+            (None, Some(s)) => crate::inject::waits_prompt(hub, s, &session_prefix(q.id)),
+            _ => false,
+        },
+        DeliveryStatus::Delivering | DeliveryStatus::NotNeeded => false,
+    }
+}
+
+/// `question.undo`: the human takes back the answer they gave in the tab, until the asker has
+/// read it (`can_undo`). The question is open again. A message already in the asker's input
+/// queue is taken out of it and its log entry marked as taken back.
+pub fn undo(hub: &Arc<Hub>, number: i64) -> anyhow::Result<Value> {
+    let current = hub.store().question(number)?.with_context(|| format!("no question Q{number}"))?;
+    let Some(a) = current.answer.as_ref().filter(|_| current.status == Status::Answered) else {
+        anyhow::bail!("Q{number} has no answer to take back")
+    };
+    anyhow::ensure!(a.how == How::Tab, "Q{number} was answered{}, not in the Questions tab: only an answer given there is taken back here",
+        answered_by(Some(a)));
+    let to = a.delivery.to.clone().unwrap_or_else(|| current.asker.label.clone());
+    let read = || format!("{to} has read your answer to Q{number} already, so it can't be taken back; send it a message instead");
+    let (status, at) = (a.delivery.status, a.at);
+    let taken = match status {
+        DeliveryStatus::Pending | DeliveryStatus::Refused | DeliveryStatus::Undelivered => None,
+        DeliveryStatus::Delivering => anyhow::bail!("your answer to Q{number} is being delivered right now; try again in a moment"),
+        DeliveryStatus::NotNeeded => anyhow::bail!(read()),
+        // Out of the queue first: what is being typed can't be taken out.
+        DeliveryStatus::Delivered => match (a.delivery.msg_id, a.delivery.session_id) {
+            (Some(m), _) => {
+                anyhow::ensure!(crate::inject::drop_message(hub, m)?, read());
+                Some(m)
+            }
+            (None, Some(s)) => {
+                anyhow::ensure!(crate::inject::drop_prompt(hub, s, &session_prefix(number))?, read());
+                None
+            }
+            _ => anyhow::bail!(read()),
+        },
+    };
+    let (q, ()) = hub.store().update_question(number, |q| {
+        anyhow::ensure!(q.status == Status::Answered && q.answer.as_ref().is_some_and(|a| a.how == How::Tab && a.at == at
+            && a.delivery.status == status), "your answer to Q{number} changed meanwhile (it is on its way now)");
+        q.status = Status::Open;
+        q.answer = None;
+        Ok(())
+    })?;
+    if let Some(m) = taken {
+        match hub.store().set_agent_message_refused(m, "taken back: the human undid this answer in the Questions tab before it was read") {
+            Ok(_) => agents::publish_message(hub, m),
+            Err(e) => tracing::warn!(question = number, msg = m, "marking an answer taken back: {e:#}"),
+        }
+    }
+    publish(hub, &q);
+    Ok(view(hub, &q, true))
+}
+
+/// `question.picture`: picture `index` (from 0) of question `number`, as a data URI for the tab.
+/// Read as the image panel reads a file: a regular file (no symlink at the end), at most 8 MiB,
+/// and an image by its content (PNG, JPEG, GIF, WebP, or SVG, which `<img>` shows without running
+/// its scripts).
+pub fn picture(hub: &Hub, number: i64, index: usize) -> anyhow::Result<Value> {
+    use base64::Engine;
+    let q = hub.store().question(number)?.with_context(|| format!("no question Q{number}"))?;
+    let p = q.pictures.get(index).with_context(|| format!("Q{number} has no picture {}", index + 1))?;
+    let rel = p.path.trim_start_matches('/');
+    let (mime, bytes) = crate::panel_apps::read_image(std::path::Path::new("/"), rel)?;
+    Ok(json!({
+        "src": format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(&bytes)),
+        "caption": p.caption,
     }))
 }
 
@@ -844,7 +1009,9 @@ pub fn delivered_text(q: &Question, a: &Answer, note: Option<&str>) -> String {
         How::Chat => t.push_str(&format!(
             "{by} recorded this as the human's answer, typed to it in chat ({}); Muster can't check that. The words {by} recorded: \"{}\"\n",
             local_time(a.at), a.words)),
-        How::Tab => t.push_str(&format!("The human answered it in the Questions tab ({}): \"{}\"\n", local_time(a.at), a.words)),
+        How::Tab if a.words.is_empty() => t.push_str(&format!("The human picked it in Muster's Questions tab ({}).\n", local_time(a.at))),
+        How::Tab => t.push_str(&format!("The human answered it in Muster's Questions tab ({}), in these words: \"{}\"\n",
+            local_time(a.at), a.words)),
         How::Default => t.push_str(&format!("Nobody answered by {}: your default was taken.\n", local_time(a.at))),
     }
     if let Some(n) = note {
@@ -934,6 +1101,7 @@ pub async fn finish(hub: &Arc<Hub>, id: i64) -> anyhow::Result<Question> {
         }
         Ok(())
     })?;
+    publish(hub, &q);
     Ok(q)
 }
 
@@ -1005,7 +1173,8 @@ async fn deliver(hub: &Arc<Hub>, q: &Question, a: &Answer) -> Delivery {
             }
             let text = format!("{}\n{}", answer_envelope(q.id, &from, route.origin, route.hop), delivered_text(q, a, note.as_deref()));
             let source = Source::Chain(Prov { origin: route.origin, hop: route.hop, msg_id: None });
-            let log_from = from_session.map_or_else(|| "muster".to_string(), |s| format!("session:{s}"));
+            // The human's own answer (the tab) is logged as theirs.
+            let log_from = from_session.map_or_else(|| from.clone(), |s| format!("session:{s}"));
             let mut d = outcome(DeliveryStatus::Delivered, String::new());
             d.to = Some(format!("session {}", s.id));
             d.session_id = Some(s.id);
@@ -1086,7 +1255,7 @@ async fn resume_one(hub: &Arc<Hub>, id: i64) -> anyhow::Result<()> {
             // Its queue may have it: typing it again could show it twice.
             // Still in its queue: it arrives. Otherwise it is sent again (if the restart came just
             // after it was typed in, the session sees it twice, rather than never).
-            Target::Session(s, _) if crate::inject::holds_prompt(hub, s.id, &format!("[muster answer to question Q{} from ", q.id)) =>
+            Target::Session(s, _) if crate::inject::holds_prompt(hub, s.id, &session_prefix(q.id)) =>
                 Some(Delivery { to: Some(format!("session {}", s.id)), session_id: Some(s.id),
                     ..outcome(DeliveryStatus::Delivered, format!("queued for session {} before a backend restart", s.id)) }),
             _ => None,
@@ -1151,6 +1320,12 @@ pub fn view(hub: &Hub, q: &Question, full: bool) -> Value {
     if q.status == Status::Open {
         v["asker_now"] = asker_now(hub, q);
     }
+    if let Some(a) = &q.answer {
+        // For the tab: may the human still take it back, and when the asker read it (a message
+        // to a named agent records when it was typed in).
+        v["can_undo"] = json!(can_undo(hub, q));
+        v["read_at"] = json!(a.delivery.msg_id.and_then(|m| hub.store().agent_message_delivered_at(m).ok().flatten()));
+    }
     v
 }
 
@@ -1196,7 +1371,9 @@ pub fn may_read(hub: &Hub, viewer: SessionId, q: &Question) -> bool {
 /// Questions (`filter`), oldest first, only `mine`'s when given, the newest `limit` (filtered in
 /// the database), and only those `viewer` may read (None: the human's client, all of them).
 /// `total` counts every match in Muster, `shown` those returned.
-pub fn list(hub: &Hub, filter: Filter, mine: Option<&Who>, limit: Option<usize>, viewer: Option<SessionId>) -> anyhow::Result<Value> {
+/// `full`: each question whole, as `get` returns it (the Questions tab).
+pub fn list(hub: &Hub, filter: Filter, mine: Option<&Who>, limit: Option<usize>, viewer: Option<SessionId>, full: bool)
+    -> anyhow::Result<Value> {
     let limit = limit.unwrap_or(LIST_MAX).clamp(1, LIST_MAX);
     let (mut qs, total) = hub.store().questions(filter.status(), mine.map(|m| (m.agent_id, m.session_id)), limit)?;
     if let Some(me) = mine {
@@ -1206,7 +1383,7 @@ pub fn list(hub: &Hub, filter: Filter, mine: Option<&Who>, limit: Option<usize>,
         qs.retain(|q| may_read(hub, v, q));
     }
     Ok(json!({
-        "questions": qs.iter().map(|q| view(hub, q, false)).collect::<Vec<_>>(),
+        "questions": qs.iter().map(|q| view(hub, q, full)).collect::<Vec<_>>(),
         "shown": qs.len(),
         "total": total,
     }))
@@ -1244,7 +1421,7 @@ pub async fn tool(hub: &Arc<Hub>, caller: SessionId, name: &str, args: Value) ->
                 return get(hub, n, Some(caller));
             }
             let me = if p.mine { Some(who(hub, caller).context("calling session no longer exists")?) } else { None };
-            list(hub, p.status, me.as_ref(), p.limit, Some(caller))
+            list(hub, p.status, me.as_ref(), p.limit, Some(caller), false)
         }
         "withdraw_question" => {
             #[derive(Deserialize)]
@@ -1436,18 +1613,18 @@ mod tests {
         assert_eq!((q.asker.agent_id, q.asker.label.as_str(), q.status), (Some(writer.id), "writer", Status::Open));
         assert_eq!(q.pick, vec!["a"]);
         assert_eq!(q.options[1].letter, "b");
-        let open = list(&hub, Filter::Open, None, None, None).unwrap();
+        let open = list(&hub, Filter::Open, None, None, None, false).unwrap();
         assert_eq!(open["total"], 3);
         assert_eq!(open["questions"][0]["number"], "Q1");
         assert!(open["questions"][0]["asker_now"].is_object());
-        let mine = list(&hub, Filter::Open, who(&hub, 3).as_ref(), None, Some(3)).unwrap();
+        let mine = list(&hub, Filter::Open, who(&hub, 3).as_ref(), None, Some(3), false).unwrap();
         assert_eq!(mine["total"], 2);
         // Only the asker withdraws, and only while open.
         assert!(withdraw(&hub, 4, 2, "not needed any more").unwrap_err().to_string().contains("only the asker"));
         assert_eq!(withdraw(&hub, 3, 2, "not needed any more").unwrap()["status"], "withdrawn");
         assert!(withdraw(&hub, 3, 2, "again please").is_err());
-        assert_eq!(list(&hub, Filter::Open, None, None, None).unwrap()["total"], 2);
-        assert_eq!(list(&hub, Filter::All, None, None, None).unwrap()["total"], 3);
+        assert_eq!(list(&hub, Filter::Open, None, None, None, false).unwrap()["total"], 2);
+        assert_eq!(list(&hub, Filter::All, None, None, None, false).unwrap()["total"], 3);
     }
 
     #[test]
@@ -1587,7 +1764,7 @@ mod tests {
         let e = record(&hub, 2, rec(1, "Q1 b", json!("b"))).await.unwrap_err().to_string();
         assert!(e.contains("answered already") && e.contains("manager"), "{e}");
         // The writer reads its answered question back after a reset.
-        let back = list(&hub, Filter::Answered, who(&hub, 3).as_ref(), None, Some(3)).unwrap();
+        let back = list(&hub, Filter::Answered, who(&hub, 3).as_ref(), None, Some(3), false).unwrap();
         assert_eq!(back["questions"][0]["answer"]["words"], "Q1: a.. but ask the lead first");
         // The asker records its own: kept, nothing sent.
         let mut own = good();
@@ -1688,9 +1865,9 @@ mod tests {
         assert!(!may_read(&hub, 7, &q));
         assert!(get(&hub, 1, Some(7)).unwrap_err().to_string().contains("another workspace"));
         assert!(may_read(&hub, 5, &q) && may_read(&hub, 2, &q));
-        assert_eq!(list(&hub, Filter::Open, None, None, Some(7)).unwrap()["shown"], 0);
+        assert_eq!(list(&hub, Filter::Open, None, None, Some(7), false).unwrap()["shown"], 0);
         // The newest two, oldest first; total counts all.
-        let v = list(&hub, Filter::Open, None, Some(2), Some(5)).unwrap();
+        let v = list(&hub, Filter::Open, None, Some(2), Some(5), false).unwrap();
         assert_eq!((v["shown"].as_u64(), v["total"].as_u64()), (Some(2), Some(3)));
         assert_eq!((v["questions"][0]["id"].as_i64(), v["questions"][1]["id"].as_i64()), (Some(2), Some(3)));
     }
@@ -1795,5 +1972,128 @@ mod tests {
         let e = answer_envelope(3, "man ager]", Origin::Human, 1);
         assert_eq!(e, "[muster answer to question Q3 from man_ager_ origin=human hop=1]");
         assert_eq!(agents::parse_envelope(&e), None);
+    }
+
+    /// Waits for question `n`'s answer to leave `pending` (the tab's hold, then `finish`).
+    async fn sent(hub: &Arc<Hub>, n: i64) -> Question {
+        for _ in 0..200 {
+            let q = hub.store().question(n).unwrap().unwrap();
+            if q.answer.as_ref().is_some_and(|a| !matches!(a.delivery.status, DeliveryStatus::Pending | DeliveryStatus::Delivering)) {
+                return q;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("Q{n}'s answer was never sent");
+    }
+
+    #[tokio::test]
+    async fn the_human_answers_in_the_tab_and_it_goes_by_name_as_their_own_words() {
+        let hub = fixture();
+        let writer = agent(&hub, "writer", SessionKind::Codex, 3);
+        post(&hub, 3, good()).unwrap();
+        let mut own = without("options");
+        own.as_object_mut().unwrap().remove("pick");
+        own["kind"] = json!("own_words");
+        own["question"] = json!("Can you paste two real bounce emails from Gmail?");
+        post(&hub, 3, own).unwrap();
+        let mut events = hub.subscribe();
+        let none = std::time::Duration::ZERO;
+        // What the question allows: its letters, one for a pick_one, words for own_words, something.
+        for (n, pick, words, needle) in [(1, vec!["z"], "", "not one of"), (1, vec!["a", "b"], "", "one letter"),
+            (1, vec![], "  ", "pick an option or type"), (2, vec![], "", "your own words")]
+        {
+            let e = answer_in_tab(&hub, n, pick.into_iter().map(String::from).collect(), words, none).await.unwrap_err().to_string();
+            assert!(e.contains(needle), "{e}");
+        }
+        assert_eq!(hub.store().question(1).unwrap().unwrap().status, Status::Open);
+        // The writer starts fresh meanwhile: the answer follows the agent, by name.
+        hub.agents().link_session(hub.store(), writer.id, Some(4)).unwrap();
+        let v = answer_in_tab(&hub, 1, vec!["a".into()], "and keep it short", none).await.unwrap();
+        assert_eq!((v["status"].as_str(), v["answer"]["how"].as_str(), v["can_undo"].as_bool()), (Some("answered"), Some("tab"), Some(true)), "{v}");
+        let mut saw = false;
+        while let Ok(ev) = events.try_recv() {
+            saw |= matches!(ev, crate::hub::ServerEvent::QuestionUpserted(q) if q["id"] == 1 && q["status"] == "answered");
+        }
+        assert!(saw, "the window hears of it");
+        let q = sent(&hub, 1).await;
+        let a = q.answer.as_ref().unwrap();
+        assert_eq!((a.how, a.recorded_by.as_ref(), a.prov, a.from_label.as_deref()), (How::Tab, None, None, Some("human")));
+        // The same path as a recorded answer: the asking agent by name (this fixture has no
+        // terminal host, so the send itself fails, and says so; the smoke test types it in).
+        assert_eq!(a.delivery.to.as_deref(), Some("writer"), "{:?}", a.delivery);
+        let text = delivered_text(&q, a, None);
+        assert!(text.contains("Answer to your question Q1: a) See who sends email as your domain.") &&
+            text.contains("The human answered it in Muster's Questions tab") && text.contains("\"and keep it short\"")
+            && text.contains(&q.note_to_self), "{text}");
+        let mut clicked = a.clone();
+        clicked.words.clear();
+        assert!(delivered_text(&q, &clicked, None).contains("The human picked it in Muster's Questions tab"));
+        // Once only, whoever tries next.
+        let e = answer_in_tab(&hub, 1, vec!["b".into()], "", none).await.unwrap_err().to_string();
+        assert!(e.contains("answered already in the Questions tab"), "{e}");
+        agent(&hub, "manager", SessionKind::Claude, 2);
+        let rec: Record = serde_json::from_value(json!({"number": 1, "words": "Q1 b", "pick": "b"})).unwrap();
+        assert!(record(&hub, 2, rec).await.unwrap_err().to_string().contains("answered already"));
+    }
+
+    #[tokio::test]
+    async fn the_human_takes_an_answer_back_until_the_asker_has_read_it() {
+        let hub = fixture();
+        agent(&hub, "writer", SessionKind::Codex, 3);
+        agent(&hub, "manager", SessionKind::Claude, 2);
+        post(&hub, 3, good()).unwrap();
+        // Within the hold: taken back, open again, and the hold's end sends nothing.
+        answer_in_tab(&hub, 1, vec!["a".into()], "", std::time::Duration::from_millis(80)).await.unwrap();
+        let v = undo(&hub, 1).unwrap();
+        assert_eq!((v["status"].as_str(), v["answer"].is_null()), (Some("open"), true), "{v}");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(hub.store().question(1).unwrap().unwrap().answer.is_none());
+        assert!(undo(&hub, 1).unwrap_err().to_string().contains("no answer to take back"));
+        // Answered again: sent. One that never reached the writer can be taken back too.
+        answer_in_tab(&hub, 1, vec!["b".into()], "", std::time::Duration::ZERO).await.unwrap();
+        let q = sent(&hub, 1).await;
+        assert_eq!(q.answer.as_ref().unwrap().picked, vec!["b"]);
+        assert!(can_undo(&hub, &q));
+        assert_eq!(undo(&hub, 1).unwrap()["status"], "open");
+        // Delivered and no longer waiting in a queue: the writer has read it.
+        answer_in_tab(&hub, 1, vec!["a".into()], "", std::time::Duration::from_secs(60)).await.unwrap();
+        hub.store().update_question(1, |q| {
+            let d = &mut q.answer.as_mut().unwrap().delivery;
+            (d.status, d.msg_id, d.to) = (DeliveryStatus::Delivered, Some(4242), Some("writer".into()));
+            Ok(())
+        }).unwrap();
+        assert!(!can_undo(&hub, &hub.store().question(1).unwrap().unwrap()));
+        let e = undo(&hub, 1).unwrap_err().to_string();
+        assert!(e.contains("writer has read your answer to Q1 already"), "{e}");
+        assert_eq!(hub.store().question(1).unwrap().unwrap().status, Status::Answered);
+        // An answer a lead recorded from chat isn't taken back here.
+        let mut other = good();
+        other["question"] = json!("Should the sign-up card show what the paid plan costs?");
+        post(&hub, 3, other).unwrap();
+        let rec: Record = serde_json::from_value(json!({"number": 2, "words": "no price", "pick": "a"})).unwrap();
+        record(&hub, 2, rec).await.unwrap();
+        let e = undo(&hub, 2).unwrap_err().to_string();
+        assert!(e.contains("recorded by manager") && e.contains("not in the Questions tab"), "{e}");
+    }
+
+    #[test]
+    fn the_tab_shows_a_questions_pictures_and_only_images() {
+        let dir = std::env::temp_dir().join(format!("muster-q-shot-{}-{:x}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("card.png");
+        std::fs::write(&png, b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR").unwrap();
+        let hub = fixture();
+        agent(&hub, "writer", SessionKind::Codex, 3);
+        let mut v = good();
+        v["pictures"] = json!([{"path": png.to_str().unwrap(), "caption": "The card today"}]);
+        post(&hub, 3, v).unwrap();
+        let p = picture(&hub, 1, 0).unwrap();
+        assert!(p["src"].as_str().unwrap().starts_with("data:image/png;base64,"), "{p}");
+        assert_eq!(p["caption"], "The card today");
+        assert!(picture(&hub, 1, 1).unwrap_err().to_string().contains("no picture 2"));
+        // Changed into something that isn't an image since: refused, never shown.
+        std::fs::write(&png, b"secret=hunter2").unwrap();
+        assert!(picture(&hub, 1, 0).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

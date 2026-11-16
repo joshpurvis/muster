@@ -185,3 +185,44 @@ Deno.test("drawer data rejects invalid session ids and clamps saved heights", ()
   });
   equal(allSessions(state.layouts[10].root), [2]);
 });
+
+Deno.test("the pinned Questions tab sits first in the first group of whichever channel is shown", async () => {
+  const { QUESTIONS_TAB: Q, activateTab, noteId, panelId, pinFirst } = await import("./tree.ts");
+  equal([noteId(Q), panelId(Q)], [null, null]);
+  // Two groups; the tab arrives in the focused (right) one, not selected, and moves to the front
+  // of the left one without being selected there either.
+  const split = splitPane(emptyLayout([1, 2]), "right", 3);
+  const l = activateTab(addTab(split, Q, split.focus), 3);
+  const pinned = pinFirst(l, Q);
+  equal(sig(pinned.root), `row([${Q},1,2] [3])`);
+  equal(allPanes(pinned.root)[0].active, 1);
+  equal(allPanes(pinned.root)[1].active, 3);
+  equal(pinned.focus, l.focus);
+  // Selected where it was: still selected in its new place, and focus follows it.
+  const moved = pinFirst(addTab(split, Q, split.focus), Q);
+  equal(sig(moved.root), `row([${Q},1,2] [3])`);
+  equal(allPanes(moved.root)[0].active, Q);
+  equal(moved.focus, allPanes(moved.root)[0].id);
+  // A drag that put it elsewhere in its own group is undone.
+  const dragged = pinFirst(emptyLayout([1, Q, 2]), Q);
+  equal(sig(dragged.root), `[${Q},1,2]`);
+  equal(pinFirst(dragged, Q), dragged);
+
+  // Reconciling: it follows the shown channel and leaves the others; hidden, it is nowhere.
+  const tabs = (active: number): TabHome[] => [
+    { id: 1, channel: 10 }, { id: 2, channel: 20 }, { id: Q, channel: active, pinned: true },
+  ];
+  let w = loadChannelLayout({ v: 2, active: 10, layouts: {}, sidebar: {} }, [10, 20], tabs(10));
+  equal(sig(w.layouts[10].root), `[${Q},1]`);
+  equal(sig(w.layouts[20].root), "[2]");
+  w = reconcileChannels({ ...w, active: 20 }, [10, 20], tabs(20));
+  equal(sig(w.layouts[10].root), "[1]");
+  equal(sig(w.layouts[20].root), `[${Q},2]`);
+  equal(allPanes(w.layouts[20].root)[0].active, 2);
+  // Hiding it is saved with the window; a saved layout without the field shows it.
+  const hidden = loadChannelLayout(JSON.parse(JSON.stringify({ ...w, questions: false })), [10, 20],
+    tabs(20).slice(0, 2));
+  equal(hidden.questions, false);
+  equal(sig(hidden.layouts[20].root), "[2]");
+  equal(loadChannelLayout(JSON.parse(JSON.stringify(w)), [10, 20], tabs(20)).questions, undefined);
+});

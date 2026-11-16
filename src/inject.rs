@@ -439,6 +439,35 @@ pub fn holds_prompt(hub: &Hub, id: SessionId, prefix: &str) -> bool {
         q.items.iter().any(|i| i.text.starts_with(prefix)) || q.active.as_ref().is_some_and(|a| a.item.text.starts_with(prefix)))
 }
 
+/// Is agent message `msg` waiting in a prompt queue, not yet being typed (`drop_message` could
+/// still take it out)? (src/questions.rs: the human may take an answer back until then.)
+pub fn waits_message(hub: &Hub, msg: i64) -> bool {
+    let is = |item: &Item| matches!(item.source, crate::agents::Source::Chain(p) if p.msg_id == Some(msg));
+    hub.injection.inner.lock().values().any(|q| q.items.iter().any(is))
+}
+
+/// Does session `id`'s queue hold a prompt starting with `prefix` that waits, not yet being
+/// typed (`drop_prompt` could still take it out)?
+pub fn waits_prompt(hub: &Hub, id: SessionId, prefix: &str) -> bool {
+    hub.injection.inner.lock().get(&id).is_some_and(|q| q.items.iter().any(|i| i.text.starts_with(prefix)))
+}
+
+/// Take the prompts of session `id` that start with `prefix` out of its queue where they still
+/// wait (not one being typed). True when one was removed. (src/questions.rs: the human takes
+/// back an answer typed into a session that isn't a named agent, which has no message id.)
+pub fn drop_prompt(hub: &Hub, id: SessionId, prefix: &str) -> anyhow::Result<bool> {
+    if !waits_prompt(hub, id, prefix) {
+        return Ok(false);
+    }
+    let dropped = hub.injection.edit_with(id, Unsent::Discard, |q| {
+        let before = q.items.len();
+        q.items.retain(|item| !item.text.starts_with(prefix));
+        q.items.len() != before
+    })?;
+    sync_queued(hub, id);
+    Ok(dropped)
+}
+
 /// Session `id` has no prompt waiting, being typed, or paused for review (src/sleep.rs).
 pub(crate) fn queue_idle(hub: &Hub, id: SessionId) -> bool {
     hub.injection.inner.lock().get(&id).is_none_or(|q| q.items.is_empty() && q.active.is_none() && !q.busy && !q.blocked)

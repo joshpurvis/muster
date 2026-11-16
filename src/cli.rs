@@ -3469,7 +3469,11 @@ fn asker_line(q: &Value) -> Option<String> {
 fn answer_line(a: &Value) -> String {
     let picked: Vec<&str> = a["picked"].as_array().map(|p| p.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
     let picked = if picked.is_empty() { String::new() } else { format!(" (picked {})", picked.join(", ")) };
-    let by = a["recorded_by"].as_str().map(|b| format!(", recorded by {b}")).unwrap_or_default();
+    let by = match (a["how"].as_str(), a["recorded_by"].as_str()) {
+        (Some("tab"), _) => ", in the Questions tab".to_string(),
+        (_, Some(b)) => format!(", recorded by {b}"),
+        _ => String::new(),
+    };
     let d = &a["delivery"];
     format!("answered \"{}\"{picked}{by}; {}: {}", a["words"].as_str().unwrap_or(""),
         d["status"].as_str().unwrap_or("?").replace('_', " "), d["note"].as_str().unwrap_or(""))
@@ -3514,7 +3518,7 @@ pub fn questions(d: &Discovery, action: Option<QuestionsCmd>, all: bool, as_json
             }
             if q["answer"].is_object() {
                 let a = &q["answer"];
-                let flat = json!({"picked": a["picked"], "words": a["words"], "recorded_by": a["recorded_by"]["label"], "delivery": a["delivery"]});
+                let flat = json!({"picked": a["picked"], "words": a["words"], "how": a["how"], "recorded_by": a["recorded_by"]["label"], "delivery": a["delivery"]});
                 println!("\n{}", answer_line(&flat));
             }
             if let Some(r) = q["withdrawn"]["reason"].as_str() { println!("\nwithdrawn: {r}"); }

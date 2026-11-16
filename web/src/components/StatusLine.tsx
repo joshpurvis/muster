@@ -17,6 +17,8 @@ import * as A from "../actions.ts";
 import { IconBranch, IconFolder, IconTerminal } from "../icons.tsx";
 import { cx, tildify } from "../util.ts";
 import { taskLabel } from "../model.ts";
+import { openQuestionCount } from "../questions.ts";
+import { QUESTIONS_TAB } from "../layout/tree.ts";
 
 const CONN_LABEL = {
   open: "connected",
@@ -28,10 +30,13 @@ const CONN_LABEL = {
 
 export function StatusLine() {
   const c = focusedTask.value;
-  const n = needsYou.value.length;
+  const waiting = needsYou.value.length;
+  const asked = openQuestionCount.value;
+  // Sessions that need you, and open questions (the Questions tab).
+  const n = waiting + asked;
   const status = connStatus.value;
-  // Terminal, panel and note tabs alike.
-  const count = visibleIds.value.size;
+  // Terminal, panel and note tabs alike (not the pinned Questions tab).
+  const count = visibleIds.value.size - (visibleIds.value.has(QUESTIONS_TAB) ? 1 : 0);
   const s = focusedSession.value;
   // Where the focused tab is now: a shell's `cd` or Claude's `/cd` moves it off the task folder.
   const live = s && c && s.channel_id === c.id ? s.live_cwd : undefined;
@@ -100,7 +105,9 @@ export function StatusLine() {
         <button
           type="button"
           class="sl-needs"
-          data-tip="Go to the next session that needs you"
+          data-tip={asked === 0 ? "Go to the next session that needs you"
+            : waiting === 0 ? `${asked} open ${asked === 1 ? "question" : "questions"}: show the Questions tab`
+            : `${waiting} ${waiting === 1 ? "session" : "sessions"} and ${asked} open ${asked === 1 ? "question" : "questions"}: go to the next`}
           data-keys="Alt+J"
           onClick={() => A.nextNeedsYou()}
         >

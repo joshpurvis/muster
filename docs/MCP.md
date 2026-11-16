@@ -967,9 +967,10 @@ and `muster schedule rm` run `pause_schedule` and `delete_schedule` (docs/CLI.md
 An agent that needs the human posts a question and carries on: nothing waits on it, its turn
 goes on and messages to it keep arriving (unlike an interview box, which holds every message to
 the agent until it is answered). Muster keeps the question; the answer reaches the agent later as
-a message. This is the first step of the Questions tab: there is no tab yet. Questions are listed
-with `list_questions` or `muster questions` (docs/CLI.md "Questions"), and a lead records an
-answer the human typed in chat with `record_answer`. Code: `src/questions.rs`.
+a message. The human sees every open question in the pinned Questions tab of Muster's window
+(docs/UI.md "Questions") and answers there with a click or in their own words; questions are also
+listed with `list_questions` or `muster questions` (docs/CLI.md "Questions"), and a lead records
+an answer the human typed in chat with `record_answer`. Code: `src/questions.rs`.
 
 | Tool | Arguments | Result |
 |---|---|---|
@@ -1007,6 +1008,16 @@ it again by calling `record_answer` with the same words and pick. Muster can't c
 human said it: the message says who recorded it and that Muster can't check it, and arrives as
 that recorder's message, never as the human's own input.
 
+**An answer from the Questions tab.** The human's own, given with a click in Muster's window
+(docs/PROTOCOL.md "Questions", `question.answer`): it has no recorder, and goes after 8 seconds
+(the human can take it back meanwhile, and later while it still waits in the asker's input queue)
+along the same path as a recorded one, as the human's own message: `[muster msg <id> from human
+origin=human hop=0]` to a named agent (or `[muster answer to question Q<n> from human
+origin=human hop=0]` to a session), then `The human picked it in Muster's Questions tab (<time>).`
+or `The human answered it in Muster's Questions tab (<time>), in these words: "<words>"`, and the
+whole question with the asker's note as below. An answer the human took back never arrives; if
+its message was already queued, it is taken out and marked refused ("taken back").
+
 **Delivery.** The answer is stored first, then delivered:
 - To the asking **named agent, by name**: through `ask_agent`'s path, as a message from the
   recorder (`[muster msg <id> from <recorder> origin=<o> hop=<n>]`), so the asker's accepted
@@ -1037,7 +1048,7 @@ restart came right after it was typed in, the session sees it twice rather than 
 can't be delivered (`refused`, `undelivered`) is kept with its reason, `list_questions` shows it,
 and its recorder can send it again.
 
-Not yet (later steps of the Questions tab): the tab itself and answering there, a lead passing a
+Not yet (later steps of the Questions tab): one-key answers, Later and Skip, a lead passing a
 session's question on in one call (`passed_on_by` is kept for it), defaults that answer a question
 at a set time (`area` is kept: merges, money, public and customer DNS will never take one),
 delivering into a fresh start for an asker gone cold (`asker_now.cold` is the signal), answers

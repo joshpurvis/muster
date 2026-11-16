@@ -29,6 +29,7 @@ import {
 import { hasTerminalFocus, setShortcutMatcher } from "./terms.ts";
 import { noteId } from "./layout/tree.ts";
 import { notesSupported } from "./notes.ts";
+import { questionsSupported } from "./questions.ts";
 import { canCloseWindow, isNative } from "./native.ts";
 import { latencyMonitorOn, setLatencyMonitor } from "./latency_monitor.ts";
 import { isMac } from "./util.ts";
@@ -161,10 +162,17 @@ export const commands: Command[] = [
   },
   {
     id: "next-needs-you",
-    title: "Next session that needs you",
+    title: "Next session or question that needs you",
     group: "Navigate",
     keys: ["Alt+J"],
     run: () => A.nextNeedsYou(),
+  },
+  {
+    id: "questions",
+    title: "Questions (what agents asked you)",
+    group: "Navigate",
+    enabled: () => questionsSupported.value,
+    run: () => A.openQuestionsTab(),
   },
   {
     id: "next-tab",

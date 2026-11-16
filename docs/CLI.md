@@ -141,13 +141,14 @@ muster note read release --json | jq .rev     # then: muster note write release 
 ## Questions
 
 Questions agents posted for you with the MCP tool `post_question` (docs/MCP.md "Questions for
-the human"). Read-only here (apart from `start-at`): a lead records the answer you give it in chat with
-`record_answer`, and the answer reaches the asking agent as a message. Needs a running daemon
-(it doesn't start one).
+the human"). Read-only here (apart from `start-at`): you answer in the Questions tab of Muster's
+window (docs/UI.md "Questions"; only a click there answers as you), or a lead records the answer
+you give it in chat with `record_answer`; either way the answer reaches the asking agent as a
+message. Needs a running daemon (it doesn't start one).
 
 | Command | What it does |
 |---|---|
-| `muster questions [--all] [--json]` | The open questions, oldest first: number, age, asker, product, what it holds up, the question, its lettered options with the asker's pick, what happens if you don't answer, and the asker now (idle for how long, asleep, cold: its next message re-reads its whole conversation). `--all`: answered and withdrawn ones too, with the answer, who recorded it and how it was delivered. `--json` prints `question.list`. |
+| `muster questions [--all] [--json]` | The open questions, oldest first: number, age, asker, product, what it holds up, the question, its lettered options with the asker's pick, what happens if you don't answer, and the asker now (idle for how long, asleep, cold: its next message re-reads its whole conversation). `--all`: answered and withdrawn ones too, with the answer, who recorded it (or "in the Questions tab") and how it was delivered. `--json` prints `question.list`. |
 | `muster questions show <N\|QN> [--json]` | One question in full: context, example, each option's why, details, links, pictures, the asker's note to itself, the answer and its delivery. |
 | `muster questions start-at <N>` | Before the first question is posted: make it QN, so numbers carry on from a list you kept elsewhere. Refused once any question exists, and from an agent's session. |
 

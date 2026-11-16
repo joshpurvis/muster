@@ -497,18 +497,29 @@ before it goes.
 ## Questions
 
 Questions agents posted for the human (`src/questions.rs`; the agents' side is docs/MCP.md
-"Questions for the human"). Stored in the `questions` table (migration v30), one JSON record per
-question; the row id is its number (Q<id>, never reused). Desktop client token only: devices
-have no `question.*` methods. There are no events yet (nothing on screen shows them).
+"Questions for the human"; the window's side is docs/UI.md "Questions"). Stored in the `questions`
+table (migration v30), one JSON record per question; the row id is its number (Q<id>, never
+reused). Desktop client token only: devices have no `question.*` methods and get no
+`question_upserted` events.
 
 | Method | Params | Result |
 |---|---|---|
-| `question.list` | `{status?: "open" \| "answered" \| "withdrawn" \| "all" (default "open"), limit? (≤ 200)}` | `{questions: [...], shown, total}`, oldest first (the newest `limit`), as MCP `list_questions` returns them; every question, whatever its workspace. |
-| `question.get` | `{id}` | The whole question, as MCP `list_questions` with `number` returns it. |
+| `question.list` | `{status?: "open" \| "answered" \| "withdrawn" \| "all" (default "open"), limit? (≤ 200), full?}` | `{questions: [...], shown, total}`, oldest first (the newest `limit`), as MCP `list_questions` returns them; every question, whatever its workspace. `full`: each one whole, as `question.get` returns it (the Questions tab). |
+| `question.get` | `{id}` | The whole question, as MCP `list_questions` with `number` returns it, plus (answered) `can_undo` and `read_at` (below). |
+| `question.picture` | `{id, index}` (from 0) | `{src, caption}`: the question's picture as a `data:` URI. Read like the image panel reads a file (a regular file, no symlink at the end, at most 8 MiB, an image by its content: PNG, JPEG, GIF, WebP or SVG); anything else is refused. |
+| `question.answer` | `{id, pick?: [letters], words?}` | The question, answered. The human's own answer: **only a click in Muster's window** (the WebSocket checks, as for `schedule.approve`: the UI's origin, a claimed window, no `from_session`, a program outside every session); refused from `/api/rpc`, the CLI and any other WebSocket. Letters must be the question's (one for `pick_one`/`yes_no`); an `own_words` question needs `words`, the others a letter or words (at most 4000 characters). Refused once answered or withdrawn. Stored at once with `how: "tab"`, no recorder, sender `human`, delivery `pending`; sent 8 seconds later (`TAB_HOLD`) unless taken back, along the same path as a recorded answer (the asking agent by name, else the session that asked, else its lead), as the human's own message (origin human, hop 0, `[muster msg <id> from human origin=human hop=0]`). A restart during the hold sends it at the next start. |
+| `question.undo` | `{id}` | The question, open again. Click only, as `question.answer`. Takes back an answer given in the tab until its asker has read it: still in the hold, still waiting in the asker's input queue (not being typed; it is taken out, and its message is marked refused, "taken back"), or never delivered (refused, undeliverable). Refused for an answer a lead recorded from chat, while it is being delivered, and once the asker has it. |
 | `question.start_at` | `{first}` (1 to 1000000) | `{first}`. The first question posted gets number `first`. Refused once any question exists, from a paired device, and from a session (`from_session`: the CLI inside one). |
 
-Posting, withdrawing and recording an answer are MCP tools only (each runs as the calling
-session, with its guards): no client method writes a question or an answer.
+An answered question also carries `can_undo` (the human may still take it back, as
+`question.undo` would allow, worked out when it is read) and `read_at` (when the message that
+carried it was typed into the asking agent; null while it waits, and for a session that isn't a
+named agent).
+
+Every change (posted, answered, taken back, withdrawn, a delivery moving on) emits
+`question_upserted` with the whole question as `question.get` returns it. Posting, withdrawing and
+recording an answer from chat are MCP tools only (each runs as the calling session, with its
+guards); the human's own answer is `question.answer`, from the window.
 
 ## Schedules
 

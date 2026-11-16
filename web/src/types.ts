@@ -628,6 +628,87 @@ export interface SchedulePreview {
   daily_cap_default?: number;
 }
 
+// ---------------- questions for the human (docs/PROTOCOL.md "Questions") ----------------
+
+/** A session acting on a question (the asker, a lead that passed it on, a recorder). */
+export interface QuestionWho {
+  /** A named agent's name, else "Claude (task)" and the like. */
+  label: string;
+  session_id: SessionId;
+  kind: SessionKind;
+  agent_id?: number;
+  parent_id?: SessionId;
+}
+
+export interface QuestionChoice {
+  letter: string;
+  text: string;
+  why?: string;
+}
+
+export type QuestionDeliveryStatus = "pending" | "delivering" | "delivered" | "not_needed" | "refused" | "undelivered";
+
+export interface QuestionAnswer {
+  /** The letters picked (none: own words only). */
+  picked: string[];
+  /** The human's words, verbatim (empty: a click on an option in the tab). */
+  words: string;
+  how: "chat" | "tab" | "default";
+  recorded_by?: QuestionWho;
+  at: number;
+  delivery: {
+    status: QuestionDeliveryStatus;
+    note?: string;
+    /** An agent's name or `session <id>`. */
+    to?: string;
+    msg_id?: number;
+    session_id?: SessionId;
+    at?: number;
+  };
+}
+
+/** A question as `question.list {full: true}`, `question.get` and `question_upserted` give it. */
+export interface Question {
+  id: number;
+  /** "Q<id>". */
+  number: string;
+  status: "open" | "answered" | "withdrawn";
+  created_at: number;
+  updated_at: number;
+  asker: QuestionWho;
+  passed_on_by?: QuestionWho;
+  product?: string;
+  question: string;
+  context: string;
+  example: string;
+  kind: "pick_one" | "yes_no" | "pick_several" | "own_words";
+  options: QuestionChoice[];
+  /** The asker's pick (letters). */
+  pick: string[];
+  if_no_answer: string;
+  holding_up?: string;
+  area: "merge" | "money" | "public" | "customer_dns" | "other";
+  pictures?: { path: string; caption: string }[];
+  links?: { label: string; url: string }[];
+  details?: string;
+  note_to_self: string;
+  answer?: QuestionAnswer;
+  withdrawn?: { at: number; reason: string };
+  /** Open questions: the asker as it was when this was sent. */
+  asker_now?: {
+    session_id?: SessionId;
+    state: AgentState | "gone";
+    running: boolean;
+    asleep: boolean;
+    cold: boolean;
+    idle_ms?: number | null;
+  };
+  /** Answered ones: the human may still take it back (an answer given in the tab, not yet read). */
+  can_undo?: boolean;
+  /** When the asking agent got the message that carried the answer. */
+  read_at?: number | null;
+}
+
 export type ServerEvent =
   | { event: "panel_upserted"; data: Panel }
   | { event: "panel_removed"; data: { id: number } }
@@ -655,6 +736,7 @@ export type ServerEvent =
   | { event: "updates_changed"; data: UpdateStatus }
   | { event: "prefs_changed"; data: WindowPrefs }
   | { event: "daemon_stopping"; data: { reason: string } }
+  | { event: "question_upserted"; data: Question }
   // Connection-scoped, only to a client that asked `session.attach` for a `replay` kind.
   | {
     event: "attach_info";

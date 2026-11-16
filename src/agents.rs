@@ -538,11 +538,9 @@ fn add_links_section(path: &Path) {
         Some(i) => format!("{}{section}{}", &text[..i + 1], &text[i + 1..]),
         None => format!("{}\n\n{}\n", text.trim_end(), section.trim_end()),
     };
-    // Written beside it and renamed over it, so a failed write never leaves it cut short.
-    let tmp = path.with_extension("md.muster-links");
-    let done = write_persona(&tmp, &next).and_then(|()| Ok(std::fs::rename(&tmp, path)?));
-    if let Err(e) = done {
-        let _ = std::fs::remove_file(&tmp);
+    // A fresh temporary file renamed over it (`paths::write_private`), so a failed write never
+    // leaves it cut short and a planted file can't be truncated.
+    if let Err(e) = refuse_symlink(path).and_then(|()| Ok(paths::write_private(path, next.as_bytes())?)) {
         tracing::warn!("adding the Links section to {}: {e:#}", path.display());
     }
 }

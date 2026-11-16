@@ -201,9 +201,9 @@ function followClicks(el: HTMLElement, term: Terminal, state: LinkState, sid: nu
 
 /** Muster addresses written as text in the logical line around buffer row `row` (0-based): the
  * row and the rows wrapped to and from it, only as far as an address can reach. Characters
- * just outside what is read (a wrapped row cut off, or a row drawn full to its edge that a
- * redrawn replay no longer marks as wrapped) go in as `edges`, so a cut address is no link
- * rather than a link to the wrong id. */
+ * just outside what is read (the row before a wrapped one, or the next row's text after the last
+ * one's, since a replay redrawn at another width no longer marks wrapped rows) go in as `edges`,
+ * so a cut address is no link rather than a link to the wrong id. */
 function textLinks(term: Terminal, row: number) {
   const b = term.buffer.active;
   const cols = term.cols;
@@ -226,11 +226,14 @@ function textLinks(term: Terminal, row: number) {
   if (!text.includes("muster://")) return [];
   const cells: { chars: string; width: number }[] = [];
   for (let r = top; r <= bottom; r++) cells.push(...cellsOf(r));
+  // The last row's trailing blanks go, so its last character meets the next row's text: an
+  // address ending there may have been cut by a wrap the terminal no longer knows of (a replay
+  // drawn at another width), and is then no link if that text would make it another one.
+  while (cells.length > (bottom - top) * cols && !cells.at(-1)?.chars) cells.pop();
   const full = (r: number) => !!b.getLine(r)?.getCell(cols - 1)?.getChars();
   const before = top > 0 && (b.getLine(top)?.isWrapped || full(top - 1)) ? cellsOf(top - 1).at(-1)?.chars || " " : "";
-  const next = b.getLine(bottom + 1);
-  const after = next && (next.isWrapped || full(bottom)) ? next.getCell(0)?.getChars() || " " : "";
-  return linkRanges(cells, cols, top, { before, after });
+  const next = b.getLine(bottom + 1)?.translateToString(false, 0, MAX_LINK) ?? "";
+  return linkRanges(cells, cols, top, { before, next });
 }
 
 function parkEl(): HTMLDivElement {

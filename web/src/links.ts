@@ -45,15 +45,15 @@ export function findMusterLinks(text: string): { start: number; end: number; uri
 
 /** Links in one terminal row as 1-based, inclusive cell columns (xterm's `IBufferRange.x`).
  * `cells` are the row's cells left to right; a wide character takes two, the second with width 0
- * and no text, so columns after one differ from string offsets. `before` and `after` are the
- * characters just outside `cells`, if any may belong to the same text (a row wrapped or drawn
- * full to its edge): a link they would continue (`muster://note/9` then `1`) is none, never a link
- * to the wrong id. */
+ * and no text, so columns after one differ from string offsets. `before` is the character just
+ * before `cells` and `next` the text just after them, when they may belong to the same text (a
+ * wrap, or rows a replay redrew at another width): a link that `next` would turn into another
+ * link (`muster://note/9` then `1`) is none, never a link to the wrong id. */
 export function linkColumns(
   cells: { chars: string; width: number }[],
-  edges: { before?: string; after?: string } = {},
+  edges: { before?: string; next?: string } = {},
 ): { start: number; end: number; uri: string }[] {
-  const before = edges.before ?? "", after = edges.after ?? "";
+  const before = edges.before ?? "", next = edges.next ?? "";
   let text = "";
   const col: number[] = [];
   cells.forEach((c, x) => {
@@ -63,8 +63,9 @@ export function linkColumns(
     text += s;
   });
   const n = before.length;
-  return findMusterLinks(before + text + after)
-    .filter((l) => l.start >= n && l.end <= n + text.length)
+  const joined = next ? findMusterLinks(before + text + next) : [];
+  return findMusterLinks(before + text)
+    .filter((l) => l.start >= n && !joined.some((j) => j.start === l.start && j.uri !== l.uri))
     .map((l) => ({ start: col[l.start - n] + 1, end: col[l.end - n - 1] + 1, uri: l.uri }));
 }
 
@@ -76,7 +77,7 @@ export function linkRanges(
   cells: { chars: string; width: number }[],
   cols: number,
   top: number,
-  edges: { before?: string; after?: string } = {},
+  edges: { before?: string; next?: string } = {},
 ) {
   const at = (col: number) => ({ x: ((col - 1) % cols) + 1, y: top + 1 + Math.floor((col - 1) / cols) });
   return linkColumns(cells, edges).map((l) => ({ start: at(l.start), end: at(l.end), uri: l.uri }));

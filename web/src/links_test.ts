@@ -84,12 +84,15 @@ Deno.test("linkRanges: a link split by a wrap is one range over both rows, never
   ]);
 });
 
-Deno.test("linkColumns: a link the next or previous row may continue is none, never the wrong id", () => {
+Deno.test("linkColumns: a link the next row would turn into another is none, never the wrong id", () => {
   const cells = (s: string) => [...s].map((chars) => ({ chars, width: 1 }));
   // A replay drew "muster://note/91" as two rows cut after the 9: the 9 alone is no link.
-  assertEquals(linkColumns(cells("muster://note/9"), { after: "1" }), []);
-  assertEquals(linkColumns(cells("muster://note/9"), { after: " " }).map((l) => l.uri), ["muster://note/9"]);
-  assertEquals(linkColumns(cells("muster://note/9"), { after: ")" }).map((l) => l.uri), ["muster://note/9"]);
+  assertEquals(linkColumns(cells("muster://note/9"), { next: "1)" }), []);
+  assertEquals(linkColumns(cells("see muster://agent/rev"), { next: "iewer" }), []);
+  // What follows can't continue it: the link stands.
+  for (const next of [" ", ")", "muster-links $", "", "- item"]) {
+    assertEquals(linkColumns(cells("muster://note/9"), { next }).map((l) => l.uri), ["muster://note/9"], next);
+  }
   // Glued to the row before.
   assertEquals(linkColumns(cells("muster://note/9 "), { before: "x" }), []);
   assertEquals(linkColumns(cells("muster://note/9 "), { before: "(" }).map((l) => l.start), [1]);

@@ -1151,7 +1151,8 @@ impl Store {
         let mut after = before.clone();
         let out = edit(&mut after)?;
         if after != before {
-            after.updated_at = now_ms().max(before.updated_at);
+            // Strictly increasing: the window keeps the newest copy of a question by it.
+            after.updated_at = now_ms().max(before.updated_at + 1);
             tx.execute("UPDATE questions SET status = ?2, updated_at = ?3, record = ?4 WHERE id = ?1",
                 params![id, after.status.as_str(), after.updated_at, serde_json::to_string(&after)?])?;
             tx.commit()?;

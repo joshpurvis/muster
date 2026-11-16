@@ -35,7 +35,7 @@ export const openQuestionCount = computed(() => (questionsSupported.value ? open
 let changedDuringLoad: Map<number, Question> | null = null;
 
 /** Record question `q` from an event or a reply, unless this window has a newer copy (an older
- * reply arriving after an event). */
+ * reply arriving after an event: every change raises `updated_at`). */
 export function applyQuestion(q: Question) {
   const have = questions.value.get(q.id);
   if (have && have.updated_at > q.updated_at) return;

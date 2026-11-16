@@ -14,7 +14,7 @@ import {
   sendAnswer, sendsText, setDraft, typeWords, undoAnswer, whatHappened, whoText,
 } from "../questions.ts";
 import type { Question } from "../types.ts";
-import { agents, agentsSupported, dismissToastKey, sessions, toast } from "../state.ts";
+import { agents, agentsLoaded, dismissToastKey, sessions, toast } from "../state.ts";
 import { isAsleep } from "../agents.ts";
 import { wakeCold } from "../cache.ts";
 import * as A from "../actions.ts";
@@ -56,7 +56,7 @@ function askerSession(q: Question) {
   const agent = q.asker.agent_id != null ? agents.value.find((a) => a.id === q.asker.agent_id) : undefined;
   const sid = agent?.session_id ?? q.asker_now?.session_id ?? q.asker.session_id;
   // A named asker this window no longer lists (once the list is loaded) was removed.
-  const gone = q.asker.agent_id != null && agentsSupported.value && agents.value.length > 0 && !agent;
+  const gone = q.asker.agent_id != null && agentsLoaded.value && !agent;
   return { agent, gone, session: sid != null ? sessions.value.get(sid) : undefined };
 }
 

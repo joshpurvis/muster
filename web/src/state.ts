@@ -183,6 +183,8 @@ export const lifecycleChecking = signal<"restart" | "shutdown" | null>(null);
 export const agents = signal<Agent[]>([]);
 /** The daemon knows agents (false: an older daemon answered "unknown method"). */
 export const agentsSupported = signal(true);
+/** The agent list arrived at least once (so an agent missing from it was removed). */
+export const agentsLoaded = signal(false);
 /** The message log, newest first (`agent.messages`, then `agent_message` events). */
 export const agentMessages = signal<AgentMessage[]>([]);
 /** The panel's selected agent: the log shows only messages to it. */
@@ -206,6 +208,7 @@ async function loadAgents() {
       rpc.call<{ messages: AgentMessage[] }>("agent.messages", { limit: 100 }),
     ]);
     agentsSupported.value = true;
+    agentsLoaded.value = true;
     agents.value = sortAgents(list);
     agentMessages.value = log.messages;
   } catch (e) {

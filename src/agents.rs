@@ -319,6 +319,7 @@ pub fn persona_text(name: &str, kind: SessionKind, persona: &str) -> String {
          Keep durable notes (facts, decisions, open threads) in `memory/` in this folder, one topic per \
          file, and read them when a conversation starts. Conversations get compacted or restarted; \
          `memory/` is what survives.\n\n\
+         ## Links\n\n{links}\n\n\
          ## Messages\n\n\
          A prompt that starts with `[muster msg <id> from <sender> origin=<origin> hop=<n>]` came from \
          another agent or session through muster, not from the human typing. Answer it in your reply: \
@@ -333,6 +334,7 @@ pub fn persona_text(name: &str, kind: SessionKind, persona: &str) -> String {
          shows yours. Neither works while you handle scheduled or triggered work.\n",
         kind = kind.as_str(),
         resume = " resumes your conversation when you restart",
+        links = crate::links::INSTRUCTION,
         persona = if persona.is_empty() { "(none given)" } else { persona },
     )
 }
@@ -3800,6 +3802,8 @@ mod tests {
         assert!(check_name(&"x".repeat(41)).is_err());
         let t = persona_text("ada", SessionKind::Claude, "Reviews diffs.");
         assert!(t.contains("Reviews diffs.") && t.contains("memory/") && t.contains("resumes"));
+        // Every agent is told to mention things by title, as a link, with the form shown.
+        assert!(t.contains("## Links") && t.contains("[Pairs to review](muster://note/91)"), "{t}");
         assert_eq!(persona_file(SessionKind::Codex), "AGENTS.md");
         assert_eq!(parse_accepts("human, schedule,human").unwrap(), vec![Origin::Human, Origin::Schedule]);
         assert!(parse_accepts("cron").is_err());

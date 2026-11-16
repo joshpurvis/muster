@@ -416,8 +416,9 @@ pub(super) fn pretty(v: &Value) -> String {
     serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string())
 }
 
+/// A session as the tools describe it, with its tab's `link` and `mention` (src/links.rs).
 fn session_json(s: &SessionInfo, caller: SessionId) -> Value {
-    json!({
+    let mut v = json!({
         "id": s.id,
         "channel_id": s.channel_id,
         "kind": s.kind,
@@ -431,7 +432,9 @@ fn session_json(s: &SessionInfo, caller: SessionId) -> Value {
         "title": s.title,
         "exit_code": s.exit_code,
         "is_me": s.id == caller,
-    })
+    });
+    crate::links::add(&mut v, crate::links::tab(s.id), &crate::links::tab_title(&s.name, s.kind.as_str()));
+    v
 }
 
 fn channel_json(c: &Channel, ws: Option<&Workspace>) -> Value {
@@ -1282,6 +1285,7 @@ fn list_agents<B: Backend>(st: &McpState<B>, caller: SessionId) -> TResult {
             let s = b.session_id.and_then(|s| st.backend.session(s));
             let mut v = crate::agents::agent_json(b, s.as_ref());
             v["is_me"] = json!(b.session_id == Some(caller));
+            crate::links::add(&mut v, crate::links::agent(&b.name), &b.name);
             v
         })
         .collect();

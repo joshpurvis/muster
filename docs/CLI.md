@@ -56,6 +56,7 @@ list the candidates (`id  tab/name  kind  state`).
 | `muster reply <msg_id> [TEXT...] [--json]` | Inside an agent's session only: answer message `msg_id` (from its `[muster msg <id> …]` line) after the turn that received it. It calls the session's MCP `reply` with that session's own token (`$MUSTER_TOKEN`, else its token file), never through the client token, so nothing outside the session can answer as the agent (Codex hides `*TOKEN*` variables from the commands it runs, so a Codex agent uses the MCP tool `reply` instead) (once per message, only for messages delivered to this agent; docs/MCP.md "Late replies"). TEXT as for `send`. Prints how it reached the asker (returned to the waiting ask, delivered as message N, shown in the agents panel). Exit 1 when it was refused before being stored, or stored but not delivered (a guard refused it, the asker is gone). Outside an agent's session it is refused: the human never replies to agent messages. |
 | `muster start-fresh FILE [--json]` | Inside a named agent's session only: ask for its own fresh start from handoff file FILE (relative to the current directory), through the session's MCP `start_fresh` with its own token (Muster checks the call comes from that session's own processes). Only for agents the human allowed (`agent edit --self-handoff on`), Claude only, at most once every 30 minutes; FILE must exist inside the agent's home folder or working directory. Prints what happens next: once the agent is idle, Muster types `/clear` (its process and background tasks keep running) and then one prompt naming FILE (docs/MCP.md "Self handoff"). Exit 1 when refused, with why. |
 | `muster note ls/new/read/write/append/rename/open/close/rm/triggers` | Plain-text notes shared with agents. See "Notes" below. |
+| `muster link note\|panel\|tab\|agent <target> [--url]` | Print the Markdown link that mentions it to the human, `[Pairs to review](muster://note/91)`: clicked in Muster's window, it shows that note, panel, tab or agent (docs/UI.md "Links"). The target is a note id or title (as for `note`), a panel id, a session target (as above) or an agent name. `--url` prints the address alone. Reads only; exit 2 when there is no such thing. |
 | `muster schedule add/ls/rm/pause/resume/run/skip/renew/history/approve` | Recurring and one-off messages to a named agent, and triggers (`--on note:/git:/gh:/url:/files:`); `approve` an agent's proposal. Inside an agent's session, `propose` and `remind`. See "Schedules" below. |
 | `muster trigger <name> [DATA...]` / `--url <name>` | Fire a URL trigger now, or print its URL and secret. See "Triggers and Then" under "Schedules" below. |
 | `muster pr list --repo OWNER/NAME [--limit N]` / `muster pr snapshot --repo OWNER/NAME NUMBER [--media-dir DIR] [--max-diff-bytes N]` | Read-only GitHub fetches for PR reviews, printed as JSON; no daemon needed. See "PR snapshots" below. |
@@ -104,7 +105,7 @@ muster panel event 1 42
 muster panel close 1
 ```
 
-Open/update also accept `--html '<html>…</html>'` instead of `--html-path`. Open accepts
+`open` and `list` print each panel's `link` and `mention` too. Open/update also accept `--html '<html>…</html>'` instead of `--html-path`. Open accepts
 `--csp '{"resourceDomains":["https://cdn.example"]}'`; fetching remains blocked. HTML paths
 must stay in the task cwd. Omit the ID on `wait` for any panel in the task; timeout is 0–1800
 seconds (default 300). A timeout prints `{events: [], remaining: 0, timed_out: true}` and exits
@@ -120,13 +121,13 @@ title prefix; ambiguous or unknown ones exit 2.
 
 | Command | What it does |
 |---|---|
-| `muster note ls [--json]` (alias `list`) | `ID  REV  BYTES  OPEN  UPDATED  BY  TITLE`. `--json` prints `note.list`. |
-| `muster note new [--title T] [TEXT...]` | Create a note (empty without TEXT; `-` reads stdin). Prints its id. Not shown until opened. |
+| `muster note ls [--json]` (alias `list`) | `ID  REV  BYTES  OPEN  UPDATED  BY  LINK  TITLE`. `--json` prints `note.list`, each note with `link` and `mention` (docs/MCP.md "Links"). |
+| `muster note new [--title T] [TEXT...]` | Create a note (empty without TEXT; `-` reads stdin). Prints its id, and on stderr `link: [title](muster://note/ID)` to mention it with. Not shown until opened. |
 | `muster note read <note> [--json]` | Print the text exactly (no newline added). `--json` prints the whole note, with its `rev`. |
 | `muster note write <note> --rev N [TEXT...]` | Replace the text (none or `-`: stdin, as is). `--rev` is the revision you read; refused when the note changed since. Prints `note ID: rev R`. |
 | `muster note append <note> [TEXT...]` | Add at the end, on a new line (none or `-`: stdin, trailing newlines dropped). Never conflicts. |
 | `muster note rename <note> <title>` | Rename it. |
-| `muster note open <note> [--window N]` | Show its tab in window N, else beside this session (needs a session). |
+| `muster note open <note> [--window N]` | Show its tab in window N, else beside this session (needs a session). Prints `note ID: window N: [title](muster://note/ID)`. |
 | `muster note close <note>` | Close its tab; the note stays. |
 | `muster note rm <note>` | Delete it for good. Refused from an agent's session. |
 | `muster note triggers <note> [on\|off]` | "Allow triggers": only then can a schedule's note trigger fire on its changes (off by default). Refused from an agent's session. |

@@ -16,6 +16,7 @@ import type { SessionInfo } from "./types.ts";
 import { isRightButtonReport, RIGHT_BUTTON } from "./mousereport.ts";
 import { copyText } from "./util.ts";
 import { measure, metricsEnabled, onMetricsFlush } from "./metrics.ts";
+import { linkColumns, type MusterLink, parseMusterLink } from "./links.ts";
 
 const MAX_WEBGL = 10;
 
@@ -119,6 +120,34 @@ export function onTerminalFocus(f: (sid: number) => void) {
   focusListener = f;
 }
 
+/** A click on a Muster link (links.ts) in session `sid`'s terminal. */
+let linkListener: (link: MusterLink, sid: number) => void = () => {};
+export function onMusterLink(f: (link: MusterLink, sid: number) => void) {
+  linkListener = f;
+}
+
+/** Links a program marked up itself (OSC 8: Claude Code prints Markdown links this way when
+ * Muster starts it, see src/adapters/claude.rs). A Muster link opens on a plain click; it only
+ * shows something. A web link opens in a new browser tab on Ctrl/Cmd+click, as a bare address
+ * does; its text may say something else than where it goes, so hovering shows the address. Any
+ * other kind (file://, ssh://…) is left alone. */
+function oscLinks(sid: number, el: HTMLElement) {
+  return {
+    allowNonHttpProtocols: true,
+    activate(ev: MouseEvent, uri: string) {
+      const link = parseMusterLink(uri);
+      if (link) return linkListener(link, sid);
+      if (/^https?:\/\//i.test(uri) && (ev.ctrlKey || ev.metaKey)) globalThis.open(uri, "_blank", "noopener");
+    },
+    hover(_ev: MouseEvent, uri: string) {
+      if (parseMusterLink(uri) || /^https?:\/\//i.test(uri)) el.title = uri;
+    },
+    leave() {
+      el.removeAttribute("title");
+    },
+  };
+}
+
 function parkEl(): HTMLDivElement {
   if (!park) {
     park = document.createElement("div");
@@ -203,6 +232,7 @@ function create(sid: number): Entry {
     disableStdin: connStatus.peek() !== "open",
     // App shortcuts use Alt; don't let xterm swallow Alt+letters on macOS.
     macOptionClickForcesSelection: true,
+    linkHandler: oscLinks(sid, el),
   });
   const fit = new FitAddon();
   const search = new SearchAddon();
@@ -213,6 +243,32 @@ function create(sid: number): Entry {
       if (ev.ctrlKey || ev.metaKey) globalThis.open(uri, "_blank", "noopener");
     }),
   );
+  // Muster links written out as text (`title (muster://note/91)`, as Codex prints Markdown
+  // links): clickable like the marked-up ones.
+  term.registerLinkProvider({
+    provideLinks(y, callback) {
+      const line = term.buffer.active.getLine(y - 1);
+      if (!line || !line.translateToString(true).includes("muster://")) return callback(undefined);
+      const cells: { chars: string; width: number }[] = [];
+      for (let x = 0; x < line.length; x++) {
+        const c = line.getCell(x);
+        cells.push({ chars: c?.getChars() ?? "", width: c?.getWidth() ?? 1 });
+      }
+      const found = linkColumns(cells);
+      callback(
+        found.length
+          ? found.map((l) => ({
+            range: { start: { x: l.start, y }, end: { x: l.end, y } },
+            text: l.uri,
+            activate: () => {
+              const link = parseMusterLink(l.uri);
+              if (link) linkListener(link, sid);
+            },
+          }))
+          : undefined,
+      );
+    },
+  });
   try {
     term.loadAddon(new Unicode11Addon());
     term.unicode.activeVersion = "11";

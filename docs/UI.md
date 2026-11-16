@@ -286,6 +286,41 @@ docs/MCP.md "Notes") and `muster note` (docs/CLI.md); the human types in it.
   show neither.
 - The status line's tab count includes notes. The phone UI has no notes (it receives none).
 
+### Links
+
+Agents mention a note, panel, tab or agent to the human by its title, as a link that shows it
+when clicked, instead of a bare number ("your three pairs are in note 91"). The address names a
+kind and an id, or an agent's name, and nothing else (no token, no window), so it is safe in
+transcripts and pasted elsewhere (src/links.rs, web/src/links.ts):
+
+| Address | Shows |
+|---|---|
+| `muster://note/91` | the note: selected here, or opened beside the terminal that showed the link (from closed, or from another window), as Jump does |
+| `muster://panel/3` | the panel, selected here or brought from its window |
+| `muster://tab/12` | session 12's tab |
+| `muster://agent/reviewer` | the named agent's tab |
+
+- **How it arrives**: an agent writes Markdown, `[Pairs to review](muster://note/91)`. Claude
+  Code prints it as a terminal hyperlink (OSC 8: only the title shows, underlined on hover; Muster
+  starts Claude sessions with `FORCE_HYPERLINK=1`, since Claude Code can't tell that Muster's
+  terminal supports them). Codex prints `Pairs to review (muster://note/91)`, and any program may
+  print the bare address: Muster's terminal finds those in the text and makes them clickable too.
+- **Click**: a plain click follows a Muster link. Web links keep their Ctrl+click (⌘-click), also
+  as hyperlinks, whose address shows as a tooltip on hover since their text may say something
+  else. Other hyperlinks (`file://`, …) do nothing.
+- **Gone**: a link to a deleted note, a closed panel or tab, or an agent that doesn't exist (or
+  has never started) shows a short message saying so.
+- **Only shows**: following a link selects a tab, opens a note's tab or raises a window, nothing
+  else. It never sends a prompt, approves, starts or stops a session or agent, or changes a
+  note's text, so a link in untrusted text (a web page an agent printed) is safe to click.
+- Agents get the link ready-made: tool and command results that return a note, panel, session or
+  agent carry `link` and `mention` (docs/MCP.md "Links"), and `muster link` prints one
+  (docs/CLI.md). Every agent's instructions (its CLAUDE.md or AGENTS.md, the MCP server's
+  instructions) say to mention things this way.
+- Not yet: outside Muster's window (another terminal, a browser) the address isn't registered
+  with the system, so it does nothing there; the phone UI shows Claude's linked titles as plain
+  text.
+
 ### Dragging tabs
 Pointer-based (not HTML5 DnD), with the v1 drop-zone overlay:
 - Onto another group's body: left/right/top/bottom halves (outer 28%) split that group on that

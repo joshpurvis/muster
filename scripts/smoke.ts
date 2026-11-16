@@ -617,6 +617,18 @@ done
   ok(dec.decode(cliRead.stdout) === "rewritten\nfrom the cli", "muster note read prints the text");
   const cliLs = await new Deno.Command(BIN, { args: ["note", "ls"], env: cliEnv0(), stdout: "piped" }).output();
   ok(dec.decode(cliLs.stdout).includes("Agent findings"), "muster note ls");
+  // Links (src/links.rs): what the agent writes to the human names the note by title, as a link
+  // that carries nothing but the kind and id.
+  const link = `muster://note/${made.note_id}`;
+  ok(made.link === link && made.mention === `[Agent findings](${link})` && opened.mention === made.mention &&
+    listed.notes.every((n: Json) => n.link === `muster://note/${n.id}`), `MCP note results carry the link (${made.mention})`);
+  const cliLink = await new Deno.Command(BIN, { args: ["link", "note", "Agent findings"], env: cliEnv0(), stdout: "piped", stderr: "piped" }).output();
+  ok(cliLink.success && dec.decode(cliLink.stdout) === `[Agent findings](${link})\n`, `muster link note (${dec.decode(cliLink.stderr)})`);
+  const cliTabLink = await new Deno.Command(BIN, { args: ["link", "tab", String(fake.id), "--url"], env: cliEnv0(), stdout: "piped" }).output();
+  ok(dec.decode(cliTabLink.stdout) === `muster://tab/${fake.id}\n`, "muster link tab --url");
+  const noLink = await new Deno.Command(BIN, { args: ["link", "note", "99999"], env: cliEnv0(), stdout: "piped", stderr: "piped" }).output();
+  ok(noLink.code === 2, "muster link for a missing note exits 2");
+  ok(!JSON.stringify([made, opened, listed]).includes(fakeToken) && !made.link.includes(d.token), "a link holds no token");
   const noteRev = 5;
 
   await c.call("session.remove", { id: fake.id });

@@ -260,14 +260,28 @@ async fn dispatch_inner(hub: &Arc<Hub>, who: &Principal, method: &str, params: V
         // only, so each carries its session's identity and guards.
         "question.list" => {
             #[derive(Deserialize)] #[serde(deny_unknown_fields)]
-            struct P { #[serde(default)] status: crate::questions::Filter, #[serde(default)] limit: Option<usize> }
+            struct P {
+                #[serde(default)] status: crate::questions::Filter,
+                #[serde(default)] limit: Option<usize>,
+                // Each question whole (the Questions tab).
+                #[serde(default)] full: bool,
+            }
             let p: P = parse(params)?;
-            Ok(crate::questions::list(hub, p.status, None, p.limit, None)?)
+            Ok(crate::questions::list(hub, p.status, None, p.limit, None, p.full)?)
         }
         "question.get" => {
             let p: IdParam<i64> = parse(params)?;
             Ok(crate::questions::get(hub, p.id, None)?)
         }
+        "question.picture" => {
+            #[derive(Deserialize)] #[serde(deny_unknown_fields)]
+            struct P { id: i64, index: usize }
+            let p: P = parse(params)?;
+            Ok(crate::questions::picture(hub, p.id, p.index)?)
+        }
+        // The human's own answer: only a click in Muster's window (`question_from_window`), never
+        // the CLI, `/api/rpc` or a script, so no agent can answer as the human through them.
+        "question.answer" | "question.undo" => Err(RpcError(ANSWER_BY_CLICK.into())),
         "question.start_at" => {
             // The human's: never from a session (the CLI sends `$MUSTER_SESSION_ID`).
             human_only(who, method, &params)?;
@@ -1593,6 +1607,47 @@ pub async fn from_window(hub: &Arc<Hub>, who: &Principal, conn: u64, link: &WsLi
     }
 }
 
+/// Refusal for `question.answer` and `question.undo` from anywhere but a click in the window.
+pub const ANSWER_BY_CLICK: &str = "only a click in Muster's window answers a question as you (or takes an answer back): \
+    open the Questions tab there. An agent records an answer you gave it in chat with record_answer";
+
+/// `question.answer` (`{id, pick?: [letters], words?}`) and `question.undo` (`{id}`): the human
+/// answers a question in the Questions tab, or takes that answer back, only with a click in their
+/// own window (`from_window`): an answer from there goes to the asker as the human's own words.
+pub async fn question_from_window(hub: &Arc<Hub>, who: &Principal, conn: u64, link: &WsLink, method: &str, params: Value)
+    -> RpcResult {
+    require_local(who, method)?;
+    let from = params.get("from_session").and_then(|v| v.as_u64()).map(|v| v as SessionId);
+    from_window(hub, who, conn, link, from).await.map_err(|why| RpcError(format!("{ANSWER_BY_CLICK} ({why})")))?;
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct P {
+        id: i64,
+        #[serde(default)]
+        pick: Vec<String>,
+        #[serde(default)]
+        words: String,
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct U {
+        id: i64,
+        // The answer the human means to take back (its `answer.at`): never a newer one.
+        #[serde(default)]
+        at: Option<i64>,
+    }
+    Ok(match method {
+        "question.answer" => {
+            let p: P = parse(params)?;
+            crate::questions::answer_in_tab(hub, p.id, p.pick, &p.words, crate::questions::TAB_HOLD).await?
+        }
+        _ => {
+            let u: U = parse(params)?;
+            crate::questions::undo(hub, u.id, u.at)?
+        }
+    })
+}
+
 /// `schedule.approve`, the owner approving an agent's proposal or a schedule made or changed
 /// outside the window: only a click in the owner's window (`from_window`), never the CLI or
 /// `/api/rpc` (`dispatch` refuses it). `seen`: the schedule's `updated_at` the owner looked at;
@@ -1631,6 +1686,7 @@ fn forwarded(own_device: Option<i64>, ev: &ServerEvent) -> bool {
             | ServerEvent::ScheduleRun(_) | ServerEvent::ScheduleSettings(_)
             | ServerEvent::PanelUpserted(_) | ServerEvent::PanelRemoved { .. }
             | ServerEvent::NoteUpserted(_) | ServerEvent::NoteRemoved { .. }
+            | ServerEvent::QuestionUpserted(_)
         )
 }
 
@@ -2365,6 +2421,14 @@ async fn handle_request(
                     Err(_) => Via::Outside,
                 };
                 let r = dispatch_via(&hub, &who, &req.method, req.params, via).await;
+                let _ = resp.send(Message::Text(response(&req.id, r).to_string().into())).await;
+            });
+        }
+        // Answering a question as the human: only a click in a UI window (see `question_from_window`).
+        "question.answer" | "question.undo" => {
+            let (hub, who, resp, link) = (hub.clone(), who.clone(), resp.clone(), link.clone());
+            tokio::spawn(async move {
+                let r = question_from_window(&hub, &who, conn, &link, &req.method, req.params).await;
                 let _ = resp.send(Message::Text(response(&req.id, r).to_string().into())).await;
             });
         }

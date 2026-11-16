@@ -8,15 +8,18 @@
 export type Dir = "row" | "col";
 
 // Session ids are positive u32s. Panels use -(id + 1); -1 stays the internal empty-pane
-// sentinel. Notes use -(2^40 + id), far below any panel's. Keeping numeric tabs means existing
-// saved layouts load without migration.
+// sentinel. Notes use -(2^40 + id), far below any panel's. The window's one Questions tab is
+// -2^52, below every note's. Keeping numeric tabs means existing saved layouts load without
+// migration.
 const NOTE_BASE = 2 ** 40;
+/** The pinned Questions tab (docs/UI.md "Questions"): one per window, in every channel. */
+export const QUESTIONS_TAB = -(2 ** 52);
 export const panelTab = (id: number): number => -id - 1;
 export const panelId = (tab: number): number | null =>
   Number.isSafeInteger(tab) && tab <= -2 && tab > -NOTE_BASE ? -tab - 1 : null;
 export const noteTab = (id: number): number => -NOTE_BASE - id;
 export const noteId = (tab: number): number | null =>
-  Number.isSafeInteger(tab) && tab < -NOTE_BASE ? -tab - NOTE_BASE : null;
+  Number.isSafeInteger(tab) && tab < -NOTE_BASE && tab > QUESTIONS_TAB ? -tab - NOTE_BASE : null;
 /** A tab that is a terminal (a session), not a panel or a note. */
 export const isSessionTab = (tab: number): boolean => tab > 0;
 
@@ -282,6 +285,27 @@ export function reconcile(s: LayoutState, live: number[]): LayoutState {
     };
   }
   return finish(st);
+}
+
+/**
+ * A pinned tab sits first in the first group (the top-left one): moved there if it is anywhere
+ * else, keeping focus and every group's selection (it stays selected if it was).
+ */
+export function pinFirst(s: LayoutState, tab: number): LayoutState {
+  const from = paneOfSession(s.root, tab);
+  const first = allPanes(s.root)[0];
+  if (!from || (from.id === first.id && first.tabs[0] === tab)) return s;
+  const selected = from.active === tab;
+  const focused = s.focus === from.id;
+  const root = mapPanes(s.root, (p) => {
+    const rest = p.tabs.filter((t) => t !== tab);
+    if (p.id === first.id) {
+      return { ...p, tabs: [tab, ...rest], active: selected ? tab : p.active ?? tab };
+    }
+    if (p.id !== from.id) return p;
+    return { ...p, tabs: rest, active: p.active === tab ? rest[0] ?? null : p.active };
+  });
+  return finish({ ...s, root, focus: selected && focused ? first.id : s.focus });
 }
 
 /** A new panel joins the group immediately to its opener's right, or splits there. */

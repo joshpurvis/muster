@@ -89,7 +89,7 @@ Quota-aware scheduling, team/multiplayer, mobile client, tournament mode, playbo
 - Two signal sources, combined per adapter:
   1. **Structured hooks** (preferred): Claude Code hooks and Codex's notify config call back into the daemon (e.g., a tiny `yourapp hook <event>` subcommand that posts to the daemon socket). The implementing agent must check both CLIs' current docs; these APIs change.
   2. **Screen parsing** (fallback): match patterns on the headless VT screen state (approval prompts, input box idle, spinners).
-- **Decision inbox:** one ranked queue of everything that needs the human (approvals, questions, errors), across all channels. Approve/deny/reply inline. (Questions: agents post them and get the answer back as a message, docs/MCP.md "Questions for the human"; the tab that lists and answers them comes next.)
+- **Decision inbox:** one ranked queue of everything that needs the human (approvals, questions, errors), across all channels. Approve/deny/reply inline. (Questions: agents post them and get the answer back as a message, docs/MCP.md "Questions for the human"; the pinned Questions tab lists them and the human answers there, docs/UI.md "Questions".)
 - OS notifications when something enters the inbox.
 - Basic stuck detection: no meaningful output or the same failing command repeating for N minutes.
 

@@ -112,6 +112,13 @@ export const IconNote = (p: P) => (
     <path d="M14 3v6h6M8 13h8M8 17h5" />
   </Svg>
 );
+/** The pinned Questions tab (Lucide "pin"). */
+export const IconPin = (p: P) => (
+  <Svg {...p}>
+    <path d="M12 17v5" />
+    <path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z" />
+  </Svg>
+);
 export const IconTrash = (p: P) => (
   <Svg {...p}>
     <path d="M4 7h16M10 11v6M14 11v6M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12M9 7V4h6v3" />

@@ -3,9 +3,11 @@
 // window controls.
 import type { ComponentChildren } from "preact";
 import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
-import { noteId, noteTab, panelId, panelTab, type PaneNode } from "./tree.ts";
+import { noteId, noteTab, panelId, panelTab, type PaneNode, QUESTIONS_TAB } from "./tree.ts";
 import { PanelSlot, reloadPanel } from "../panels/PanelView.tsx";
 import { NoteView } from "../components/NoteView.tsx";
+import { QuestionsView } from "../components/QuestionsView.tsx";
+import { openQuestionCount } from "../questions.ts";
 import { notes, notesSupported } from "../notes.ts";
 import type { NoteInfo } from "../types.ts";
 import {
@@ -29,6 +31,7 @@ import {
   workspaceById,
   windowChannels,
   tabChannel,
+  questionsShown,
 } from "../state.ts";
 import {
   addDismissal, CACHE_DOT_LABEL, cacheDot, coldKey, coldText, DEFAULT_CACHE_TTL, idleFor, idleText, isCold, ttlFor, ttlText,
@@ -57,6 +60,7 @@ import {
   IconZap,
   IconPlus,
   IconPanel,
+  IconPin,
   IconRestart,
   IconShield,
   IconSpark,
@@ -255,9 +259,11 @@ export function Group(
 ) {
   const all = sessions.value;
   const tabs = pane.tabs.filter((id) =>
-    all.has(id) || panels.value.has(panelId(id) ?? -1) || notes.value.has(noteId(id) ?? -1)
+    all.has(id) || panels.value.has(panelId(id) ?? -1) || notes.value.has(noteId(id) ?? -1) ||
+    (id === QUESTIONS_TAB && questionsShown.value)
   );
   const active = pane.active !== null ? all.get(pane.active) ?? null : null;
+  const activeQuestions = pane.active === QUESTIONS_TAB && tabs.includes(QUESTIONS_TAB);
   const activePanel = pane.active !== null ? panels.value.get(panelId(pane.active) ?? -1) : undefined;
   const activeNote = pane.active !== null ? notes.value.get(noteId(pane.active) ?? -1) : undefined;
   const find = A.findOpen.value;
@@ -291,7 +297,7 @@ export function Group(
       onPointerDownCapture={() => A.focusGroup(pane.id)}
     >
       {!fullscreen && <TabStrip pane={pane} tabs={tabs} focused={focused} zoomed={zoomed} controls={controls} />}
-      {fullscreen && (active || activeNote) && (
+      {fullscreen && (active || activeNote || activeQuestions) && (
         // Terminals keep Esc (agents and editors use it), so a terminal shown fullscreen gets
         // this way back (a note's editor keeps Esc too); a panel has the same button in its strip.
         <button
@@ -321,6 +327,7 @@ export function Group(
         {active && find?.sid === active.id && <FindBar sid={active.id} />}
         {active && <TermHost sid={active.id} />}
         {activePanel && <PanelSlot key={activePanel.id} id={activePanel.id} />}
+        {activeQuestions && <QuestionsView />}
         {tabs.map((t) => noteId(t)).filter((n): n is number => n !== null).map((n) => (
           <NoteView key={n} id={n} hidden={n !== activeNote?.id} />
         ))}
@@ -451,9 +458,11 @@ function TabStrip(
       [
         { header: `${tabs.length} tabs in this group` },
         ...tabs.map((id, i): MenuItem => ({
-          label: panels.value.get(panelId(id) ?? -1)?.title ?? notes.value.get(noteId(id) ?? -1)?.title ??
-            tabText(labelOf(sessions.value.get(id)!)),
-          icon: panelId(id) !== null
+          label: id === QUESTIONS_TAB ? "Questions" : panels.value.get(panelId(id) ?? -1)?.title ??
+            notes.value.get(noteId(id) ?? -1)?.title ?? tabText(labelOf(sessions.value.get(id)!)),
+          icon: id === QUESTIONS_TAB
+            ? <IconPin size={13} />
+            : panelId(id) !== null
             ? <IconPanel size={13} />
             : noteId(id) !== null
             ? <IconNote size={13} />
@@ -480,7 +489,7 @@ function TabStrip(
       e.preventDefault();
       A.focusActiveTerminalSoon();
       return;
-    } else if (e.key === "F2" && pane.active !== null) {
+    } else if (e.key === "F2" && pane.active !== null && pane.active !== QUESTIONS_TAB) {
       e.preventDefault();
       const note = noteId(pane.active);
       if (note !== null) A.startNoteRename(note);
@@ -509,6 +518,9 @@ function TabStrip(
         onKeyDown={onKeyDown}
       >
         {tabs.map((id, i) => {
+          if (id === QUESTIONS_TAB) {
+            return <QuestionsTab key={id} index={i} paneId={pane.id} active={id === pane.active} focused={focused} />;
+          }
           const panel = panels.value.get(panelId(id) ?? -1);
           if (panel) return <PanelTab key={id} panel={panel} index={i} paneId={pane.id} tabsInGroup={tabs.length} active={id === pane.active} focused={focused} />;
           const note = notes.value.get(noteId(id) ?? -1);
@@ -624,6 +636,32 @@ function PanelTab({ panel, paneId, index, tabsInGroup, active, focused }: {
       <span class="tab-name"><span class="tab-task">{panel.title}</span></span>
       <button type="button" class="tab-close" aria-label={`Close ${panel.title}`} data-tip="Close panel"
         onClick={(e) => { e.stopPropagation(); A.closeTab(id); }}><IconX size={12} /></button>
+    </div>
+  );
+}
+
+/** The pinned Questions tab: first in the strip, with the number of open questions. It doesn't
+ * drag, rename or close; its menu hides it (the palette's Questions shows it again). */
+function QuestionsTab({ paneId, index, active, focused }: {
+  paneId: string; index: number; active: boolean; focused: boolean;
+}) {
+  const n = openQuestionCount.value;
+  const label = n === 1 ? "Questions, 1 open" : `Questions, ${n} open`;
+  const menu: MenuItem[] = [
+    { label: "Zoom group", keys: "Alt+Z", run: () => { A.focusGroup(paneId); A.zoomToggle(); } },
+    { label: "Fullscreen", icon: <IconMaximize size={14} />, keys: "Alt+Shift+Z", run: () => A.toggleFullscreen(QUESTIONS_TAB) },
+    "sep",
+    { label: "Hide Questions tab", keys: "Alt+W", run: () => A.hideQuestionsTab() },
+  ];
+  return (
+    <div class={cx("tab", "questions-tab", active && "active", active && focused && "focused")}
+      role="tab" aria-selected={active} aria-label={label} tabIndex={active ? 0 : -1}
+      data-tab-sid={QUESTIONS_TAB} data-tip={`Questions agents asked you · pinned · ${n} open`}
+      onClick={() => A.revealSession(QUESTIONS_TAB)}
+      onContextMenu={(e) => { e.preventDefault(); openMenu({ x: e.clientX, y: e.clientY, items: menu }); }}>
+      <TabIcon index={index} focused={focused}><IconPin size={13} /></TabIcon>
+      <span class="tab-name"><span class="tab-task">Questions</span></span>
+      {n > 0 && <span class="tab-count" aria-hidden="true">{n}</span>}
     </div>
   );
 }

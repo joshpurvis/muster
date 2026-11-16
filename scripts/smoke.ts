@@ -1284,7 +1284,7 @@ done
   await c.call("agent.remove", { name: "bg" });
 
   await lateReplies(c, mcp);
-  await questionsForHuman(c, mcp);
+  await questionsForHuman(c, d, mcp);
   await selfHandoff(c, mcp);
   ({ c, d } = await sleepAndWake(c, d, { mcp }));
 
@@ -1445,8 +1445,8 @@ async function lateReplies(c: Client, mcp: (token: string, name: string, args?: 
     return await Deno.readTextFile(path);
   };
   /** Session `id`'s fake terminal got `needle` (waits up to 10 s). */
-  const got = async (id: number, needle: string) => {
-    for (let n = 0; n < 100; n++) {
+  const got = async (id: number, needle: string, tries = 100) => {
+    for (let n = 0; n < tries; n++) {
       const text = await Deno.readTextFile(`${BASE}/fake-input-${id}`).catch(() => "");
       if (text.includes(needle)) return true;
       await sleep(100);
@@ -1549,7 +1549,7 @@ async function lateReplies(c: Client, mcp: (token: string, name: string, args?: 
 /** Questions for the human (docs/MCP.md "Questions for the human"): a fake Codex "writer" posts
  * questions and carries on; a fake Codex "lead" records the human's chat answer; the answer reaches
  * the writer by name, the second one after the writer started fresh. */
-async function questionsForHuman(c: Client, mcp: (token: string, name: string, args?: Json) => Promise<any>) {
+async function questionsForHuman(c: Client, d: Daemon, mcp: (token: string, name: string, args?: Json) => Promise<any>) {
   await c.call("agent.create", { name: "writer", kind: "codex" });
   await c.call("agent.create", { name: "lead", kind: "codex" });
   const writerS: number = (await c.call("agent.start", { name: "writer" })).session.id;
@@ -1622,6 +1622,40 @@ async function questionsForHuman(c: Client, mcp: (token: string, name: string, a
   ok(mine.total === 2 && mine.questions[1].answer.words === "Q6: b, the plain one", `questions: the writer reads its answers back after the reset (${JSON.stringify(mine).slice(0, 200)})`);
   out = await questions("--all");
   ok(dec.decode(out.stdout).includes("recorded by lead"), "questions: muster questions --all shows who recorded each answer");
+
+  // The Questions tab: the human answers with a click in Muster's window, and nowhere else (the
+  // command line, `/api/rpc` or a script's WebSocket can't answer as the human).
+  const q3 = await mcp(writerT, "post_question", ask("Which button colour goes on the card?", "smoke-note-three: on a keep the yellow"));
+  const viaApi = await (await fetch(`http://127.0.0.1:${PORT}/api/rpc`, {
+    method: "POST", headers: { Authorization: `Bearer ${d.token}` },
+    body: JSON.stringify({ id: 1, method: "question.answer", params: { id: q3.number, pick: ["b"] } }),
+  })).json();
+  ok(String(viaApi.error?.message).includes("only a click in Muster's window"), `questions: /api/rpc can't answer as the human (${JSON.stringify(viaApi)})`);
+  ok(await refused(c.call("question.answer", { id: q3.number, pick: ["b"] }), "only a click in Muster's window") === true,
+    "questions: nor a WebSocket that isn't Muster's window");
+  const w = await ownerWindow(d);
+  const mark3 = c.events.length;
+  const a3 = await w.call("question.answer", { id: q3.number, pick: ["b"], words: "the darker one" });
+  ok(a3.status === "answered" && a3.answer.how === "tab" && a3.answer.delivery.status === "pending" && a3.can_undo === true,
+    `questions: answered with a click in the window, held so it can be taken back (${JSON.stringify(a3).slice(0, 200)})`);
+  ok((await w.call("question.undo", { id: q3.number })).status === "open", "questions: taken back before it went, open again");
+  await w.call("question.answer", { id: q3.number, pick: ["a"] });
+  // After the hold it reaches the writer by name, as the human's own message.
+  ok(await got(writerS, `Answer to your question Q${q3.number}: a) Heading one on every page.`, 250) &&
+    await got(writerS, "from human origin=human") && await got(writerS, "The human picked it in Muster's Questions tab") &&
+    await got(writerS, "smoke-note-three"), "questions: the tab's answer is typed into the writer, from the human, with its note");
+  ok(!(await Deno.readTextFile(`${BASE}/fake-input-${writerS}`)).includes("the darker one"), "questions: the answer taken back never arrived");
+  ok(c.events.slice(mark3).some((e) => e.event === "question_upserted" && e.data.id === q3.number && e.data.status === "open"),
+    "questions: the window hears of each change (question_upserted)");
+  // Typed in already; its delivery record follows a moment later.
+  let read = await w.call("question.get", { id: q3.number });
+  for (let n = 0; n < 50 && ["pending", "delivering"].includes(read.answer.delivery.status); n++) {
+    await sleep(100);
+    read = await w.call("question.get", { id: q3.number });
+  }
+  ok(read.answer.delivery.status === "delivered" && read.answer.delivery.to === "writer", `questions: delivered to the writer by name (${JSON.stringify(read.answer.delivery)})`);
+  ok(await refused(w.call("question.undo", { id: q3.number }), "has read your answer") === true, "questions: no taking back once the writer has it");
+  w.close();
   await c.call("agent.remove", { name: "writer" });
   await c.call("agent.remove", { name: "lead" });
 }

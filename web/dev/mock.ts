@@ -11,6 +11,7 @@ import { isPreviewUrl } from "../src/panels/preview.ts";
 import { hiddenCharsOrSpaces, memoryFileNameError } from "../src/agents.ts";
 import { servePanelHtml } from "./build_panels.ts";
 import { scheduleMock } from "./mock_schedules.ts";
+import { questionMock } from "./mock_questions.ts";
 
 const PORT = Number(Deno.env.get("MOCK_PORT") ?? 17744);
 const TOKEN = "dev";
@@ -829,6 +830,17 @@ function pushAgentMessage(m: any) {
   return msg;
 }
 
+// ---------- questions for the human (dev/mock_questions.ts) ----------
+
+const questionsMock = questionMock({
+  now,
+  broadcast,
+  session: (id) => {
+    const s = sessions.get(id);
+    return s && { name: s.name, state: s.state, kind: s.kind };
+  },
+});
+
 // ---------- schedules (dev/mock_schedules.ts) ----------
 
 const sched = scheduleMock({
@@ -1395,6 +1407,7 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
     return { key_present: orKey, models: OR_MODELS, fetched_at: now() - 20 * 60_000, stale: false, error: null };
   }
   if (method.startsWith("schedule.") || method.startsWith("trigger.")) return sched.handle(method, p);
+  if (method.startsWith("question.") || method.startsWith("mock.question_")) return questionsMock.handle(method, p);
   if (method.startsWith("agent.") || method.startsWith("mock.")) return agentMethod(method, p);
   if (method.startsWith("note.")) return noteMethod(method, p);
   switch (method) {

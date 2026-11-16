@@ -75,11 +75,13 @@ import {
   workspaces,
   accountProfiles,
   accountProfilesSupported,
+  questionsShown,
 } from "./state.ts";
 import { drawerHeight, folderChannel, type TerminalDrawerState } from "./layout/channels.ts";
 import type { ScheduleOverlay } from "./state.ts";
 import * as native from "./native.ts";
-import { noteId, noteTab, panelId, panelTab } from "./layout/tree.ts";
+import { noteId, noteTab, panelId, panelTab, QUESTIONS_TAB } from "./layout/tree.ts";
+import { openQuestionCount, questions, questionsFilter, questionsSupported, selectedQuestion } from "./questions.ts";
 import { flushAllDrafts, flushDraft, knowNote, notes, persistAllDrafts, unsavedNotes } from "./notes.ts";
 import type { HelloResult, Note } from "./types.ts";
 import { inheritedProfile } from "./account_profiles.ts";
@@ -451,10 +453,11 @@ export function renameNote(id: number, title: string) {
 let lastNeedsYou: SessionId | null = null;
 
 export function nextNeedsYou() {
-  const list = needsYou.value;
+  // The sessions that need you, then the Questions tab while questions are open.
+  const list: { id: number }[] = [...needsYou.value, ...(openQuestionCount.value > 0 ? [{ id: QUESTIONS_TAB }] : [])];
   // Cycle from the focused session when it needs you; else from the last one we went to (it may
   // be in another window that was raised, so focus here didn't move).
-  const focused = focusedSession.value?.id ?? null;
+  const focused = focusedTabId.value === QUESTIONS_TAB ? QUESTIONS_TAB : focusedSession.value?.id ?? null;
   const from = focused !== null && list.some((s) => s.id === focused) ? focused : lastNeedsYou;
   const next = nextInCycle(list, from);
   if (!next) {
@@ -462,7 +465,38 @@ export function nextNeedsYou() {
     return;
   }
   lastNeedsYou = next.id;
-  gotoSession(next.id);
+  if (next.id === QUESTIONS_TAB) openQuestionsTab();
+  else gotoSession(next.id);
+}
+
+/** Show the pinned Questions tab (shown again if it was hidden), on the open questions, or on
+ * question `id`. */
+export function openQuestionsTab(id?: number) {
+  if (!questionsSupported.value) return toast("info", "This Muster has no questions yet: restart it after updating");
+  const s = channelLayout.peek();
+  if (!s || activeChannelId.peek() === null) return toast("info", "Open a channel first: the Questions tab sits in its tab strip");
+  if (s.questions === false) {
+    const { questions: _hidden, ...shown } = s;
+    channelLayout.value = shown;
+  }
+  if (id !== undefined) selectedQuestion.value = id;
+  else if (openQuestionCount.value > 0) {
+    // On the open questions: a question picked before that is answered by now isn't one.
+    questionsFilter.value = "open";
+    if (selectedQuestion.value !== null && questions.value.get(selectedQuestion.value)?.status !== "open") selectedQuestion.value = null;
+  }
+  exitFullscreen(false);
+  if (questionsShown.peek()) revealSession(QUESTIONS_TAB);
+}
+
+/** Hide the pinned Questions tab in this window (the palette's Questions, or "needs you", shows
+ * it again). */
+export function hideQuestionsTab() {
+  const s = channelLayout.peek();
+  if (!s) return;
+  channelLayout.value = { ...s, questions: false };
+  toast("info", "Questions tab hidden. \"Questions\" in the palette, or \"needs you\" in the status line, shows it again", 5000);
+  focusActiveTerminalSoon();
 }
 
 /** Focus is in a text field outside the terminals (an inline rename, a find bar…). */
@@ -484,6 +518,7 @@ export function focusActiveTerminalSoon() {
         const note = tab === null ? null : noteId(tab);
         if (id !== null) document.querySelector<HTMLIFrameElement>(`iframe[data-panel-id="${id}"]`)?.focus();
         else if (note !== null) document.querySelector<HTMLTextAreaElement>(`textarea[data-note-id="${note}"]`)?.focus();
+        else if (tab === QUESTIONS_TAB) document.querySelector<HTMLElement>(".questions-view")?.focus();
       }
     })
   );
@@ -531,7 +566,8 @@ export function toggleFullscreen(tab: SessionId | null = focusedTabId.value) {
   revealSession(tab, false);
   focusGroup(pane.id);
   fullscreen.value = pane.id;
-  const note = noteId(tab) !== null;
+  // A note's editor and the Questions tab keep Esc too (text boxes in them use it).
+  const note = noteId(tab) !== null || tab === QUESTIONS_TAB;
   const terminal = panelId(tab) === null && !note;
   toast("info", terminal ? "Fullscreen. Alt+Shift+Z goes back (Esc stays with the terminal)"
     : note ? "Fullscreen. Alt+Shift+Z goes back" : "Fullscreen. Esc or Alt+Shift+Z goes back", 2500, "fullscreen");
@@ -838,6 +874,8 @@ export function splitFocused(side: Side, kind: SessionKind = "shell") {
  * agent's session), so closing before the agent list has loaded can't stop one.
  */
 export function closeTab(sid: SessionId, force = false) {
+  // The pinned Questions tab hides (questions stay; the palette shows it again).
+  if (sid === QUESTIONS_TAB) return hideQuestionsTab();
   const nid = noteId(sid);
   if (nid !== null) {
     // Closing a note's tab keeps the note (the notes list and Jump reopen it). Unsaved typing

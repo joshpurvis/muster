@@ -1119,6 +1119,26 @@ impl Store {
         Ok((out, total.max(0) as usize))
     }
 
+    /// The answered questions answered last (the Questions tab's history), oldest answer first,
+    /// with how many are answered in all.
+    pub fn recently_answered(&self, limit: usize) -> anyhow::Result<(Vec<crate::questions::Question>, usize)> {
+        let conn = self.conn.lock();
+        let total: i64 = conn.query_row("SELECT COUNT(*) FROM questions WHERE status = 'answered'", [], |r| r.get(0))?;
+        let mut st = conn.prepare("SELECT id, record FROM questions WHERE status = 'answered'
+            ORDER BY json_extract(record, '$.answer.at') DESC, id DESC LIMIT ?1")?;
+        let rows = st.query_map([limit as i64], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, record) = row?;
+            match Self::row_question(id, &record) {
+                Ok(q) => out.push(q),
+                Err(e) => tracing::warn!("skipping a question that doesn't read: {e:#}"),
+            }
+        }
+        out.reverse();
+        Ok((out, total.max(0) as usize))
+    }
+
     /// Change question `id` with `edit`, read and written in one transaction (so two callers
     /// can't both answer it). An error from `edit` changes nothing. Returns the question after.
     pub fn update_question<T>(&self, id: i64, edit: impl FnOnce(&mut crate::questions::Question) -> anyhow::Result<T>)
@@ -1131,7 +1151,8 @@ impl Store {
         let mut after = before.clone();
         let out = edit(&mut after)?;
         if after != before {
-            after.updated_at = now_ms().max(before.updated_at);
+            // Strictly increasing: the window keeps the newest copy of a question by it.
+            after.updated_at = now_ms().max(before.updated_at + 1);
             tx.execute("UPDATE questions SET status = ?2, updated_at = ?3, record = ?4 WHERE id = ?1",
                 params![id, after.status.as_str(), after.updated_at, serde_json::to_string(&after)?])?;
             tx.commit()?;

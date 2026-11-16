@@ -21,7 +21,8 @@ kills it, and reopening restores the window's channel selection, layouts and sid
   available to launch again.
 - **Group**: one tile in a channel's split tree, with its own tab strip and one visible tab.
 - **Tab**: a terminal session, panel or note. Each belongs to a window and channel. The same
-  channel can have tabs in several windows, with an independent layout in each.
+  channel can have tabs in several windows, with an independent layout in each. The pinned
+  Questions tab is the exception: one per window, in whichever channel is shown (see "Questions").
 - **Project**: the API's `Workspace`, a known folder. The sidebar does not group by it.
 
 ## Channels sidebar
@@ -214,7 +215,7 @@ the app never sent `ui/initialize`, or it never sent `ui/notifications/initializ
 app's last error and Reload panel. A load cut off by a dropped connection retries on reconnect.
 Jump lists every panel by title (pulling one from another window), and the status line counts
 panel tabs with terminals.
-Saved layouts still use numbers: positive session IDs, panel tab IDs `-(panel_id + 1)`, note tab IDs `-(2^40 + note_id)`;
+Saved layouts still use numbers: positive session IDs, panel tab IDs `-(panel_id + 1)`, note tab IDs `-(2^40 + note_id)`, the Questions tab `-(2^52)`;
 `-1` remains the internal empty-pane sentinel. Legacy window trees migrate as described below.
 
 ### Notes
@@ -285,6 +286,53 @@ docs/MCP.md "Notes") and `muster note` (docs/CLI.md); the human types in it.
   lightning after its title (", triggers allowed" in its name and tooltip). Backends without it
   show neither.
 - The status line's tab count includes notes. The phone UI has no notes (it receives none).
+
+### Questions
+
+Agents that need the human post a question and carry on (docs/MCP.md "Questions for the
+human"); the **Questions** tab is where the human sees and answers them (`web/src/components/QuestionsView.tsx`,
+`web/src/questions.ts`).
+
+- **The tab**: pinned, one per window, first in the top-left group of whichever channel is shown
+  (it moves with the channel you select, and goes back to the front if a tab is dragged before
+  it). Pin icon, "Questions" and the number of open questions in an amber badge. It doesn't drag,
+  rename or close: its menu (and Alt+W) **Hide Questions tab**, which the window remembers; the
+  palette's **Questions**, Alt+J or the status line's "needs you" shows it again. Shown only when
+  the backend has questions.
+- **The count**: on the tab, in "needs you" in the status line (sessions that need you plus open
+  questions; its tooltip says which), and in the window title.
+- **Layout**: a bar with **Open N** and **Answered N**; the list on the left (340px), "Holding up
+  work" first, then "Can wait", oldest first in each, each row its number, the question, product,
+  asker and age; the question on the right: its number, product, asker ("passed on by" a lead),
+  when it was asked, an amber **Holding up work** tag, the question, its context, **Example**, its
+  pictures (click for full size; Esc or a click closes), the lettered options (each with its why;
+  the asker's pick is marked "<asker>'s pick" and starts out chosen), a box for the human's own
+  words (every question; the only box for an "own words" question), then **If you don't answer**,
+  **Holding up** and **After you answer** (where the asker is now: working, idle, cold, asleep or
+  not running, and so how the answer reaches it), **Send answer**, the question's links and
+  **Open <asker>'s tab**. **Details** (closed) has the asker's details, its note to itself (which
+  comes back with the answer), the picture paths and what it is about (a merge, money, …).
+- **Answering**: click an option (pick several: tick any number; a chosen option clicked again is
+  unchosen) or type, then **Send answer** (or Ctrl+Enter in the box). The first words typed replace
+  the chosen options ("or answer in your own words": typing "No, hold it" under a preselected "Yes,
+  merge it" never sends the yes too); an option clicked after typing goes with the words. A line
+  under the box says what Send sends. What was picked or typed is kept per question while you
+  look at others. The answer goes after 8 seconds; a toast says so with **Undo**, and the next
+  open question is shown. Only a click in the window answers as the human (`question.answer`).
+- **Undo**: until the asker has read the answer (in those 8 seconds, or while it waits in the
+  asker's input queue because it is busy and was never typed into its box, or when it couldn't be
+  delivered), the answered page and the toast offer **Undo**: the question is open again with your
+  answer kept to change. Each answer's toast takes back that answer only, never one given after it.
+  Once the asker has it, or it was typed into the asker's box (a dialog then put it back in the
+  queue), Undo is refused.
+- **Answered**: the 50 answered last; each page shows **Your answer** (or "The answer" when a lead
+  recorded it from chat), what was not chosen, **How** (here, or told to a lead in chat) and
+  **What happened** (on its way, waiting for the asker's current step, read at a time, or why it
+  didn't arrive).
+- **Narrow** (the tab's group under 760px wide): the list and the question take turns; **‹
+  Questions** goes back, and the send button spans the width.
+- Later steps add the key sheet and one-key answers, Later and Skip, filters by product and age,
+  find, one question at a time, and pasting a picture into an answer.
 
 ### Links
 
@@ -443,8 +491,9 @@ conversation uncached: an estimate).
 ### Status line (optional, on by default, toggle in the palette)
 22px, muted: the focused tab's task name (only once it has a real name, not just its folder's;
 truncated with an ellipsis, the full name in the tooltip, click copies), its folder (truncated
-from the left, click copies), branch (click copies) and the number of tabs in the window. Right:
-"needs you: N" (same as Alt+J) and a connection dot.
+from the left, click copies), branch (click copies) and the number of tabs in the window (not
+counting the Questions tab). Right: "needs you: N", the sessions that need you plus the open
+questions (same as Alt+J), and a connection dot.
 
 **Typing latency monitor** (palette, off by default, not kept across reloads): a small overlay above the status line timing each key typed into a terminal by stage, from keydown to the next animation frame after the first output that follows it (an estimate: output is not matched to keys, and the real paint time is not measured), with Copy (plain-text report) and Clear (`web/src/latency_monitor.ts`).
 
@@ -861,7 +910,7 @@ Chromium `--app` mode, so there Alt+T and Alt+Shift+N are the reliable fallbacks
 | Ctrl+Tab / Ctrl+Shift+Tab, Alt+] / Alt+[ | Next / previous tab in the focused group |
 | Alt+Shift+[ / Alt+Shift+] | Move the tab left / right within its group |
 | Ctrl+Alt+←↑→↓ | Move the tab to the neighbouring group in that direction (splitting at the window edge) |
-| Alt+J | Jump to the next session that needs you (all windows; pulls its tab here, or raises its window with "Jump focuses the other window"). Order: most urgent state, then longest waiting; repeated presses cycle |
+| Alt+J | Jump to the next session that needs you (all windows; pulls its tab here, or raises its window with "Jump focuses the other window"), then to the Questions tab while questions are open. Order: most urgent state, then longest waiting; repeated presses cycle |
 | Alt+D / Alt+Shift+D | Split the focused group right / down with a new shell in the focused tab's task (picker via menu) |
 | Alt+W | Close the focused tab (inline confirm if working; a named agent's tab is hidden, its agent keeps running); an emptied group closes |
 | Alt+←↑→↓ | Focus the group in that direction |

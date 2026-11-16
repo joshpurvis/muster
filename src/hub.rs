@@ -95,6 +95,9 @@ pub enum ServerEvent {
     DaemonStopping {
         reason: String,
     },
+    /// A question for the human was posted, answered, taken back, withdrawn, or its answer's
+    /// delivery moved on (`questions::view`, whole). The desktop window's Questions tab.
+    QuestionUpserted(serde_json::Value),
     /// A paired device's phone-alert subscription or its delivery status changed (src/push.rs).
     /// Sent only to that device's own connections, which ask `push.status` again.
     PushChanged {

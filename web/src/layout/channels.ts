@@ -3,7 +3,7 @@
 // old, unassigned notes in a window with no channels (never a backend channel id).
 import {
   allPanes, allSessions, emptyLayout, findPane, type LayoutState, parseLayout,
-  placeBeside, reconcile,
+  pinFirst, placeBeside, reconcile,
 } from "./tree.ts";
 import { type Channel, DEFAULT_PERMISSIONS, type Permissions } from "../types.ts";
 
@@ -45,6 +45,8 @@ export interface TabHome {
   id: number;
   channel: number | null;
   beside?: number | null;
+  /** First in the channel's first group, whatever moved it (the Questions tab). */
+  pinned?: boolean;
 }
 
 export interface SidebarState {
@@ -70,6 +72,8 @@ export interface WindowLayoutState {
   layouts: Record<string, LayoutState>;
   sidebar: SidebarState;
   drawers?: Record<string, TerminalDrawerState>;
+  /** The pinned Questions tab is hidden in this window (absent: shown). */
+  questions?: false;
   /** The untouched pre-channel layout, retained for recovery. Never rendered or reconciled. */
   previous?: unknown;
 }
@@ -96,6 +100,7 @@ function reconcileChannel(s: LayoutState, tabs: TabHome[]): LayoutState {
   // Existing panels/notes keep their places; new ones go beside their opener, when present.
   let next = reconcile(s, [...new Set([...tabs.filter((t) => t.beside == null).map((t) => t.id), ...existing])]);
   for (const t of tabs) if (t.beside != null) next = placeBeside(next, t.id, t.beside);
+  for (const t of tabs) if (t.pinned) next = pinFirst(next, t.id);
   return next;
 }
 
@@ -159,6 +164,7 @@ export function loadChannelLayout(raw: unknown, channels: number[], tabs: TabHom
       active: typeof obj.active === "number" && Number.isSafeInteger(obj.active) ? obj.active : null,
       layouts,
       ...(obj.drawers ? { drawers } : {}),
+      ...(obj.questions === false ? { questions: false as const } : {}),
       sidebar: {
         hidden: side.hidden === true,
         channels: side.channels !== false,

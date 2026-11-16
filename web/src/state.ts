@@ -30,6 +30,7 @@ import { needsHuman } from "./types.ts";
 import { rpc } from "./rpc.ts";
 import { sessionSizeChanged } from "./terms.ts";
 import { applyNoteRemoved, applyNotesHello, applyNoteUpsert, notes, notesSupported, restoreDrafts } from "./notes.ts";
+import { applyQuestion, loadQuestions, openQuestionCount, questionsSupported, refreshForMessage } from "./questions.ts";
 import { debounce, load, save } from "./util.ts";
 import { upsertMessage } from "./agents.ts";
 import { newerRun, upsertRun } from "./schedules.ts";
@@ -44,6 +45,7 @@ import {
   noteTab,
   panelTab,
   panelId,
+  QUESTIONS_TAB,
 } from "./layout/tree.ts";
 import {
   changeChannelLayout, loadChannelLayout, reconcileChannels, savedChannel,
@@ -127,7 +129,7 @@ export const windowNotes = computed(() => [...notes.value.values()].filter((n) =
 ));
 export const hereIds = computed(() => new Set([
   ...windowSessions.value.map((s) => s.id), ...windowPanels.value.map((p) => panelTab(p.id)),
-  ...windowNotes.value.map((n) => noteTab(n.id)),
+  ...windowNotes.value.map((n) => noteTab(n.id)), ...(questionsShown.value ? [QUESTIONS_TAB] : []),
 ]));
 
 // ---------------- updates, shared window prefs, shutdown ----------------
@@ -181,6 +183,8 @@ export const lifecycleChecking = signal<"restart" | "shutdown" | null>(null);
 export const agents = signal<Agent[]>([]);
 /** The daemon knows agents (false: an older daemon answered "unknown method"). */
 export const agentsSupported = signal(true);
+/** The agent list arrived at least once (so an agent missing from it was removed). */
+export const agentsLoaded = signal(false);
 /** The message log, newest first (`agent.messages`, then `agent_message` events). */
 export const agentMessages = signal<AgentMessage[]>([]);
 /** The panel's selected agent: the log shows only messages to it. */
@@ -204,6 +208,7 @@ async function loadAgents() {
       rpc.call<{ messages: AgentMessage[] }>("agent.messages", { limit: 100 }),
     ]);
     agentsSupported.value = true;
+    agentsLoaded.value = true;
     agents.value = sortAgents(list);
     agentMessages.value = log.messages;
   } catch (e) {
@@ -549,6 +554,12 @@ export const activeChannelId = computed(() => channelLayout.value?.active ?? nul
 export const drawerFocused = signal(false);
 export const activeDrawer = computed(() => channelLayout.value?.drawers?.[activeChannelId.value ?? -1] ?? null);
 export const activeChannel = computed(() => channelById.value.get(activeChannelId.value ?? -1) ?? null);
+/** The pinned Questions tab is in this window: the backend has questions and the human didn't
+ * hide it. It sits first in the shown channel's first group (docs/UI.md "Questions"). */
+export const questionsShown = computed(() =>
+  questionsSupported.value && channelLayout.value !== null && channelLayout.value.questions !== false &&
+  activeChannelId.value !== null
+);
 const vacantLayout = emptyLayout();
 /** Existing tile controls operate on the selected channel. */
 export const layout = computed<LayoutState | null>(() => {
@@ -686,6 +697,9 @@ const liveTabs = computed((): TabHome[] => {
     ...windowPanels.value.map((p) => ({ id: panelTab(p.id), channel: p.channel_id, beside: p.session_id })),
     ...windowNotes.value.map((n) => ({ id: noteTab(n.id),
       channel: n.channel_id != null ? valid(n.channel_id) ?? 0 : null, beside: n.beside })),
+    // In whichever channel is shown, first in its first group (never one archived meanwhile:
+    // then the channel that takes its place).
+    ...(questionsShown.value ? [{ id: QUESTIONS_TAB, channel: valid(activeChannelId.value), pinned: true }] : []),
   ].filter((t) => !held.value.has(t.id));
 });
 
@@ -894,6 +908,7 @@ export function applyHello(h: HelloResult) {
     helloDone.value = true;
   });
   loadAgents();
+  loadQuestions();
   // Seed unread state with a little history per task.
   for (const c of h.channels) {
     if (c.archived) continue;
@@ -1006,6 +1021,11 @@ export function applyEvent(ev: ServerEvent) {
       break;
     case "agent_message":
       agentMessages.value = upsertMessage(agentMessages.value, ev.data);
+      // It may carry an answer from the Questions tab that its agent has now read.
+      refreshForMessage(ev.data.id);
+      break;
+    case "question_upserted":
+      applyQuestion(ev.data);
       break;
     case "schedule_upserted": {
       // An upsert carries the schedule's own last run; one recorded since (by `schedule_run`) stays.
@@ -1157,5 +1177,5 @@ effect(() => {
 });
 
 effect(() => {
-  document.title = documentTitle(windowsSupported.value ? myWindow.value : null, needsYouHere.value);
+  document.title = documentTitle(windowsSupported.value ? myWindow.value : null, needsYouHere.value + openQuestionCount.value);
 });

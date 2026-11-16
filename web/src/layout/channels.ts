@@ -2,8 +2,8 @@
 // this envelope owns channel selection and the shared sidebar. Zero is the Notes fallback for
 // old, unassigned notes in a window with no channels (never a backend channel id).
 import {
-  allPanes, allSessions, emptyLayout, FIRST_PLACE, findPane, type LayoutState, parseLayout,
-  parseTabPlace, placeBeside, placeOf, putAt, QUESTIONS_TAB, reconcile, type TabPlace,
+  allPanes, allSessions, emptyLayout, FIRST_PLACE, findPane, generalPlace, type LayoutState, parseLayout,
+  parseTabPlace, placeBeside, placeOf, putAt, QUESTIONS_TAB, reconcile, sameGeneralPlace, type TabPlace,
 } from "./tree.ts";
 import { type Channel, DEFAULT_PERMISSIONS, type Permissions } from "../types.ts";
 
@@ -45,8 +45,8 @@ export interface TabHome {
   id: number;
   channel: number | null;
   beside?: number | null;
-  /** The window's Questions tab: it arrives in a channel at the window's `questionsAt`, then
-   * stays wherever it is moved. */
+  /** The window's Questions tab: it arrives in a channel at that channel's place
+   * (`questionsIn`), else at the window's `questionsAt`, then stays wherever it is moved. */
   questions?: boolean;
   /** Only keep it where the saved layout has it, never place it anew (loading, before the window
    * knows whether to show it: its group survives the load). */
@@ -78,8 +78,12 @@ export interface WindowLayoutState {
   drawers?: Record<string, TerminalDrawerState>;
   /** The Questions tab is hidden in this window (absent: shown). */
   questions?: false;
-  /** Where the human last put the Questions tab; it goes there in each channel it arrives in
-   * (absent: first in the first group). */
+  /** Where the Questions tab was in each channel (by channel id), taken when it is moved there and
+   * when it leaves; it comes back there in that channel. */
+  questionsIn?: Record<string, TabPlace>;
+  /** Where the human last put the Questions tab, in any channel: where it goes in a channel that
+   * has no place of its own yet (absent: first in the first group). Saves from before
+   * `questionsIn` have only this. */
   questionsAt?: TabPlace;
   /** The untouched pre-channel layout, retained for recovery. Never rendered or reconciled. */
   previous?: unknown;
@@ -135,31 +139,30 @@ export function reconcileChannels(s: WindowLayoutState, channels: number[], tabs
     if (!groups.has(channel)) groups.set(channel, []);
     groups.get(channel)!.push(t);
   }
-  // Questions leaving a channel (another one shown, or hidden) remembers where it was there: a
-  // resize or the tabs around it may have changed since it was last moved.
-  let questionsAt = s.questionsAt;
+  // A channel where Questions was never put anywhere: where it was last put in any channel.
+  const fallback = s.questionsAt ? generalPlace(s.questionsAt) : FIRST_PLACE;
+  // A channel where it was put keeps its own place (only channels still here). Leaving it (another
+  // channel shown, or hidden) records where it was there: a resize or the tabs around it may have
+  // changed since it was moved. So does leaving one where it is no longer where the window-wide
+  // place would put it (resized there, say), so it isn't moved back.
+  const questionsIn: Record<string, TabPlace> = {};
+  for (const [id, at] of Object.entries(s.questionsIn ?? {})) if (groups.has(Number(id))) questionsIn[id] = at;
   for (const [id, l] of Object.entries(s.layouts)) {
-    if (!allSessions(l.root).includes(QUESTIONS_TAB)) continue;
-    if (groups.get(Number(id))?.some((t) => t.id === QUESTIONS_TAB)) continue;
-    questionsAt = leftFrom(l, questionsAt);
+    if (!groups.has(Number(id)) || groups.get(Number(id))!.some((t) => t.id === QUESTIONS_TAB)) continue;
+    const at = placeOf(l, QUESTIONS_TAB);
+    if (at && (questionsIn[id] || !sameGeneralPlace(at, fallback))) questionsIn[id] = at;
   }
   const layouts: Record<string, LayoutState> = {};
   for (const [id, items] of groups) {
-    layouts[id] = reconcileChannel(s.layouts[id] ?? emptyLayout(), items, questionsAt ?? FIRST_PLACE);
+    layouts[id] = reconcileChannel(s.layouts[id] ?? emptyLayout(), items, questionsIn[id] ?? fallback);
   }
   const active = s.active !== null && Object.hasOwn(layouts, s.active) ? s.active :
     (groups.keys().next().value ?? null);
-  return { ...s, active, layouts, ...(s.drawers ? { drawers } : {}), ...(questionsAt ? { questionsAt } : {}) };
-}
-
-/** Where Questions was in layout `l` as it leaves. With one group there, "first" or "last" group
- * can't be told apart, so the remembered one stays. */
-function leftFrom(l: LayoutState, before: TabPlace | undefined): TabPlace | undefined {
-  const at = placeOf(l, QUESTIONS_TAB);
-  if (!at) return before;
-  const one = allPanes(l.root).length === 1;
-  const kept = one && !at.alone && before && !before.alone ? { ...at, group: before.group } : at;
-  return one && !before && kept.group === 0 && kept.index === 0 ? before : kept;
+  const { questionsIn: _, ...rest } = s;
+  return {
+    ...rest, active, layouts, ...(s.drawers ? { drawers } : {}),
+    ...(Object.keys(questionsIn).length ? { questionsIn } : {}),
+  };
 }
 
 /** Read v2, or partition a legacy window tree without merging tasks with the same folder. */
@@ -187,13 +190,21 @@ export function loadChannelLayout(raw: unknown, channels: number[], tabs: TabHom
     }
     const side = obj.sidebar && typeof obj.sidebar === "object" ? obj.sidebar as Partial<SidebarState> : {};
     const questionsAt = parseTabPlace(obj.questionsAt);
+    const questionsIn: Record<string, TabPlace> = {};
+    if (obj.questionsIn && typeof obj.questionsIn === "object") {
+      for (const [key, value] of Object.entries(obj.questionsIn)) {
+        const at = /^\d+$/.test(key) && Number.isSafeInteger(Number(key)) ? parseTabPlace(value) : null;
+        if (at) questionsIn[key] = at;
+      }
+    }
     return reconcileChannels({
       v: 2,
       active: typeof obj.active === "number" && Number.isSafeInteger(obj.active) ? obj.active : null,
       layouts,
       ...(obj.drawers ? { drawers } : {}),
       ...(obj.questions === false ? { questions: false as const } : {}),
-      ...(questionsAt ? { questionsAt } : {}),
+      ...(questionsAt ? { questionsAt: generalPlace(questionsAt) } : {}),
+      ...(Object.keys(questionsIn).length ? { questionsIn } : {}),
       sidebar: {
         hidden: side.hidden === true,
         channels: side.channels !== false,
@@ -230,11 +241,13 @@ export function loadChannelLayout(raw: unknown, channels: number[], tabs: TabHom
 }
 
 /** Remember where tab `tab` (the Questions tab) now is in the shown channel, after the human
- * moved it, for the channels it goes to next. */
+ * moved it: that channel's own place, and the place for channels that have none yet. */
 export function rememberPlace(s: WindowLayoutState, tab: number): WindowLayoutState {
   const l = s.active === null ? undefined : s.layouts[s.active];
   const at = l ? placeOf(l, tab) : null;
-  return at && JSON.stringify(at) !== JSON.stringify(s.questionsAt) ? { ...s, questionsAt: at } : s;
+  if (!at || s.active === null) return s;
+  const next = { ...s, questionsIn: { ...s.questionsIn, [s.active]: at }, questionsAt: generalPlace(at) };
+  return JSON.stringify(next) === JSON.stringify(s) ? s : next;
 }
 
 /** Update an explicitly captured destination, even if the user switched while an RPC ran. */

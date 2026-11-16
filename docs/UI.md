@@ -297,18 +297,26 @@ human"); the **Questions** tab is where the human sees and answers them (`web/sr
   select). It starts first in the top-left group. It drags like any tab: to another place in its
   strip, into another group, or onto a group's edge for a split of its own; its menu's **Split
   right** / **Split down**, Alt+Shift+[ / ] and Ctrl+Alt+arrows move it too. It never goes to
-  another window or channel. A reload keeps it exactly where it was. The window also remembers
-  its place (`questionsAt` in the saved layout, taken when it is moved and when it leaves a
-  channel), and each channel it moves to gets that place: the same group counting from the first,
-  or the last group when it was in the last one, at the same place in the strip (or its end); a
-  group of its own along a whole window edge becomes a group of its own along that edge, with the
-  same share of the window. A group of its own inside a column or row (not along a whole edge)
-  comes back as a tab of the group at that place. When it leaves a channel, the group it had alone
-  there closes; when it comes back (another channel shown, or Hide then show), it is put at the
-  remembered place again, so it is never lost or doubled. Pin icon, "Questions" and the number of open questions in an amber
-  badge. It doesn't rename or close: its menu (and Alt+W) **Hide Questions tab**, which the window
-  remembers; the palette's **Questions**, Alt+J or the status line's "needs you" shows it again,
-  wherever it is. Shown only when the backend has questions.
+  another window or channel. **Each channel remembers its own place** for it (`questionsIn` in the
+  saved layout, per channel): put it somewhere in a channel and that channel shows it there every
+  time you come back to it, after switching channels, Hide then show, a reload or a restart.
+  Moving it in one channel never changes where it is in another. The place is exact: the same
+  group and place in its strip (and the open tab there if it was), or a group of its own beside
+  the same groups at the same size, including one inside a column or row (say under the right-hand
+  terminal), not only along a window edge. A resize, or tabs moved around it, counts too: the
+  channel records where it is each time it leaves. A channel where you never put it gets the place
+  you last put it in any channel (`questionsAt`), in terms any channel can follow: the same group
+  counting from the first, or the last group when it was in the last one, at the same place in the
+  strip (or its end); a group of its own along a whole window edge becomes one along that edge with
+  the same share of the window. Before you have put it anywhere, that is first in the first group.
+  Saves from before per-channel places use their one window place this way. If the groups its place
+  names are gone (a terminal next to it closed meanwhile), it goes where that channel's place says
+  in those general terms. When it leaves a channel, the group it had alone there closes; when it
+  comes back it is put at that channel's place again, so it is never lost or doubled. Pin icon,
+  "Questions" and the number of open questions in an amber badge. It doesn't rename or close: its
+  menu (and Alt+W) **Hide Questions tab**, which the window remembers; the palette's
+  **Questions**, Alt+J or the status line's "needs you" shows it again, wherever it is. Shown only
+  when the backend has questions.
 - **The count**: on the tab, in "needs you" in the status line (sessions that need you plus open
   questions; its tooltip says which), and in the window title.
 - **Layout**: a bar with **Open N** and **Answered N**; the list on the left (340px), "Holding up

@@ -605,8 +605,8 @@ export function gotoTabIndex(n: number) {
   if (sid !== undefined) revealSession(sid);
 }
 
-/** After the human moved tab `sid`: the Questions tab remembers its new place for the channels it
- * goes to next (docs/UI.md "Questions"). */
+/** After the human moved tab `sid`: the Questions tab remembers its new place in this channel,
+ * and as the place for channels that have none yet (docs/UI.md "Questions"). */
 function moved(sid: SessionId) {
   const s = channelLayout.peek();
   if (sid === QUESTIONS_TAB && s) channelLayout.value = rememberPlace(s, sid);

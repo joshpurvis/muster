@@ -288,9 +288,11 @@ export function reconcile(s: LayoutState, live: number[]): LayoutState {
 }
 
 /**
- * Where a tab sits in its channel's groups, in terms another channel's groups can follow (the
- * Questions tab keeps one per window, docs/UI.md "Questions"). A group of its own along a whole
- * window edge is remembered as that edge and its share of the window.
+ * Where a tab sits in its channel's groups (the Questions tab, docs/UI.md "Questions"). `group`,
+ * `index`, `alone` and `size` are in terms any channel's groups can follow; a group of its own
+ * along a whole window edge is remembered as that edge and its share of the window. `pane`, or
+ * `near`, `side` and `share`, say exactly where it was in that same channel, by the ids of the
+ * groups around it, so that channel can put it back there.
  */
 export interface TabPlace {
   /** Its group in reading order (top-left first); -1 is the last of two or more. */
@@ -301,6 +303,16 @@ export interface TabPlace {
   alone?: Side;
   /** ...taking this share of the window's width (left, right) or height (top, bottom). */
   size?: number;
+  /** Same channel: the id of the group it shared, at `index`... */
+  pane?: string;
+  /** ...where it was the open tab. */
+  open?: true;
+  /** Same channel: it had a group of its own on `side` of the groups with these ids (a whole
+   * branch of the split tree)... */
+  near?: string[];
+  side?: Side;
+  /** ...taking this share of the split they were in together. */
+  share?: number;
 }
 
 /** The first tab of the top-left group: the Questions tab's place before it could move. */
@@ -316,11 +328,29 @@ export function parseTabPlace(raw: unknown): TabPlace | null {
   const int = (v: unknown) => typeof v === "number" && Number.isSafeInteger(v) && v >= -1 && v <= MAX_GROUPS * 64;
   if (!int(o.group) || !int(o.index)) return null;
   const place: TabPlace = { group: Math.min(o.group as number, MAX_GROUPS), index: o.index as number };
+  const share = (v: unknown) => typeof v === "number" && v > 0 && v < 1;
+  const id = (v: unknown) => typeof v === "string" && v.length > 0 && v.length <= 64;
   if (SIDES.includes(o.alone as Side)) {
     place.alone = o.alone as Side;
-    if (typeof o.size === "number" && o.size > 0 && o.size < 1) place.size = o.size;
+    if (share(o.size)) place.size = o.size as number;
+  }
+  if (id(o.pane)) {
+    place.pane = o.pane as string;
+    if (o.open === true) place.open = true;
+  } else if (Array.isArray(o.near) && o.near.length > 0 && o.near.length <= MAX_GROUPS && o.near.every(id) &&
+    SIDES.includes(o.side as Side) && share(o.share)) {
+    place.near = [...o.near as string[]];
+    place.side = o.side as Side;
+    place.share = o.share as number;
   }
   return place;
+}
+
+/** `place` without the parts that only mean something in the channel it was taken in. */
+export function generalPlace(place: TabPlace): TabPlace {
+  // Not `open` either: in another channel it doesn't take over a group's view.
+  const { group, index, alone, size } = place;
+  return { group, index, ...(alone ? { alone } : {}), ...(alone && size !== undefined ? { size } : {}) };
 }
 
 /** Where tab `tab` sits now (null: not in this layout). */
@@ -330,36 +360,122 @@ export function placeOf(s: LayoutState, tab: number): TabPlace | null {
   if (i < 0) return null;
   const p = panes[i];
   if (p.tabs.length === 1 && panes.length > 1) {
+    // A group of its own: the groups beside it in its split, and its share there.
+    const path = pathOfPane(s.root, p.id)!;
+    const parent = nodeAt(s.root, path.slice(0, -1)) as SplitNode;
+    const k = path[path.length - 1];
+    const after = k > 0;
+    const exact = {
+      near: allPanes(parent.children[after ? k - 1 : k + 1]).map((q) => q.id),
+      side: (parent.dir === "row" ? (after ? "right" : "left") : (after ? "bottom" : "top")) as Side,
+      share: parent.sizes[k],
+    };
     const r = paneRects(s.root).get(p.id)!;
     const e = 1e-6;
     const tall = r.y <= e && r.y + r.h >= 1 - e;
     const wide = r.x <= e && r.x + r.w >= 1 - e;
-    if (tall && r.x + r.w >= 1 - e) return { group: -1, index: 0, alone: "right", size: r.w };
-    if (tall && r.x <= e) return { group: 0, index: 0, alone: "left", size: r.w };
-    if (wide && r.y + r.h >= 1 - e) return { group: -1, index: 0, alone: "bottom", size: r.h };
-    if (wide && r.y <= e) return { group: 0, index: 0, alone: "top", size: r.h };
+    if (tall && r.x + r.w >= 1 - e) return { group: -1, index: 0, alone: "right", size: r.w, ...exact };
+    if (tall && r.x <= e) return { group: 0, index: 0, alone: "left", size: r.w, ...exact };
+    if (wide && r.y + r.h >= 1 - e) return { group: -1, index: 0, alone: "bottom", size: r.h, ...exact };
+    if (wide && r.y <= e) return { group: 0, index: 0, alone: "top", size: r.h, ...exact };
+    return { group: i === panes.length - 1 ? -1 : i, index: 0, ...exact };
   }
   const at = p.tabs.indexOf(tab);
   return {
     group: panes.length > 1 && i === panes.length - 1 ? -1 : i,
     index: at > 0 && at === p.tabs.length - 1 ? -1 : at,
+    pane: p.id,
+    ...(p.active === tab ? { open: true as const } : {}),
   };
 }
 
-const samePlace = (a: TabPlace | null, b: TabPlace) =>
-  !!a && a.alone === b.alone && (b.alone ? Math.abs((a.size ?? 0.5) - (b.size ?? 0.5)) < 1e-6
-    : a.group === b.group && a.index === b.index);
+const sameIds = (a: string[], b: string[]) => a.length === b.length && a.every((id) => b.includes(id));
+const closeTo = (a: number | undefined, b: number | undefined) => Math.abs((a ?? 0.5) - (b ?? 0.5)) < 1e-6;
+
+/** Tab already at `b`, judged by what `b` says (the exact parts when it has them). */
+function samePlace(a: TabPlace | null, b: TabPlace): boolean {
+  if (!a) return false;
+  if (b.near) return !!a.near && a.side === b.side && sameIds(a.near, b.near) && closeTo(a.share, b.share);
+  if (b.pane) return a.pane === b.pane && a.index === b.index && (!b.open || a.open === true);
+  return a.alone === b.alone && (b.alone ? closeTo(a.size, b.size) : a.group === b.group && a.index === b.index);
+}
+
+/** `a` is `b` in the words any channel follows (group and strip, or edge and share). */
+export function sameGeneralPlace(a: TabPlace, b: TabPlace): boolean {
+  return samePlace(generalPlace(a), generalPlace(b));
+}
 
 /**
- * Move tab `tab` (already in the layout) to `place`: into that group's strip, clamped to the
- * groups and tabs there are, or, for a place along an edge, into a new group along that whole
- * edge. Focus and every group's selection stay (the tab stays selected if it was).
+ * New group `np` on `side` of the branch made of exactly the groups `ids`, taking `share` of the
+ * split they then share (the inverse of closing it there). Null when no branch is made of those
+ * groups any more. A branch whose split was folded into its parent's (closing a group can do
+ * that) is found as a run of that parent's children and gathered back into its own split.
+ */
+function insertNear(root: Layout, ids: string[], np: PaneNode, side: Side, share: number): Layout | null {
+  const dir = sideDir(side);
+  const before = side === "left" || side === "top";
+  const s = Math.max(0.05, Math.min(0.95, share));
+  const groups = (n: Layout) => allPanes(n).map((p) => p.id);
+  const wrap = (n: Layout): Layout =>
+    ({ type: "split", dir, children: before ? [np, n] : [n, np], sizes: before ? [s, 1 - s] : [1 - s, s] });
+  if (sameIds(groups(root), ids)) return wrap(root);
+  const rec = (n: Layout): Layout | null => {
+    if (n.type === "pane") return null;
+    for (let i = 0; i < n.children.length; i++) {
+      const run: string[] = [];
+      for (let j = i; j < n.children.length; j++) {
+        const more = groups(n.children[j]);
+        if (!more.every((id) => ids.includes(id))) break;
+        run.push(...more);
+        if (!sameIds(run, ids)) continue;
+        if (n.dir === dir) {
+          // Beside them in the same split: its share back, the others' scaled down to make room.
+          const at = before ? i : j + 1;
+          const children = [...n.children];
+          const sizes = n.sizes.map((x) => x * (1 - s));
+          children.splice(at, 0, np);
+          sizes.splice(at, 0, s);
+          return { ...n, children, sizes };
+        }
+        const kids = n.children.slice(i, j + 1);
+        const total = n.sizes.slice(i, j + 1).reduce((a, b) => a + b, 0);
+        const branch: Layout = kids.length === 1
+          ? kids[0]
+          : { type: "split", dir: n.dir, children: kids, sizes: normSizes(n.sizes.slice(i, j + 1)) };
+        return {
+          ...n,
+          children: [...n.children.slice(0, i), wrap(branch), ...n.children.slice(j + 1)],
+          sizes: [...n.sizes.slice(0, i), total, ...n.sizes.slice(j + 1)],
+        };
+      }
+    }
+    for (let i = 0; i < n.children.length; i++) {
+      const r = rec(n.children[i]);
+      if (r) return { ...n, children: n.children.map((c, j) => (j === i ? r : c)) };
+    }
+    return null;
+  };
+  return rec(root);
+}
+
+/**
+ * Move tab `tab` (already in the layout) to `place`. Exactly where it was when the place names
+ * groups that are still here: into that group's strip, or into a new group beside the same groups
+ * at the same share. Otherwise into the group at `group`, clamped to the groups and tabs there
+ * are, or, for a place along an edge, into a new group along that whole edge. Focus and every
+ * group's selection stay (the tab stays selected if it was).
  */
 export function putAt(s: LayoutState, tab: number, place: TabPlace): LayoutState {
   const from = paneOfSession(s.root, tab);
   if (!from || samePlace(placeOf(s, tab), place)) return s;
   const selected = from.active === tab;
   const focused = s.focus === from.id;
+  if (place.near && place.side) {
+    const base = removeSession(s, tab);
+    const np = pane([tab]);
+    const root = insertNear(base.root, place.near, np, place.side, place.share ?? 0.5);
+    if (root) return finish({ ...base, root, focus: selected && focused ? np.id : base.focus });
+  }
   if (place.alone) {
     const base = removeSession(s, tab);
     const np = pane([tab]);
@@ -377,15 +493,18 @@ export function putAt(s: LayoutState, tab: number, place: TabPlace): LayoutState
     return finish({ ...base, root, focus: selected && focused ? np.id : base.focus });
   }
   const panes = allPanes(s.root);
-  const target = panes[place.group < 0 ? panes.length - 1 : Math.min(place.group, panes.length - 1)];
+  const own = panes.find((p) => p.id === place.pane);
+  const target = own ?? panes[place.group < 0 ? panes.length - 1 : Math.min(place.group, panes.length - 1)];
   const rest = target.tabs.filter((t) => t !== tab);
   const at = place.index < 0 ? rest.length : Math.min(place.index, rest.length);
-  if (target.id === from.id && from.tabs.indexOf(tab) === at) return s;
+  // Back in its own group, it is the open tab there again if it was.
+  const open = selected || (!!own && place.open === true);
+  if (target.id === from.id && from.tabs.indexOf(tab) === at && (!open || from.active === tab)) return s;
   const root = mapPanes(s.root, (p) => {
     if (p.id === target.id) {
       const tabs = [...rest];
       tabs.splice(at, 0, tab);
-      return { ...p, tabs, active: selected ? tab : p.active ?? tab };
+      return { ...p, tabs, active: open ? tab : p.active ?? tab };
     }
     if (p.id !== from.id) return p;
     const left = p.tabs.filter((t) => t !== tab);

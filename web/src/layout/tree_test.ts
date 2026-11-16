@@ -530,6 +530,70 @@ Deno.test("placeOf names a tab's place so putAt can rebuild it in another layout
   let mid = splitPane(emptyLayout([1]), "right", 2);
   mid = splitPane(mid, "left", T, findPane(mid.root, mid.focus)!.id);
   assertEquals(sig(mid.root), `row([1] [${T}] [2])`);
-  assertEquals(placeOf(mid, T), { group: 1, index: 0 });
+  const m = placeOf(mid, T)!;
+  assertEquals([m.group, m.index, m.alone, m.side, m.share], [1, 0, undefined, "right", 0.25]);
+  assertEquals(m.near, [paneOfSession(mid.root, 1)!.id]);
   assertEquals(placeOf(emptyLayout([1, 2]), T), null);
+});
+
+/** A layout with its split sizes, rounded (to compare a rebuilt layout with the one it was). */
+function sized(n: LayoutState["root"]): string {
+  if (n.type === "pane") return `[${n.tabs.join(",")}]`;
+  return `${n.dir}(${n.children.map((c, i) => `${sized(c)}:${n.sizes[i].toFixed(4)}`).join(" ")})`;
+}
+
+Deno.test("putAt puts a tab back exactly where it was in the same layout, by the groups around it", async () => {
+  const { placeOf, putAt, setSizes, generalPlace } = await import("./tree.ts");
+  const T = 99;
+  /** Take the tab out (its group closes), add it back to the focused group, then put it at its place. */
+  const roundTrip = (l: LayoutState) => {
+    const at = JSON.parse(JSON.stringify(placeOf(l, T)));
+    const gone = removeSession(l, T);
+    const back = putAt(reconcile(gone, [...allPanes(gone.root).flatMap((p) => p.tabs), T]), T, at);
+    assertEquals(sized(back.root), sized(l.root));
+    // Every other group keeps its id: the same groups, not look-alikes.
+    assertEquals(allPanes(back.root).filter((p) => !p.tabs.includes(T)).map((p) => p.id),
+      allPanes(l.root).filter((p) => !p.tabs.includes(T)).map((p) => p.id));
+    return { gone, back };
+  };
+  // Under the right group, inside its column, a third of its height.
+  let inner = splitPane(splitPane(emptyLayout([1]), "right", 2), "bottom", T);
+  inner = setSizes(inner, [1], [2 / 3, 1 / 3]);
+  inner = setSizes(inner, [], [0.4, 0.6]);
+  assertEquals(sig(inner.root), `row([1] col([2] [${T}]))`);
+  assertEquals(sig(roundTrip(inner).gone.root), "row([1] [2])");
+  // The middle of three in a column.
+  let three = splitPane(emptyLayout([1]), "bottom", 2);
+  three = splitPane(three, "top", T, paneOfSession(three.root, 2)!.id);
+  three = setSizes(three, [], [0.5, 0.2, 0.3]);
+  assertEquals(sig(three.root), `col([1] [${T}] [2])`);
+  roundTrip(three);
+  // Under a pair of groups whose row folds into the window's row when it closes: gathered back.
+  let fold = splitPane(emptyLayout([1]), "right", 3);
+  fold = splitPane(fold, "bottom", T, paneOfSession(fold.root, 1)!.id);
+  fold = splitPane(fold, "right", 2, paneOfSession(fold.root, 1)!.id);
+  fold = setSizes(fold, [], [0.7, 0.3]);
+  assertEquals(sig(fold.root), `row(col(row([1] [2]) [${T}]) [3])`);
+  assertEquals(sig(roundTrip(fold).gone.root), "row([1] [2] [3])");
+  // Left of everything, along the window edge.
+  roundTrip(setSizes(splitPane(splitPane(emptyLayout([1]), "bottom", 2), "left", T), [], [0.2, 0.8]));
+  // In a shared group, third in its strip and the open tab there: back third, open again.
+  let shared = splitPane(emptyLayout([1]), "right", 2);
+  shared = addTab(addTab(addTab(shared, 3), T), 4);
+  shared = activateTab(shared, T);
+  shared = activateTab(shared, 1);
+  assertEquals(sig(shared.root), `row([1] [2,3,${T},4])`);
+  const { back } = roundTrip(shared);
+  assertEquals(paneOfSession(back.root, T)!.active, T);
+  assertEquals(back.focus, shared.focus);
+
+  // The groups it was beside are gone (a terminal closed meanwhile): the place any channel can
+  // follow, never lost or doubled.
+  const at = placeOf(inner, T)!;
+  const gone = removeSession(removeSession(inner, T), 2);
+  const fallback = putAt(reconcile(gone, [1, 3, T]), T, at);
+  assertEquals(sig(fallback.root), `[${T},1,3]`);
+  // The general place drops what only means something in its own channel.
+  assertEquals(generalPlace(at), { group: -1, index: 0 });
+  assertEquals(generalPlace(placeOf(shared, T)!), { group: -1, index: 2 });
 });

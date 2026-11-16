@@ -87,7 +87,7 @@ and targets in them are refused.
 |---|---|---|
 | `whoami` | — | Caller session, cwd, channel (id, name, branch, base branch, cwd, `permissions`), workspace (id, name, path), spawn budget, `policy: {shell_commands, other_workspaces}`. |
 | `list_channels` | — | Non-archived channels: id, name, workspace, cwd, branch, base_branch, `permissions`, `state` (aggregate), `sessions`, `live_sessions`. |
-| `list_sessions` | `channel_id?` | All sessions (including exited): id, channel_id, kind, name, state, detail, state_since_ms, queued, parent_id, title, exit_code, is_me. |
+| `list_sessions` | `channel_id?` | All sessions (including exited): id, channel_id, kind, name, state, detail, state_since_ms, queued, parent_id, title, exit_code, is_me, `link`, `mention` (see "Links" below). |
 | `spawn_session` (alias `spawn_agent`, its old name: still accepted, not listed) | `kind` (`claude`\|`codex`\|`shell`), `prompt?`, `name?`, `model?`, `effort?`, `args?: string[]`, `channel_id?` **or** `new_channel?: {name?, worktree? = true, base?}` | New session (`parent_id` = caller) plus its channel. Default: caller's channel. The new session is a tab in the caller's window. `new_channel` is created in the caller's workspace, in the caller's window (else its channel's), with the caller's channel's permission profile. Without a `name` it is auto-named like any unnamed channel (docs/PROTOCOL.md), usually from the agent's title or the `prompt`. Unlike `channel.create`, `worktree` defaults to `true` here, so parallel agents don't share a checkout. `kind: shell` with a `prompt` or any `args` is refused unless shell commands are allowed (arguments to a shell are a command too). `model`/`effort` become `--model`/`--effort` (claude) or `-m`/`-c model_reasoning_effort=` (codex); `args` are extra CLI arguments; all of them go through the agent-argument allowlist (docs/PROTOCOL.md, "Channel permissions"), so they can't widen the profile. |
 | `send_message` | `session_id`, `text`, `interrupt? = false` | `{delivered, queued, sent_at_ms}`. Goes through the injection queue (`inject::send`, `from = "session:<caller>"`). Like any first prompt, it names an auto-named channel. Shell targets are refused unless shell commands are allowed; when allowed, the text is preceded by a line clear (Ctrl-E Ctrl-U) so it doesn't append to a half-typed command. |
 | `read_screen` | `session_id` | `[session N (kind) state=S]` header, then the visible screen. |
@@ -102,6 +102,23 @@ and targets in them are refused.
 
 `whoami` also returns `agent` (the caller's agent name, or null) and `origin: {origin, hop}`.
 
+### Links
+
+When an agent mentions a note, panel, tab or agent to the human, it writes the title as a
+Markdown link, never the bare number: `[Pairs to review](muster://note/91)`. In Muster's window
+a click on it shows that note (docs/UI.md "Links"). Results that return one carry it ready-made:
+
+- `link`: the address, `muster://note/<id>`, `muster://panel/<id>`, `muster://tab/<session id>` or
+  `muster://agent/<name>`. It holds nothing else (no token, nothing private).
+- `mention`: `[title](link)`, with the title on one line and its Markdown characters escaped.
+
+They come with every session in `whoami`, `list_sessions` and `spawn_session`, `wait_for_state`, every agent in
+`list_agents`, `panel_open` and every panel in `list_panels`, and every note result (`note_list`,
+`note_read`, `note_write`, `note_append`, `note_open`). `muster link note|panel|tab|agent
+<target>` prints one from the shell (docs/CLI.md). The server's `instructions` and every named
+agent's CLAUDE.md or AGENTS.md ("Links", added to an older agent's file at its next start) tell
+agents to use them. The link works in Muster's terminal, not inside panels or notes.
+
 ### Panels
 
 Panels always belong to the caller's **task**, even when cross-workspace access is enabled.
@@ -110,10 +127,10 @@ are model-only. The bridge's `get_diff` accepts only `max_bytes`, using the pane
 
 | Tool | Arguments | Result |
 |---|---|---|
-| `panel_open` | `title`, `app` (`markdown`, `image`, `chart`, `table`, `pr_decision`, `pr_overview`, `board`, `web_preview` or `custom`), `data?`, `html?`, `html_path?`, `csp?`, `kit?` (custom only, see [The kit](#the-kit-kit-true)), `notify_on_close?` (see below) | `{panel_id, note?}`; `note` only for a `web_preview` with a problem |
+| `panel_open` | `title`, `app` (`markdown`, `image`, `chart`, `table`, `pr_decision`, `pr_overview`, `board`, `web_preview` or `custom`), `data?`, `html?`, `html_path?`, `csp?`, `kit?` (custom only, see [The kit](#the-kit-kit-true)), `notify_on_close?` (see below) | `{panel_id, link, mention, note?}`; `note` only for a `web_preview` with a problem |
 | `panel_update` | `panel_id`, `data?` (replaces the whole input) or `set?` (edits to it, see [Changing part of the data](#changing-part-of-the-data-set)), `html?`, `html_path?`, `title?`, `kit?` (custom only; switching it reloads the app) | `{note?, added?}`; advances the revision |
 | `panel_close` | `panel_id` | `{}` |
-| `list_panels` | `{}` | `{panels: [...]}`; open panels in this task, with their latest `context` |
+| `list_panels` | `{}` | `{panels: [...]}`; open panels in this task, with their latest `context`, each with `link` and `mention` |
 | `wait_for_panel_event` | `panel_id?`, `timeout_seconds? = 300` (0–1800) | `{events: [...], remaining, timed_out}`; consumes the returned events |
 | `panel_event` | `panel_id`, `event_id` | `{event}`; the full event a panel prompt showed only as a placeholder; consumes it |
 
@@ -730,11 +747,11 @@ Wire format and limits: docs/PROTOCOL.md "Notes".
 
 | Tool | Arguments | Result |
 |---|---|---|
-| `note_list` | — | `{notes: [{id, title, rev, version, bytes, lines, preview, created_at, updated_at, updated_by, open, window_id, beside}]}`, no text (`preview` is the first non-blank line). |
-| `note_read` | `note_id` | `{note_id, title, rev, text, updated_at, updated_by, open}`. |
-| `note_write` | `text`, `title?`, `note_id?`, `rev?` | `{note_id, title, rev}`. Without `note_id`: a new note (not shown until `note_open`). With it: replaces the whole text (and the title, if given); `rev` is required and must be the current one, else the write is refused (`changed since revision …`): read again, redo the change, write with the new rev. |
-| `note_append` | `note_id`, `text` | `{note_id, rev}`. Adds the text at the end, on a new line. No rev, never conflicts: use it while the human may be typing. |
-| `note_open` | `note_id` | `{note_id, window_id}`. Shows the note as a tab beside the caller's terminal (in its window, moving it from another one). Refused for a hidden agent tab. |
+| `note_list` | — | `{notes: [{id, title, rev, version, bytes, lines, preview, created_at, updated_at, updated_by, open, window_id, beside, link, mention}]}`, no text (`preview` is the first non-blank line). |
+| `note_read` | `note_id` | `{note_id, title, rev, text, updated_at, updated_by, open, link, mention}`. |
+| `note_write` | `text`, `title?`, `note_id?`, `rev?` | `{note_id, title, rev, link, mention}`. Without `note_id`: a new note (not shown until `note_open`). With it: replaces the whole text (and the title, if given); `rev` is required and must be the current one, else the write is refused (`changed since revision …`): read again, redo the change, write with the new rev. |
+| `note_append` | `note_id`, `text` | `{note_id, title, rev, link, mention}`. Adds the text at the end, on a new line. No rev, never conflicts: use it while the human may be typing. |
+| `note_open` | `note_id` | `{note_id, title, window_id, link, mention}`. Shows the note as a tab beside the caller's terminal (in its window, moving it from another one). Refused for a hidden agent tab. |
 
 Each write and append records the caller as `updated_by` (`{kind: "agent", name, session_id}`;
 the name is a named agent's, else `Claude (task name)`), which the editor shows as "edited by …".

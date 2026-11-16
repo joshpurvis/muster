@@ -367,6 +367,8 @@ async fn legacy_handshake() {
     assert_eq!(r["result"]["protocolVersion"], "2025-06-18");
     assert_eq!(r["result"]["serverInfo"]["name"], "muster");
     assert!(r["result"]["capabilities"]["tools"].is_object());
+    // The instructions say to mention things by title, as a link, and show the form.
+    assert!(r["result"]["instructions"].as_str().unwrap().contains("[Pairs to review](muster://note/91)"));
     let r = legacy(&st, "initialize", json!({"protocolVersion": "1999-01-01"})).await;
     assert_eq!(r["result"]["protocolVersion"], protocol::LEGACY_VERSIONS[0]);
 
@@ -567,6 +569,9 @@ async fn whoami_and_lists() {
     assert_eq!(v["channel"]["branch"], "muster/main-task");
     assert_eq!(v["workspace"]["path"], "/repo");
     assert_eq!(v["spawn_budget"]["caller_depth"], 0);
+    // A session carries its tab's link, for telling the human about it.
+    assert_eq!(v["session"]["link"], "muster://tab/1");
+    assert!(v["session"]["mention"].as_str().unwrap().ends_with("](muster://tab/1)"));
 
     m.update(2, |s| s.state = AgentState::NeedsApproval);
     let v = parse(&call(&st, "list_channels", json!({})).await.0);
@@ -580,6 +585,7 @@ async fn whoami_and_lists() {
     );
     assert_eq!(v.as_array().unwrap().len(), 2);
     assert_eq!(v[0]["is_me"], true);
+    assert_eq!(v[1]["link"], format!("muster://tab/{}", v[1]["id"]));
     let v = parse(
         &call(&st, "list_sessions", json!({"channel_id": 999}))
             .await

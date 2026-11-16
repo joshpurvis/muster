@@ -933,7 +933,9 @@ pub async fn tool(hub: &Arc<Hub>, session: SessionId, name: &str, args: Value) -
     match name {
         "panel_open" => {
             let id = open(hub, session, serde_json::from_value(args)?)?;
-            Ok(with_preview_note(hub, id, json!({"panel_id": id})).await)
+            let mut result = json!({"panel_id": id});
+            if let Ok(p) = get(hub, id) { crate::links::add(&mut result, crate::links::panel(id), &p.title); }
+            Ok(with_preview_note(hub, id, result).await)
         },
         "panel_update" => {
             let args: Update = serde_json::from_value(args)?;
@@ -953,7 +955,12 @@ pub async fn tool(hub: &Arc<Hub>, session: SessionId, name: &str, args: Value) -
         "list_panels" => {
             ensure!(args.as_object().is_some_and(|o| o.is_empty()), "list_panels takes no arguments");
             let (_, ch) = caller(hub, session)?;
-            Ok(json!({"panels": list(hub)?.into_iter().filter(|p| p.channel_id == ch.id && !p.closed).collect::<Vec<_>>()}))
+            let panels: Vec<Value> = list(hub)?.into_iter().filter(|p| p.channel_id == ch.id && !p.closed).map(|p| {
+                let mut v = serde_json::to_value(&p).unwrap_or(Value::Null);
+                crate::links::add(&mut v, crate::links::panel(p.id), &p.title);
+                v
+            }).collect();
+            Ok(json!({"panels": panels}))
         },
         "wait_for_panel_event" => {
             #[derive(Deserialize)] #[serde(deny_unknown_fields)] struct P { panel_id: Option<PanelId>, timeout_seconds: Option<u64> }
@@ -1581,6 +1588,18 @@ mod tests {
         assert!(typo["note"].as_str().unwrap().contains("misspelt"));
         assert_eq!(resource(&hub, id).unwrap()["data"]["prs"][1]["status"], "merged");
         assert!(call(json!([{"path": "prs[number=227].status"}])).await.is_err(), "a value is required");
+        archive(&hub, 1).unwrap();
+    }
+
+    #[tokio::test]
+    async fn open_and_list_give_the_panels_link() {
+        let hub = fixture();
+        let opened = tool(&hub, 1, "panel_open", json!({"title": "Review [draft]", "app": "markdown", "data": {"markdown": "x"}})).await.unwrap();
+        let id = opened["panel_id"].as_i64().unwrap();
+        assert_eq!(opened["link"], format!("muster://panel/{id}"));
+        assert_eq!(opened["mention"], format!(r"[Review \[draft\]](muster://panel/{id})"));
+        let listed = tool(&hub, 1, "list_panels", json!({})).await.unwrap();
+        assert_eq!((listed["panels"][0]["id"].as_i64(), &listed["panels"][0]["link"]), (Some(id), &json!(format!("muster://panel/{id}"))));
         archive(&hub, 1).unwrap();
     }
 

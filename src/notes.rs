@@ -304,20 +304,33 @@ pub fn check_delete_from(hub: &Hub, from_session: Option<SessionId>) -> anyhow::
     Ok(())
 }
 
+/// A tool result with the note's `link` and `mention` (src/links.rs), for telling the human.
+fn linked(mut v: Value, n: &Note) -> Value {
+    crate::links::add(&mut v, crate::links::note(n.id), &n.title);
+    v
+}
+
 /// The MCP note tools, run as session `caller` (src/mcp/tools.rs checks the rate limit).
 pub fn tool(hub: &Hub, caller: SessionId, name: &str, args: Value) -> anyhow::Result<Value> {
     let by = || author(hub, Some(caller));
     match name {
         "note_list" => {
             ensure!(args.as_object().is_none_or(|o| o.is_empty()), "note_list takes no arguments");
-            Ok(json!({"notes": list(hub)?}))
+            let mut notes = serde_json::to_value(list(hub)?)?;
+            for n in notes.as_array_mut().into_iter().flatten() {
+                if let Some(id) = n["id"].as_i64() {
+                    let title = n["title"].as_str().unwrap_or("").to_string();
+                    crate::links::add(n, crate::links::note(id), &title);
+                }
+            }
+            Ok(json!({"notes": notes}))
         }
         "note_read" => {
             #[derive(Deserialize)] #[serde(deny_unknown_fields)] struct P { note_id: NoteId }
             let p: P = serde_json::from_value(args)?;
             let n = get(hub, p.note_id)?;
-            Ok(json!({"note_id": n.id, "title": n.title, "rev": n.rev, "text": n.body, "updated_at": n.updated_at,
-                "updated_by": n.updated_by, "open": n.window_id.is_some()}))
+            Ok(linked(json!({"note_id": n.id, "title": n.title, "rev": n.rev, "text": n.body, "updated_at": n.updated_at,
+                "updated_by": n.updated_by, "open": n.window_id.is_some()}), &n))
         }
         "note_write" => {
             #[derive(Deserialize)] #[serde(deny_unknown_fields)]
@@ -333,20 +346,20 @@ pub fn tool(hub: &Hub, caller: SessionId, name: &str, args: Value) -> anyhow::Re
                     write(hub, id, &p.text, rev, by()?, p.title.as_deref())?
                 }
             };
-            Ok(json!({"note_id": n.id, "title": n.title, "rev": n.rev}))
+            Ok(linked(json!({"note_id": n.id, "title": n.title, "rev": n.rev}), &n))
         }
         "note_append" => {
             #[derive(Deserialize)] #[serde(deny_unknown_fields)] struct P { note_id: NoteId, text: String }
             let p: P = serde_json::from_value(args)?;
             let n = append(hub, p.note_id, &p.text, by()?)?;
-            Ok(json!({"note_id": n.id, "rev": n.rev}))
+            Ok(linked(json!({"note_id": n.id, "title": n.title, "rev": n.rev}), &n))
         }
         "note_open" => {
             #[derive(Deserialize)] #[serde(deny_unknown_fields)] struct P { note_id: NoteId }
             let p: P = serde_json::from_value(args)?;
             let window = window_of(hub, caller)?;
             let n = open(hub, p.note_id, window, Some(caller))?;
-            Ok(json!({"note_id": n.id, "window_id": window}))
+            Ok(linked(json!({"note_id": n.id, "title": n.title, "window_id": window}), &n))
         }
         _ => anyhow::bail!("unknown note tool"),
     }
@@ -512,6 +525,13 @@ mod tests {
         assert_eq!(listed["notes"][0]["bytes"], 7);
         assert!(listed["notes"][0].get("text").is_none());
         assert_eq!(tool(&hub, 1, "note_open", json!({"note_id": id})).unwrap()["window_id"], 1);
+        // Every result that names a note gives the human-facing link with its title.
+        assert_eq!((made["link"].as_str(), made["mention"].as_str()), (Some(&*format!("muster://note/{id}")), Some(&*format!("[Todo](muster://note/{id})"))));
+        for name in ["note_read", "note_open"] {
+            assert_eq!(tool(&hub, 1, name, json!({"note_id": id})).unwrap()["mention"], format!("[Todo](muster://note/{id})"), "{name}");
+        }
+        assert_eq!(tool(&hub, 1, "note_append", json!({"note_id": id, "text": "- d"})).unwrap()["link"], format!("muster://note/{id}"));
+        assert_eq!(listed["notes"][0]["mention"], format!("[Todo](muster://note/{id})"));
         assert_eq!(get(&hub, id).unwrap().beside, Some(1));
         assert!(tool(&hub, 1, "note_read", json!({"note_id": id, "extra": 1})).is_err());
     }

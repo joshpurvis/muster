@@ -286,6 +286,50 @@ docs/MCP.md "Notes") and `muster note` (docs/CLI.md); the human types in it.
   show neither.
 - The status line's tab count includes notes. The phone UI has no notes (it receives none).
 
+### Links
+
+Agents mention a note, panel, tab or agent to the human by its title, as a link that shows it
+when clicked, instead of a bare number ("your three pairs are in note 91"). The address names a
+kind and an id, or an agent's name, and nothing else (no token, no window), so it is safe in
+transcripts and pasted elsewhere (src/links.rs, web/src/links.ts):
+
+| Address | Shows |
+|---|---|
+| `muster://note/91` | the note: selected here, or opened beside the terminal that showed the link (from closed, or from another window), as Jump does |
+| `muster://panel/3` | the panel, selected here or brought from its window |
+| `muster://tab/12` | session 12's tab |
+| `muster://agent/reviewer` | the named agent's tab |
+
+- **How it arrives**: an agent writes Markdown, `[Pairs to review](muster://note/91)`. Claude
+  Code and Codex both print it as `Pairs to review (muster://note/91)`; Muster's terminal finds the
+  address in the text (also when the line wraps inside it) and underlines it on hover. An
+  address cut at a row's edge in a way Muster can't join again (a terminal redrawn after a resize)
+  is no link rather than a link to the wrong id. A program
+  that prints a terminal hyperlink (OSC 8) to a Muster address gets the same. Claude Code is not
+  asked to print hyperlinks (`FORCE_HYPERLINK`): a terminal redrawn by the daemon (after a resize,
+  then a reload or reconnect) drops them, and the title alone would lose its address.
+- **Click**: a left click without a modifier follows a Muster link. Muster takes the press and
+  release itself, so a program with mouse reporting on gets no click, no selection starts, and a
+  middle-click (paste) or a click with a modifier does what it always did. Web links are as
+  before: Ctrl+click (⌘-click) on an address, and xterm's "Do you want to navigate…" question
+  for a hyperlink. Other hyperlinks (`file://`, …) do nothing.
+- **Gone**: a link to a deleted note, a closed panel or tab, or an agent that doesn't exist (or
+  has never started) shows a short message saying so.
+- **Only shows**: following a link selects a tab, opens a note's tab or raises a window, nothing
+  else. It never sends a prompt, approves, starts or stops a session or agent, or changes a
+  note's text, so a link in untrusted text (a web page an agent printed) is safe to click.
+- Agents get the link ready-made: tool and command results that return a note, panel, session or
+  agent carry `link` and `mention` (docs/MCP.md "Links"), and `muster link` prints one
+  (docs/CLI.md). Every agent's instructions say to mention things this way: the MCP server's
+  instructions, and a named agent's CLAUDE.md or AGENTS.md ("Links"; an agent made before this
+  gets the section at its next start, unless its file was replaced by hand).
+- **Where**: a link always shows the thing in the window it was clicked in (a note beside the
+  terminal that showed the link, a panel or tab moved here from another window), also with "Jump
+  focuses the other window" on: raising that window would show whatever is selected there.
+- Not yet: outside Muster's window (another terminal, a browser) the address isn't registered
+  with the system, so it does nothing there; the phone UI and Markdown panels show it as plain
+  text.
+
 ### Dragging tabs
 Pointer-based (not HTML5 DnD), with the v1 drop-zone overlay:
 - Onto another group's body: left/right/top/bottom halves (outer 28%) split that group on that

@@ -507,7 +507,8 @@ done
   await c.waitFor("fake idle agent", () => c.events.some((e) => e.event === "session_upserted" && e.data.id === fake.id && e.data.state === "idle"));
   const fakeToken = await Deno.readTextFile(`${BASE}/fake-token`);
   // Cold prompt cache (src/cache.rs): a turn's end starts the clock, the lifetime comes from the
-  // shared prefs (Codex on its plan: 30 min), and changing it moves every session's cold time.
+  // shared prefs (Codex logged in with ChatGPT: 0, never cold; `codex_chatgpt` in CacheTtl), and
+  // changing it moves every session's cold time.
   const fakeInfo = async () => (await c.call("hello")).sessions.find((x: Json) => x.id === fake.id);
   ok((await fakeInfo()).cache_cold_at === null, "cache: no cold time before the agent's first turn");
   const notified = await fetch(`http://127.0.0.1:${PORT}/hook/notify`, {
@@ -517,14 +518,14 @@ done
   ok(notified.ok, "cache: Codex's turn-complete notify accepted");
   await c.waitFor("a turn's end", () => c.events.some((e) => e.event === "session_upserted" && e.data.id === fake.id && e.data.last_turn_at));
   const turned = await fakeInfo();
-  ok(turned.cache_cold_at === turned.last_turn_at + 30 * 60_000, "cache: Codex on its plan goes cold 30 min after its last turn");
+  ok(turned.last_turn_at && turned.cache_cold_at === null && turned.cache_ttl_min === 0, "cache: Codex on its plan never goes cold (lifetime 0)");
   const shellInfo = (await c.call("hello")).sessions.find((x: Json) => x.kind === "shell");
   ok(shellInfo && shellInfo.cache_cold_at === null && shellInfo.last_turn_at === null, "cache: shells never get a cold time");
-  await c.call("prefs.set", { cache_ttl: { codex: 1 } });
+  await c.call("prefs.set", { cache_ttl: { codex_chatgpt: 1 } });
   ok((await fakeInfo()).cache_cold_at === turned.last_turn_at + 60_000, "cache: a 1-minute lifetime moves its cold time");
   await c.call("prefs.set", { cache_warn: false });
   ok((await fakeInfo()).cache_cold_at === null, "cache: the warning off clears it");
-  await c.call("prefs.set", { cache_warn: true, cache_ttl: { codex: 30 } });
+  await c.call("prefs.set", { cache_warn: true, cache_ttl: { codex_chatgpt: 0 } });
   const fakePanel = (await mcp(fakeToken, "panel_open", { title: "Idle delivery", app: "markdown" })).panel_id;
   // Registering a wait suppresses automatic injection even for an idle opener.
   const idleWait = mcp(fakeToken, "wait_for_panel_event", { panel_id: fakePanel, timeout_seconds: 5 });
@@ -617,6 +618,18 @@ done
   ok(dec.decode(cliRead.stdout) === "rewritten\nfrom the cli", "muster note read prints the text");
   const cliLs = await new Deno.Command(BIN, { args: ["note", "ls"], env: cliEnv0(), stdout: "piped" }).output();
   ok(dec.decode(cliLs.stdout).includes("Agent findings"), "muster note ls");
+  // Links (src/links.rs): what the agent writes to the human names the note by title, as a link
+  // that carries nothing but the kind and id.
+  const link = `muster://note/${made.note_id}`;
+  ok(made.link === link && made.mention === `[Agent findings](${link})` && opened.mention === made.mention &&
+    listed.notes.every((n: Json) => n.link === `muster://note/${n.id}`), `MCP note results carry the link (${made.mention})`);
+  const cliLink = await new Deno.Command(BIN, { args: ["link", "note", "Agent findings"], env: cliEnv0(), stdout: "piped", stderr: "piped" }).output();
+  ok(cliLink.success && dec.decode(cliLink.stdout) === `[Agent findings](${link})\n`, `muster link note (${dec.decode(cliLink.stderr)})`);
+  const cliTabLink = await new Deno.Command(BIN, { args: ["link", "tab", String(fake.id), "--url"], env: cliEnv0(), stdout: "piped" }).output();
+  ok(dec.decode(cliTabLink.stdout) === `muster://tab/${fake.id}\n`, "muster link tab --url");
+  const noLink = await new Deno.Command(BIN, { args: ["link", "note", "99999"], env: cliEnv0(), stdout: "piped", stderr: "piped" }).output();
+  ok(noLink.code === 2, "muster link for a missing note exits 2");
+  ok(!JSON.stringify([made, opened, listed]).includes(fakeToken) && !made.link.includes(d.token), "a link holds no token");
   const noteRev = 5;
 
   await c.call("session.remove", { id: fake.id });

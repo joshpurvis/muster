@@ -15,6 +15,7 @@ mod hookcmd;
 mod hook_inbox;
 mod hub;
 mod inject;
+mod links;
 mod mcp;
 mod model;
 mod metrics;
@@ -105,6 +106,16 @@ records an answer you typed in chat with `record_answer` (docs/MCP.md, \"Questio
         all: bool,
         #[arg(long)]
         json: bool,
+    },
+    /// Print the link to a note, panel, tab or agent, for mentioning it to the human:
+    /// `[title](muster://note/91)`, which opens it when clicked in Muster (`--url`: the address).
+    Link {
+        #[arg(value_parser = ["note", "panel", "tab", "agent"])]
+        kind: String,
+        /// A note id or title, a panel id, a session target (as for `send`), an agent name.
+        target: String,
+        #[arg(long)]
+        url: bool,
     },
     /// Schedules: recurring or one-off messages to a named agent (add, ls, rm, pause, resume,
     /// run, skip, renew, history).
@@ -729,6 +740,7 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
     match cmd {
         Cmd::Panel { action } => cli::panel(d, action),
         Cmd::Note { action } => cli::note(d, action),
+        Cmd::Link { kind, target, url } => cli::link(d, &kind, &target, url),
         Cmd::Schedule { action } => cli::schedule(d, action),
         Cmd::Trigger { name, data, url, rotate } => cli::trigger(d, &name, &data, url, rotate),
         Cmd::Read {

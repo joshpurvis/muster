@@ -64,6 +64,7 @@ import { DragOverlay } from "./layout/dnd.tsx";
 import { LaunchButtons } from "./layout/Pane.tsx";
 import { focusPane, paneOfSession } from "./layout/tree.ts";
 import { windowParam } from "./model.ts";
+import { followLink } from "./links.ts";
 import { RESTART_WAIT_MS } from "./updates.ts";
 import type { SessionKind } from "./types.ts";
 import { tildify } from "./util.ts";
@@ -98,6 +99,24 @@ mq.addEventListener("change", applyThemePref);
 terms.setFontSize(prefs.value.fontSize);
 terms.setInputPaused((sid) => !!sessions.value.get(sid)?.input_interrupted);
 terms.onClipboardFailed((text) => toast("error", text));
+// A click on a Muster link in a terminal shows what it names (links.ts), here: a closed note opens
+// beside the terminal that linked it, and a thing in another window comes to this one (raising
+// that window, as Jump may, would show whatever is selected there).
+terms.onMusterLink((link, sid) => {
+  followLink(link, {
+    hasNote: (id) => notes.value.has(id),
+    hasPanel: (id) => panels.value.get(id)?.closed === false,
+    hasSession: (id) => sessions.value.has(id),
+    agent: (name) => {
+      const a = agents.value.find((x) => x.name.toLowerCase() === name.toLowerCase());
+      return a ? { name: a.name, session: a.session_id } : null;
+    },
+    gotoNote: (id) => void A.gotoNote(id, undefined, sid, false),
+    gotoPanel: (id) => void A.gotoPanel(id, false),
+    gotoSession: (id) => void A.gotoSession(id, false),
+    notify: (text) => toast("info", text, 5000),
+  });
+});
 
 rpc.onHello = async (h, reconnect) => {
   applyHello(h);

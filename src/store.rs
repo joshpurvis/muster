@@ -1093,11 +1093,20 @@ impl Store {
         raw.map(|r| Self::row_question(id, &r)).transpose()
     }
 
-    /// Every question with `status` (None: all), oldest first.
-    pub fn questions(&self, status: Option<crate::questions::Status>) -> anyhow::Result<Vec<crate::questions::Question>> {
+    /// The newest `limit` questions with `status` (None: all), asked by `asker` (its named agent
+    /// id, else its session) when given, oldest first; and how many match in all.
+    pub fn questions(&self, status: Option<crate::questions::Status>, asker: Option<(Option<i64>, SessionId)>, limit: usize)
+        -> anyhow::Result<(Vec<crate::questions::Question>, usize)> {
         let conn = self.conn.lock();
-        let mut st = conn.prepare("SELECT id, record FROM questions WHERE ?1 IS NULL OR status = ?1 ORDER BY id")?;
-        let rows = st.query_map([status.map(|s| s.as_str())], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        let filter = "(?1 IS NULL OR status = ?1) AND (?2 = 0 OR (?3 IS NOT NULL AND asker_agent = ?3)
+            OR (?3 IS NULL AND asker_agent IS NULL AND asker_session = ?4))";
+        let (on, agent, session) = match asker { Some((a, s)) => (1, a, s), None => (0, None, 0) };
+        let status = status.map(|s| s.as_str());
+        let total: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM questions WHERE {filter}"),
+            params![status, on, agent, session], |r| r.get(0))?;
+        let mut st = conn.prepare(&format!("SELECT id, record FROM questions WHERE {filter} ORDER BY id DESC LIMIT ?5"))?;
+        let rows = st.query_map(params![status, on, agent, session, limit as i64],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
         let mut out = Vec::new();
         for row in rows {
             let (id, record) = row?;
@@ -1106,7 +1115,8 @@ impl Store {
                 Err(e) => tracing::warn!("skipping a question that doesn't read: {e:#}"),
             }
         }
-        Ok(out)
+        out.reverse();
+        Ok((out, total.max(0) as usize))
     }
 
     /// Change question `id` with `edit`, read and written in one transaction (so two callers

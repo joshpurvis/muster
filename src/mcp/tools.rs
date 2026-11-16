@@ -358,7 +358,7 @@ fn question_definitions() -> Vec<Value> {
     let letters = json!({"description":"A letter (\"a\") or, for pick_several, a list of letters.","anyOf":[{"type":"string"},{"type":"array","items":{"type":"string"},"maxItems":6}]});
     vec![
         tool("post_question", "Post a question for the human",
-            "Ask the human something without waiting: Muster stores the question and this call returns at once, so your turn goes on and messages to you keep arriving. Use it instead of an interview box or a form. When the human answers, Muster sends you a message starting \"Answer to your question Q<n>\" that repeats the whole question and your note_to_self, addressed to you by name if you are a named agent (it reaches you after a restart or fresh start too), else to this session or, if it has ended, to the session that started it. Usually a lead passes questions on: if a lead started you or you work for one, ask the lead (request_session, ask_agent) unless the human has been talking to you directly. Write for someone who knows the product but not the code: no file names, PR numbers or internal labels in question, context, example or options (put them in details). Refused, with every problem listed, without: context, a concrete example of what changes, 2-6 options with your pick first (as a) and its why (except kind own_words), if_no_answer, note_to_self. Lettered a-f in the order given. At most 20 open per asker; the same open question is refused with its number.",
+            "Ask the human something without waiting: Muster stores the question and this call returns at once, so your turn goes on and messages to you keep arriving. Use it instead of an interview box or a form. When the human answers, Muster sends you a message starting \"Answer to your question Q<n>\" that repeats the whole question and your note_to_self, addressed to you by name if you are a named agent (it reaches you after a restart or fresh start too), else to this session or, if it has ended, to the session that started it. Usually a lead passes questions on: if a lead started you or you work for one, ask the lead (request_session, ask_agent) unless the human has been talking to you directly. Write for someone who knows the product but not the code: no file names, PR numbers or internal labels in question, context, example or options (put them in details). Refused, with every problem listed, without: context, a concrete example of what changes, 2-6 options with your pick and its why (a single pick goes first, as a; kind own_words takes no options), if_no_answer, note_to_self. Lettered a-f in the order given. Never ask for a password, key or token: leads and other agents read questions and answers. At most 20 open per asker; the same open question is refused with its number.",
             json!({"type":"object","properties":{
                 "question":line(300, "The question, one sentence on one line."),
                 "context":line(1000, "One or two sentences in plain words: what this is about."),
@@ -374,9 +374,9 @@ fn question_definitions() -> Vec<Value> {
                 "details":line(2000, "File names, job and PR numbers: shown only when the human opens the details."),
                 "pictures":{"type":"array","maxItems":6,"items":{"type":"object","properties":{"path":{"type":"string","description":"Absolute path of a png, jpg, gif, webp or svg."},"caption":line(200, "What it shows.")},"required":["path","caption"],"additionalProperties":false}},
                 "links":{"type":"array","maxItems":4,"items":{"type":"object","properties":{"label":line(80, "What it opens, e.g. Open the pull request."),"url":{"type":"string","description":"http(s) address."}},"required":["label","url"],"additionalProperties":false}}
-            },"required":["question"],"additionalProperties":false}), false),
+            },"required":["question","context","example","if_no_answer","note_to_self"],"additionalProperties":false}), false),
         tool("list_questions", "List questions for the human",
-            "List the questions agents posted for the human: number (Q<n>), asker, product, question, options with the asker's pick, what it holds up, and for open ones the asker's state now (running, asleep, cold: whether its next message re-reads its whole conversation). Answered ones carry the answer, who recorded it and how it was delivered. Oldest first. With number: that one question in full (its note_to_self included). With mine=true: only yours (as a named agent, also those you asked before a restart), e.g. to check an answer before asking again.",
+            "List the questions agents posted for the human: number (Q<n>), asker, product, question, options with the asker's pick, what it holds up, and for open ones the asker's state now (running, asleep, cold: whether its next message re-reads its whole conversation). Answered ones carry the answer, who recorded it and how it was delivered. Oldest first, the newest limit; shown are those you may read: your own, those of sessions you started, those asked in your workspace or one whose output a sharing rule lets you read (named agents read all). With number: that one question in full (its note_to_self included). With mine=true: only yours (as a named agent, also those you asked before a restart), e.g. to check an answer before asking again.",
             json!({"type":"object","properties":{
                 "number":number,
                 "status":{"type":"string","enum":["open","answered","withdrawn","all"],"default":"open"},
@@ -387,7 +387,7 @@ fn question_definitions() -> Vec<Value> {
             "Take back a question you posted that is still open (it no longer matters, or you found the answer). Only the asker can.",
             json!({"type":"object","properties":{"number":number,"reason":line(500, "Why, in a few words.")},"required":["number","reason"],"additionalProperties":false}), false),
         tool("record_answer", "Record the human's answer",
-            "Record the answer the human gave you in chat to an open question (\"Q3 a\"), for a lead relaying it. Only the human's own words, never your opinion: put them in words verbatim, and the letters they chose in pick. Muster stores it, then delivers it to the asker as a message from you (your envelope, origin and hop, the same guards and caps as ask_agent), repeating the whole question and the asker's note to itself; it never arrives as the human's own input. Allowed for the asker itself (then nothing is sent), any named agent, or the session that started the asker; refused while you handle scheduled or triggered work, and once the question was answered or withdrawn. The result says how it was delivered.",
+            "Record the answer the human gave you in chat to an open question (\"Q3 a\"), for a lead relaying it. Only the human's own words, never your opinion: put them in words verbatim, and the letters they chose in pick. Muster stores it, then delivers it to the asker as a message from you (your envelope, origin and hop, the same guards and caps as ask_agent), repeating the whole question and the asker's note to itself; it never arrives as the human's own input. Allowed for the asker itself (then nothing is sent), any named agent, or the session that started the asker, and only while you handle what the human typed to you (not another agent's message or scheduled work, unless you started the asker). Refused, with nothing stored, when the answer couldn't reach the asker under the rules your own messages follow: a shell, another workspace without a sharing rule, a tab with wider permissions than your channel, the asker's origin rule, hop limit or daily cap. Once answered or withdrawn it is refused; if its delivery failed, the one who recorded it sends it again by recording the same words and pick. The result says how it was delivered.",
             json!({"type":"object","properties":{
                 "number":number,
                 "words":line(4000, "What the human typed, verbatim, e.g. \"Q3 a, but ask the lead first\"."),
@@ -663,8 +663,19 @@ async fn question_tool<B: Backend>(st: &McpState<B>, caller: SessionId, name: &s
             return Err(format!("rate limit: at most {} questions, answers, note writes or posts per minute; try again in {wait_s}s", st.limits.post_per_window));
         }
     }
-    st.backend.question_tool(caller, name, Value::Object(args.clone())).await
-        .map(|v| pretty(&v)).map_err(|e| format!("{e:#}"))
+    // An answer is a message to the asker: it counts toward the send limit too, as ask_agent does.
+    let sends = name == "record_answer";
+    if sends && let Err(wait_s) = st.edit_guard(|g| g.sends.check_and_record(
+        caller, now_ms(), st.limits.send_per_window, st.limits.send_window_ms,
+    ))? {
+        return Err(format!("rate limit: at most {} messages per minute. Try again in {wait_s}s.", st.limits.send_per_window));
+    }
+    let r = st.backend.question_tool(caller, name, Value::Object(args.clone())).await;
+    if sends && r.is_err() {
+        // Refused before anything was stored or sent: the slot isn't used.
+        if let Err(error) = st.edit_guard(|g| g.sends.refund(caller)) { tracing::warn!("{error}"); }
+    }
+    r.map(|v| pretty(&v)).map_err(|e| format!("{e:#}"))
 }
 
 fn target_session<B: Backend>(st: &McpState<B>, id: SessionId) -> Result<SessionInfo, String> {

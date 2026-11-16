@@ -503,9 +503,9 @@ have no `question.*` methods. There are no events yet (nothing on screen shows t
 
 | Method | Params | Result |
 |---|---|---|
-| `question.list` | `{status?: "open" \| "answered" \| "withdrawn" \| "all" (default "open"), limit? (≤ 200)}` | `{questions: [...], total}`, oldest first (the newest `limit`), as MCP `list_questions` returns them. |
+| `question.list` | `{status?: "open" \| "answered" \| "withdrawn" \| "all" (default "open"), limit? (≤ 200)}` | `{questions: [...], shown, total}`, oldest first (the newest `limit`), as MCP `list_questions` returns them; every question, whatever its workspace. |
 | `question.get` | `{id}` | The whole question, as MCP `list_questions` with `number` returns it. |
-| `question.start_at` | `{first}` (1 to 1000000) | `{first}`. The first question posted gets number `first`. Refused once any question exists. |
+| `question.start_at` | `{first}` (1 to 1000000) | `{first}`. The first question posted gets number `first`. Refused once any question exists, from a paired device, and from a session (`from_session`: the CLI inside one). |
 
 Posting, withdrawing and recording an answer are MCP tools only (each runs as the calling
 session, with its guards): no client method writes a question or an answer.

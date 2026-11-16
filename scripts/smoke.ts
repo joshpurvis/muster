@@ -1590,7 +1590,7 @@ async function questionsForHuman(c: Client, mcp: (token: string, name: string, a
   const r1 = await mcp(leadT, "record_answer", { number: 5, words: "Q5 a", pick: "a" });
   ok(r1.status === "answered" && r1.delivered === true && r1.delivery.to === "writer", `questions: the lead records the answer (${JSON.stringify(r1)})`);
   ok(await got(writerS, `from lead origin=human`) && await got(writerS, "Answer to your question Q5: a) Heading one on every page.") &&
-    await got(writerS, "smoke-note-one") && await got(writerS, `Their words, verbatim: "Q5 a"`),
+    await got(writerS, "smoke-note-one") && await got(writerS, `The words lead recorded: "Q5 a"`),
     "questions: the answer is typed into the writer with the question and its own note, from the lead");
   ok(await refused(mcp(leadT, "record_answer", { number: 5, words: "Q5 b", pick: "b" }), "answered already") === true, "questions: one answer per question");
 

@@ -3418,7 +3418,7 @@ fn answer_line(a: &Value) -> String {
 pub fn questions(d: &Discovery, action: Option<QuestionsCmd>, all: bool, as_json: bool) -> anyhow::Result<()> {
     match action {
         Some(QuestionsCmd::StartAt { first }) => {
-            client::rpc(d, "question.start_at", json!({"first": first}))?;
+            client::rpc(d, "question.start_at", json!({"first": first, "from_session": env_session()}))?;
             println!("the first question will be Q{first}");
             Ok(())
         }

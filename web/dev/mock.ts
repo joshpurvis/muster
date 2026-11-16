@@ -950,7 +950,7 @@ const sched = scheduleMock({
     "notes.md",
     "# Notes\n\n- reviewer is good at Rust diffs\n- release notes due Friday\n",
   );
-  memory.get(orch.name)!.set("people/josh.md", "Prefers short summaries.\n");
+  memory.get(orch.name)!.set("people/owner.md", "Prefers short summaries.\n");
   const t0 = now() - 40 * 60_000;
   agentMsgs.push(
     {

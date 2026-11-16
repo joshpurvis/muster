@@ -226,7 +226,9 @@ interface Sched {
   updated_at: number;
 }
 
-const localZone = () => Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+// The mock's own time zone is pinned to UTC, so its data and screenshots never carry the zone of
+// the machine they were made on.
+const MOCK_ZONE = "UTC";
 
 export function scheduleMock(deps: ScheduleDeps) {
   const { now, broadcast } = deps;
@@ -257,7 +259,7 @@ export function scheduleMock(deps: ScheduleDeps) {
     error: null,
     resets_at: (Math.floor(now() / DAY) + 1) * DAY,
   });
-  const settings = { paused: false, quiet_start: "23:00", quiet_end: "07:00", unattended_cap: 24, tz: localZone() };
+  const settings = { paused: false, quiet_start: "23:00", quiet_end: "07:00", unattended_cap: 24, tz: MOCK_ZONE };
   const settingsJson = () => ({ ...settings, spend: spendJson() });
 
   const agentOf = (s: Sched) => deps.agents().find((a) => a.id === s.agent_id);
@@ -547,7 +549,7 @@ export function scheduleMock(deps: ScheduleDeps) {
 
   function create(p: any) {
     const a = agentNamed(p.agent);
-    const tz = String(p.tz ?? "").trim() || localZone();
+    const tz = String(p.tz ?? "").trim() || MOCK_ZONE;
     const when = whenIn(p.when, tz);
     const origin = isTrig(when) ? "webhook" : "schedule";
     checkAgent(a, origin);
@@ -587,7 +589,7 @@ export function scheduleMock(deps: ScheduleDeps) {
   function update(p: any) {
     const s = get(p.id);
     if ("agent" in p) throw new Error("a schedule's agent can't change: make a new schedule");
-    const tz = p.tz !== undefined ? String(p.tz).trim() || localZone() : s.tz;
+    const tz = p.tz !== undefined ? String(p.tz).trim() || MOCK_ZONE : s.tz;
     const when = p.when !== undefined ? whenIn(p.when, tz, s.id) : s.when;
     const origin = isTrig(when) ? "webhook" : "schedule";
     if (isTrig(when) !== isTrig(s.when)) checkAgent(agentOf(s)!, origin);
@@ -725,7 +727,7 @@ export function scheduleMock(deps: ScheduleDeps) {
         return { queued: true, trigger: p.name, runs_at: s.next_run };
       }
       case "schedule.preview": {
-        const tz = String(p.tz ?? "").trim() || localZone();
+        const tz = String(p.tz ?? "").trim() || MOCK_ZONE;
         const when = whenIn(p.when, tz, p.id);
         const a = p.agent ? agentNamed(p.agent) : undefined;
         if (isTrig(when)) {

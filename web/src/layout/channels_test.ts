@@ -421,43 +421,43 @@ function shape(l: WindowLayoutState["layouts"][string]): string {
 const show = (w: WindowLayoutState, channel: number, extra: TabHome[] = []) =>
   reconcileChannels({ ...w, active: channel }, [10, 20, 30], qTabs(channel, extra));
 
-Deno.test("each channel keeps its own Questions place: set in one, set in another, and back (Josh, 16 Nov)", async () => {
+Deno.test("each channel keeps its own Questions place: set in one, set in another, and back", async () => {
   const { moveTab } = await import("./tree.ts");
-  // Channel 10 ("otis"): two groups side by side. Channel 20 ("marketer"): two groups stacked.
+  // Channel 10 ("alpha"): two groups side by side. Channel 20 ("beta"): two groups stacked.
   let w = twoGroups();
   w = changeChannelLayout(w, 20, (l) => splitPane(l, "bottom", 4, allPanes(l.root)[0].id));
   w = reconcileChannels(w, [10, 20, 30], qTabs(10));
   equal(sig(w.layouts[20].root), "col([3] [4])");
-  // In 10 he puts it under the right terminal (a group of its own inside that column), then
+  // In 10 the owner puts it under the right terminal (a group of its own inside that column), then
   // makes it a third of the column's height and the column 60% of the window.
   const right = allPanes(w.layouts[10].root)[1].id;
   w = rememberPlace(reconcileChannels(changeChannelLayout(w, 10, (l) => moveTab(l, QTAB, right, "bottom")),
     [10, 20, 30], qTabs(10)), QTAB);
   w = changeChannelLayout(w, 10, (l) => setSizes(setSizes(l, [1], [2 / 3, 1 / 3]), [], [0.4, 0.6]));
-  const otis = shape(w.layouts[10]);
-  equal(otis, "row([1]:0.4000 col([2]:0.6667 [Q]:0.3333):0.6000)");
-  const otisGroups = allPanes(w.layouts[10].root).map((p) => p.id).filter((id) => id !== allPanes(w.layouts[10].root)[2].id);
-  // 20 has no place of its own yet: where he last put it, the last group (the bottom one).
+  const alpha = shape(w.layouts[10]);
+  equal(alpha, "row([1]:0.4000 col([2]:0.6667 [Q]:0.3333):0.6000)");
+  const alphaGroups = allPanes(w.layouts[10].root).map((p) => p.id).filter((id) => id !== allPanes(w.layouts[10].root)[2].id);
+  // 20 has no place of its own yet: where the owner last put it, the last group (the bottom one).
   w = show(w, 20);
   equal(shape(w.layouts[20]), "col([3]:0.5000 [Q,4]:0.5000)");
-  // There he puts it first in the top group.
+  // There the owner puts it first in the top group.
   w = rememberPlace(changeChannelLayout(w, 20, (l) => moveTab(l, QTAB, allPanes(l.root)[0].id, "center", 0)), QTAB);
-  const marketer = shape(w.layouts[20]);
-  equal(marketer, "col([Q,3]:0.5000 [4]:0.5000)");
+  const beta = shape(w.layouts[20]);
+  equal(beta, "col([Q,3]:0.5000 [4]:0.5000)");
   // Back and forth: each channel shows its own place every time, the same size, the same groups.
   for (let i = 0; i < 3; i++) {
     w = show(w, 10);
-    equal(shape(w.layouts[10]), otis);
+    equal(shape(w.layouts[10]), alpha);
     equal(shape(w.layouts[20]), "col([3]:0.5000 [4]:0.5000)");
-    assert(otisGroups.every((id) => allPanes(w.layouts[10].root).some((p) => p.id === id)), "the same groups");
+    assert(alphaGroups.every((id) => allPanes(w.layouts[10].root).some((p) => p.id === id)), "the same groups");
     w = show(w, 20);
-    equal(shape(w.layouts[20]), marketer);
+    equal(shape(w.layouts[20]), beta);
     equal(shape(w.layouts[10]), "row([1]:0.4000 [2]:0.6000)");
   }
   // Moving it in 20 never changed 10's place, and the other way round.
   w = rememberPlace(changeChannelLayout(w, 20, (l) => moveTab(l, QTAB, allPanes(l.root)[1].id, "center")), QTAB);
   w = show(w, 10);
-  equal(shape(w.layouts[10]), otis);
+  equal(shape(w.layouts[10]), alpha);
   w = show(w, 20);
   equal(shape(w.layouts[20]), "col([3]:0.5000 [4,Q]:0.5000)");
   w = rememberPlace(changeChannelLayout(w, 20, (l) => moveTab(l, QTAB, allPanes(l.root)[0].id, "center", 0)), QTAB);
@@ -467,28 +467,28 @@ Deno.test("each channel keeps its own Questions place: set in one, set in anothe
   equal(shape(hidden.layouts[10]), "row([1]:0.4000 [2]:0.6000)");
   const { questions: _h, ...shownAgain } = hidden;
   w = reconcileChannels(shownAgain, [10, 20, 30], qTabs(10));
-  equal(shape(w.layouts[10]), otis);
+  equal(shape(w.layouts[10]), alpha);
   // Hidden in 10, shown again after switching to 20: 20's own place.
   const away = reconcileChannels({ ...hidden, active: 20 }, [10, 20, 30], qTabs(20).filter((t) => t.id !== QTAB));
   const { questions: _a, ...away2 } = away;
-  equal(shape(reconcileChannels(away2, [10, 20, 30], qTabs(20)).layouts[20]), marketer);
+  equal(shape(reconcileChannels(away2, [10, 20, 30], qTabs(20)).layouts[20]), beta);
 
   // Reload (or restart: the same saved JSON) in 10, then 20 and back.
   const kept: TabHome = { id: QTAB, channel: null, questions: true, kept: true };
   let r = loadChannelLayout(JSON.parse(JSON.stringify(w)), [10, 20, 30],
     [...qTabs(10).filter((t) => t.id !== QTAB), kept]);
   r = reconcileChannels(r, [10, 20, 30], qTabs(10));
-  equal(shape(r.layouts[10]), otis);
+  equal(shape(r.layouts[10]), alpha);
   r = show(r, 20);
-  equal(shape(r.layouts[20]), marketer);
+  equal(shape(r.layouts[20]), beta);
   r = show(r, 10);
-  equal(shape(r.layouts[10]), otis);
-  // A channel he never placed it in: where he last put it, first in the first group.
+  equal(shape(r.layouts[10]), alpha);
+  // A channel the owner never placed it in: where the owner last put it, first in the first group.
   r = show(r, 30);
   equal(sig(r.layouts[30].root), `[${QTAB}]`);
   equal(r.questionsAt, { group: 0, index: 0 });
   r = show(r, 10);
-  equal(shape(r.layouts[10]), otis);
+  equal(shape(r.layouts[10]), alpha);
 });
 
 Deno.test("Questions places: old saves load, bad ones are ignored, gone channels are forgotten", () => {

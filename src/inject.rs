@@ -432,6 +432,13 @@ pub fn holds_message(hub: &Hub, msg: i64) -> bool {
         .any(|q| q.items.iter().any(is) || q.active.as_ref().is_some_and(|a| is(&a.item)))
 }
 
+/// Does session `id`'s prompt queue hold a prompt (waiting, or being typed) that starts with
+/// `prefix`? (src/questions.rs: an answer typed into a plain session has no message id.)
+pub fn holds_prompt(hub: &Hub, id: SessionId, prefix: &str) -> bool {
+    hub.injection.inner.lock().get(&id).is_some_and(|q|
+        q.items.iter().any(|i| i.text.starts_with(prefix)) || q.active.as_ref().is_some_and(|a| a.item.text.starts_with(prefix)))
+}
+
 /// Session `id` has no prompt waiting, being typed, or paused for review (src/sleep.rs).
 pub(crate) fn queue_idle(hub: &Hub, id: SessionId) -> bool {
     hub.injection.inner.lock().get(&id).is_none_or(|q| q.items.is_empty() && q.active.is_none() && !q.busy && !q.blocked)

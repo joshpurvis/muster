@@ -209,6 +209,10 @@ pub struct Answer {
     /// The recorder's provenance when it recorded: the delivery's chain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prov: Option<Prov>,
+    /// The sender label its message carries (the recorder's agent name, else `session:<id>`),
+    /// fixed when recorded, so a restart looks for the message under the label it was sent with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_label: Option<String>,
     #[serde(default)]
     pub into: Conversation,
     pub delivery: Delivery,
@@ -680,6 +684,7 @@ pub async fn record(hub: &Arc<Hub>, caller: SessionId, args: Record) -> anyhow::
     }
     let answer = Answer {
         picked, words, how: How::Chat, recorded_by: Some(me.clone()), at: now_ms(), prov, into: Conversation::Current,
+        from_label: Some(agents::sender_label(hub.agents().by_session(caller).as_ref(), caller)),
         delivery: Delivery { status: DeliveryStatus::Pending, note: None, to: None, msg_id: None, session_id: None, at: None },
     };
     hub.store().update_question(args.number, |q| {
@@ -798,7 +803,7 @@ pub fn target(hub: &Hub, q: &Question, recorder: Option<&Who>, live: &HashSet<Se
     let ended = format!("session {} ({}), which asked, has ended", asker.session_id, asker.label);
     let Some(p) = asker.parent_id else { return Target::Gone(ended) };
     if is_recorder(asker.parent_agent_id, p) {
-        return Target::Gone(format!("{ended}; you started it, so nothing was sent"));
+        return Target::NotNeeded(format!("not sent: {ended}, and you started it, so you have the answer"));
     }
     let note = Some(format!("{ended}; you started it, so its answer comes to you"));
     if let Some(a) = asker.parent_agent_id.and_then(|id| agent_then(hub, id, asker.parent_agent_created_at)) {
@@ -895,6 +900,9 @@ pub fn answer_envelope(number: i64, from: &str, origin: Origin, hop: u32) -> Str
 
 /// The recorder's label in an envelope: its agent name, else `session:<id>`.
 fn sender(hub: &Hub, a: &Answer) -> (String, Option<SessionId>) {
+    if let Some(l) = &a.from_label {
+        return (l.clone(), a.recorded_by.as_ref().map(|w| w.session_id));
+    }
     match &a.recorded_by {
         Some(w) => (agents::sender_label(w.agent_id.and_then(|id| hub.agents().by_id(id)).as_ref(), w.session_id), Some(w.session_id)),
         None => ("muster".into(), None),
@@ -939,9 +947,13 @@ async fn deliver(hub: &Arc<Hub>, q: &Question, a: &Answer) -> Delivery {
     let (from, from_session) = sender(hub, a);
     let route = agents::outgoing(a.prov);
     let t = target(hub, q, a.recorded_by.as_ref(), &live);
-    if let Some(r) = a.recorded_by.as_ref()
-        && hub.session(r.session_id).and_then(|s| hub.channel(s.channel_id)).is_some()
-        && let Err(why) = check_reach(hub, r.session_id, &t)
+    // Checked again now (the asker, its lead or their tabs may have changed since): with the
+    // recorder's current session (a named agent's, whatever happened to the one it recorded
+    // from). A recorder Muster can no longer find refuses: it can't be checked.
+    let recorder = a.recorded_by.as_ref().map(|r| r.agent_id
+        .and_then(|id| agent_then(hub, id, r.agent_created_at)).and_then(|ag| ag.session_id).unwrap_or(r.session_id));
+    if let Some(r) = recorder
+        && let Err(why) = check_reach(hub, r, &t)
     {
         let mut d = outcome(DeliveryStatus::Refused, format!("not delivered: {why}"));
         if let Target::Agent(to, _) = &t { d.to = Some(to.name.clone()); }
@@ -984,6 +996,10 @@ async fn deliver(hub: &Arc<Hub>, q: &Question, a: &Answer) -> Delivery {
             d
         }
         Target::Session(s, note) => {
+            // Never typed into a shell, whoever recorded it (`check_reach` says so too).
+            if s.kind == SessionKind::Shell {
+                return outcome(DeliveryStatus::Refused, format!("not delivered: session {} is a shell", s.id));
+            }
             if let Err(why) = crate::mcp::guard::check_claude_origin(s.kind, route.origin) {
                 return outcome(DeliveryStatus::Refused, format!("not delivered to session {}: {why}", s.id));
             }
@@ -1068,8 +1084,11 @@ async fn resume_one(hub: &Arc<Hub>, id: i64) -> anyhow::Result<()> {
                 }
             }
             // Its queue may have it: typing it again could show it twice.
-            Target::Session(s, _) => Some(outcome(DeliveryStatus::Undelivered,
-                format!("a backend restart interrupted typing it into session {}; it may not have arrived", s.id))),
+            // Still in its queue: it arrives. Otherwise it is sent again (if the restart came just
+            // after it was typed in, the session sees it twice, rather than never).
+            Target::Session(s, _) if crate::inject::holds_prompt(hub, s.id, &format!("[muster answer to question Q{} from ", q.id)) =>
+                Some(Delivery { to: Some(format!("session {}", s.id)), session_id: Some(s.id),
+                    ..outcome(DeliveryStatus::Delivered, format!("queued for session {} before a backend restart", s.id)) }),
             _ => None,
         };
         hub.store().update_question(id, |q| {
@@ -1479,7 +1498,7 @@ mod tests {
         }
         // The message repeats the whole question and the note, so a new conversation can act on it.
         let a = Answer {
-            picked: vec!["a".into()], words: "Q1 a".into(), how: How::Chat, recorded_by: Some(me), at: 0, prov: None,
+            picked: vec!["a".into()], words: "Q1 a".into(), how: How::Chat, recorded_by: Some(me), at: 0, prov: None, from_label: None,
             into: Conversation::Current, delivery: interrupted(),
         };
         let text = delivered_text(&q, &a, None);
@@ -1527,7 +1546,7 @@ mod tests {
             t => panic!("{t:?}"),
         }
         // The lead recording it for its own ended session: nobody to send it to.
-        assert!(matches!(target(&hub, &q5, who(&hub, 2).as_ref(), &HashSet::new()), Target::Gone(w) if w.contains("you started it")));
+        assert!(matches!(target(&hub, &q5, who(&hub, 2).as_ref(), &HashSet::new()), Target::NotNeeded(w) if w.contains("you started it")));
         // A plain lead (session 3) that is running gets it; one that ended doesn't.
         assert!(matches!(target(&hub, &q6, Some(&other), &HashSet::from([3])), Target::Session(s, Some(_)) if s.id == 3));
         assert!(matches!(target(&hub, &q6, Some(&other), &HashSet::new()), Target::Gone(w) if w.contains("so has session 3")));
@@ -1595,7 +1614,7 @@ mod tests {
         let mut q = hub.store().question(1).unwrap().unwrap();
         q.pictures = vec![Picture { path: evil.to_str().unwrap().into(), caption: "x".into() }];
         let a = Answer { picked: vec![], words: "ok\u{1b}[201~".into(), how: How::Chat, recorded_by: who(&hub, 2), at: 0,
-            prov: None, into: Conversation::Current, delivery: interrupted() };
+            prov: None, from_label: None, into: Conversation::Current, delivery: interrupted() };
         let text = delivered_text(&q, &a, None);
         assert!(!text.chars().any(|c| c.is_control() && c != '\n' && c != '\t'), "{text:?}");
         let _ = std::fs::remove_dir_all(&dir);
@@ -1695,6 +1714,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_delivery_refuses_what_it_can_no_longer_check_or_a_replaced_agent() {
+        let hub = fixture();
+        let writer = agent(&hub, "writer", SessionKind::Codex, 3);
+        post(&hub, 3, good()).unwrap();
+        // A recorder Muster can't find any more: refused, not sent unchecked.
+        let gone = Who { label: "ghost".into(), session_id: 99, kind: SessionKind::Codex, agent_id: None,
+            agent_created_at: None, parent_id: None, parent_agent_id: None, parent_agent_created_at: None };
+        let a = Answer { picked: vec!["a".into()], words: "Q1 a".into(), how: How::Chat, recorded_by: Some(gone), at: now_ms(),
+            prov: None, from_label: Some("session:99".into()), into: Conversation::Current,
+            delivery: Delivery { status: DeliveryStatus::Pending, note: None, to: None, msg_id: None, session_id: None, at: None } };
+        hub.store().update_question(1, |q| { q.status = Status::Answered; q.answer = Some(a.clone()); Ok(()) }).unwrap();
+        resume(&hub, unfinished(&hub)).await;
+        let d = hub.store().question(1).unwrap().unwrap().answer.unwrap().delivery;
+        assert_eq!(d.status, DeliveryStatus::Refused, "{d:?}");
+        assert!(d.note.as_deref().is_some_and(|n| n.contains("recorder's channel")), "{d:?}");
+        // A message for an agent that was removed and made again under its name is refused
+        // before the new one is started.
+        agents::remove(&hub, "writer").unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        agent(&hub, "writer", SessionKind::Codex, 4);
+        let out = agents::Outgoing { agent: "writer".into(), agent_id: Some(writer.id), text: "hi".into(), from: "lead".into(),
+            from_session: Some(2), route: agents::Route { origin: Origin::Human, hop: 1, reply_to: None } };
+        let e = agents::deliver(&hub, out).await.unwrap_err();
+        assert!(e.downcast_ref::<agents::Refused>().is_some() && e.to_string().contains("belongs to another agent"), "{e:#}");
+    }
+
+    #[tokio::test]
     async fn an_answer_stored_before_a_restart_is_delivered_at_the_next_start() {
         let hub = fixture();
         agent(&hub, "writer", SessionKind::Codex, 3);
@@ -1703,7 +1749,7 @@ mod tests {
         // Stored, never delivered (the backend stopped right after).
         let a = Answer {
             picked: vec!["a".into()], words: "Q1 a".into(), how: How::Chat, recorded_by: who(&hub, 2), at: now_ms(),
-            prov: None, into: Conversation::Current,
+            prov: None, from_label: None, into: Conversation::Current,
             delivery: Delivery { status: DeliveryStatus::Pending, note: None, to: None, msg_id: None, session_id: None, at: None },
         };
         hub.store().update_question(1, |q| { q.status = Status::Answered; q.answer = Some(a.clone()); Ok(()) }).unwrap();
@@ -1727,7 +1773,7 @@ mod tests {
         post(&hub, 3, good()).unwrap();
         let a = Answer {
             picked: vec!["a".into()], words: "Q1 a".into(), how: How::Chat, recorded_by: who(&hub, 2), at: now_ms(),
-            prov: None, into: Conversation::Current,
+            prov: None, from_label: Some("manager".into()), into: Conversation::Current,
             delivery: Delivery { status: DeliveryStatus::Delivering, note: None, to: None, msg_id: None, session_id: None, at: None },
         };
         let (q, ()) = hub.store().update_question(1, |q| { q.status = Status::Answered; q.answer = Some(a.clone()); Ok(()) }).unwrap();
@@ -1736,6 +1782,8 @@ mod tests {
         let carried = hub.store().insert_agent_message(&agents::message_record(&writer, "manager", Some(2), route,
             &delivered_text(&q, &a, None))).unwrap();
         hub.store().set_agent_message_delivered(carried, now_ms()).unwrap();
+        // The recorder is removed before the restart: the label it was sent with is kept.
+        agents::remove(&hub, "manager").unwrap();
         resume(&hub, unfinished(&hub)).await;
         let d = hub.store().question(1).unwrap().unwrap().answer.unwrap().delivery;
         assert_eq!((d.status, d.msg_id), (DeliveryStatus::Delivered, Some(carried)));

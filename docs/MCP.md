@@ -1001,16 +1001,24 @@ that recorder's message, never as the human's own input.
   `[muster answer to question Q<n> from <recorder> origin=<o> hop=<n>]` header (no agent
   message row; a Claude session takes it only on a human-rooted chain).
 - Else to the **session that started it** (its lead: by name when that is a named agent),
-  saying the asker has ended. If the recorder is that lead, nothing is sent.
+  saying the asker has ended. If the recorder is that lead, nothing is sent (`not_needed`).
+A message for a named agent that was removed, and another made with its name, in the moment
+before it is typed in is refused (as every agent message now is).
 
 The message starts `Answer to your question Q<n>: <letter>) <option>.`, says who recorded it and
 quotes the words it recorded, then repeats the whole question (context, example, options with the
 asker's pick, if no answer, holding up, details, links, pictures) and the asker's `note_to_self`
 (headed as the asker's note, not the reader's, when it goes to the asker's lead), so an agent
 whose conversation was restarted since can act on it. It is plain text: control characters are
-removed before it is typed anywhere. A delivery that a backend
-restart interrupted is finished at the next start; one that can't be delivered (`refused`,
-`undelivered`) is kept with its reason, and `list_questions` shows it.
+removed before it is typed anywhere. Each delivery checks the reach rules again, with the
+recorder's current session (a named recorder's, after its restarts); a recorder Muster can no
+longer find refuses it rather than sending unchecked. A delivery that a backend restart
+interrupted is finished at the next start: to a named agent, the message it was sent as is looked
+up (under the sender label kept when it was recorded) and never sent twice; to a session, it
+counts as delivered while still in that session's input queue and is sent again otherwise (if the
+restart came right after it was typed in, the session sees it twice rather than never). One that
+can't be delivered (`refused`, `undelivered`) is kept with its reason, `list_questions` shows it,
+and its recorder can send it again.
 
 Not yet (later steps of the Questions tab): the tab itself and answering there, a lead passing a
 session's question on in one call (`passed_on_by` is kept for it), defaults that answer a question

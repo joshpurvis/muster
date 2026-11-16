@@ -1435,6 +1435,7 @@ async fn ask_agent<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_>
     }
     let out = crate::agents::Outgoing {
         agent: agent.name.clone(),
+        agent_id: Some(agent.id),
         text,
         from,
         from_session: Some(caller),

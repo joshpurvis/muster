@@ -124,3 +124,23 @@ Deno.test("malformed pinned metadata cannot choose a session id", () => {
   equal(s.pinned![key].at, undefined);
   equal(s.pinned![key].in, { 10: { group: 0, index: 0 } });
 });
+Deno.test("several pinned tabs restore in remembered order within the same pane", () => {
+  const homes = (active: number): TabHome[] => [
+    { id: 11, channel: 10 },
+    { id: 33, channel: 20 },
+    { id: QUESTIONS_TAB, channel: active, questions: true },
+    { id: tab, channel: active, pinned: key },
+  ];
+  let s: WindowLayoutState = {
+    v: 2,
+    active: 20,
+    sidebar: defaultSidebar(),
+    layouts: { 10: emptyLayout([11]), 20: emptyLayout([tab, QUESTIONS_TAB, 33]) },
+  };
+  s = rememberPlace(rememberPlace(reconcileChannels(s, [10, 20], homes(20)), tab), QUESTIONS_TAB);
+  for (let i = 0; i < 3; i++) {
+    s = reconcileChannels({ ...s, active: 10 }, [10, 20], homes(10));
+    s = reconcileChannels({ ...s, active: 20 }, [10, 20], homes(20));
+    equal(allSessions(s.layouts[20].root), [tab, QUESTIONS_TAB, 33]);
+  }
+});

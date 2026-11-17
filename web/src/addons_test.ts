@@ -1,4 +1,11 @@
-import { addonMessage, externalLink } from "./addons.ts";
+import {
+  ADDON_SANDBOX,
+  addonMessage,
+  addonMessageError,
+  externalLink,
+  pinnedLabel,
+  reloadAddonFrame,
+} from "./addons.ts";
 function equal(a: unknown, b: unknown) {
   if (JSON.stringify(a) !== JSON.stringify(b)) {
     throw new Error(`Expected ${JSON.stringify(b)}, got ${JSON.stringify(a)}`);
@@ -64,4 +71,49 @@ Deno.test("add-on external links allow only bounded credential-free https URLs",
     equal(receive({ muster: 1, type: "open-link", url }), null);
   }
   equal(externalLink("https://example.test/path"), "https://example.test/path");
+});
+Deno.test("add-on sandbox has exactly the three permitted capabilities", async () => {
+  equal(ADDON_SANDBOX, "allow-scripts allow-same-origin allow-forms");
+  const view = await Deno.readTextFile(new URL("./panels/AddonView.tsx", import.meta.url));
+  equal(view.match(/sandbox=\{ADDON_SANDBOX\}/g)?.length, 1);
+  equal(view.includes("allow-popups"), false);
+});
+Deno.test("frame receives only allowlisted message errors, never RPC details", () => {
+  for (
+    const text of [
+      "Not sent: this agent isn't allowed.",
+      "Not sent: limit of 30 an hour.",
+      "Not sent: message must be 1-300 characters.",
+      "Not sent.",
+    ]
+  ) equal(addonMessageError(new Error(text)), text);
+  for (
+    const error of [new Error("agent beta was removed"), new Error("Not sent. /tmp/daemon"), {
+      message: "details",
+    }, null]
+  ) {
+    equal(addonMessageError(error), "Not sent.");
+  }
+});
+Deno.test("reload retries the same frame and its exact address", () => {
+  let writes = 0;
+  const url = "http://localhost:5173/?count=4";
+  const frame = {
+    get src() {
+      return url;
+    },
+    set src(value) {
+      equal(value, url);
+      writes++;
+    },
+  };
+  reloadAddonFrame(frame);
+  equal(writes, 1);
+  reloadAddonFrame(null);
+});
+Deno.test("Questions keeps open counts including zero; add-ons have their own count label", () => {
+  equal(pinnedLabel("Questions", 3, false), "Questions, 3 open");
+  equal(pinnedLabel("Questions", 0, false), "Questions, 0 open");
+  equal(pinnedLabel("Counter", 4, true), "Counter, 4");
+  equal(pinnedLabel("Counter", 0, true), "Counter");
 });

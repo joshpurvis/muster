@@ -35,6 +35,7 @@ use crate::worktree;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", content = "data", rename_all = "snake_case")]
 pub enum ServerEvent {
+    AddonsChanged {},
     PanelUpserted(Panel),
     PanelRemoved { id: PanelId },
     /// A note was created or changed (text, title, window), with its full text.

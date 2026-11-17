@@ -2,6 +2,7 @@
 // update local state (the window's layout of groups, prefs, windows).
 
 import { addons } from "./addons.ts";
+import { leaveWithDrafts } from "./leave.ts";
 import { addonTab, isPinnedTab } from "./layout/tree.ts";
 import { batch, signal } from "@preact/signals";
 import { connStatus, rpc } from "./rpc.ts";
@@ -583,7 +584,8 @@ export function toggleFullscreen(tab: SessionId | null = focusedTabId.value) {
   // A note's editor and the Questions tab keep Esc too (text boxes in them use it).
   const note = noteId(tab) !== null || isPinnedTab(tab);
   const terminal = panelId(tab) === null && !note;
-  toast("info", terminal ? "Fullscreen. Alt+Shift+Z goes back (Esc stays with the terminal)"
+  toast("info", tab < QUESTIONS_TAB ? "Fullscreen. Use the Exit fullscreen button to go back."
+    : terminal ? "Fullscreen. Alt+Shift+Z goes back (Esc stays with the terminal)"
     : note ? "Fullscreen. Alt+Shift+Z goes back" : "Fullscreen. Esc or Alt+Shift+Z goes back", 2500, "fullscreen");
   if (terminal || note) focusActiveTerminalSoon();
   else refocusIfLost();
@@ -1358,20 +1360,20 @@ addEventListener("pagehide", () => void flushAllDrafts());
 /** Go ahead with `go` (`what`: "Reload", "Close") unless note typing is neither saved nor kept
  * in this browser (storage full or blocked): then ask first. */
 function leaveUnlessUnsaved(what: string, go: () => void) {
-  const left = unsavedNotes();
-  if (!left.length || persistAllDrafts()) return go();
-  const names = left.map((id) => `“${notes.value.get(id)?.title ?? `Note ${id}`}”`).join(", ");
-  overlay.value = {
-    kind: "confirm",
-    title: "Some note text isn't saved yet",
-    body: [
-      `${names} ${left.length === 1 ? "has" : "have"} typing Muster couldn't save (it isn't reachable) and this browser couldn't keep.`,
-      `${what} now and that typing is lost. Cancel, wait until the note says Saved, then try again.`,
-    ],
-    confirmLabel: `${what} anyway`,
-    danger: true,
-    run: go,
-  };
+  leaveWithDrafts(unsavedNotes(), persistAllDrafts, go, (left) => {
+    const names = left.map((id) => `“${notes.value.get(id)?.title ?? `Note ${id}`}”`).join(", ");
+    overlay.value = {
+      kind: "confirm",
+      title: "Some note text isn't saved yet",
+      body: [
+        `${names} ${left.length === 1 ? "has" : "have"} typing Muster couldn't save (it isn't reachable) and this browser couldn't keep.`,
+        `${what} now and that typing is lost. Cancel, wait until the note says Saved, then try again.`,
+      ],
+      confirmLabel: `${what} anyway`,
+      danger: true,
+      run: go,
+    };
+  });
 }
 
 /** Ctrl+Shift+R: reload this window, which also loads the active UI release. */

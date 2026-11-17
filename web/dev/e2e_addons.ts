@@ -1,7 +1,7 @@
 // Run only against a fresh isolated mock. See docs/ADDONS.md for permissions and commands.
 import { launch } from "./cdp.ts";
 import { allPanes, type Layout } from "../src/layout/tree.ts";
-import type { Addon } from "../src/addons.ts";
+import type { Addon, AddonRegistry } from "../src/addons.ts";
 const url = Deno.args[0];
 if (!url || new URL(url).hostname !== "127.0.0.1") throw new Error("Pass an isolated loopback mock URL");
 const health = await (await fetch(new URL("/api/health", url))).json();
@@ -80,7 +80,7 @@ try {
   await b.eval(`${M}.prefs.value = {...${M}.prefs.value, theme:'dark'}`);
   const demo = await rpc<Addon>("mock.addon_demo");
   check(
-    (await rpc<Addon[]>("addon.list")).some((a) => a.id === "counter"),
+    (await rpc<AddonRegistry>("addon.list")).addons.some((a) => a.id === "counter"),
     "Start a fresh mock with MOCK_ADDONS=1",
   );
   await rpc("agent.create", { name: "alpha" });

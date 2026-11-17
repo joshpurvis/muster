@@ -122,7 +122,13 @@ function reconcileChannel(s: LayoutState, tabs: TabHome[], places: Map<number, T
   let next = reconcile(s, [...new Set([...tabs.filter((t) => t.beside == null).map((t) => t.id), ...existing])]);
   for (const t of tabs) if (t.beside != null) next = placeBeside(next, t.id, t.beside);
   // Arriving (another channel was shown, it was hidden, or its group went): at its place.
-  for (const t of tabs) if ((t.questions || t.pinned) && !existing.includes(t.id)) next = putAt(next, t.id, places.get(t.id) ?? FIRST_PLACE);
+  const arrivals = tabs.filter((t) => (t.questions || t.pinned) && !existing.includes(t.id));
+  const index = (t: TabHome) => {
+    const i = (places.get(t.id) ?? FIRST_PLACE).index;
+    return i < 0 ? Infinity : i;
+  };
+  // Put earlier tabs in first, so inserting another pin cannot displace a restored one.
+  for (const t of arrivals.sort((a, b) => index(a) - index(b))) next = putAt(next, t.id, places.get(t.id) ?? FIRST_PLACE);
   return next;
 }
 

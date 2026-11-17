@@ -1,6 +1,6 @@
 // Modal overlays: Jump / command palette, New tab, Rename window, shortcuts sheet, confirm
 // dialog, and the agent dialogs (Agents.tsx). Plus toasts.
-import { type Addon, addons } from "../addons.ts";
+import { type Addon, addons, addonRevision } from "../addons.ts";
 import { iconNames } from "../panels/kit/icons.ts";
 import { KitIcon } from "../panels/KitIcon.tsx";
 import { rpc } from "../rpc.ts";
@@ -1017,10 +1017,10 @@ function ShellDialog() {
   );
 }
 
-/** "Cache warning…": the cold prompt cache bar on or off, and how long each CLI/provider pair
- * keeps a conversation cached (`prefs.set {cache_warn, cache_ttl}`, src/cache.rs). */
+/** A snapshot of the registry; a concurrent edit must be reopened before saving. */
 function AddonSettingsDialog() {
   const blank = (): Addon => ({ id: "", name: "", url: "", icon: "globe", agents: [] });
+  const [loaded] = useState(() => ({ addons: addons.peek(), revision: addonRevision.peek() }));
   const [draft, setDraft] = useState<Addon>(blank);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -1032,8 +1032,8 @@ function AddonSettingsDialog() {
     if (!remove && !draft.url) return setError("Enter a local address, including http:// or https:// and a port.");
     setBusy(true);
     try {
-      await rpc.call(remove ? "addon.remove" : "addon.save", remove ? { id: draft.id } :
-        { ...draft, id: draft.id || crypto.randomUUID(), name: draft.name.trim() });
+      await rpc.call(remove ? "addon.remove" : "addon.save", remove ? { id: draft.id, revision: loaded.revision } :
+        { addon: { ...draft, id: draft.id || crypto.randomUUID(), name: draft.name.trim() }, revision: loaded.revision });
       A.reloadWindow();
     } catch (e) { setError(e instanceof Error ? e.message : String(e)); setBusy(false); }
   };
@@ -1042,8 +1042,8 @@ function AddonSettingsDialog() {
       <div class="dlg-head"><h2>Add-on tabs</h2><span class="muted">Pin a local app such as a test dashboard.</span></div>
       <div class="dlg-body">
         <label class="field"><span>Add-on</span><select value={draft.id} disabled={busy} onChange={(e) => {
-          setDraft(addons.value.find((a) => a.id === e.currentTarget.value) ?? blank()); setError("");
-        }}><option value="">New add-on</option>{addons.value.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}</select></label>
+          setDraft(loaded.addons.find((a) => a.id === e.currentTarget.value) ?? blank()); setError("");
+        }}><option value="">New add-on</option>{loaded.addons.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}</select></label>
         <label class="field"><span>Name</span><input autoFocus name="addon-name" value={draft.name} disabled={busy}
           aria-describedby={error ? "addon-error" : undefined} onInput={(e) => change({ name: e.currentTarget.value })} /></label>
         <label class="field"><span>Address</span><input name="addon-url" value={draft.url} disabled={busy} placeholder="http://localhost:5173/"

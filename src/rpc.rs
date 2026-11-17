@@ -94,6 +94,7 @@ struct Rename<T> {
 }
 
 pub fn hello(hub: &Hub) -> Value {
+    let addons = hub.addons.snapshot(&crate::panels::own_ports(hub));
     json!({
         "version": env!("CARGO_PKG_VERSION"),
         "ui_protocol": crate::assets::UI_PROTOCOL,
@@ -110,7 +111,8 @@ pub fn hello(hub: &Hub) -> Value {
             .filter_map(|a| a.session_id.map(|id| (id.to_string(), json!(a.name))))
             .collect::<serde_json::Map<_, _>>(),
         "panels": crate::panels::list(hub).unwrap_or_default().into_iter().filter(|p| !p.closed).collect::<Vec<_>>(),
-        "addons": hub.addons.list(&crate::panels::own_ports(hub)),
+        "addons": addons.addons,
+        "addon_revision": addons.revision,
         "panel_origin": format!("http://127.0.0.1:{}", hub.panels.port.load(Ordering::Relaxed)),
         "notes": crate::notes::list(hub).unwrap_or_default(),
         "windows": hub.windows(),
@@ -249,6 +251,7 @@ async fn dispatch_inner(hub: &Arc<Hub>, who: &Principal, method: &str, params: V
             if matches!(who, Principal::Device { .. }) {
                 if let Some(fields) = result.as_object_mut() {
                     fields.remove("addons");
+                    fields.remove("addon_revision");
                     fields.remove("panels");
                     fields.remove("panel_origin");
                     fields.remove("notes");
@@ -281,13 +284,14 @@ async fn dispatch_inner(hub: &Arc<Hub>, who: &Principal, method: &str, params: V
             let p: P = parse(params)?;
             Ok(crate::questions::picture(hub, p.id, p.index)?)
         }
-        // The human's own answer: only a click in Muster's window (`question_from_window`), never
-        // the CLI, `/api/rpc` or a script, so no agent can answer as the human through them.
+        // Add-on registration and forwarding belong to the window (docs/ADDONS.md).
         "addon.save" | "addon.remove" | "addon.message" => Err(RpcError(crate::addon::BY_WINDOW.into())),
         "addon.list" => {
             require_local(who, method)?;
-            to_value(hub.addons.list(&crate::panels::own_ports(hub)))
+            to_value(hub.addons.snapshot(&crate::panels::own_ports(hub)))
         }
+        // The human's own answer: only a click in Muster's window (`question_from_window`), never
+        // the CLI, `/api/rpc` or a script, so no agent can answer as the human through them.
         "question.answer" | "question.undo" => Err(RpcError(ANSWER_BY_CLICK.into())),
         "question.start_at" => {
             // The human's: never from a session (the CLI sends `$MUSTER_SESSION_ID`).
@@ -1617,20 +1621,34 @@ pub async fn from_window(hub: &Arc<Hub>, who: &Principal, conn: u64, link: &WsLi
 pub async fn addon_from_window(hub: &Arc<Hub>, who: &Principal, conn: u64, link: &WsLink, method: &str, params: Value) -> RpcResult {
     from_window(hub, who, conn, link, params.get("from_session").map(|_| 0)).await
         .map_err(|why| RpcError(format!("{} ({why})", crate::addon::BY_WINDOW)))?;
+    addon_window_call(hub, method, params).await
+}
+
+/// Called only after the shared window-attribution check above.
+async fn addon_window_call(hub: &Arc<Hub>, method: &str, params: Value) -> RpcResult {
     #[derive(Deserialize)] #[serde(deny_unknown_fields)]
-    struct Remove { id: String }
+    struct Remove { id: String, revision: String }
     #[derive(Deserialize)] #[serde(deny_unknown_fields)]
-    struct Message { id: String, agent: String, text: String }
+    struct Message { id: String, origin: String, agent: String, text: String }
+    #[derive(Deserialize)] #[serde(deny_unknown_fields)]
+    struct Save { addon: crate::addon::Addon, revision: String }
     match method {
         "addon.save" => {
-            let a = parse::<crate::addon::Addon>(params)?.checked(&crate::panels::own_ports(hub))?;
+            let p: Save = parse(params)?;
+            if p.revision != hub.addons.snapshot(&[]).revision { return Err(RpcError(crate::addon::CHANGED.into())); }
+            let a = p.addon.checked(&crate::panels::own_ports(hub))?;
             for name in &a.agents { if hub.agents().get(name).is_none() { return Err(RpcError("Choose an existing agent.".into())); } }
-            hub.addons.save(Some(a.clone()), &a.id)?;
+            hub.addons.save(Some(a.clone()), &a.id, &p.revision)?;
         }
-        "addon.remove" => { let p: Remove = parse(params)?; hub.addons.save(None, &p.id)?; }
-        "addon.message" => { let p: Message = parse(params)?; crate::addon::message(hub, &p.id, &p.agent, p.text).await?; }
+        "addon.remove" => { let p: Remove = parse(params)?; hub.addons.save(None, &p.id, &p.revision)?; }
+        "addon.message" => {
+            let p: Message = parse(params)?;
+            crate::addon::message(hub, &p.id, &p.origin, &p.agent, p.text).await?;
+            return Ok(json!({}));
+        }
         _ => return Err(RpcError("Unknown add-on method".into())),
     }
+    hub.emit(ServerEvent::AddonsChanged {});
     Ok(json!({}))
 }
 
@@ -1712,6 +1730,7 @@ fn forwarded(own_device: Option<i64>, ev: &ServerEvent) -> bool {
             | ServerEvent::ScheduleUpserted(_) | ServerEvent::ScheduleRemoved { .. }
             | ServerEvent::ScheduleRun(_) | ServerEvent::ScheduleSettings(_)
             | ServerEvent::PanelUpserted(_) | ServerEvent::PanelRemoved { .. }
+            | ServerEvent::AddonsChanged { .. }
             | ServerEvent::NoteUpserted(_) | ServerEvent::NoteRemoved { .. }
             | ServerEvent::QuestionUpserted(_)
         )
@@ -2745,6 +2764,60 @@ mod tests {
             assert!(addon_from_window(&hub, &Principal::Device { id: 1 }, 71, &claimed, method, json!({})).await.is_err());
         }
         assert!(hub.addons.list(&[]).is_empty());
+    }
+
+    #[tokio::test]
+    async fn addon_checks_grants_before_agent_lookup_and_keeps_events_off_phone() {
+        let (hub, _st) = fixture();
+        let a = crate::addon::Addon { id: "counter".into(), name: "Counter".into(), url: "http://localhost:5173/".into(), icon: "globe".into(), agents: vec!["alpha".into()] };
+        hub.addons.save(Some(a), "counter", &hub.addons.snapshot(&[]).revision).unwrap();
+        let err = crate::addon::message(&hub, "counter", "http://localhost:5173", "beta", "hello".into()).await.unwrap_err();
+        assert_eq!(err.to_string(), crate::addon::NOT_ALLOWED);
+        let err = crate::addon::message(&hub, "counter", "http://localhost:5174", "alpha", "hello".into()).await.unwrap_err();
+        assert_eq!(err.to_string(), crate::addon::NOT_ALLOWED);
+        let err = crate::addon::message(&hub, "counter", "http://localhost:5173", "alpha", "hello".into()).await.unwrap_err();
+        assert_eq!(err.to_string(), crate::addon::NOT_SENT);
+        assert!(forwarded(None, &ServerEvent::AddonsChanged {}));
+        assert!(!forwarded(Some(1), &ServerEvent::AddonsChanged {}));
+        let list = call(&hub, "addon.list", json!({})).await.unwrap();
+        assert_eq!(list["revision"], hello(&hub)["addon_revision"]);
+        assert_eq!(list["addons"], hello(&hub)["addons"]);
+    }
+
+    #[tokio::test]
+    async fn addon_origins_cannot_become_agent_settings_via_create_or_update() {
+        let (hub, _st) = fixture();
+        let err = call(&hub, "agent.create", json!({"name":"alpha", "accepts":["human", "addon:counter"]})).await.unwrap_err();
+        assert!(err.contains("accepts allows only"));
+        agent(&hub, "alpha");
+        for via in [Via::Outside, Via::Window] {
+            let err = dispatch_via(&hub, &Principal::Local, "agent.update",
+                json!({"name":"alpha", "accepts":["human", "addon:counter"]}), via).await.unwrap_err();
+            assert!(err.0.contains("accepts allows only"));
+        }
+        assert_eq!(hub.agents().get("alpha").unwrap().accepts_origins, vec![crate::agents::Origin::Human]);
+    }
+
+    #[tokio::test]
+    async fn addon_window_writes_broadcast_and_reject_stale_dialogs() {
+        let (hub, _st) = fixture();
+        let mut rx = hub.subscribe();
+        let revision = hub.addons.snapshot(&[]).revision;
+        let a = json!({"id":"counter", "name":"Counter", "url":"http://localhost:5173/"});
+        addon_window_call(&hub, "addon.save", json!({"addon":a, "revision":revision})).await.map_err(|e| e.0).unwrap();
+        assert_eq!(drain(&mut rx, "addons_changed").len(), 1);
+        for (method, params) in [
+            ("addon.save", json!({"addon":a, "revision":revision})),
+            ("addon.remove", json!({"id":"counter", "revision":revision})),
+        ] {
+            assert_eq!(addon_window_call(&hub, method, params).await.unwrap_err().0, crate::addon::CHANGED);
+        }
+        assert!(drain(&mut rx, "addons_changed").is_empty());
+        let revision = hub.addons.snapshot(&[]).revision;
+        addon_window_call(&hub, "addon.remove", json!({"id":"counter", "revision":revision})).await.map_err(|e| e.0).unwrap();
+        assert_eq!(drain(&mut rx, "addons_changed").len(), 1);
+        assert!(hub.addons.list(&[]).is_empty());
+        assert!(addon_window_call(&hub, "addon.message", json!({"id":"counter", "agent":"alpha", "text":"hello"})).await.is_err());
     }
 
     #[tokio::test]

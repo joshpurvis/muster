@@ -218,7 +218,8 @@ const NOT_BUILT: &str = r#"<!doctype html><html><head><meta charset="utf-8"><tit
 /// frontend, and an unchanged one costs a 304.
 fn file(source: &Source, path: &str, req: &HeaderMap) -> Option<Response> {
     let (data, etag) = source.read(path)?;
-    let fresh = req
+    // Desktop HTML carries a per-load frame policy. Never reuse a body with an older policy.
+    let fresh = !(path.ends_with(".html") && !path.starts_with("m/")) && req
         .get(header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.split(',').any(|t| t.trim() == etag));
@@ -309,12 +310,22 @@ fn mobile(source: &Source, path: &str, req: &HeaderMap) -> Response {
 pub async fn serve(axum::extract::Extension(hub): axum::extract::Extension<std::sync::Arc<crate::hub::Hub>>, uri: Uri, req: HeaderMap) -> Response {
     let desktop = uri.path() != "/m" && !uri.path().starts_with("/m/");
     let r = serve_content(uri, req).await;
-    if desktop { desktop_headers(r, crate::panels::own_ports(&hub), &hub.addons.list(&crate::panels::own_ports(&hub))) } else { r }
+    if desktop { desktop_headers(r, crate::panels::own_ports(&hub), &hub.addons.list(&crate::panels::own_ports(&hub))).await } else { r }
 }
 
-fn desktop_headers(mut r: Response, ports: [u16; 2], addons: &[crate::addon::Addon]) -> Response {
+async fn desktop_headers(mut r: Response, ports: [u16; 2], addons: &[crate::addon::Addon]) -> Response {
     if r.headers().get(header::CONTENT_TYPE).is_some_and(|v| v.as_bytes().starts_with(b"text/html")) {
         let csp = desktop_csp(ports, addons);
+        // Exactly the policy sent in this response, not a later hello's registry or panel port.
+        // Its values are generated from the loopback parser, never from raw add-on fields.
+        let meta = format!("<meta name=\"muster-frame-policy\" content=\"{csp}\">");
+        let (mut parts, body) = r.into_parts();
+        let Ok(bytes) = axum::body::to_bytes(body, usize::MAX).await else { return StatusCode::INTERNAL_SERVER_ERROR.into_response() };
+        let html = String::from_utf8_lossy(&bytes).replacen("</head>", &format!("{meta}</head>"), 1);
+        parts.headers.remove(header::CONTENT_LENGTH);
+        parts.headers.remove(header::ETAG);
+        parts.headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        r = Response::from_parts(parts, axum::body::Body::from(html));
         r.headers_mut().insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_str(&csp).unwrap());
         r.headers_mut().insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
     }
@@ -417,19 +428,35 @@ fn serve_from(source: &Source, uri: Uri, req: HeaderMap) -> Response {
 mod tests {
     use super::*;
 
-    #[test]
-    fn addon_html_headers_refresh_even_for_not_modified() {
+    #[tokio::test]
+    async fn addon_page_snapshots_its_frame_policy_and_cannot_use_an_old_etag() {
+        let source = Source::Embedded;
+        let mut req = HeaderMap::new();
+        if let Some((_, etag)) = source.read("index.html") {
+            req.insert(header::IF_NONE_MATCH, HeaderValue::from_str(&etag).unwrap());
+            assert_eq!(file(&source, "index.html", &req).unwrap().status(), StatusCode::OK);
+        }
+        let r = axum::response::Html("<html><head></head><body></body></html>").into_response();
+        let r = desktop_headers(r, [7433, 7434], &[]).await;
+        let csp = r.headers()[header::CONTENT_SECURITY_POLICY].to_str().unwrap().to_string();
+        assert_eq!(r.headers()[header::CACHE_CONTROL], "no-store");
+        let body = axum::body::to_bytes(r.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8(body.to_vec()).unwrap().contains(&format!("<meta name=\"muster-frame-policy\" content=\"{csp}\">")));
+    }
+
+    #[tokio::test]
+    async fn addon_html_headers_refresh_even_for_not_modified() {
         for status in [StatusCode::OK, StatusCode::NOT_MODIFIED] {
             let r = (status, [(header::CONTENT_TYPE, "text/html")], "").into_response();
             let a = crate::addon::Addon { id: "counter".into(), name: "Counter".into(), url: "http://localhost:5173/".into(), icon: "globe".into(), agents: vec![] };
-            let r = desktop_headers(r, [7433, 7434], &[a]);
+            let r = desktop_headers(r, [7433, 7434], &[a]).await;
             assert_eq!(r.headers()[header::X_FRAME_OPTIONS], "DENY");
             assert!(r.headers()[header::CONTENT_SECURITY_POLICY].to_str().unwrap().ends_with("http://localhost:5173"));
-            let r = desktop_headers(r, [7433, 7434], &[]);
+            let r = desktop_headers(r, [7433, 7434], &[]).await;
             assert!(!r.headers()[header::CONTENT_SECURITY_POLICY].to_str().unwrap().contains("5173"));
         }
         let script = ([(header::CONTENT_TYPE, "application/javascript")], "").into_response();
-        assert!(desktop_headers(script, [7433, 7434], &[]).headers().get(header::CONTENT_SECURITY_POLICY).is_none());
+        assert!(desktop_headers(script, [7433, 7434], &[]).await.headers().get(header::CONTENT_SECURITY_POLICY).is_none());
     }
 
     #[test]

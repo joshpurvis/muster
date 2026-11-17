@@ -2,7 +2,7 @@
 // channel layouts and sidebar are owned here and saved with window.set_layout; UI prefs
 // persist to localStorage.
 
-import { addons } from "./addons.ts";
+import { addons, addonRevision, type AddonRegistry } from "./addons.ts";
 import { addonTab, isPinnedTab } from "./layout/tree.ts";
 import { batch, computed, effect, signal } from "@preact/signals";
 import type {
@@ -887,6 +887,7 @@ function withHolds(fn: () => void) {
 }
 
 export function applyHello(h: HelloResult) {
+  addonLoad++;
   batch(() => {
     const before = hereIds.peek();
     meta.value = {
@@ -912,6 +913,7 @@ export function applyHello(h: HelloResult) {
     panels.value = new Map((h.panels ?? []).filter((p) => !p.closed).map((p) => [p.id, p]));
     panelOrigin.value = h.panel_origin ?? "";
     addons.value = h.addons ?? [];
+    addonRevision.value = h.addon_revision ?? "";
     applyNotesHello(h.notes);
     helloEpoch.value++;
     for (const id of prev.keys()) {
@@ -939,8 +941,17 @@ export function knowPanel(p: Panel) {
   panels.value = next;
 }
 
+let addonLoad = 0;
 export function applyEvent(ev: ServerEvent) {
   switch (ev.event) {
+    case "addons_changed": {
+      const load = ++addonLoad;
+      rpc.call<AddonRegistry>("addon.list").then((registry) => {
+        if (load !== addonLoad) return;
+        batch(() => { addons.value = registry.addons; addonRevision.value = registry.revision; });
+      }).catch(() => {});
+      break;
+    }
     case "panel_upserted":
       knowPanel(ev.data);
       break;

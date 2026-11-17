@@ -1,7 +1,17 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
-import { type Addon, addonLabels, addonMessage, addonTitle, externalLink, THEME_TOKENS } from "../addons.ts";
+import {
+  type Addon,
+  ADDON_SANDBOX,
+  addonLabels,
+  addonMessage,
+  addonMessageError,
+  addonTitle,
+  externalLink,
+  THEME_TOKENS,
+} from "../addons.ts";
 import { addonTab } from "../layout/tree.ts";
-import { focusGroup } from "../actions.ts";
+import { focusGroup, reloadWindow } from "../actions.ts";
+import { loadedFramePolicy } from "../frame_policy.ts";
 import { focusedTabId } from "../state.ts";
 import { rpc } from "../rpc.ts";
 import { usePanelPlacement } from "./placement.ts";
@@ -41,10 +51,10 @@ export function AddonView({ addon }: { addon: Addon }) {
         globalThis.open(externalLink(m.url)!, "_blank", "noopener,noreferrer");
       } else {
         try {
-          await rpc.call("addon.message", { id: addon.id, agent: m.agent, text: m.text });
+          await rpc.call("addon.message", { id: addon.id, origin, agent: m.agent, text: m.text });
           post("message-agent-result", { ok: true });
         } catch (e) {
-          post("message-agent-result", { ok: false, error: e instanceof Error ? e.message : String(e) });
+          post("message-agent-result", { ok: false, error: addonMessageError(e) });
         }
       }
     };
@@ -74,21 +84,30 @@ export function AddonView({ addon }: { addon: Addon }) {
     <div ref={ref} class={`panel-view${dim ? " dim" : ""}`}>
       <div class="panel-body">
         <div class="panel-frame-host">
-          <iframe
-            ref={frame}
-            class="panel-frame"
-            data-addon-id={addon.id}
-            data-addon-tab={tab}
-            title={addonTitle(addon)}
-            src={addon.url}
-            sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
-            referrerPolicy="no-referrer"
-            onLoad={() => {
-              theme();
-              post("visible", { visible });
-              if (focused) post("focus");
-            }}
-          />
+          {!loadedFramePolicy.addons.has(origin)
+            ? (
+              <div class="panel-status" role="status">
+                <p>Reload the window to open this add-on.</p>
+                <button type="button" class="btn" onClick={reloadWindow}>Reload</button>
+              </div>
+            )
+            : (
+              <iframe
+                ref={frame}
+                class="panel-frame"
+                data-addon-id={addon.id}
+                data-addon-tab={tab}
+                title={addonTitle(addon)}
+                src={addon.url}
+                sandbox={ADDON_SANDBOX}
+                referrerPolicy="no-referrer"
+                onLoad={() => {
+                  theme();
+                  post("visible", { visible });
+                  if (focused) post("focus");
+                }}
+              />
+            )}
         </div>
       </div>
     </div>

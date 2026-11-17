@@ -1,7 +1,7 @@
 // One group: its tab strip (always shown; a tab is one session) + the active tab's terminal
 // (+ approval banner, exited bar, find bar). The top-right group's strip also carries the
 // window controls.
-import { type Addon, addons, addonLabels, addonTitle } from "../addons.ts";
+import { type Addon, addons, addonLabels, addonTitle, pinnedLabel, reloadAddonFrame } from "../addons.ts";
 import { addonTab, isPinnedTab } from "./tree.ts";
 import { KitIcon } from "../panels/KitIcon.tsx";
 import type { ComponentChildren } from "preact";
@@ -656,7 +656,7 @@ function PinnedTab({ addon, paneId, index, tabsInGroup, active, focused }: {
   const id = addon ? addonTab(addon.id) : QUESTIONS_TAB;
   const title = addon ? addonTitle(addon) : "Questions";
   const n = addon ? addonLabels.value[addon.id]?.count ?? 0 : openQuestionCount.value;
-  const label = `${title}${n ? `, ${n}` : ""}`;
+  const label = pinnedLabel(title, n, !!addon);
   const menu: MenuItem[] = [
     { label: "Split right", disabled: tabsInGroup < 2, run: () => A.splitWithTab(id, "right") },
     { label: "Split down", disabled: tabsInGroup < 2, run: () => A.splitWithTab(id, "bottom") },
@@ -665,6 +665,8 @@ function PinnedTab({ addon, paneId, index, tabsInGroup, active, focused }: {
     "sep",
     { label: addon ? "Hide" : "Hide Questions tab", keys: "Alt+W", run: () => addon ? A.showAddon(addon.id, false) : A.hideQuestionsTab() },
   ];
+  if (addon) menu.splice(4, 0, { label: "Reload", icon: <IconRestart size={14} />, run: () =>
+    reloadAddonFrame(document.querySelector<HTMLIFrameElement>(`iframe[data-addon-tab="${id}"]`)) });
   return (
     <div class={cx("tab", addon ? "addon-tab" : "questions-tab", active && "active", active && focused && "focused",
       drag.value?.sid === id && "dragging")}

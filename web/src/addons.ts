@@ -8,6 +8,31 @@ export interface Addon {
   agents: string[];
 }
 export const addons = signal<Addon[]>([]);
+export interface AddonRegistry {
+  addons: Addon[];
+  revision: string;
+}
+export const addonRevision = signal("");
+export const ADDON_SANDBOX = "allow-scripts allow-same-origin allow-forms";
+const MESSAGE_ERRORS = [
+  "Not sent: this agent isn't allowed.",
+  "Not sent: limit of 30 an hour.",
+  "Not sent: message must be 1-300 characters.",
+  "Not sent.",
+] as const;
+export function addonMessageError(error: unknown): string {
+  const text = error instanceof Error ? error.message : error;
+  return MESSAGE_ERRORS.find((allowed) => allowed === text) ?? "Not sent.";
+}
+/** Retry the existing node: moving/replacing it would lose the frame's placement. */
+export function reloadAddonFrame(frame: Pick<HTMLIFrameElement, "src"> | null) {
+  // The DOM setter navigates even when the address is unchanged.
+  // deno-lint-ignore no-self-assign
+  if (frame) frame.src = frame.src;
+}
+export function pinnedLabel(title: string, count: number, addon: boolean): string {
+  return addon ? `${title}${count ? `, ${count}` : ""}` : `Questions, ${count} open`;
+}
 export const addonLabels = signal<Record<string, { title?: string; count?: number }>>({});
 export const addonTitle = (a: Addon) => addonLabels.value[a.id]?.title || a.name;
 export const THEME_TOKENS = [

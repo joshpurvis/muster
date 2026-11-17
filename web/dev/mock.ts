@@ -31,6 +31,7 @@ const counterServer = Deno.serve({ port: 0, hostname: "127.0.0.1" }, () => new R
   headers: { "content-type": "text/html", "content-security-policy": `frame-ancestors http://127.0.0.1:${PORT}` },
 }));
 const demoAddon: Addon = { id: "counter", name: "Counter", url: `http://127.0.0.1:${counterServer.addr.port}/`, icon: "globe", agents: [] };
+let addonRevision = crypto.randomUUID();
 let addons: Addon[] = Deno.env.get("MOCK_ADDONS") === "1" ? [demoAddon] : [];
 const addonSent = new Map<string, number[]>();
 // Drawn by the UI around the panel server's /preview page (src/web_preview.rs).
@@ -713,6 +714,7 @@ const agentMsgs: any[] = [];
 const memory = new Map<string, Map<string, string>>();
 
 function newAgent(p: any): MockAgent {
+  if (p.accepts && (!Array.isArray(p.accepts) || !p.accepts.length || p.accepts.some((o: string) => !["human", "schedule", "webhook"].includes(o)))) throw new Error("accepts needs human, schedule or webhook");
   const name = String(p.name ?? "").trim();
   if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,39}$/.test(name)) throw new Error(`bad agent name \`${name}\``);
   if (agentList.some((a) => a.name.toLowerCase() === name.toLowerCase())) {
@@ -1190,7 +1192,7 @@ async function agentMethod(method: string, p: any): Promise<unknown> {
       }
       if ("permissions" in p) a.permissions = p.permissions;
       if ("accepts" in p) {
-        if (!p.accepts.length) {
+        if (!Array.isArray(p.accepts) || !p.accepts.length || p.accepts.some((o: string) => !["human", "schedule", "webhook"].includes(o))) {
           throw new Error("accepts needs at least one origin (human, schedule, webhook)");
         }
         a.accepts_origins = p.accepts;
@@ -1418,27 +1420,38 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
     return { key_present: orKey, models: OR_MODELS, fetched_at: now() - 20 * 60_000, stale: false, error: null };
   }
   if (method === "mock.addon_demo") return demoAddon;
-  if (method === "addon.list") return addons;
+  if (method === "addon.list") return { addons, revision: addonRevision };
   if (["addon.save", "addon.remove", "addon.message"].includes(method)) {
     if (!ws || !holding.has(ws) || Object.hasOwn(p, "from_session")) throw new Error("Add-on changes and messages are allowed only from Muster's window. Open Add-on tabs there.");
+    if (method !== "addon.message" && p.revision !== addonRevision) throw new Error("Changed in another window. Reopen Add-on tabs to see it.");
     if (method === "addon.save") {
-      if (Object.keys(p).some((k) => !["id", "name", "url", "icon", "agents"].includes(k))) throw new Error("Unknown add-on field.");
-      if (typeof p.name !== "string" || !p.name.trim() || [...p.name].length > 40) throw new Error("Name must be 1–40 characters.");
-      if (!/^[a-z0-9][a-z0-9-]{0,39}$/.test(p.id) || p.id.endsWith("-")) throw new Error("Use a short lower-case slug for the add-on id.");
-      const url = mockPreviewUrl(p.url).href;
-      if (!iconNames().includes(p.icon)) throw new Error("Choose an icon from the list.");
-      if (!Array.isArray(p.agents) || p.agents.some((n: string) => !agentList.some((a) => a.name === n))) throw new Error("Choose an existing agent.");
-      addons = [...addons.filter((a) => a.id !== p.id), { ...p, url }];
+      if (Object.keys(p).some((k) => !["addon", "revision"].includes(k))) throw new Error("Unknown add-on field.");
+      const a = p.addon;
+      if (!a || Object.keys(a).some((k) => !["id", "name", "url", "icon", "agents"].includes(k))) throw new Error("Unknown add-on field.");
+      if (typeof a.name !== "string" || !a.name.trim() || [...a.name].length > 40) throw new Error("Name must be 1–40 characters.");
+      if (!/^[a-z0-9][a-z0-9-]{0,39}$/.test(a.id) || a.id.endsWith("-")) throw new Error("Use a short lower-case slug for the add-on id.");
+      if (!isPreviewUrl(a.url)) throw new Error("Use a local address: http://localhost:<port> or http://127.0.0.1:<port>.");
+      const url = new URL(a.url);
+      const port = Number(url.port || (url.protocol === "https:" ? 443 : 80));
+      if (port === PORT || port === panelServer.addr.port) throw new Error("That's Muster's own address. Use your app's port.");
+      if (!iconNames().includes(a.icon)) throw new Error("Choose an icon from the list.");
+      if (!Array.isArray(a.agents) || a.agents.some((n: string) => !agentList.some((agent) => agent.name === n))) throw new Error("Choose an existing agent.");
+      addons = [...addons.filter((old) => old.id !== a.id), { ...a, url: url.href }];
     } else if (method === "addon.remove") addons = addons.filter((a) => a.id !== p.id);
     else {
-      const a = addons.find((a) => a.id === p.id);
-      if (!a?.agents.includes(p.agent)) throw new Error("This agent is not ticked for the add-on.");
-      if (typeof p.text !== "string" || [...p.text].length < 1 || [...p.text].length > 300) throw new Error("Message must be 1–300 characters.");
       const times = (addonSent.get(p.id) ?? []).filter((t) => Date.now() - t < 3600000);
-      if (times.length >= 30) throw new Error("This add-on has sent 30 messages in the last hour. Try later.");
+      if (times.length >= 30) throw new Error("Not sent: limit of 30 an hour.");
       addonSent.set(p.id, [...times, Date.now()]);
-      pushAgentMessage({ from: `addon:${a.id}`, to: p.agent, to_agent: agentNamed(p.agent).id, origin: `addon:${a.id}`, hop: 0, text: p.text });
+      const a = addons.find((a) => a.id === p.id);
+      if (!a || new URL(a.url).origin !== p.origin || !a.agents.includes(p.agent)) throw new Error("Not sent: this agent isn't allowed.");
+      if (typeof p.text !== "string" || [...p.text].length < 1 || [...p.text].length > 300) throw new Error("Not sent: message must be 1-300 characters.");
+      const agent = agentList.find((a) => a.name === p.agent);
+      if (!agent) throw new Error("Not sent.");
+      pushAgentMessage({ from: `addon:${a.id}`, to: p.agent, to_agent: agent.id, origin: `addon:${a.id}`, hop: 0, text: p.text });
+      return {};
     }
+    addonRevision = crypto.randomUUID();
+    broadcast("addons_changed", {});
     return {};
   }
   if (method.startsWith("schedule.") || method.startsWith("trigger.")) return sched.handle(method, p);
@@ -1558,6 +1571,7 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
         panels: [...panels.values()].map((r) => r.panel).filter((p) => !p.closed),
         panel_origin: panelOrigin,
         addons: ws && deviceClients.has(ws) ? undefined : addons,
+        addon_revision: ws && deviceClients.has(ws) ? undefined : addonRevision,
         notes: [...notes.keys()].map(getNote).map(noteSummary),
         windows,
         home: HOME,
@@ -2153,8 +2167,12 @@ Deno.serve({ port: PORT, hostname: "127.0.0.1" }, async (req) => {
     : url.pathname.slice(1);
   if (path.includes("..")) return new Response("no", { status: 400 });
   try {
-    const body = await Deno.readFile(new URL(path, DIST));
+    let body = await Deno.readFile(new URL(path, DIST));
     const ext = path.split(".").pop() ?? "";
+    const csp = `frame-ancestors 'none'; frame-src about: ${panelOrigin}/proxy ${panelOrigin}/preview ${[...new Set(addons.map((a) => new URL(a.url).origin))].join(" ")}`;
+    if (ext === "html" && !path.startsWith("m/")) {
+      body = new TextEncoder().encode(new TextDecoder().decode(body).replace("</head>", `<meta name="muster-frame-policy" content="${csp}"></head>`));
+    }
     return new Response(body, {
       headers: {
         "content-type": TYPES[ext] ?? "application/octet-stream",
@@ -2166,7 +2184,7 @@ Deno.serve({ port: PORT, hostname: "127.0.0.1" }, async (req) => {
           }
           : ext === "html" ? {
             "x-frame-options": "DENY",
-            "content-security-policy": `frame-ancestors 'none'; frame-src about: ${panelOrigin}/proxy ${panelOrigin}/preview ${[...new Set(addons.map((a) => new URL(a.url).origin))].join(" ")}`,
+            "content-security-policy": csp,
           } : {}),
       },
     });

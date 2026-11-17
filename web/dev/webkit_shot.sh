@@ -28,13 +28,32 @@ fi
 log="$(mktemp -t muster-webkit-mock.XXXXXX)"
 MOCK_PORT="$port" setsid bash scripts/isolated.sh deno task --cwd web mock >"$log" 2>&1 &
 mock=$!
-trap 'kill -- -"$mock" 2>/dev/null || true; wait "$mock" 2>/dev/null || true' EXIT
-for _ in $(seq 1 100); do
-  curl -s -o /dev/null "http://127.0.0.1:$port/api/health" && break
+stop_mock() {
+  kill -- -"$mock" 2>/dev/null || true
+  wait "$mock" 2>/dev/null || true
+  # The mock's server exits a moment after its shell: wait (up to 5 s) until the port is free,
+  # so the next run can take it.
+  for _ in $(seq 1 50); do
+    curl -s -o /dev/null "http://127.0.0.1:$port/api/health" || return 0
+    sleep 0.1
+  done
+}
+trap stop_mock EXIT
+ready=
+for _ in $(seq 1 150); do
+  health="$(curl -s "http://127.0.0.1:$port/api/health" 2>/dev/null || true)"
+  if [[ "$health" == *'"version":"mock"'* ]]; then
+    ready=1
+    break
+  fi
   if ! kill -0 "$mock" 2>/dev/null; then
     echo "the mock did not start; its log: $log" >&2
     exit 1
   fi
   sleep 0.1
 done
+if [[ -z "$ready" ]]; then
+  echo "the mock did not answer within 15 s; its log: $log" >&2
+  exit 1
+fi
 python3 -I web/dev/webkit_shot.py "http://127.0.0.1:$port/#token=dev" "$steps" "$out" "$@"

@@ -1,6 +1,7 @@
-// Screenshots of the Questions tab (docs/UI.md "Questions") for docs/screenshots/questions-*.webp,
-// against the isolated mock only. Every question, name and picture here is invented (a made-up
-// bakery): this repo is public, so sample data never comes from real work.
+// A headless Chromium walkthrough of the Questions tab (docs/UI.md "Questions") that took the first
+// docs/screenshots/questions-*.webp, against the isolated mock only. Every question, name and
+// picture here is invented (a made-up bakery): this repo is public, so sample data never comes from
+// real work.
 //
 //   deno task build:dev && MOCK_PORT=17796 deno task mock &
 //   deno run --allow-net=127.0.0.1 --allow-run=chromium --allow-read=<shots> --allow-write=<shots>,/tmp \
@@ -9,10 +10,7 @@
 // These are headless Chromium pictures. New pictures of the desktop window come from WebKitGTK
 // (AGENTS.md, "Screenshots of the UI"): its steps can set up the same questions through
 // `globalThis.__muster.rpc.call(...)`. Before a picture from this script goes in a pull request or
-// docs/screenshots, retake it that way.
-//
-// It writes PNGs; convert them for the repo with
-//   for f in <shots-dir>/questions-*.png; do magick "$f" -quality 80 "${f%.png}.webp"; done
+// docs/screenshots, retake it that way and convert the WebKitGTK PNGs as AGENTS.md says.
 import { type Browser, launch } from "./cdp.ts";
 
 const [url, shots = "/tmp/muster-questions-shots"] = Deno.args;

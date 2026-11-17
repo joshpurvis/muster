@@ -51,7 +51,7 @@ import {
   QUESTIONS_TAB,
 } from "./layout/tree.ts";
 import {
-  changeChannelLayout, loadChannelLayout, reconcileChannels, savedChannel,
+  changeChannelLayout, followingChannel, loadChannelLayout, reconcileChannels, savedChannel,
   type SidebarState, type TabHome, type WindowLayoutState,
 } from "./layout/channels.ts";
 import {
@@ -701,15 +701,17 @@ export function releaseNewSessions() {
 
 const liveTabs = computed((): TabHome[] => {
   const valid = (id: number | null | undefined) => id != null && channelById.value.has(id) ? id : null;
+  const shown = followingChannel(activeChannelId.value, (id) => channelById.value.has(id));
   return [
     ...windowSessions.value.map((s) => ({ id: s.id, channel: s.channel_id })),
     ...windowPanels.value.map((p) => ({ id: panelTab(p.id), channel: p.channel_id, beside: p.session_id })),
     ...windowNotes.value.map((n) => ({ id: noteTab(n.id),
       channel: n.channel_id != null ? valid(n.channel_id) ?? 0 : null, beside: n.beside })),
-    // In whichever channel is shown (never one archived meanwhile: then the channel that takes
-    // its place), arriving at that channel's own place, else where the human last put it.
-    ...(questionsShown.value ? [{ id: QUESTIONS_TAB, channel: valid(activeChannelId.value), questions: true }] : []),
-    ...shownAddons.value.map((a) => ({ id: addonTab(a.id), channel: valid(activeChannelId.value), pinned: `addon:${a.id}` })),
+    // In whichever channel is shown, the unfiled note tabs included (never one archived meanwhile:
+    // then the channel that takes its place), arriving at that channel's own place, else where the
+    // human last put it.
+    ...(questionsShown.value ? [{ id: QUESTIONS_TAB, channel: shown, questions: true }] : []),
+    ...shownAddons.value.map((a) => ({ id: addonTab(a.id), channel: shown, pinned: `addon:${a.id}` })),
   ].filter((t) => !held.value.has(t.id));
 });
 

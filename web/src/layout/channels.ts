@@ -107,6 +107,13 @@ export function sidebarRatio(value: number): number {
   return Number.isFinite(value) ? Math.max(0.2, Math.min(0.8, value)) : 0.45;
 }
 
+/** The channel a tab that follows the shown channel (Questions, an add-on tab) belongs in: the
+ * shown one when it is one of the window's channels, or the unfiled notes tabs (channel 0, the
+ * Notes button's "Show unfiled note tabs"), which have a layout of their own too; else none. */
+export function followingChannel(active: number | null | undefined, known: (id: number) => boolean): number | null {
+  return active === 0 || (active != null && known(active)) ? active : null;
+}
+
 /** Find the saved home of a tab; useful for notes predating channel membership. */
 export function savedChannel(s: WindowLayoutState, tab: number): number | null {
   for (const [id, l] of Object.entries(s.layouts)) {

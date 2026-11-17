@@ -24,7 +24,7 @@
 
 › Ask Codex to do anything
 
-  gpt-6-luna low · /tmp/claude-1000/-home-josh-projects-muster/465b39be-8c1a-42fd-9c93-4e1ebb9537a4/scratchpad/repo2
+  gpt-6-luna low · /tmp/claude-1000/-home-user-projects-muster/465b39be-8c1a-42fd-9c93-4e1ebb9537a4/scratchpad/repo2
 
 
 

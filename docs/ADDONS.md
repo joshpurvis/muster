@@ -118,8 +118,10 @@ or other RPCs. Register only apps whose origin you intend to trust with the sele
 `web/dev/counter.html` is the only demo. The mock serves it on a separate loopback port and starts with it
 registered when `MOCK_ADDONS=1` (other mock checks keep their existing layouts). The browser check removes
 that registration through the dialog, registers it again, checks its badge and tab placement, hides and
-restores it, and writes three dark screenshots. Run from the worktree, using the isolated wrapper for every
-process:
+restores it, and writes three dark screenshots. Those are headless Chromium pictures of each step, not of how
+the desktop window draws it: pictures for a pull request or `docs/screenshots/` come from WebKitGTK
+(AGENTS.md, "Screenshots of the UI"; `MOCK_ADDONS=1 deno task shot:desktop <steps.json> <dir>` starts the mock
+with the demo registered). Run from the worktree, using the isolated wrapper for every process:
 
 ```sh
 bash scripts/isolated.sh deno task web

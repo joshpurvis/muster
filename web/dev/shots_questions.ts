@@ -6,6 +6,11 @@
 //   deno run --allow-net=127.0.0.1 --allow-run=chromium --allow-read=<shots> --allow-write=<shots>,/tmp \
 //     dev/shots_questions.ts http://127.0.0.1:17796/#token=dev <shots-dir>
 //
+// These are headless Chromium pictures. New pictures of the desktop window come from WebKitGTK
+// (AGENTS.md, "Screenshots of the UI"): its steps can set up the same questions through
+// `globalThis.__muster.rpc.call(...)`. Before a picture from this script goes in a pull request or
+// docs/screenshots, retake it that way.
+//
 // It writes PNGs; convert them for the repo with
 //   for f in <shots-dir>/questions-*.png; do magick "$f" -quality 80 "${f%.png}.webp"; done
 import { type Browser, launch } from "./cdp.ts";

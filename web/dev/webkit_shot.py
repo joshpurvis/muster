@@ -51,6 +51,11 @@ import cairo  # noqa: E402
 from gi.repository import GLib, Gtk, WebKit2  # noqa: E402
 
 
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="Desktop UI screenshots in WebKitGTK")
     p.add_argument("url")
@@ -72,7 +77,8 @@ def parse_args():
     # The mock's /api/health says version "mock"; a real Muster (even the owner's live one on
     # loopback) says its own version and is refused.
     try:
-        direct = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # never via a proxy
+        # Never via a proxy, and never following a redirect to some other listener.
+        direct = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
         with direct.open(f"{u.scheme}://{u.netloc}/api/health", timeout=5) as r:
             health = json.load(r)
     except (OSError, ValueError) as e:

@@ -21,7 +21,7 @@ if [[ ! -f web/dist/app.js ]]; then
   exit 2
 fi
 port="${MOCK_PORT:-17840}"
-if curl -s -o /dev/null "http://127.0.0.1:$port/api/health"; then
+if curl -s --max-time 2 -o /dev/null "http://127.0.0.1:$port/api/health"; then
   echo "port $port is already in use; set MOCK_PORT to a free one" >&2
   exit 2
 fi
@@ -34,21 +34,22 @@ stop_mock() {
   # The mock's server exits a moment after its shell: wait (up to 5 s) until the port is free,
   # so the next run can take it.
   for _ in $(seq 1 50); do
-    curl -s -o /dev/null "http://127.0.0.1:$port/api/health" || return 0
+    curl -s --max-time 2 -o /dev/null "http://127.0.0.1:$port/api/health" || return 0
     sleep 0.1
   done
 }
 trap stop_mock EXIT
 ready=
 for _ in $(seq 1 150); do
-  health="$(curl -s "http://127.0.0.1:$port/api/health" 2>/dev/null || true)"
-  if [[ "$health" == *'"version":"mock"'* ]]; then
-    ready=1
-    break
-  fi
+  # Alive first: a mock that lost the port to another run must not take that run's answer.
   if ! kill -0 "$mock" 2>/dev/null; then
     echo "the mock did not start; its log: $log" >&2
     exit 1
+  fi
+  health="$(curl -s --max-time 2 "http://127.0.0.1:$port/api/health" 2>/dev/null || true)"
+  if [[ "$health" == *'"version":"mock"'* ]]; then
+    ready=1
+    break
   fi
   sleep 0.1
 done

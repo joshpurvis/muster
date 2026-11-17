@@ -44,7 +44,7 @@ async function shot(name: string, selector: string) {
 async function menu(label: string) {
   await b.click("[data-addon]", { button: "right" });
   const find =
-    `Array.from(document.querySelectorAll('[role="menuitem"]')).find(e => e.textContent.trim() === ${
+    `Array.from(document.querySelectorAll('[role="menuitem"]')).find(e => e.querySelector('.menu-label')?.textContent.trim() === ${
       JSON.stringify(label)
     })`;
   await b.wait(`!!${find}`);

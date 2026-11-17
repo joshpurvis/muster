@@ -14,14 +14,15 @@ export interface QuestionDeps {
   session: (id: number) => { name: string; state: string; kind: string } | undefined;
 }
 
-/** A small picture for questions that carry one: a sign-up card, drawn as SVG. */
+/** A small picture for questions that carry one: an order card for a made-up bakery, drawn as SVG.
+ *  All sample data here is invented; nothing is taken from a real job. */
 const CARD_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="920" height="340" viewBox="0 0 920 340">
-<rect width="920" height="340" fill="#ffffff"/><rect x="18" y="18" width="884" height="304" rx="14" fill="none" stroke="#e5157a" stroke-width="4"/>
-<text x="58" y="96" font-family="Inter, sans-serif" font-size="34" font-weight="700" fill="#16161a">The senders using your own domain</text>
-<text x="58" y="142" font-family="Inter, sans-serif" font-size="17" fill="#3c3c44">We read your domain's reports. On a paid plan we email you the day a sender first</text>
-<text x="58" y="168" font-family="Inter, sans-serif" font-size="17" fill="#3c3c44">fails. Every plan gets a Monday summary.</text>
-<rect x="58" y="200" width="112" height="44" rx="6" fill="#ffd21f"/><text x="76" y="228" font-family="Inter, sans-serif" font-size="16" font-weight="600" fill="#16161a">Start free</text>
-<text x="58" y="290" font-family="Inter, sans-serif" font-size="14" fill="#5c5c66">Free for your first domain · No card · Totals kept for life</text></svg>`;
+<rect width="920" height="340" fill="#fffaf2"/><rect x="18" y="18" width="884" height="304" rx="14" fill="none" stroke="#b5651d" stroke-width="4"/>
+<text x="58" y="96" font-family="Inter, sans-serif" font-size="34" font-weight="700" fill="#2b1d12">Fresh bread on your doorstep</text>
+<text x="58" y="142" font-family="Inter, sans-serif" font-size="17" fill="#4a3a2c">We bake on Thursday night and bring a box of three loaves to your door</text>
+<text x="58" y="168" font-family="Inter, sans-serif" font-size="17" fill="#4a3a2c">before 8 on Friday. Skip any week you like.</text>
+<rect x="58" y="200" width="132" height="44" rx="6" fill="#f2c46d"/><text x="76" y="228" font-family="Inter, sans-serif" font-size="16" font-weight="600" fill="#2b1d12">Order a box</text>
+<text x="58" y="290" font-family="Inter, sans-serif" font-size="14" fill="#6b5a4a">Delivered in town · Pause any week · Loaves change with the season</text></svg>`;
 
 export function questionMock(d: QuestionDeps) {
   const all = new Map<number, Question>();
@@ -57,8 +58,8 @@ export function questionMock(d: QuestionDeps) {
       product: p.product, question: p.question, context: p.context, example: p.example, kind: p.kind ?? "pick_one",
       options: (p.options ?? []).map((o: any, i: number) => ({ letter: "abcdef"[i], text: o.text, ...(o.why ? { why: o.why } : {}) })),
       pick: p.pick ?? [], if_no_answer: p.if_no_answer, holding_up: p.holding_up, area: p.area ?? "other",
-      pictures: p.picture ? [{ path: "/home/you/shots/card.svg", caption: p.picture }] : undefined,
-      links: p.links, details: p.details, note_to_self: p.note_to_self ?? "On a: edit cards.md and run the build.",
+      pictures: p.picture ? [{ path: "/home/user/shots/card.svg", caption: p.picture }] : undefined,
+      links: p.links, details: p.details, note_to_self: p.note_to_self ?? "On a: update the card and rebuild the recipe pages.",
     };
     all.set(id, q);
     publish(q);

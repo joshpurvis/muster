@@ -5073,7 +5073,7 @@ mod tests {
         assert_eq!(clean_title("bash", SessionKind::Shell), None);
         assert_eq!(clean_title("cargo test", SessionKind::Shell).as_deref(), Some("cargo test"));
         // Paths and user@host prompts.
-        for t in ["/home/josh/p/muster", "~/p/muster", "~", "josh@arch: ~/p", "josh@arch:~/p/muster", "root@box"] {
+        for t in ["/home/user/p/muster", "~/p/muster", "~", "user@host: ~/p", "user@host:~/p/muster", "root@box"] {
             assert_eq!(clean_title(t, SessionKind::Shell), None, "{t}");
         }
         // Mail-like words elsewhere are fine; long titles are capped.

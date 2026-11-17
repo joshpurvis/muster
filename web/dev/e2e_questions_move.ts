@@ -1,6 +1,6 @@
 // Moving the Questions tab (docs/UI.md "Questions"), against the isolated mock only: drag it into
 // the right group, into a split of its own on the right, reload, switch channels, hide and show.
-// Then Josh's story (16 Nov): each channel keeps its own place. Set it in one channel, set it
+// Then the per-channel story: each channel keeps its own place. Set it in one channel, set it
 // somewhere else in the other, and switching back and forth (and hide/show, reload) shows each
 // channel's own place every time.
 //
@@ -160,8 +160,8 @@ try {
   check((await b.eval(`${M}.layout.value.focus`)) === g.panes[g.at].id, "and focused");
   ok("Hidden and shown again from the palette, it is back in its right split, focused");
 
-  // ---- Josh's story: one place per channel. Beta ("marketer", one terminal) and Alpha ("otis",
-  // two terminals side by side) get different places, and each keeps its own.
+  // ---- One place per channel. Beta (one terminal) and Alpha (two terminals side by side) get
+  // different places, and each keeps its own.
   const shown = async (id: number) => {
     await b.click(`[data-channel-id="${id}"] .channel-select`);
     await b.wait(`${M}.activeChannelId.value === ${id}`);

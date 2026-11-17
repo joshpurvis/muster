@@ -92,28 +92,29 @@ function parseCron(line: string): Cron {
 }
 
 function dayMatches(c: Cron, d: Date): boolean {
-  const dom = c.dom.includes(d.getDate()), dow = c.dow.includes(d.getDay());
+  const dom = c.dom.includes(d.getUTCDate()), dow = c.dow.includes(d.getUTCDay());
   if (c.domStar && c.dowStar) return true;
   if (c.domStar) return dow;
   if (c.dowStar) return dom;
   return dom || dow;
 }
 
-/** The first fire time strictly after `ms`, in this process's zone. */
+/** The first fire time strictly after `ms`, in the mock's zone (UTC). Plausible, not exact: the
+ *  mock reads every cron in UTC, also for a schedule saved with another zone. */
 function nextAfter(c: Cron, ms: number): number | null {
   const d = new Date(Math.floor(ms / MIN) * MIN + MIN);
   const limit = ms + 4 * 366 * DAY;
   while (d.getTime() < limit) {
-    if (!c.mon.includes(d.getMonth() + 1)) {
-      d.setMonth(d.getMonth() + 1, 1);
-      d.setHours(0, 0, 0, 0);
+    if (!c.mon.includes(d.getUTCMonth() + 1)) {
+      d.setUTCMonth(d.getUTCMonth() + 1, 1);
+      d.setUTCHours(0, 0, 0, 0);
     } else if (!dayMatches(c, d)) {
-      d.setDate(d.getDate() + 1);
-      d.setHours(0, 0, 0, 0);
-    } else if (!c.hour.includes(d.getHours())) {
-      d.setHours(d.getHours() + 1, 0, 0, 0);
-    } else if (!c.min.includes(d.getMinutes())) {
-      d.setMinutes(d.getMinutes() + 1, 0, 0);
+      d.setUTCDate(d.getUTCDate() + 1);
+      d.setUTCHours(0, 0, 0, 0);
+    } else if (!c.hour.includes(d.getUTCHours())) {
+      d.setUTCHours(d.getUTCHours() + 1, 0, 0, 0);
+    } else if (!c.min.includes(d.getUTCMinutes())) {
+      d.setUTCMinutes(d.getUTCMinutes() + 1, 0, 0);
     } else return d.getTime();
   }
   return null;
@@ -226,7 +227,9 @@ interface Sched {
   updated_at: number;
 }
 
-const localZone = () => Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+// The mock's own time zone is pinned to UTC, so its data and screenshots never carry the zone of
+// the machine they were made on.
+const MOCK_ZONE = "UTC";
 
 export function scheduleMock(deps: ScheduleDeps) {
   const { now, broadcast } = deps;
@@ -257,7 +260,7 @@ export function scheduleMock(deps: ScheduleDeps) {
     error: null,
     resets_at: (Math.floor(now() / DAY) + 1) * DAY,
   });
-  const settings = { paused: false, quiet_start: "23:00", quiet_end: "07:00", unattended_cap: 24, tz: localZone() };
+  const settings = { paused: false, quiet_start: "23:00", quiet_end: "07:00", unattended_cap: 24, tz: MOCK_ZONE };
   const settingsJson = () => ({ ...settings, spend: spendJson() });
 
   const agentOf = (s: Sched) => deps.agents().find((a) => a.id === s.agent_id);
@@ -312,7 +315,7 @@ export function scheduleMock(deps: ScheduleDeps) {
 
   function inQuiet(ms: number): boolean {
     const [sh, sm] = settings.quiet_start.split(":").map(Number), [eh, em] = settings.quiet_end.split(":").map(Number);
-    const d = new Date(ms), m = d.getHours() * 60 + d.getMinutes(), a = sh * 60 + sm, b = eh * 60 + em;
+    const d = new Date(ms), m = d.getUTCHours() * 60 + d.getUTCMinutes(), a = sh * 60 + sm, b = eh * 60 + em;
     return a <= b ? m >= a && m < b : m >= a || m < b;
   }
 
@@ -492,7 +495,7 @@ export function scheduleMock(deps: ScheduleDeps) {
     record(s, sent);
     publish(s);
     setTimeout(() => {
-      deps.reply(m, `Done: ${s.name.toLowerCase()} for ${new Date(run.slot).toDateString()}. Nothing needs you.`);
+      deps.reply(m, `Done: ${s.name.toLowerCase()} for ${new Date(run.slot).toUTCString().slice(0, 16)}. Nothing needs you.`);
       const r = { ...sent, outcome: "replied", finished_at: now(), message: m };
       record(s, r);
       if (s.note_id !== null) {
@@ -547,7 +550,7 @@ export function scheduleMock(deps: ScheduleDeps) {
 
   function create(p: any) {
     const a = agentNamed(p.agent);
-    const tz = String(p.tz ?? "").trim() || localZone();
+    const tz = String(p.tz ?? "").trim() || MOCK_ZONE;
     const when = whenIn(p.when, tz);
     const origin = isTrig(when) ? "webhook" : "schedule";
     checkAgent(a, origin);
@@ -587,7 +590,7 @@ export function scheduleMock(deps: ScheduleDeps) {
   function update(p: any) {
     const s = get(p.id);
     if ("agent" in p) throw new Error("a schedule's agent can't change: make a new schedule");
-    const tz = p.tz !== undefined ? String(p.tz).trim() || localZone() : s.tz;
+    const tz = p.tz !== undefined ? String(p.tz).trim() || MOCK_ZONE : s.tz;
     const when = p.when !== undefined ? whenIn(p.when, tz, s.id) : s.when;
     const origin = isTrig(when) ? "webhook" : "schedule";
     if (isTrig(when) !== isTrig(s.when)) checkAgent(agentOf(s)!, origin);
@@ -725,7 +728,7 @@ export function scheduleMock(deps: ScheduleDeps) {
         return { queued: true, trigger: p.name, runs_at: s.next_run };
       }
       case "schedule.preview": {
-        const tz = String(p.tz ?? "").trim() || localZone();
+        const tz = String(p.tz ?? "").trim() || MOCK_ZONE;
         const when = whenIn(p.when, tz, p.id);
         const a = p.agent ? agentNamed(p.agent) : undefined;
         if (isTrig(when)) {
@@ -844,18 +847,18 @@ export function scheduleMock(deps: ScheduleDeps) {
     return s;
   }
 
-  /** The `n`th weekday (Mon-Fri) at 09:00 before now, counting back from the latest. */
+  /** The `n`th weekday (Mon-Fri) at 09:00 (UTC, the mock's zone) before now, counting back from the latest. */
   function weekdayAt(n: number, h = 9, m = 0): number {
     const d = new Date(now());
-    d.setHours(h, m, 0, 0);
-    if (d.getTime() > now()) d.setDate(d.getDate() - 1);
+    d.setUTCHours(h, m, 0, 0);
+    if (d.getTime() > now()) d.setUTCDate(d.getUTCDate() - 1);
     let left = n;
     for (;;) {
-      if (d.getDay() !== 0 && d.getDay() !== 6) {
+      if (d.getUTCDay() !== 0 && d.getUTCDay() !== 6) {
         if (left === 0) return d.getTime();
         left--;
       }
-      d.setDate(d.getDate() - 1);
+      d.setUTCDate(d.getUTCDate() - 1);
     }
   }
 

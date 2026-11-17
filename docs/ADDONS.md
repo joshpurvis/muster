@@ -90,8 +90,9 @@ window.parent.postMessage({ muster: 1, type: "badge", count: 3 }, windowOrigin);
 | `visible`              | `visible`: boolean                              | Frame load and when it is shown or hidden.                                                                             |
 | `message-agent-result` | `ok`: boolean; `error`?: string                 | After message forwarding succeeds or is refused. Success means accepted into delivery, not that the agent has replied. |
 
-Theme tokens are exactly `--bg-0`, `--bg-1`, `--bg-2`, `--border`, `--text`, `--text-muted`, `--accent`,
-`--font-ui` and `--font-mono`, with their computed CSS string values. No other settings or tokens are sent.
+Theme tokens are exactly `--bg-0`, `--bg-1`, `--bg-2`, `--bg-3`, `--border`, `--border-strong`, `--hover`,
+`--text`, `--text-muted`, `--text-faint`, `--accent`, `--accent-soft`, `--accent-strong`, `--on-accent`,
+`--ok-text`, `--warn-text`, `--error-text`, `--font-ui` and `--font-mono` (the ones Questions uses), with their computed CSS string values. No other settings or tokens are sent.
 
 Agent messages start with sender and origin `addon:<id>` and hop 0. The window's tick grants the initial
 recipient for that message only; `addon:` origins cannot be added to agent settings. Later replies retain the

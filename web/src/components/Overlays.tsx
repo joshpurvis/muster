@@ -1,5 +1,9 @@
 // Modal overlays: Jump / command palette, New tab, Rename window, shortcuts sheet, confirm
 // dialog, and the agent dialogs (Agents.tsx). Plus toasts.
+import { type Addon, addons, addonRevision } from "../addons.ts";
+import { iconNames } from "../panels/kit/icons.ts";
+import { KitIcon } from "../panels/KitIcon.tsx";
+import { rpc } from "../rpc.ts";
 import type { ComponentChildren } from "preact";
 import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "preact/hooks";
 import {
@@ -161,6 +165,8 @@ export function Overlays() {
       return <NotesDialog />;
     case "shell":
       return <ShellDialog />;
+    case "addons":
+      return <AddonSettingsDialog />;
     case "cache_settings":
       return <CacheSettingsDialog />;
     case "shutdown":
@@ -247,6 +253,8 @@ function commandEntries(): Entry[] {
       run: () => runCommand(c),
     });
   }
+  for (const a of addons.value) out.push({ key: `addon:${a.id}`, label: `Show ${a.name}`, hay: `Show ${a.name}`,
+    needs: false, sub: "Add-on tabs", icon: <KitIcon name={a.icon} />, run: () => { overlay.value = null; A.showAddon(a.id); } });
   return out;
 }
 
@@ -1009,8 +1017,55 @@ function ShellDialog() {
   );
 }
 
-/** "Cache warning…": the cold prompt cache bar on or off, and how long each CLI/provider pair
- * keeps a conversation cached (`prefs.set {cache_warn, cache_ttl}`, src/cache.rs). */
+/** A snapshot of the registry; a concurrent edit must be reopened before saving. */
+function AddonSettingsDialog() {
+  const blank = (): Addon => ({ id: "", name: "", url: "", icon: "globe", agents: [] });
+  const [loaded] = useState(() => ({ addons: addons.peek(), revision: addonRevision.peek() }));
+  const [draft, setDraft] = useState<Addon>(blank);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const agentNames = [...new Set([...agents.value.map((a) => a.name), ...draft.agents])];
+  const change = (patch: Partial<Addon>) => { setDraft({ ...draft, ...patch }); setError(""); };
+  const save = async (remove = false) => {
+    if (busy) return;
+    if (!remove && (!draft.name.trim() || [...draft.name].length > 40)) return setError("Name must be 1–40 characters.");
+    if (!remove && !draft.url) return setError("Enter a local address, including http:// or https:// and a port.");
+    setBusy(true);
+    try {
+      await rpc.call(remove ? "addon.remove" : "addon.save", remove ? { id: draft.id, revision: loaded.revision } :
+        { addon: { ...draft, id: draft.id || crypto.randomUUID(), name: draft.name.trim() }, revision: loaded.revision });
+      A.reloadWindow();
+    } catch (e) { setError(e instanceof Error ? e.message : String(e)); setBusy(false); }
+  };
+  return <Modal class="dialog dialog-scroll dlg-calm" label="Add-on tabs">
+    <form noValidate onSubmit={(e) => { e.preventDefault(); save(); }}>
+      <div class="dlg-head"><h2>Add-on tabs</h2><span class="muted">Pin a local app such as a test dashboard.</span></div>
+      <div class="dlg-body">
+        <label class="field"><span>Add-on</span><select value={draft.id} disabled={busy} onChange={(e) => {
+          setDraft(loaded.addons.find((a) => a.id === e.currentTarget.value) ?? blank()); setError("");
+        }}><option value="">New add-on</option>{loaded.addons.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}</select></label>
+        <label class="field"><span>Name</span><input autoFocus name="addon-name" value={draft.name} disabled={busy}
+          aria-describedby={error ? "addon-error" : undefined} onInput={(e) => change({ name: e.currentTarget.value })} /></label>
+        <label class="field"><span>Address</span><input name="addon-url" value={draft.url} disabled={busy} placeholder="http://localhost:5173/"
+          aria-describedby={error ? "addon-error" : undefined} onInput={(e) => change({ url: e.currentTarget.value })} /></label>
+        <label class="field"><span>Icon</span><select name="addon-icon" value={draft.icon} disabled={busy}
+          onChange={(e) => change({ icon: e.currentTarget.value })}>{iconNames().map((n) => <option key={n} value={n}>{n}</option>)}</select></label>
+        <fieldset disabled={busy}><legend>Agents it may message</legend>{agentNames.map((name) => <label class="check-row" key={name}>
+          <input type="checkbox" checked={draft.agents.includes(name)} onChange={(e) => change({ agents: e.currentTarget.checked
+            ? [...draft.agents, name] : draft.agents.filter((n) => n !== name) })} /> {name}{!agents.value.some((a) => a.name === name) && " (removed)"}
+        </label>)}{!agentNames.length && <span class="muted">Create a named agent to enable messages.</span>}</fieldset>
+        <p class="muted">Saving reloads this window. Terminal sessions keep running.</p>
+        {error && <p class="form-error" id="addon-error" role="alert">{error}</p>}
+      </div>
+      <div class="dlg-foot">
+        {draft.id && <button type="button" class="btn btn-danger" disabled={busy} onClick={() => save(true)}>Remove</button>}
+        <button type="button" class="btn" disabled={busy} onClick={close}>Cancel</button>
+        <button type="submit" class="btn btn-primary" disabled={busy}>Save</button>
+      </div>
+    </form>
+  </Modal>;
+}
+
 function CacheSettingsDialog() {
   // What the dialog opened with: only fields edited here are sent, so a change another window
   // saved meanwhile to a field left alone is never reverted.

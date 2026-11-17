@@ -221,7 +221,7 @@ export interface TimelineEvent {
 }
 
 /** Where a message chain started (docs/MCP.md "Agents"). */
-export type Origin = "human" | "schedule" | "webhook";
+export type Origin = "human" | "schedule" | "webhook" | `addon:${string}`;
 
 /** A named agent (`agent.list`, `agent_upserted`; src/agents.rs `agent_json`). */
 /** Where an agent's model runs (src/openrouter.rs): the CLI's own login, or OpenRouter (pay per
@@ -710,6 +710,7 @@ export interface Question {
 }
 
 export type ServerEvent =
+  | { event: "addons_changed"; data: Record<string, never> }
   | { event: "panel_upserted"; data: Panel }
   | { event: "panel_removed"; data: { id: number } }
   | { event: "note_upserted"; data: Note }
@@ -776,6 +777,8 @@ export interface WindowPrefs {
 }
 
 export interface HelloResult {
+  addons?: import("./addons.ts").Addon[];
+  addon_revision?: string;
   metrics_enabled?: boolean;
   panels?: Panel[];
   panel_origin?: string;

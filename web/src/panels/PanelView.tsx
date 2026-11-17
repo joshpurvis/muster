@@ -1,5 +1,7 @@
 // Panel apps live in one layer per window, positioned over their tab's slot in the layout
 // (placement.ts). A web preview is drawn by WebPreview.tsx instead of the sandbox proxy.
+import { addons } from "../addons.ts";
+import { AddonView } from "./AddonView.tsx";
 import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
 import { rpc } from "../rpc.ts";
 import { channels, focusedTabId, fullscreen, helloEpoch, meta, sessions, shownAlone, updateLayout, windowPanels } from "../state.ts";
@@ -37,6 +39,7 @@ export function PanelSlot({ id }: { id: number }) {
 export function PanelLayer() {
   return (
     <div class="panel-layer">
+      {addons.value.map((a) => <AddonView key={`addon:${a.id}`} addon={a} />)}
       {windowPanels.value.map((p) => p.app === "web_preview" ? <WebPreview key={p.id} panel={p} /> : <PanelView key={p.id} panel={p} />)}
     </div>
   );

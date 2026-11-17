@@ -1,6 +1,9 @@
 // User-facing actions. Components and the command table call these; they talk to the daemon and
 // update local state (the window's layout of groups, prefs, windows).
 
+import { addons } from "./addons.ts";
+import { leaveWithDrafts } from "./leave.ts";
+import { addonTab, isPinnedTab } from "./layout/tree.ts";
 import { batch, signal } from "@preact/signals";
 import { connStatus, rpc } from "./rpc.ts";
 import {
@@ -499,6 +502,17 @@ export function hideQuestionsTab() {
   focusActiveTerminalSoon();
 }
 
+export function showAddon(id: string, show = true) {
+  if (show && activeChannelId.peek() === null) return toast("info", "Open a channel first to show this add-on tab");
+  const s = channelLayout.peek();
+  if (!s) return;
+  const key = `addon:${id}`, tab = addonTab(id);
+  const { hidden: _, ...pin } = s.pinned?.[key] ?? { tab };
+  channelLayout.value = { ...s, pinned: { ...s.pinned, [key]: { ...pin, ...(show ? {} : { hidden: true as const }) } } };
+  if (show) { exitFullscreen(false); revealSession(tab); }
+  else focusActiveTerminalSoon();
+}
+
 /** Focus is in a text field outside the terminals (an inline rename, a find bar…). */
 function typingElsewhere(): boolean {
   const a = document.activeElement as HTMLElement | null;
@@ -518,6 +532,7 @@ export function focusActiveTerminalSoon() {
         const note = tab === null ? null : noteId(tab);
         if (id !== null) document.querySelector<HTMLIFrameElement>(`iframe[data-panel-id="${id}"]`)?.focus();
         else if (note !== null) document.querySelector<HTMLTextAreaElement>(`textarea[data-note-id="${note}"]`)?.focus();
+        else if (tab !== null && tab < QUESTIONS_TAB) document.querySelector<HTMLIFrameElement>(`iframe[data-addon-tab="${tab}"]`)?.focus();
         else if (tab === QUESTIONS_TAB) document.querySelector<HTMLElement>(".questions-view")?.focus();
       }
     })
@@ -567,9 +582,10 @@ export function toggleFullscreen(tab: SessionId | null = focusedTabId.value) {
   focusGroup(pane.id);
   fullscreen.value = pane.id;
   // A note's editor and the Questions tab keep Esc too (text boxes in them use it).
-  const note = noteId(tab) !== null || tab === QUESTIONS_TAB;
+  const note = noteId(tab) !== null || isPinnedTab(tab);
   const terminal = panelId(tab) === null && !note;
-  toast("info", terminal ? "Fullscreen. Alt+Shift+Z goes back (Esc stays with the terminal)"
+  toast("info", tab < QUESTIONS_TAB ? "Fullscreen. Use the Exit fullscreen button to go back."
+    : terminal ? "Fullscreen. Alt+Shift+Z goes back (Esc stays with the terminal)"
     : note ? "Fullscreen. Alt+Shift+Z goes back" : "Fullscreen. Esc or Alt+Shift+Z goes back", 2500, "fullscreen");
   if (terminal || note) focusActiveTerminalSoon();
   else refocusIfLost();
@@ -609,7 +625,7 @@ export function gotoTabIndex(n: number) {
  * and as the place for channels that have none yet (docs/UI.md "Questions"). */
 function moved(sid: SessionId) {
   const s = channelLayout.peek();
-  if (sid === QUESTIONS_TAB && s) channelLayout.value = rememberPlace(s, sid);
+  if (isPinnedTab(sid) && s) channelLayout.value = rememberPlace(s, sid);
 }
 
 /** Alt+Shift+[ / ]: move the focused tab within its group. */
@@ -888,6 +904,8 @@ export function splitFocused(side: Side, kind: SessionKind = "shell") {
 export function closeTab(sid: SessionId, force = false) {
   // The Questions tab hides (questions stay; the palette shows it again).
   if (sid === QUESTIONS_TAB) return hideQuestionsTab();
+  const addon = addons.value.find((a) => addonTab(a.id) === sid);
+  if (addon) return showAddon(addon.id, false);
   const nid = noteId(sid);
   if (nid !== null) {
     // Closing a note's tab keeps the note (the notes list and Jump reopen it). Unsaved typing
@@ -1342,20 +1360,20 @@ addEventListener("pagehide", () => void flushAllDrafts());
 /** Go ahead with `go` (`what`: "Reload", "Close") unless note typing is neither saved nor kept
  * in this browser (storage full or blocked): then ask first. */
 function leaveUnlessUnsaved(what: string, go: () => void) {
-  const left = unsavedNotes();
-  if (!left.length || persistAllDrafts()) return go();
-  const names = left.map((id) => `“${notes.value.get(id)?.title ?? `Note ${id}`}”`).join(", ");
-  overlay.value = {
-    kind: "confirm",
-    title: "Some note text isn't saved yet",
-    body: [
-      `${names} ${left.length === 1 ? "has" : "have"} typing Muster couldn't save (it isn't reachable) and this browser couldn't keep.`,
-      `${what} now and that typing is lost. Cancel, wait until the note says Saved, then try again.`,
-    ],
-    confirmLabel: `${what} anyway`,
-    danger: true,
-    run: go,
-  };
+  leaveWithDrafts(unsavedNotes(), persistAllDrafts, go, (left) => {
+    const names = left.map((id) => `“${notes.value.get(id)?.title ?? `Note ${id}`}”`).join(", ");
+    overlay.value = {
+      kind: "confirm",
+      title: "Some note text isn't saved yet",
+      body: [
+        `${names} ${left.length === 1 ? "has" : "have"} typing Muster couldn't save (it isn't reachable) and this browser couldn't keep.`,
+        `${what} now and that typing is lost. Cancel, wait until the note says Saved, then try again.`,
+      ],
+      confirmLabel: `${what} anyway`,
+      danger: true,
+      run: go,
+    };
+  });
 }
 
 /** Ctrl+Shift+R: reload this window, which also loads the active UI release. */
@@ -1566,7 +1584,7 @@ export function openChannel(id: number, focus = true) {
  * directories and permission flags stay as they were; restart applies the new channel profile. */
 export async function moveTabToChannel(tab: number, channel: number) {
   // The Questions tab is in whichever channel is shown; it doesn't belong to one.
-  if (tab === QUESTIONS_TAB || tabChannel(tab) === channel) return;
+  if (isPinnedTab(tab) || tabChannel(tab) === channel) return;
   const target = windowChannels.peek().find((c) => c.id === channel);
   if (!target) return toast("error", "That channel is no longer in this window");
   const nid = noteId(tab);

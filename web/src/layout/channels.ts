@@ -1,6 +1,7 @@
 // A window contains independently tiled channels. The split-tree reducers remain unchanged;
 // this envelope owns channel selection and the shared sidebar. Zero is the Notes fallback for
 // old, unassigned notes in a window with no channels (never a backend channel id).
+import { addonTab } from "./tree.ts";
 import {
   allPanes, allSessions, emptyLayout, FIRST_PLACE, findPane, generalPlace, type LayoutState, parseLayout,
   parseTabPlace, placeBeside, placeOf, putAt, QUESTIONS_TAB, reconcile, removeSession, sameGeneralPlace,
@@ -49,6 +50,7 @@ export interface TabHome {
   /** The window's Questions tab: it arrives in a channel at that channel's place
    * (`questionsIn`), else at the window's `questionsAt`, then stays wherever it is moved. */
   questions?: boolean;
+  pinned?: string;
   /** Only keep it where the saved layout has it, never place it anew (loading, before the window
    * knows whether to show it: its group survives the load). */
   kept?: boolean;
@@ -71,6 +73,12 @@ export function drawerHeight(value: number): number {
   return Number.isFinite(value) ? Math.max(140, Math.min(700, value)) : 260;
 }
 
+export interface PinnedPlace {
+  tab: number;
+  hidden?: true;
+  at?: TabPlace;
+  in?: Record<string, TabPlace>;
+}
 export interface WindowLayoutState {
   v: 2;
   active: number | null;
@@ -79,6 +87,7 @@ export interface WindowLayoutState {
   drawers?: Record<string, TerminalDrawerState>;
   /** The Questions tab is hidden in this window (absent: shown). */
   questions?: false;
+  pinned?: Record<string, PinnedPlace>;
   /** Where the Questions tab was in each channel (by channel id), taken when it is moved there and
    * when it leaves; it comes back there in that channel. */
   questionsIn?: Record<string, TabPlace>;
@@ -106,14 +115,20 @@ export function savedChannel(s: WindowLayoutState, tab: number): number | null {
   return null;
 }
 
-function reconcileChannel(s: LayoutState, tabs: TabHome[], questionsAt: TabPlace): LayoutState {
+function reconcileChannel(s: LayoutState, tabs: TabHome[], places: Map<number, TabPlace>): LayoutState {
   const ids = tabs.map((t) => t.id);
   const existing = allSessions(s.root).filter((id) => ids.includes(id));
   // Existing panels/notes keep their places; new ones go beside their opener, when present.
   let next = reconcile(s, [...new Set([...tabs.filter((t) => t.beside == null).map((t) => t.id), ...existing])]);
   for (const t of tabs) if (t.beside != null) next = placeBeside(next, t.id, t.beside);
   // Arriving (another channel was shown, it was hidden, or its group went): at its place.
-  for (const t of tabs) if (t.questions && !existing.includes(t.id)) next = putAt(next, t.id, questionsAt);
+  const arrivals = tabs.filter((t) => (t.questions || t.pinned) && !existing.includes(t.id));
+  const index = (t: TabHome) => {
+    const i = (places.get(t.id) ?? FIRST_PLACE).index;
+    return i < 0 ? Infinity : i;
+  };
+  // Put earlier tabs in first, so inserting another pin cannot displace a restored one.
+  for (const t of arrivals.sort((a, b) => index(a) - index(b))) next = putAt(next, t.id, places.get(t.id) ?? FIRST_PLACE);
   return next;
 }
 
@@ -131,7 +146,7 @@ export function reconcileChannels(s: WindowLayoutState, channels: number[], tabs
   }
   const groups = new Map<number, TabHome[]>(channels.map((id) => [id, []]));
   for (const t of tabs) {
-    if (drawerIds.has(t.id)) continue;
+    if (drawerIds.has(t.id) || (t.pinned && s.pinned?.[t.pinned]?.hidden)) continue;
     const saved = t.channel === null ? savedChannel(s, t.id) : null;
     if (t.kept && (saved === null || !ids.has(saved))) continue;
     const beside = t.beside == null ? null : tabs.find((x) => x.id === t.beside)?.channel;
@@ -140,39 +155,46 @@ export function reconcileChannels(s: WindowLayoutState, channels: number[], tabs
     if (!groups.has(channel)) groups.set(channel, []);
     groups.get(channel)!.push(t);
   }
-  // A channel where Questions was never put anywhere: where it was last put in any channel.
-  const fallback = s.questionsAt ? generalPlace(s.questionsAt) : FIRST_PLACE;
-  // A channel where it was put keeps its own place (only channels still here). Leaving it (another
-  // channel shown, or hidden) records where it was there: a resize or the tabs around it may have
-  // changed since it was moved. So does leaving one where it is no longer where the window-wide
-  // place puts it in that channel's groups (resized there, say), so it isn't moved back.
-  const questionsIn: Record<string, TabPlace> = {};
-  for (const [id, at] of Object.entries(s.questionsIn ?? {})) if (groups.has(Number(id))) questionsIn[id] = at;
-  for (const [id, l] of Object.entries(s.layouts)) {
-    if (!groups.has(Number(id)) || groups.get(Number(id))!.some((t) => t.id === QUESTIONS_TAB)) continue;
-    const at = placeOf(l, QUESTIONS_TAB);
-    const given = at && !questionsIn[id] ? arrivedAt(l, fallback) : null;
-    if (at && (questionsIn[id] || !given || !sameGeneralPlace(at, given))) questionsIn[id] = at;
+  // Questions retains its old saved fields. All pinned tabs use the same placement rules.
+  const pins: Record<string, PinnedPlace> = { ...s.pinned,
+    questions: { tab: QUESTIONS_TAB, at: s.questionsAt, in: s.questionsIn } };
+  for (const t of tabs) if (t.pinned && !pins[t.pinned]) pins[t.pinned] = { tab: t.id };
+  for (const [key, pin] of Object.entries(pins)) {
+    const fallback = pin.at ? generalPlace(pin.at) : pin.tab === QUESTIONS_TAB ? FIRST_PLACE : { group: 0, index: -1 };
+    const within: Record<string, TabPlace> = {};
+    for (const [id, at] of Object.entries(pin.in ?? {})) if (groups.has(Number(id))) within[id] = at;
+    for (const [id, l] of Object.entries(s.layouts)) {
+      if (!groups.has(Number(id)) || groups.get(Number(id))!.some((t) => t.id === pin.tab)) continue;
+      const at = placeOf(l, pin.tab);
+      const given = at && !within[id] ? arrivedAt(l, fallback, pin.tab) : null;
+      if (at && (within[id] || !given || !sameGeneralPlace(at, given))) within[id] = at;
+    }
+    const { in: _, ...rest } = pin;
+    pins[key] = { ...rest, ...(Object.keys(within).length ? { in: within } : {}) };
   }
   const layouts: Record<string, LayoutState> = {};
   for (const [id, items] of groups) {
-    layouts[id] = reconcileChannel(s.layouts[id] ?? emptyLayout(), items, questionsIn[id] ?? fallback);
+    const places = new Map(Object.values(pins).map((p) => [p.tab, p.in?.[id] ?? (p.at ? generalPlace(p.at) : p.tab === QUESTIONS_TAB ? FIRST_PLACE : { group: 0, index: -1 })]));
+    layouts[id] = reconcileChannel(s.layouts[id] ?? emptyLayout(), items.filter((t) => !t.pinned || !pins[t.pinned]?.hidden), places);
   }
+  const { questions, ...pinned } = pins;
+  const questionsIn = questions.in ?? {};
   const active = s.active !== null && Object.hasOwn(layouts, s.active) ? s.active :
     (groups.keys().next().value ?? null);
-  const { questionsIn: _, ...rest } = s;
+  const { questionsIn: _, pinned: _pins, ...rest } = s;
   return {
     ...rest, active, layouts, ...(s.drawers ? { drawers } : {}),
+    ...(Object.keys(pinned).length ? { pinned } : {}),
     ...(Object.keys(questionsIn).length ? { questionsIn } : {}),
   };
 }
 
 /** Where Questions would be in layout `l` if it arrived there now at `place` (its own group, if it
  * has one there, closes first, as it does when it leaves). */
-function arrivedAt(l: LayoutState, place: TabPlace): TabPlace | null {
-  const away = removeSession(l, QUESTIONS_TAB);
-  const back = reconcile(away, [...allSessions(away.root), QUESTIONS_TAB]);
-  return placeOf(putAt(back, QUESTIONS_TAB, place), QUESTIONS_TAB);
+function arrivedAt(l: LayoutState, place: TabPlace, tab = QUESTIONS_TAB): TabPlace | null {
+  const away = removeSession(l, tab);
+  const back = reconcile(away, [...allSessions(away.root), tab]);
+  return placeOf(putAt(back, tab, place), tab);
 }
 
 /** Read v2, or partition a legacy window tree without merging tasks with the same folder. */
@@ -207,8 +229,23 @@ export function loadChannelLayout(raw: unknown, channels: number[], tabs: TabHom
         if (at) questionsIn[key] = at;
       }
     }
+    const pinned: Record<string, PinnedPlace> = {};
+    if (obj.pinned && typeof obj.pinned === "object") for (const [key, value] of Object.entries(obj.pinned)) {
+      if (!/^addon:[a-z0-9][a-z0-9-]{0,39}$/.test(key) || !value || typeof value !== "object") continue;
+      const p = value as PinnedPlace;
+      const tab = addonTab(key.slice(6));
+      const at = parseTabPlace(p.at);
+      const within: Record<string, TabPlace> = {};
+      if (p.in && typeof p.in === "object") for (const [channel, raw] of Object.entries(p.in)) {
+        const place = /^\d+$/.test(channel) && Number.isSafeInteger(Number(channel)) ? parseTabPlace(raw) : null;
+        if (place) within[channel] = place;
+      }
+      pinned[key] = { tab, ...(p.hidden === true ? { hidden: true } : {}),
+        ...(at ? { at: generalPlace(at) } : {}), ...(Object.keys(within).length ? { in: within } : {}) };
+    }
     return reconcileChannels({
       v: 2,
+      ...(Object.keys(pinned).length ? { pinned } : {}),
       active: typeof obj.active === "number" && Number.isSafeInteger(obj.active) ? obj.active : null,
       layouts,
       ...(obj.drawers ? { drawers } : {}),
@@ -256,6 +293,12 @@ export function rememberPlace(s: WindowLayoutState, tab: number): WindowLayoutSt
   const l = s.active === null ? undefined : s.layouts[s.active];
   const at = l ? placeOf(l, tab) : null;
   if (!at || s.active === null) return s;
+  if (tab !== QUESTIONS_TAB) {
+    const entry = Object.entries(s.pinned ?? {}).find(([, p]) => p.tab === tab);
+    if (!entry) return s;
+    const [key, pin] = entry;
+    return { ...s, pinned: { ...s.pinned, [key]: { ...pin, in: { ...pin.in, [s.active]: at }, at: generalPlace(at) } } };
+  }
   const next = { ...s, questionsIn: { ...s.questionsIn, [s.active]: at }, questionsAt: generalPlace(at) };
   return JSON.stringify(next) === JSON.stringify(s) ? s : next;
 }

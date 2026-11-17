@@ -45,19 +45,21 @@ use crate::store::Store;
 
 /// Where a message chain started. Claude agents accept `human` only by default (PLAN.md §10).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(try_from = "String", into = "String")]
 pub enum Origin {
     Human,
     Schedule,
     Webhook,
+    Addon(crate::addon::Identity),
 }
 
 impl Origin {
-    pub fn as_str(self) -> &'static str {
+    pub fn as_str(&self) -> &str {
         match self {
             Origin::Human => "human",
             Origin::Schedule => "schedule",
             Origin::Webhook => "webhook",
+            Origin::Addon(id) => id.as_str(),
         }
     }
     pub fn parse(s: &str) -> Option<Origin> {
@@ -65,9 +67,14 @@ impl Origin {
             "human" => Some(Origin::Human),
             "schedule" => Some(Origin::Schedule),
             "webhook" => Some(Origin::Webhook),
-            _ => None,
+            other => crate::addon::Identity::parse(other).map(Origin::Addon),
         }
     }
+}
+impl From<Origin> for String { fn from(o: Origin) -> Self { o.as_str().into() } }
+impl TryFrom<String> for Origin {
+    type Error = String;
+    fn try_from(s: String) -> Result<Self, Self::Error> { Self::parse(&s).ok_or_else(|| "Unknown message origin".into()) }
 }
 
 /// Default accepted origins: Claude agents take human-started work only (Anthropic's consumer
@@ -89,10 +96,7 @@ pub fn parse_accepts(s: &str) -> anyhow::Result<Vec<Origin>> {
             out.push(o);
         }
     }
-    if out.is_empty() {
-        anyhow::bail!("accepts needs at least one origin (human, schedule, webhook)");
-    }
-    Ok(out)
+    clean_accepts(out)
 }
 
 /// Identity stays in the agent home; this selects the project it works in.
@@ -947,6 +951,8 @@ impl Registry {
             ..Default::default()
         };
         for mut b in store.load_agents()? {
+            // Old settings may contain per-message add-on grants. They never persist as policy.
+            b.accepts_origins.retain(setting_origin);
             // A Codex thread this backend didn't confirm (an older backend saved every notify's,
             // title requests and sub-agents included, and after a downgrade may have replaced
             // it) is never resumed: the agent's next start is a new conversation.
@@ -1012,6 +1018,7 @@ impl Registry {
     }
 
     fn insert(&self, store: &Store, mut b: Agent) -> anyhow::Result<Agent> {
+        b.accepts_origins = clean_accepts(b.accepts_origins)?;
         let mut g = self.inner.lock();
         if g.agents.values().any(|x| x.name.eq_ignore_ascii_case(&b.name)) {
             anyhow::bail!("an agent named {} already exists", b.name);
@@ -1051,7 +1058,7 @@ impl Registry {
         a.effort = next.effort.clone();
         a.persona = next.persona.clone();
         a.permissions = next.permissions;
-        a.accepts_origins = next.accepts_origins.clone();
+        a.accepts_origins = clean_accepts(next.accepts_origins.clone())?;
         a.autostart = next.autostart;
         a.provider = next.provider;
         a.sleep_after_min = next.sleep_after_min;
@@ -1375,10 +1382,16 @@ pub fn publish_message(hub: &Hub, id: i64) {
     }
 }
 
+/// Only these origins can be granted by persistent agent settings.
+fn setting_origin(o: &Origin) -> bool {
+    matches!(o, Origin::Human | Origin::Schedule | Origin::Webhook)
+}
+
 /// `accepts` deduplicated, in order; at least one.
 fn clean_accepts(a: Vec<Origin>) -> anyhow::Result<Vec<Origin>> {
     let mut out: Vec<Origin> = Vec::new();
     for o in a {
+        anyhow::ensure!(setting_origin(&o), "accepts allows only human, schedule or webhook; add-on access is granted in Add-on tabs");
         if !out.contains(&o) {
             out.push(o);
         }
@@ -3542,6 +3555,37 @@ mod tests {
     }
 
     #[test]
+    fn addon_delivery_record_keeps_sender_origin_and_hop() {
+        let mut a = agent(SessionKind::Shell);
+        a.name = "alpha".into();
+        let origin = Origin::parse("addon:counter").unwrap();
+        a.accepts_origins.push(origin);
+        let route = route(&a, None, Some(origin), 0).unwrap();
+        let m = message_record(&a, "addon:counter", None, route, "hello");
+        assert_eq!((m.from.as_str(), m.origin.as_str(), m.hop), ("addon:counter", "addon:counter", 0));
+        assert_eq!(envelope(1, &m.from, m.origin, m.hop), "[muster msg 1 from addon:counter origin=addon:counter hop=0]");
+        let store = Store::open_memory().unwrap();
+        let id = store.insert_agent_message(&m).unwrap();
+        let stored = store.agent_message(id).unwrap().unwrap();
+        assert_eq!((stored.origin, stored.hop), (origin, 0));
+        let mut prov = route.prov(Some(id));
+        prov.hop = guard::MAX_AGENT_HOPS;
+        assert!(super::route(&a, Some(prov), None, 0).is_err());
+    }
+
+    #[test]
+    fn addon_grants_are_removed_from_legacy_agent_settings_on_load() {
+        let store = Store::open_memory().unwrap();
+        let mut a = agent(SessionKind::Claude);
+        a.name = "alpha".into();
+        a.accepts_origins.push(Origin::parse("addon:counter").unwrap());
+        store.insert_agent(&a).unwrap();
+        let reg = Registry::load(&store).unwrap();
+        assert_eq!(reg.get("alpha").unwrap().accepts_origins, vec![Origin::Human]);
+        assert!(reg.insert(&store, a).unwrap_err().to_string().contains("accepts allows only"));
+    }
+
+    #[test]
     fn envelope_round_trip() {
         let e = envelope(17, "scout", Origin::Schedule, 2);
         assert_eq!(e, "[muster msg 17 from scout origin=schedule hop=2]");
@@ -3842,6 +3886,9 @@ mod tests {
         assert_eq!(persona_file(SessionKind::Codex), "AGENTS.md");
         assert_eq!(parse_accepts("human, schedule,human").unwrap(), vec![Origin::Human, Origin::Schedule]);
         assert!(parse_accepts("cron").is_err());
+        assert!(parse_accepts("human,addon:counter").is_err());
+        assert!(parse_accepts("ADDON:COUNTER").is_err());
+        assert!(clean_accepts(vec![Origin::Human, Origin::parse("addon:counter").unwrap()]).is_err());
         assert!(parse_accepts("").is_err());
     }
 

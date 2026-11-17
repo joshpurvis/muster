@@ -42,6 +42,7 @@ function moreMenu(): MenuItem[] {
       })),
     },
     { label: sidebarHidden.value ? "Show sidebar" : "Hide sidebar", keys: "Alt+G", run: () => A.toggleSidebar() },
+    { label: "Add-on tabs…", run: () => (overlay.value = { kind: "addons" }) },
     { label: "Status line", checked: p.statusLine, run: () => A.toggleStatusLine() },
     ...(accountProfilesSupported.value
       ? [{ label: "Claude profiles…", run: () => (overlay.value = { kind: "account_profiles" }) }]

@@ -35,6 +35,7 @@ use crate::worktree;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", content = "data", rename_all = "snake_case")]
 pub enum ServerEvent {
+    AddonsChanged {},
     PanelUpserted(Panel),
     PanelRemoved { id: PanelId },
     /// A note was created or changed (text, title, window), with its full text.
@@ -473,6 +474,7 @@ pub fn spawn_input_interruptions(hub: &Arc<Hub>) -> anyhow::Result<()> {
 pub struct Hub {
     pub metrics: Arc<crate::metrics::Metrics>,
     pub panels: crate::panels::Panels,
+    pub addons: crate::addon::Registry,
     pub notes: crate::notes::Notes,
     /// Schedules and their runs (src/schedules/).
     pub schedules: crate::schedules::Schedules,
@@ -699,6 +701,7 @@ impl Hub {
             match prov.origin {
                 crate::agents::Origin::Schedule => "a scheduled message",
                 crate::agents::Origin::Webhook => "a webhook message",
+                crate::agents::Origin::Addon(_) => "an add-on message",
                 crate::agents::Origin::Human => "a message",
             }
         };
@@ -930,9 +933,15 @@ impl Hub {
         let injection = crate::inject::Queues::load(&store)?;
         let (tx, _) = broadcast::channel(EVENT_BUS_CAP);
         let spend = crate::spend::Spend::load(&store, cfg.openrouter_key.as_ref());
+        #[cfg(not(test))]
+        let addon_path = paths::data_dir().join("addons.json");
+        #[cfg(test)]
+        let addon_path = paths::data_dir().join(format!("addons-{}.json", rand::random::<u64>()));
+        let addons = crate::addon::Registry::load(addon_path)?;
         let hub = Arc::new_cyclic(|weak| Hub {
             metrics: Arc::default(),
             panels: crate::panels::Panels::default(),
+            addons,
             notes: crate::notes::Notes::default(),
             schedules,
             triggers: Default::default(),

@@ -218,7 +218,8 @@ const NOT_BUILT: &str = r#"<!doctype html><html><head><meta charset="utf-8"><tit
 /// frontend, and an unchanged one costs a 304.
 fn file(source: &Source, path: &str, req: &HeaderMap) -> Option<Response> {
     let (data, etag) = source.read(path)?;
-    let fresh = req
+    // Desktop HTML carries a per-load frame policy. Never reuse a body with an older policy.
+    let fresh = !(path.ends_with(".html") && !path.starts_with("m/")) && req
         .get(header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.split(',').any(|t| t.trim() == etag));
@@ -305,7 +306,44 @@ fn mobile(source: &Source, path: &str, req: &HeaderMap) -> Response {
     r
 }
 
-pub async fn serve(uri: Uri, req: HeaderMap) -> Response {
+/// Every HTML response gets the current registry, even when its asset ETag is unchanged.
+pub async fn serve(axum::extract::Extension(hub): axum::extract::Extension<std::sync::Arc<crate::hub::Hub>>, uri: Uri, req: HeaderMap) -> Response {
+    let desktop = uri.path() != "/m" && !uri.path().starts_with("/m/");
+    let r = serve_content(uri, req).await;
+    if desktop { desktop_headers(r, crate::panels::own_ports(&hub), &hub.addons.list(&crate::panels::own_ports(&hub))).await } else { r }
+}
+
+async fn desktop_headers(mut r: Response, ports: [u16; 2], addons: &[crate::addon::Addon]) -> Response {
+    if r.headers().get(header::CONTENT_TYPE).is_some_and(|v| v.as_bytes().starts_with(b"text/html")) {
+        let csp = desktop_csp(ports, addons);
+        // Exactly the policy sent in this response, not a later hello's registry or panel port.
+        // Its values are generated from the loopback parser, never from raw add-on fields.
+        let meta = format!("<meta name=\"muster-frame-policy\" content=\"{csp}\">");
+        let (mut parts, body) = r.into_parts();
+        let Ok(bytes) = axum::body::to_bytes(body, usize::MAX).await else { return StatusCode::INTERNAL_SERVER_ERROR.into_response() };
+        let html = String::from_utf8_lossy(&bytes).replacen("</head>", &format!("{meta}</head>"), 1);
+        parts.headers.remove(header::CONTENT_LENGTH);
+        parts.headers.remove(header::ETAG);
+        parts.headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        r = Response::from_parts(parts, axum::body::Body::from(html));
+        r.headers_mut().insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_str(&csp).unwrap());
+        r.headers_mut().insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    }
+    r
+}
+
+fn desktop_csp(ports: [u16; 2], addons: &[crate::addon::Addon]) -> String {
+    let mut sources = vec!["about:".to_string(), format!("http://127.0.0.1:{}/proxy", ports[1]), format!("http://127.0.0.1:{}/preview", ports[1])];
+    for a in addons {
+        if let Ok(t) = crate::web_preview::parse(&a.url, &ports) {
+            let origin = t.frame_src();
+            if !sources.contains(&origin) { sources.push(origin); }
+        }
+    }
+    format!("frame-ancestors 'none'; frame-src {}", sources.join(" "))
+}
+
+async fn serve_content(uri: Uri, req: HeaderMap) -> Response {
     if let Some((mobile, release, asset)) = release_asset(uri.path()) {
         let root = crate::paths::data_dir().join("ui/releases");
         let selected = root.join(release);
@@ -389,6 +427,46 @@ fn serve_from(source: &Source, uri: Uri, req: HeaderMap) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn addon_page_snapshots_its_frame_policy_and_cannot_use_an_old_etag() {
+        let source = Source::Embedded;
+        let mut req = HeaderMap::new();
+        if let Some((_, etag)) = source.read("index.html") {
+            req.insert(header::IF_NONE_MATCH, HeaderValue::from_str(&etag).unwrap());
+            assert_eq!(file(&source, "index.html", &req).unwrap().status(), StatusCode::OK);
+        }
+        let r = axum::response::Html("<html><head></head><body></body></html>").into_response();
+        let r = desktop_headers(r, [7433, 7434], &[]).await;
+        let csp = r.headers()[header::CONTENT_SECURITY_POLICY].to_str().unwrap().to_string();
+        assert_eq!(r.headers()[header::CACHE_CONTROL], "no-store");
+        let body = axum::body::to_bytes(r.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8(body.to_vec()).unwrap().contains(&format!("<meta name=\"muster-frame-policy\" content=\"{csp}\">")));
+    }
+
+    #[tokio::test]
+    async fn addon_html_headers_refresh_even_for_not_modified() {
+        for status in [StatusCode::OK, StatusCode::NOT_MODIFIED] {
+            let r = (status, [(header::CONTENT_TYPE, "text/html")], "").into_response();
+            let a = crate::addon::Addon { id: "counter".into(), name: "Counter".into(), url: "http://localhost:5173/".into(), icon: "globe".into(), agents: vec![] };
+            let r = desktop_headers(r, [7433, 7434], &[a]).await;
+            assert_eq!(r.headers()[header::X_FRAME_OPTIONS], "DENY");
+            assert!(r.headers()[header::CONTENT_SECURITY_POLICY].to_str().unwrap().ends_with("http://localhost:5173"));
+            let r = desktop_headers(r, [7433, 7434], &[]).await;
+            assert!(!r.headers()[header::CONTENT_SECURITY_POLICY].to_str().unwrap().contains("5173"));
+        }
+        let script = ([(header::CONTENT_TYPE, "application/javascript")], "").into_response();
+        assert!(desktop_headers(script, [7433, 7434], &[]).await.headers().get(header::CONTENT_SECURITY_POLICY).is_none());
+    }
+
+    #[test]
+    fn addon_desktop_csp_names_only_panel_pages_and_registered_origins() {
+        let addon = |url: &str| crate::addon::Addon { id: "counter".into(), name: "Counter".into(), url: url.into(), icon: "globe".into(), agents: vec![] };
+        assert_eq!(desktop_csp([7433, 7434], &[]), "frame-ancestors 'none'; frame-src about: http://127.0.0.1:7434/proxy http://127.0.0.1:7434/preview");
+        let csp = desktop_csp([7433, 7434], &[addon("http://localhost:5173/a"), addon("http://localhost:5173/b"), addon("http://127.0.0.1:7433"), addon("https://elsewhere.test")]);
+        assert_eq!(csp, "frame-ancestors 'none'; frame-src about: http://127.0.0.1:7434/proxy http://127.0.0.1:7434/preview http://localhost:5173");
+        assert!(!MOBILE_CSP.contains("5173"));
+    }
 
     #[tokio::test]
     async fn external_release_switches_atomically_and_stays_within_its_root() {

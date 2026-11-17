@@ -537,6 +537,13 @@ after the restart. The banner is hidden while a dialog is open, and has its own 
 region (apart from the toasts' status region) that announces each update once. `×` dismisses that update (per viewer, in localStorage) until a different one
 of the same kind arrives; the next waiting update shows meanwhile.
 
+If a backend restart changes the panel-server origin, this slot instead shows “Muster's backend
+restarted. Reload this window to show panels and previews again.” Its **Reload window** button calls
+the same action as Ctrl+Shift+R, including the unsaved-note guard. The window never reloads automatically
+on reconnect, so Questions answers and Memory edits stay in place. This banner is hidden while a dialog
+is open or Muster is stopping or restarting, and disappears if the origin returns to the one the page
+loaded with; otherwise it stays until the user reloads.
+
 ### Window and shutdown
 - **Reload window** (Ctrl+Shift+R, palette, `⋯`): saves a pending layout change, then reloads.
   Plain Ctrl+R stays with the terminal.
@@ -995,3 +1002,18 @@ a new conversation**. Saving affects the next start only: a currently running
 agent continues in its existing directory. Restarting that agent applies the new
 location, without restarting other sessions. The dialog displays its current
 working directory; resetting a conversation never deletes memory.
+
+## Add-on tabs
+
+Pin a local app such as a test dashboard in the desktop window. Open **Add-on tabs…** from the
+command palette or window settings menu, enter a name and loopback address, choose an icon and tick
+the named agents it may message. **Save** reloads the window; terminal sessions keep running.
+
+Each add-on remembers its place in each channel. Its tab menu's **Hide** removes it from this window;
+**Show Counter** in the palette restores the demo. Moving or hiding it keeps its page running.
+Its badge is separate from “needs you”. The phone page is unchanged.
+
+An add-on can post a title and badge, open a bounded number of HTTPS links, and send short messages
+to its ticked agents. It cannot read sessions, notes, questions or credentials through the bridge.
+Registration and changes require the window, like answering Questions. See [Add-on tabs](ADDONS.md)
+for the message protocol, origin checks, limits and Counter demo.

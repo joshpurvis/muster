@@ -36,10 +36,9 @@ export function panelOriginUrl(): string {
 
 /** Keep panel `id`'s view over its slot. `frame` is its iframe: focus inside a frame being
  * hidden would fall to <body>, so it goes to the tab that took its place. */
-export function usePanelPlacement(id: number, frame: { current: HTMLIFrameElement | null }) {
+export function usePanelPlacement(id: number, frame: { current: HTMLIFrameElement | null }, tab = panelTab(id), onVisible?: (show: boolean) => void) {
   const ref = useRef<HTMLDivElement>(null);
   const visible = useRef(false);
-  const tab = panelTab(id);
   const l = layout.value;
   const pane = l ? paneOfSession(l.root, tab) : null;
   const paneId = useRef<string | null>(null);
@@ -78,6 +77,7 @@ export function usePanelPlacement(id: number, frame: { current: HTMLIFrameElemen
       delete host.dataset.placed;
       if (focused) focusActiveTerminalSoon();
     }
+    if (visible.current !== show) onVisible?.(show);
     visible.current = show;
   };
 

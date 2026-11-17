@@ -1,0 +1,15 @@
+[
+  "docs/ADDONS.md",
+  "src/addon.rs",
+  "web/dev/addon_files.json",
+  "web/dev/addon_lint.sh",
+  "web/dev/addon_lint_test.ts",
+  "web/dev/counter.html",
+  "web/dev/e2e_addons.ts",
+  "web/src/addons.ts",
+  "web/src/addons_test.ts",
+  "web/src/frame_policy.ts",
+  "web/src/frame_policy_test.ts",
+  "web/src/layout/addons_test.ts",
+  "web/src/panels/AddonView.tsx"
+]

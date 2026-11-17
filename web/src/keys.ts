@@ -144,6 +144,7 @@ function onOff(on: boolean, onText: string, offText: string) {
 }
 
 export const commands: Command[] = [
+  { id: "addons", title: "Add-on tabs…", group: "Window", run: () => (overlay.value = { kind: "addons" }) },
   // Navigation
   {
     id: "jump",

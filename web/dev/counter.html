@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Counter</title>
+    <style>
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-content: center;
+      gap: 24px;
+      text-align: center;
+      background: var(--bg-1, #141417);
+      color: var(--text, #e4e4e8);
+      font: 16px var(--font-ui, system-ui);
+    }
+    h1 {
+      margin: 0;
+      font-size: 20px;
+      font-weight: 500;
+    }
+    output {
+      display: block;
+      font: 64px var(--font-mono, monospace);
+    }
+    div {
+      display: flex;
+      gap: 16px;
+      justify-content: center;
+    }
+    button {
+      width: 56px;
+      height: 44px;
+      border: 1px solid var(--border, #34343d);
+      border-radius: 6px;
+      background: var(--bg-2, #19191d);
+      color: inherit;
+      font-size: 24px;
+      cursor: pointer;
+    }
+    button:focus-visible {
+      outline: 2px solid var(--accent, #8b7cf6);
+      outline-offset: 3px;
+    }
+    </style>
+  </head>
+  <body>
+  <h1>Counter</h1><output aria-live="polite">0</output>
+  <div><button id="minus" aria-label="Decrease">−</button><button id="plus" aria-label="Increase">+</button></div>
+  <script>
+    const origin = "__MUSTER_ORIGIN__";
+    let count = 0;
+    const post = () => window.parent.postMessage({ muster: 1, type: "badge", count }, origin);
+    function change(by) { count = Math.max(0, Math.min(999, count + by)); document.querySelector("output").textContent = count; post(); }
+    document.querySelector("#plus").onclick = () => change(1);
+    document.querySelector("#minus").onclick = () => change(-1);
+    addEventListener("message", (event) => {
+      if (event.source !== window.parent || event.origin !== origin || event.data?.muster !== 1) return;
+      if (event.data.type === "theme") {
+        document.documentElement.style.colorScheme = event.data.mode;
+        const tokens = ["--bg-0", "--bg-1", "--bg-2", "--border", "--text", "--text-muted", "--accent", "--font-ui", "--font-mono"];
+        for (const key of tokens) if (typeof event.data.tokens?.[key] === "string") document.documentElement.style.setProperty(key, event.data.tokens[key]);
+      }
+    });
+    post();
+  </script>
+  </body>
+</html>

@@ -5110,6 +5110,7 @@ body.dragging .panel-view { pointer-events: none; }
 
 /* ---------- notes (docs/UI.md "Notes") ---------- */
 .note-view {
+  position: relative;
   flex: 1;
   min-height: 0;
   display: flex;
@@ -5146,6 +5147,18 @@ body.dragging .panel-view { pointer-events: none; }
 }
 .note-text::selection { background: var(--term-selection); }
 .note-text::placeholder { color: var(--text-faint); }
+.note-text.on-link { cursor: pointer; }
+/* The link under the pointer while Ctrl (⌘) is down, underlined over the textarea's own text. */
+.note-link-lines {
+  position: absolute;
+  overflow: hidden;
+  pointer-events: none;
+}
+.note-link-lines > div {
+  position: absolute;
+  height: 1px;
+  background: var(--accent-strong);
+}
 .note-merge {
   flex: none;
   padding: 6px 14px;
@@ -5174,6 +5187,7 @@ body.dragging .panel-view { pointer-events: none; }
 .note-state.busy { color: var(--accent-strong); }
 .note-state.err { color: var(--st-error); }
 .note-by { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.note-link-hint { overflow: hidden; text-overflow: ellipsis; min-width: 0; color: var(--text-muted); }
 .note-spacer { flex: 1; }
 @container (max-width: 420px) {
   .note-size { display: none; }

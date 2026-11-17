@@ -134,3 +134,61 @@ function gone(d: LinkDeps, text: string): false {
   d.notify(text);
   return false;
 }
+
+/** A link in a note's text (docs/UI.md "Notes"): `[start, end)` offsets into the text. `web` is an
+ * http or https address, opened in the browser; `muster` an address above, shown in Muster. */
+export interface TextLink {
+  start: number;
+  end: number;
+  uri: string;
+  kind: "web" | "muster";
+}
+
+/** A web address runs from `http://` or `https://` to a space or a character no address holds
+ * unescaped (`<>"` and backtick). Not glued to a word before it (`xhttp://` is none). */
+const WEB_IN_TEXT = /https?:\/\/[^\s<>"`]+/gi;
+
+/** Characters that end a sentence or a quote rather than an address: `see https://a.org/x.`
+ * is a link to `https://a.org/x`. */
+const TRAILING = /[.,;:!?'*_~]$/;
+const CLOSE: Record<string, string> = { ")": "(", "]": "[", "}": "{" };
+
+/** Trim what follows an address in prose: sentence ends, quotes, and a closing bracket the address
+ * didn't open (`(https://a.org/x)` and the Markdown `[t](https://a.org/x)` end before the `)`;
+ * `https://en.wikipedia.org/wiki/Rust_(language)` keeps its own). */
+function trimAddress(s: string): string {
+  for (;;) {
+    const last = s[s.length - 1];
+    if (TRAILING.test(s)) s = s.slice(0, -1);
+    else if (last in CLOSE && count(s, last) > count(s, CLOSE[last])) s = s.slice(0, -1);
+    else return s;
+  }
+}
+
+function count(s: string, ch: string): number {
+  let n = 0;
+  for (const c of s) if (c === ch) n++;
+  return n;
+}
+
+/** Every link in `text`, in order: web addresses (http, https) and Muster addresses. Nothing else
+ * (`file://`, `ftp://`, `javascript:`) is a link. A Muster address inside a web address is part of
+ * that address, not a link of its own. */
+export function findTextLinks(text: string): TextLink[] {
+  const out: TextLink[] = [];
+  if (!text.includes("://")) return out;
+  for (const m of text.matchAll(WEB_IN_TEXT)) {
+    const start = m.index ?? 0;
+    if (start > 0 && /[A-Za-z0-9_]/.test(text[start - 1])) continue;
+    const uri = trimAddress(m[0]);
+    // A host must follow the slashes: `https://` alone, or `https://.`, is none.
+    if (!/^https?:\/\/[^/?#]/i.test(uri)) continue;
+    out.push({ start, end: start + uri.length, uri, kind: "web" });
+  }
+  const web = out.slice();
+  for (const l of findMusterLinks(text)) {
+    if (web.some((w) => l.start < w.end && l.end > w.start)) continue;
+    out.push({ ...l, kind: "muster" });
+  }
+  return out.sort((a, b) => a.start - b.start);
+}

@@ -2,6 +2,7 @@
 // update local state (the window's layout of groups, prefs, windows).
 
 import { addons } from "./addons.ts";
+import { followLink, type MusterLink } from "./links.ts";
 import { leaveWithDrafts } from "./leave.ts";
 import { addonTab, isPinnedTab } from "./layout/tree.ts";
 import { batch, signal } from "@preact/signals";
@@ -395,6 +396,25 @@ export async function gotoNote(id: number, group?: string, beside?: SessionId, r
     }
   }
   revealSession(tab);
+}
+
+/** Show what Muster link `link` names (links.ts), or say in a short message that it is gone. From
+ * a terminal, `beside` is its session: a closed note opens beside it. A thing in another window
+ * comes to this one (raising that window, as Jump may, would show whatever is selected there). */
+export function showLink(link: MusterLink, beside?: SessionId): boolean {
+  return followLink(link, {
+    hasNote: (id) => notes.value.has(id),
+    hasPanel: (id) => panels.value.get(id)?.closed === false,
+    hasSession: (id) => sessions.value.has(id),
+    agent: (name) => {
+      const a = agents.value.find((x) => x.name.toLowerCase() === name.toLowerCase());
+      return a ? { name: a.name, session: a.session_id } : null;
+    },
+    gotoNote: (id) => void gotoNote(id, undefined, beside, false),
+    gotoPanel: (id) => void gotoPanel(id, false),
+    gotoSession: (id) => void gotoSession(id, false),
+    notify: (text) => toast("info", text, 5000),
+  });
 }
 
 /** New note, as a tab of the focused group (or `group`), with the keyboard in it. */

@@ -2,6 +2,8 @@
 // channel layouts and sidebar are owned here and saved with window.set_layout; UI prefs
 // persist to localStorage.
 
+import { addons } from "./addons.ts";
+import { addonTab, isPinnedTab } from "./layout/tree.ts";
 import { batch, computed, effect, signal } from "@preact/signals";
 import type {
   AccountProfile,
@@ -129,7 +131,7 @@ export const windowNotes = computed(() => [...notes.value.values()].filter((n) =
 ));
 export const hereIds = computed(() => new Set([
   ...windowSessions.value.map((s) => s.id), ...windowPanels.value.map((p) => panelTab(p.id)),
-  ...windowNotes.value.map((n) => noteTab(n.id)), ...(questionsShown.value ? [QUESTIONS_TAB] : []),
+  ...windowNotes.value.map((n) => noteTab(n.id)), ...(questionsShown.value ? [QUESTIONS_TAB] : []), ...shownAddons.value.map((a) => addonTab(a.id)),
 ]));
 
 // ---------------- updates, shared window prefs, shutdown ----------------
@@ -474,6 +476,7 @@ export type Overlay =
   | { kind: "shell" }
   /** "Cache warning…": the cold prompt cache bar and each provider's cache lifetime. */
   | { kind: "cache_settings" }
+  | { kind: "addons" }
   /** "Shut down Muster…": stop the backend and terminal host, ending every session. */
   | { kind: "shutdown" }
   /** "Restart Muster…": the same, then start them again (a terminal host update). */
@@ -560,6 +563,8 @@ export const questionsShown = computed(() =>
   questionsSupported.value && channelLayout.value !== null && channelLayout.value.questions !== false &&
   activeChannelId.value !== null
 );
+export const shownAddons = computed(() => channelLayout.value && activeChannelId.value !== null
+  ? addons.value.filter((a) => !channelLayout.value?.pinned?.[`addon:${a.id}`]?.hidden) : []);
 const vacantLayout = emptyLayout();
 /** Existing tile controls operate on the selected channel. */
 export const layout = computed<LayoutState | null>(() => {
@@ -610,6 +615,7 @@ export const windowChannels = computed(() => {
 });
 
 export function tabChannel(tab: number): number | null {
+  if (isPinnedTab(tab)) return activeChannelId.value;
   const sid = sessions.peek().get(tab)?.channel_id;
   const pid = panelId(tab);
   const nid = noteId(tab);
@@ -700,6 +706,7 @@ const liveTabs = computed((): TabHome[] => {
     // In whichever channel is shown (never one archived meanwhile: then the channel that takes
     // its place), arriving at that channel's own place, else where the human last put it.
     ...(questionsShown.value ? [{ id: QUESTIONS_TAB, channel: valid(activeChannelId.value), questions: true }] : []),
+    ...shownAddons.value.map((a) => ({ id: addonTab(a.id), channel: valid(activeChannelId.value), pinned: `addon:${a.id}` })),
   ].filter((t) => !held.value.has(t.id));
 });
 
@@ -751,7 +758,8 @@ effect(() => {
   // own group would close), and drop it again if the window then hides it.
   const tabs = liveTabs.peek();
   const keep = tabs.some((t) => t.questions) ? [] : [{ id: QUESTIONS_TAB, channel: null, questions: true, kept: true }];
-  const stored = loadChannelLayout(w?.layout, windowChannels.peek().map((c) => c.id), [...tabs, ...keep]);
+  const addonKeep = addons.peek().map((a) => ({ id: addonTab(a.id), channel: null, pinned: `addon:${a.id}`, kept: true }));
+  const stored = loadChannelLayout(w?.layout, windowChannels.peek().map((c) => c.id), [...tabs, ...keep, ...addonKeep]);
   layoutOwner = owner;
   lastSaved = w?.layout ? JSON.stringify(w.layout) : "";
   clearTimeout(saveTimer);
@@ -903,6 +911,7 @@ export function applyHello(h: HelloResult) {
     sessions.value = new Map(h.sessions.map((s) => [s.id, s]));
     panels.value = new Map((h.panels ?? []).filter((p) => !p.closed).map((p) => [p.id, p]));
     panelOrigin.value = h.panel_origin ?? "";
+    addons.value = h.addons ?? [];
     applyNotesHello(h.notes);
     helloEpoch.value++;
     for (const id of prev.keys()) {

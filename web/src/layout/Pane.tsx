@@ -1,6 +1,9 @@
 // One group: its tab strip (always shown; a tab is one session) + the active tab's terminal
 // (+ approval banner, exited bar, find bar). The top-right group's strip also carries the
 // window controls.
+import { type Addon, addons, addonLabels, addonTitle } from "../addons.ts";
+import { addonTab, isPinnedTab } from "./tree.ts";
+import { KitIcon } from "../panels/KitIcon.tsx";
 import type { ComponentChildren } from "preact";
 import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
 import { noteId, noteTab, panelId, panelTab, type PaneNode, QUESTIONS_TAB } from "./tree.ts";
@@ -260,9 +263,10 @@ export function Group(
   const all = sessions.value;
   const tabs = pane.tabs.filter((id) =>
     all.has(id) || panels.value.has(panelId(id) ?? -1) || notes.value.has(noteId(id) ?? -1) ||
-    (id === QUESTIONS_TAB && questionsShown.value)
+    (id === QUESTIONS_TAB && questionsShown.value) || addons.value.some((a) => addonTab(a.id) === id)
   );
   const active = pane.active !== null ? all.get(pane.active) ?? null : null;
+  const activeAddon = addons.value.find((a) => addonTab(a.id) === pane.active);
   const activeQuestions = pane.active === QUESTIONS_TAB && tabs.includes(QUESTIONS_TAB);
   const activePanel = pane.active !== null ? panels.value.get(panelId(pane.active) ?? -1) : undefined;
   const activeNote = pane.active !== null ? notes.value.get(noteId(pane.active) ?? -1) : undefined;
@@ -297,7 +301,7 @@ export function Group(
       onPointerDownCapture={() => A.focusGroup(pane.id)}
     >
       {!fullscreen && <TabStrip pane={pane} tabs={tabs} focused={focused} zoomed={zoomed} controls={controls} />}
-      {fullscreen && (active || activeNote || activeQuestions) && (
+      {fullscreen && (active || activeNote || activeQuestions || activeAddon) && (
         // Terminals keep Esc (agents and editors use it), so a terminal shown fullscreen gets
         // this way back (a note's editor keeps Esc too); a panel has the same button in its strip.
         <button
@@ -328,6 +332,7 @@ export function Group(
         {active && <TermHost sid={active.id} />}
         {activePanel && <PanelSlot key={activePanel.id} id={activePanel.id} />}
         {activeQuestions && <QuestionsView />}
+        {activeAddon && <PanelSlot key={activeAddon.id} id={addonTab(activeAddon.id)} />}
         {tabs.map((t) => noteId(t)).filter((n): n is number => n !== null).map((n) => (
           <NoteView key={n} id={n} hidden={n !== activeNote?.id} />
         ))}
@@ -458,9 +463,9 @@ function TabStrip(
       [
         { header: `${tabs.length} tabs in this group` },
         ...tabs.map((id, i): MenuItem => ({
-          label: id === QUESTIONS_TAB ? "Questions" : panels.value.get(panelId(id) ?? -1)?.title ??
+          label: id === QUESTIONS_TAB ? "Questions" : (addons.value.find((a) => addonTab(a.id) === id) ? addonTitle(addons.value.find((a) => addonTab(a.id) === id)!) : undefined) ?? panels.value.get(panelId(id) ?? -1)?.title ??
             notes.value.get(noteId(id) ?? -1)?.title ?? tabText(labelOf(sessions.value.get(id)!)),
-          icon: id === QUESTIONS_TAB
+          icon: isPinnedTab(id)
             ? <IconPin size={13} />
             : panelId(id) !== null
             ? <IconPanel size={13} />
@@ -489,7 +494,7 @@ function TabStrip(
       e.preventDefault();
       A.focusActiveTerminalSoon();
       return;
-    } else if (e.key === "F2" && pane.active !== null && pane.active !== QUESTIONS_TAB) {
+    } else if (e.key === "F2" && pane.active !== null && !isPinnedTab(pane.active)) {
       e.preventDefault();
       const note = noteId(pane.active);
       if (note !== null) A.startNoteRename(note);
@@ -519,8 +524,10 @@ function TabStrip(
       >
         {tabs.map((id, i) => {
           if (id === QUESTIONS_TAB) {
-            return <QuestionsTab key={id} index={i} paneId={pane.id} tabsInGroup={tabs.length} active={id === pane.active} focused={focused} />;
+            return <PinnedTab key={id} index={i} paneId={pane.id} tabsInGroup={tabs.length} active={id === pane.active} focused={focused} />;
           }
+          const addon = addons.value.find((a) => addonTab(a.id) === id);
+          if (addon) return <PinnedTab key={id} addon={addon} index={i} paneId={pane.id} tabsInGroup={tabs.length} active={id === pane.active} focused={focused} />;
           const panel = panels.value.get(panelId(id) ?? -1);
           if (panel) return <PanelTab key={id} panel={panel} index={i} paneId={pane.id} tabsInGroup={tabs.length} active={id === pane.active} focused={focused} />;
           const note = notes.value.get(noteId(id) ?? -1);
@@ -643,30 +650,32 @@ function PanelTab({ panel, paneId, index, tabsInGroup, active, focused }: {
 /** The Questions tab, with the number of open questions. It drags among the groups like any tab
  * (the window remembers where), but doesn't rename or close: its menu hides it (the palette's
  * Questions shows it again). */
-function QuestionsTab({ paneId, index, tabsInGroup, active, focused }: {
-  paneId: string; index: number; tabsInGroup: number; active: boolean; focused: boolean;
+function PinnedTab({ addon, paneId, index, tabsInGroup, active, focused }: {
+  addon?: Addon; paneId: string; index: number; tabsInGroup: number; active: boolean; focused: boolean;
 }) {
-  const n = openQuestionCount.value;
-  const label = n === 1 ? "Questions, 1 open" : `Questions, ${n} open`;
+  const id = addon ? addonTab(addon.id) : QUESTIONS_TAB;
+  const title = addon ? addonTitle(addon) : "Questions";
+  const n = addon ? addonLabels.value[addon.id]?.count ?? 0 : openQuestionCount.value;
+  const label = `${title}${n ? `, ${n}` : ""}`;
   const menu: MenuItem[] = [
-    { label: "Split right", disabled: tabsInGroup < 2, run: () => A.splitWithTab(QUESTIONS_TAB, "right") },
-    { label: "Split down", disabled: tabsInGroup < 2, run: () => A.splitWithTab(QUESTIONS_TAB, "bottom") },
+    { label: "Split right", disabled: tabsInGroup < 2, run: () => A.splitWithTab(id, "right") },
+    { label: "Split down", disabled: tabsInGroup < 2, run: () => A.splitWithTab(id, "bottom") },
     { label: "Zoom group", keys: "Alt+Z", run: () => { A.focusGroup(paneId); A.zoomToggle(); } },
-    { label: "Fullscreen", icon: <IconMaximize size={14} />, keys: "Alt+Shift+Z", run: () => A.toggleFullscreen(QUESTIONS_TAB) },
+    { label: "Fullscreen", icon: <IconMaximize size={14} />, keys: "Alt+Shift+Z", run: () => A.toggleFullscreen(id) },
     "sep",
-    { label: "Hide Questions tab", keys: "Alt+W", run: () => A.hideQuestionsTab() },
+    { label: addon ? "Hide" : "Hide Questions tab", keys: "Alt+W", run: () => addon ? A.showAddon(addon.id, false) : A.hideQuestionsTab() },
   ];
   return (
-    <div class={cx("tab", "questions-tab", active && "active", active && focused && "focused",
-      drag.value?.sid === QUESTIONS_TAB && "dragging")}
+    <div class={cx("tab", addon ? "addon-tab" : "questions-tab", active && "active", active && focused && "focused",
+      drag.value?.sid === id && "dragging")}
       role="tab" aria-selected={active} aria-label={label} tabIndex={active ? 0 : -1}
-      data-tab-sid={QUESTIONS_TAB} data-tip={`Questions agents asked you · ${n} open`}
+      data-tab-sid={id} data-addon={addon?.id} data-tip={label}
       // A press without a drag is a click; screen readers' Activate sends only the click.
-      onPointerDown={(e) => startTabDrag(e, { id: QUESTIONS_TAB, kind: "questions" }, "Questions", () => {})}
-      onClick={() => A.revealSession(QUESTIONS_TAB)}
+      onPointerDown={(e) => startTabDrag(e, { id, kind: addon ? "addon" : "questions" }, title, () => {})}
+      onClick={() => A.revealSession(id)}
       onContextMenu={(e) => { e.preventDefault(); openMenu({ x: e.clientX, y: e.clientY, items: menu }); }}>
-      <TabIcon index={index} focused={focused}><IconPin size={13} /></TabIcon>
-      <span class="tab-name"><span class="tab-task">Questions</span></span>
+      <TabIcon index={index} focused={focused}>{addon ? <KitIcon name={addon.icon} /> : <IconPin size={13} />}</TabIcon>
+      <span class="tab-name"><span class="tab-task">{title}</span></span>
       {n > 0 && <span class="tab-count" aria-hidden="true">{n}</span>}
     </div>
   );

@@ -1,5 +1,6 @@
 {
   "tasks": {
+    "test:addon-names": "bash web/dev/addon_lint.sh",
     "web": "cd web && deno task build",
     "build": "bash scripts/job.sh build deno task build:inner",
     "build:inner": "deno task web && cargo build --workspace --release",

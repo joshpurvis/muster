@@ -3,6 +3,7 @@ mod adapters;
 mod agent_reply;
 mod agents;
 mod assets;
+mod addon;
 mod cache;
 mod cli;
 mod client;

@@ -11,7 +11,7 @@
     "check": "deno check src/app.tsx src/m/main.tsx src/layout/tree_test.ts src/model_test.ts src/agents_test.ts src/schedules_test.ts src/updates_test.ts src/mousereport_test.ts src/account_profiles_test.ts src/latency_test.ts src/metrics_test.ts src/cache_test.ts src/links_test.ts src/questions_test.ts dev/metrics_eval.ts dev/stamp_metrics.ts dev/mock.ts dev/e2e.ts dev/e2e_channels.ts dev/e2e_cache.ts dev/e2e_links.ts dev/e2e_tab_stability.ts dev/e2e_questions_move.ts dev/recovery.ts dev/account_profiles.ts dev/build_panels.ts dev/panel_apps_e2e.ts src/panels/apps/image/main.ts src/panels/apps/chart/main.ts src/panels/apps/table/main.ts src/panels/apps/pr_decision/main.ts src/panels/apps/pr_overview/main.ts src/panels/apps/markdown/main.ts src/panels/apps/board/main.ts src/panels/kit/main.ts && deno lint && deno task panels --check",
     "test": "deno test --allow-read=src/panels/kit,src/panels/apps/board/parity.json,dev/panel_examples,m/sw.js src/",
     "panels": "deno run --allow-read=. --allow-write=panels --allow-run=deno dev/build_panels.ts",
-    "mock": "deno run --allow-net=127.0.0.1 --allow-read=.,/tmp,$HOME --allow-run=script,git --allow-env=HOME,PATH,LANG,MOCK_PORT dev/mock.ts"
+    "mock": "deno run --allow-net=127.0.0.1 --allow-read=.,/tmp,$HOME --allow-run=script,git --allow-env=HOME,PATH,LANG,MOCK_PORT,MOCK_ADDONS dev/mock.ts"
   },
   "lint": {
     "exclude": ["dist/", "panels/kit.js"],

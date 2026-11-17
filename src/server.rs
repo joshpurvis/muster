@@ -38,6 +38,7 @@ pub fn router(hub: Arc<Hub>) -> anyhow::Result<Router> {
         .with_state(hub.clone())
         .nest("/mcp", crate::mcp::router(hub.clone())?)
         .fallback(crate::assets::serve)
+        .layer(Extension(hub.clone()))
         .layer(axum::middleware::from_fn_with_state(hub, classify)))
 }
 

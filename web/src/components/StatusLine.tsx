@@ -18,7 +18,7 @@ import { IconBranch, IconFolder, IconTerminal } from "../icons.tsx";
 import { cx, tildify } from "../util.ts";
 import { taskLabel } from "../model.ts";
 import { openQuestionCount } from "../questions.ts";
-import { QUESTIONS_TAB } from "../layout/tree.ts";
+import { isPinnedTab } from "../layout/tree.ts";
 
 const CONN_LABEL = {
   open: "connected",
@@ -36,7 +36,7 @@ export function StatusLine() {
   const n = waiting + asked;
   const status = connStatus.value;
   // Terminal, panel and note tabs alike (not the Questions tab).
-  const count = visibleIds.value.size - (visibleIds.value.has(QUESTIONS_TAB) ? 1 : 0);
+  const count = [...visibleIds.value].filter((id) => !isPinnedTab(id)).length;
   const s = focusedSession.value;
   // Where the focused tab is now: a shell's `cd` or Claude's `/cd` moves it off the task folder.
   const live = s && c && s.channel_id === c.id ? s.live_cwd : undefined;

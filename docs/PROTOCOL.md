@@ -190,7 +190,7 @@ All ids are numbers. Types (`Workspace`, `Channel`, `SessionInfo`, `Event`) are 
 | `session.output` | `{id, lines? = 200}` | `{lines: string[]}` the last `lines` lines of scrollback plus screen as plain text (ANSI stripped), oldest first, without trailing blank lines. Max 10000. Exited sessions are read from output.log. |
 
 ```ts
-type Origin = "human" | "schedule" | "webhook";
+type Origin = "human" | "schedule" | "webhook" | `addon:${string}`;
 type Agent = { id: number; name: string; kind: "claude" | "codex"; provider: "subscription" | "openrouter";
              model: string | null; effort: string | null;
              persona: string; permissions: Permissions /* its tab's, when muster creates it */;
@@ -1715,3 +1715,30 @@ Changing location requires a verified local window. Saving does not move or stop
 a live session. Agent records expose `working_location`, `reset_on_next_start`, `handoff`,
 and `working_directory` (the current session's cwd, or null). Location and pending
 reset survive backend reloads. Old worktrees are retained when changing location.
+
+## Add-on tabs
+
+The desktop `hello` includes `addons: [{id, name, url, icon, agents}]`; device hello omits it.
+`addon.list {}` returns that array to local clients. Registry data lives in `addons.json` in the
+private data directory. See [Add-on tabs](ADDONS.md) for the iframe and postMessage protocol.
+
+| Method | Params | Result |
+| --- | --- | --- |
+| `addon.save` | `{id, name, url, icon?, agents?}` | `{}`; adds or replaces this registration, including agent ticks. |
+| `addon.remove` | `{id}` | `{}`; removes this registration. |
+| `addon.message` | `{id, agent, text}` | `{}` when accepted into delivery; an RPC error on refusal. |
+
+All three writes use `rpc::from_window`, like `question.answer`: a local authenticated UI-origin
+WebSocket holding a window, attributable to a program outside sessions, without `from_session`.
+The CLI, `/api/rpc`, scripts and paired devices cannot call them. Params reject extra fields.
+The refusal text is: “Add-on changes and messages are allowed only from Muster's window. Open
+Add-on tabs there.” There are no add-on MCP tools. After a registry write the saving window reloads
+to refresh its frame CSP; other windows pick up the registry on reload.
+
+Names are 1–40 characters; IDs are 1–40 lower-case ASCII letters, digits and hyphens with an alphanumeric
+first and last character. Icons must be from the existing list, default `globe`. URLs are checked and
+rebuilt with the web-preview parser against the UI and panel ports. Every ticked agent must exist.
+For `addon.message` the daemon rechecks registration, the agent grant, 1–300 characters of text and
+30 admitted attempts per rolling hour per add-on. The limit is in memory until backend restart.
+The normal message record and envelope carry `from: "addon:<id>"`, `origin: "addon:<id>"`, `hop: 0`;
+subsequent replies retain provenance and use the existing hop, recipient and delivery limits.

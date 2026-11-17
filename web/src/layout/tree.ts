@@ -14,6 +14,13 @@ export type Dir = "row" | "col";
 const NOTE_BASE = 2 ** 40;
 /** The Questions tab (docs/UI.md "Questions"): one per window, in whichever channel is shown. */
 export const QUESTIONS_TAB = -(2 ** 52);
+/** Stable internal numeric id; saved pinned metadata uses `addon:<slug>`. */
+export function addonTab(id: string): number {
+  let hash = 5381;
+  for (const c of new TextEncoder().encode(id)) hash = (Math.imul(hash, 33) ^ c) >>> 0;
+  return QUESTIONS_TAB - 1 - hash;
+}
+export const isPinnedTab = (tab: number): boolean => tab <= QUESTIONS_TAB;
 export const panelTab = (id: number): number => -id - 1;
 export const panelId = (tab: number): number | null =>
   Number.isSafeInteger(tab) && tab <= -2 && tab > -NOTE_BASE ? -tab - 1 : null;

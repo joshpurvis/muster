@@ -1,3 +1,5 @@
+import { type Addon } from "../src/addons.ts";
+import { iconNames } from "../src/panels/kit/icons.ts";
 // Dev-only mock daemon: serves web/dist and speaks the client protocol with in-memory state.
 // Shell sessions are real bash processes behind `script` (for a PTY); "claude"/"codex"
 // sessions are bash too, with a fake state machine so approvals/inbox can be exercised.
@@ -22,6 +24,15 @@ const builtinApps: Record<string, string> = {};
 for (const app of ["markdown", "image", "chart", "table", "pr_decision", "pr_overview", "board"]) {
   builtinApps[app] = await Deno.readTextFile(new URL(`../panels/${app}.html`, import.meta.url));
 }
+// Counter is the only demo add-on. Its server has no daemon routes.
+const counterHtml = (await Deno.readTextFile(new URL("./counter.html", import.meta.url)))
+  .replace("__MUSTER_ORIGIN__", `http://127.0.0.1:${PORT}`);
+const counterServer = Deno.serve({ port: 0, hostname: "127.0.0.1" }, () => new Response(counterHtml, {
+  headers: { "content-type": "text/html", "content-security-policy": `frame-ancestors http://127.0.0.1:${PORT}` },
+}));
+const demoAddon: Addon = { id: "counter", name: "Counter", url: `http://127.0.0.1:${counterServer.addr.port}/`, icon: "globe", agents: [] };
+let addons: Addon[] = Deno.env.get("MOCK_ADDONS") === "1" ? [demoAddon] : [];
+const addonSent = new Map<string, number[]>();
 // Drawn by the UI around the panel server's /preview page (src/web_preview.rs).
 builtinApps.web_preview = "<!doctype html><!-- web_preview -->";
 const previewPage = await Deno.readTextFile(new URL("../panels/preview.html", import.meta.url));
@@ -1406,6 +1417,30 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
   if (method === "openrouter.models") {
     return { key_present: orKey, models: OR_MODELS, fetched_at: now() - 20 * 60_000, stale: false, error: null };
   }
+  if (method === "mock.addon_demo") return demoAddon;
+  if (method === "addon.list") return addons;
+  if (["addon.save", "addon.remove", "addon.message"].includes(method)) {
+    if (!ws || !holding.has(ws) || Object.hasOwn(p, "from_session")) throw new Error("Add-on changes and messages are allowed only from Muster's window. Open Add-on tabs there.");
+    if (method === "addon.save") {
+      if (Object.keys(p).some((k) => !["id", "name", "url", "icon", "agents"].includes(k))) throw new Error("Unknown add-on field.");
+      if (typeof p.name !== "string" || !p.name.trim() || [...p.name].length > 40) throw new Error("Name must be 1–40 characters.");
+      if (!/^[a-z0-9][a-z0-9-]{0,39}$/.test(p.id) || p.id.endsWith("-")) throw new Error("Use a short lower-case slug for the add-on id.");
+      const url = mockPreviewUrl(p.url).href;
+      if (!iconNames().includes(p.icon)) throw new Error("Choose an icon from the list.");
+      if (!Array.isArray(p.agents) || p.agents.some((n: string) => !agentList.some((a) => a.name === n))) throw new Error("Choose an existing agent.");
+      addons = [...addons.filter((a) => a.id !== p.id), { ...p, url }];
+    } else if (method === "addon.remove") addons = addons.filter((a) => a.id !== p.id);
+    else {
+      const a = addons.find((a) => a.id === p.id);
+      if (!a?.agents.includes(p.agent)) throw new Error("This agent is not ticked for the add-on.");
+      if (typeof p.text !== "string" || [...p.text].length < 1 || [...p.text].length > 300) throw new Error("Message must be 1–300 characters.");
+      const times = (addonSent.get(p.id) ?? []).filter((t) => Date.now() - t < 3600000);
+      if (times.length >= 30) throw new Error("This add-on has sent 30 messages in the last hour. Try later.");
+      addonSent.set(p.id, [...times, Date.now()]);
+      pushAgentMessage({ from: `addon:${a.id}`, to: p.agent, to_agent: agentNamed(p.agent).id, origin: `addon:${a.id}`, hop: 0, text: p.text });
+    }
+    return {};
+  }
   if (method.startsWith("schedule.") || method.startsWith("trigger.")) return sched.handle(method, p);
   if (method.startsWith("question.") || method.startsWith("mock.question_")) return questionsMock.handle(method, p);
   if (method.startsWith("agent.") || method.startsWith("mock.")) return agentMethod(method, p);
@@ -1522,6 +1557,7 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
         sessions: [...sessions.values()],
         panels: [...panels.values()].map((r) => r.panel).filter((p) => !p.closed),
         panel_origin: panelOrigin,
+        addons: ws && deviceClients.has(ws) ? undefined : addons,
         notes: [...notes.keys()].map(getNote).map(noteSummary),
         windows,
         home: HOME,
@@ -2128,7 +2164,10 @@ Deno.serve({ port: PORT, hostname: "127.0.0.1" }, async (req) => {
             "content-security-policy":
               "default-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'",
           }
-          : {}),
+          : ext === "html" ? {
+            "x-frame-options": "DENY",
+            "content-security-policy": `frame-ancestors 'none'; frame-src about: ${panelOrigin}/proxy ${panelOrigin}/preview ${[...new Set(addons.map((a) => new URL(a.url).origin))].join(" ")}`,
+          } : {}),
       },
     });
   } catch {

@@ -987,6 +987,24 @@ mod tests {
     }
 
     #[test]
+    fn addon_navigation_uses_the_existing_preview_rule() {
+        let ports = [7433, 7434];
+        let url = crate::web_preview::parse("http://localhost:5173/counter", &ports).unwrap().url();
+        assert!(super::allow_navigation("http://127.0.0.1:7433", &url, || Some(7434)));
+        // Preserve the existing rule: these paths on 127.0.0.1 are reserved for the panel server.
+        for path in ["proxy", "preview"] {
+            let url = format!("http://127.0.0.1:5173/{path}");
+            assert!(crate::web_preview::parse(&url, &ports).is_ok());
+            assert!(!super::allow_navigation("http://127.0.0.1:7433", &url, || Some(7434)));
+        }
+        // The UI origin itself is necessarily admitted; it is never an add-on target.
+        for url in ["http://localhost:7433/counter", "http://127.0.0.1:7434/counter"] {
+            assert!(crate::web_preview::parse(url, &ports).is_err());
+            assert!(!super::allow_navigation("http://127.0.0.1:7433", url, || Some(7434)));
+        }
+    }
+
+    #[test]
     fn navigation_allows_only_the_ui_and_the_panel_proxy() {
         use super::allow_navigation as allow;
         let ui = "http://127.0.0.1:7433";

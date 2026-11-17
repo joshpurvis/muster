@@ -45,19 +45,21 @@ use crate::store::Store;
 
 /// Where a message chain started. Claude agents accept `human` only by default (PLAN.md §10).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(try_from = "String", into = "String")]
 pub enum Origin {
     Human,
     Schedule,
     Webhook,
+    Addon(crate::addon::Identity),
 }
 
 impl Origin {
-    pub fn as_str(self) -> &'static str {
+    pub fn as_str(&self) -> &str {
         match self {
             Origin::Human => "human",
             Origin::Schedule => "schedule",
             Origin::Webhook => "webhook",
+            Origin::Addon(id) => id.as_str(),
         }
     }
     pub fn parse(s: &str) -> Option<Origin> {
@@ -65,9 +67,14 @@ impl Origin {
             "human" => Some(Origin::Human),
             "schedule" => Some(Origin::Schedule),
             "webhook" => Some(Origin::Webhook),
-            _ => None,
+            other => crate::addon::Identity::parse(other).map(Origin::Addon),
         }
     }
+}
+impl From<Origin> for String { fn from(o: Origin) -> Self { o.as_str().into() } }
+impl TryFrom<String> for Origin {
+    type Error = String;
+    fn try_from(s: String) -> Result<Self, Self::Error> { Self::parse(&s).ok_or_else(|| "Unknown message origin".into()) }
 }
 
 /// Default accepted origins: Claude agents take human-started work only (Anthropic's consumer
@@ -3539,6 +3546,25 @@ mod tests {
                 answer: None,
             })
             .unwrap()
+    }
+
+    #[test]
+    fn addon_delivery_record_keeps_sender_origin_and_hop() {
+        let mut a = agent(SessionKind::Shell);
+        a.name = "alpha".into();
+        let origin = Origin::parse("addon:counter").unwrap();
+        a.accepts_origins.push(origin);
+        let route = route(&a, None, Some(origin), 0).unwrap();
+        let m = message_record(&a, "addon:counter", None, route, "hello");
+        assert_eq!((m.from.as_str(), m.origin.as_str(), m.hop), ("addon:counter", "addon:counter", 0));
+        assert_eq!(envelope(1, &m.from, m.origin, m.hop), "[muster msg 1 from addon:counter origin=addon:counter hop=0]");
+        let store = Store::open_memory().unwrap();
+        let id = store.insert_agent_message(&m).unwrap();
+        let stored = store.agent_message(id).unwrap().unwrap();
+        assert_eq!((stored.origin, stored.hop), (origin, 0));
+        let mut prov = route.prov(Some(id));
+        prov.hop = guard::MAX_AGENT_HOPS;
+        assert!(super::route(&a, Some(prov), None, 0).is_err());
     }
 
     #[test]

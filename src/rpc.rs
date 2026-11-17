@@ -110,6 +110,7 @@ pub fn hello(hub: &Hub) -> Value {
             .filter_map(|a| a.session_id.map(|id| (id.to_string(), json!(a.name))))
             .collect::<serde_json::Map<_, _>>(),
         "panels": crate::panels::list(hub).unwrap_or_default().into_iter().filter(|p| !p.closed).collect::<Vec<_>>(),
+        "addons": hub.addons.list(&crate::panels::own_ports(hub)),
         "panel_origin": format!("http://127.0.0.1:{}", hub.panels.port.load(Ordering::Relaxed)),
         "notes": crate::notes::list(hub).unwrap_or_default(),
         "windows": hub.windows(),
@@ -247,6 +248,7 @@ async fn dispatch_inner(hub: &Arc<Hub>, who: &Principal, method: &str, params: V
             let mut result = hello(hub);
             if matches!(who, Principal::Device { .. }) {
                 if let Some(fields) = result.as_object_mut() {
+                    fields.remove("addons");
                     fields.remove("panels");
                     fields.remove("panel_origin");
                     fields.remove("notes");
@@ -281,6 +283,11 @@ async fn dispatch_inner(hub: &Arc<Hub>, who: &Principal, method: &str, params: V
         }
         // The human's own answer: only a click in Muster's window (`question_from_window`), never
         // the CLI, `/api/rpc` or a script, so no agent can answer as the human through them.
+        "addon.save" | "addon.remove" | "addon.message" => Err(RpcError(crate::addon::BY_WINDOW.into())),
+        "addon.list" => {
+            require_local(who, method)?;
+            to_value(hub.addons.list(&crate::panels::own_ports(hub)))
+        }
         "question.answer" | "question.undo" => Err(RpcError(ANSWER_BY_CLICK.into())),
         "question.start_at" => {
             // The human's: never from a session (the CLI sends `$MUSTER_SESSION_ID`).
@@ -1607,6 +1614,26 @@ pub async fn from_window(hub: &Arc<Hub>, who: &Principal, conn: u64, link: &WsLi
     }
 }
 
+pub async fn addon_from_window(hub: &Arc<Hub>, who: &Principal, conn: u64, link: &WsLink, method: &str, params: Value) -> RpcResult {
+    from_window(hub, who, conn, link, params.get("from_session").map(|_| 0)).await
+        .map_err(|why| RpcError(format!("{} ({why})", crate::addon::BY_WINDOW)))?;
+    #[derive(Deserialize)] #[serde(deny_unknown_fields)]
+    struct Remove { id: String }
+    #[derive(Deserialize)] #[serde(deny_unknown_fields)]
+    struct Message { id: String, agent: String, text: String }
+    match method {
+        "addon.save" => {
+            let a = parse::<crate::addon::Addon>(params)?.checked(&crate::panels::own_ports(hub))?;
+            for name in &a.agents { if hub.agents().get(name).is_none() { return Err(RpcError("Choose an existing agent.".into())); } }
+            hub.addons.save(Some(a.clone()), &a.id)?;
+        }
+        "addon.remove" => { let p: Remove = parse(params)?; hub.addons.save(None, &p.id)?; }
+        "addon.message" => { let p: Message = parse(params)?; crate::addon::message(hub, &p.id, &p.agent, p.text).await?; }
+        _ => return Err(RpcError("Unknown add-on method".into())),
+    }
+    Ok(json!({}))
+}
+
 /// Refusal for `question.answer` and `question.undo` from anywhere but a click in the window.
 pub const ANSWER_BY_CLICK: &str = "only a click in Muster's window answers a question as you (or takes an answer back): \
     open the Questions tab there. An agent records an answer you gave it in chat with record_answer";
@@ -2424,6 +2451,13 @@ async fn handle_request(
                 let _ = resp.send(Message::Text(response(&req.id, r).to_string().into())).await;
             });
         }
+        "addon.save" | "addon.remove" | "addon.message" => {
+            let (hub, who, resp, link) = (hub.clone(), who.clone(), resp.clone(), link.clone());
+            tokio::spawn(async move {
+                let r = addon_from_window(&hub, &who, conn, &link, &req.method, req.params).await;
+                let _ = resp.send(Message::Text(response(&req.id, r).to_string().into())).await;
+            });
+        }
         // Answering a question as the human: only a click in a UI window (see `question_from_window`).
         "question.answer" | "question.undo" => {
             let (hub, who, resp, link) = (hub.clone(), who.clone(), resp.clone(), link.clone());
@@ -2690,6 +2724,27 @@ mod tests {
         let st = Arc::new(McpState::new(HubBackend(hub.clone())));
         hub.set_mcp(Arc::downgrade(&st));
         (hub, st)
+    }
+
+    #[tokio::test]
+    async fn addon_every_write_refuses_api_cli_and_script_connections() {
+        let (hub, _st) = fixture();
+        let link = WsLink { ui_origin: false, peer: None, server: None };
+        for method in ["addon.save", "addon.remove", "addon.message"] {
+            for p in [json!({}), json!({"from_session":1}), json!({"from_session":null})] {
+                assert!(call(&hub, method, p.clone()).await.unwrap_err().contains(crate::addon::BY_WINDOW));
+                let body = serde_json::to_vec(&json!({"id":1,"method":method,"params":p})).unwrap();
+                let api = http_call(&hub, &Principal::Local, &body, None).await;
+                assert!(api["error"].to_string().contains(crate::addon::BY_WINDOW));
+                assert!(addon_from_window(&hub, &Principal::Local, 71, &link, method, p).await.unwrap_err().0.contains(crate::addon::BY_WINDOW));
+            }
+            hub.claim_window(71, None).unwrap();
+            assert!(addon_from_window(&hub, &Principal::Local, 71, &link, method, json!({})).await.is_err());
+            let claimed = WsLink { ui_origin: true, peer: None, server: None };
+            assert!(addon_from_window(&hub, &Principal::Local, 71, &claimed, method, json!({})).await.is_err());
+            assert!(addon_from_window(&hub, &Principal::Device { id: 1 }, 71, &claimed, method, json!({})).await.is_err());
+        }
+        assert!(hub.addons.list(&[]).is_empty());
     }
 
     #[tokio::test]

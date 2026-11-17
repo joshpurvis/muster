@@ -290,6 +290,7 @@ Deno.test("linkAt: the link the caret is in, on its own line", () => {
   assertEquals(linkAt(text, 0), null);
   assertEquals(linkAt(text, text.length), null);
   assertEquals(linkAt("https://a.example", 0)?.uri, "https://a.example");
+});
 
 Deno.test("markdownLinks: Muster and web links in an agent's text become links; nothing else does", () => {
   // The shape agents write (`muster link panel 393` prints it), and the tool's `mention` escapes.

@@ -1,9 +1,9 @@
 // Every select and text field in the dialogs, checked after it renders (docs/UI.md "Form controls").
 // Run only against a fresh isolated mock:
 //   deno run --config web/deno.json --allow-net=127.0.0.1 --allow-run=chromium \
-//     --allow-env=MUSTER_FORM_SHOTS --allow-read=<shots> --allow-write=<shots> \
+//     --allow-env=MUSTER_FORM_SHOTS --allow-read=<shots> --allow-write=<shots>,/tmp \
 //     web/dev/e2e_form_controls.ts http://127.0.0.1:<port>/#token=dev
-// MUSTER_FORM_SHOTS (optional) saves one picture per dialog. Chromium draws a native select
+// /tmp (Deno's temp dir) holds the browser profile. MUSTER_FORM_SHOTS (optional) saves one picture per dialog. Chromium draws a native select
 // fine, so the check asks what WebKitGTK (the desktop window) needs instead: every visible select
 // draws its own control (appearance: none), and every field's text box holds one line of its text.
 import { launch } from "./cdp.ts";
@@ -43,12 +43,42 @@ async function editAgent() {
   await b.eval(`${item}.click()`);
 }
 
-// One entry per dialog with fields. `open` leaves the dialog on screen.
-// Claude profiles is not here: the mock has no profiles (dev/account_profiles.ts covers it).
-const dialogs: { name: string; open: () => Promise<void> }[] = [
+async function profiles() {
+  await b.click('[aria-label="Settings and more"]');
+  const item = `Array.from(document.querySelectorAll('[role="menuitem"]')).find(e => e.querySelector('.menu-label')?.textContent.trim() === 'Claude profiles…')`;
+  await b.wait(`!!${item}`);
+  await b.eval(`${item}.click()`);
+}
+async function profilesTab() {
+  await b.eval(`[...${DIALOG}.querySelectorAll('[role="tab"]')].find((t) => t.textContent.trim() === 'Profiles').click()`);
+  await b.wait(`!!${DIALOG}.querySelector('.pf-head')`);
+  // The first row is the default profile (no fields); a saved profile's row has Name and Signs in to.
+  await b.eval(`[...${DIALOG}.querySelectorAll('.pf-head')].at(-1).click()`);
+  await b.wait(`!!${DIALOG}.querySelector('.pf-item.open select')`);
+}
+async function addProfileTab() {
+  await b.eval(`[...${DIALOG}.querySelectorAll('[role="tab"]')].find((t) => t.textContent.trim() === 'Add profile').click()`);
+  await b.sleep(150);
+}
+// Give the agent a working repository, so "Conversation at next start" shows. The repository is
+// this checkout (a git folder the mock may read).
+async function moveAgent() {
+  const repo = new URL("../..", import.meta.url).pathname.replace(/\/$/, "");
+  const w: { id: number } = await b.eval(`${M}.rpc.call('workspace.add', { path: ${JSON.stringify(repo)}, name: 'demo-repo' })`);
+  await b.wait(`!!document.querySelector('#agent-repository option[value="${w.id}"]')`);
+  await b.eval(`(() => { const e = document.querySelector('#agent-repository');
+    Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set.call(e, '${w.id}');
+    e.dispatchEvent(new Event('change', { bubbles: true })); })()`);
+  await b.wait(`!!document.querySelector('#agent-location-conversation')`);
+}
+
+// One entry per dialog with fields. `open` leaves the dialog on screen; each of `then` moves it to
+// another state that shows other fields, checked again.
+const dialogs: { name: string; open: () => Promise<void>; then?: [string, () => Promise<void>][] }[] = [
   { name: "Add-on tabs", open: () => palette("Add-on tabs") },
   { name: "New agent", open: () => palette("New agent") },
-  { name: "Edit agent", open: editAgent },
+  { name: "Edit agent", open: editAgent, then: [["working repository", moveAgent]] },
+  { name: "Claude profiles", open: profiles, then: [["Profiles tab, a row open", profilesTab], ["Add profile tab", addProfileTab]] },
   { name: "New schedule", open: () => palette("New schedule") },
   { name: "Scheduling settings", open: () => palette("Scheduling settings") },
   { name: "Cache warning", open: () => palette("Cache warning") },
@@ -108,19 +138,31 @@ for (const d of dialogs) {
     failures.push(`${d.name}: did not open (${(e as Error).message})`);
     continue;
   }
-  // Open every "More options" so its fields are checked too.
-  await b.eval(`${DIALOG}.querySelectorAll('.dlg-more[aria-expanded="false"]').forEach((m) => m.click())`);
-  await b.sleep(250);
-  const r: { checked: number; bad: string[] } = await b.eval(CHECK);
-  total += r.checked;
-  if (r.checked === 0) failures.push(`${d.name}: no fields found (has the dialog changed?)`);
-  for (const bad of r.bad) failures.push(`${d.name}: ${bad}`);
-  console.log(`${d.name}: ${r.checked} fields, ${r.bad.length} problems`);
-  if (shots) {
-    await Deno.mkdir(shots, { recursive: true });
-    const rect = await b.rect('.modal[role="dialog"]:not(.switcher)');
-    if (rect) await b.shot(`${shots}/${d.name.toLowerCase().replaceAll(" ", "-")}.png`, rect);
+  let seen = 0;
+  for (const [state, go] of [["", async () => {}] as [string, () => Promise<void>], ...(d.then ?? [])]) {
+    const name = state ? `${d.name} (${state})` : d.name;
+    try {
+      await go();
+    } catch (e) {
+      failures.push(`${name}: could not get there (${(e as Error).message})`);
+      continue;
+    }
+    // Open every "More options" so its fields are checked too.
+    await b.eval(`${DIALOG}.querySelectorAll('.dlg-more[aria-expanded="false"]').forEach((m) => m.click())`);
+    await b.sleep(250);
+    const r: { checked: number; bad: string[] } = await b.eval(CHECK);
+    total += r.checked;
+    seen += r.checked;
+    for (const bad of r.bad) failures.push(`${name}: ${bad}`);
+    console.log(`${name}: ${r.checked} fields, ${r.bad.length} problems`);
+    if (shots) {
+      await Deno.mkdir(shots, { recursive: true });
+      const rect = await b.rect('.modal[role="dialog"]:not(.switcher)');
+      const file = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/-$/, "");
+      if (rect) await b.shot(`${shots}/${file}.png`, rect);
+    }
   }
+  if (seen === 0) failures.push(`${d.name}: no fields found (has the dialog changed?)`);
 }
 await closeDialog();
 await b.close();

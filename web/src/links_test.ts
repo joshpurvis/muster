@@ -1,4 +1,4 @@
-import { findMusterLinks, followLink, type LinkDeps, linkColumns, linkRanges, type MusterLink, parseMusterLink } from "./links.ts";
+import { findMusterLinks, findTextLinks, linkAt, followLink, type LinkDeps, linkColumns, linkRanges, type MusterLink, parseMusterLink } from "./links.ts";
 
 function assertEquals<T>(actual: T, expected: T, msg?: string) {
   const a = JSON.stringify(actual), e = JSON.stringify(expected);
@@ -174,4 +174,120 @@ Deno.test("followLink: a click changes nothing", () => {
   }
   assertEquals(calls.length, 6);
   assertEquals(calls.every((c) => /^(note|panel|tab) \d+$|^says: /.test(c)), true, calls.join(" | "));
+});
+
+const uris = (text: string) => findTextLinks(text).map((l) => `${l.kind}:${l.uri}`);
+
+Deno.test("findTextLinks: web and Muster addresses, with their places", () => {
+  const text = "Docs: https://example.org/guide and muster://note/91.";
+  assertEquals(findTextLinks(text), [
+    { start: 6, end: 31, uri: "https://example.org/guide", kind: "web" },
+    { start: 36, end: 52, uri: "muster://note/91", kind: "muster" },
+  ]);
+  assertEquals(uris("http://127.0.0.1:7433/x?a=1&b=2#top"), ["web:http://127.0.0.1:7433/x?a=1&b=2#top"]);
+  assertEquals(uris("HTTPS://Example.org"), ["web:HTTPS://Example.org"]);
+});
+
+Deno.test("findTextLinks: what ends a sentence or wraps an address isn't part of it", () => {
+  assertEquals(uris("See https://example.org/a."), ["web:https://example.org/a"]);
+  assertEquals(uris("See https://example.org/a, then"), ["web:https://example.org/a"]);
+  assertEquals(uris("Really? https://example.org/a?!"), ["web:https://example.org/a"]);
+  assertEquals(uris("(https://example.org/a)"), ["web:https://example.org/a"]);
+  assertEquals(uris("(see https://example.org/a)."), ["web:https://example.org/a"]);
+  assertEquals(uris("[the guide](https://example.org/a)"), ["web:https://example.org/a"]);
+  assertEquals(uris("<https://example.org/a>"), ["web:https://example.org/a"]);
+  assertEquals(uris(`"https://example.org/a"`), ["web:https://example.org/a"]);
+  assertEquals(uris("'https://example.org/a'"), ["web:https://example.org/a"]);
+  assertEquals(uris("`https://example.org/a`"), ["web:https://example.org/a"]);
+  assertEquals(uris("**https://example.org/a**"), ["web:https://example.org/a"]);
+  // Brackets the address opened itself stay.
+  assertEquals(uris("https://en.wikipedia.org/wiki/Rust_(language)."), ["web:https://en.wikipedia.org/wiki/Rust_(language)"]);
+  assertEquals(uris("(https://en.wikipedia.org/wiki/Rust_(language))"), ["web:https://en.wikipedia.org/wiki/Rust_(language)"]);
+  assertEquals(uris("https://example.org/a[1]"), ["web:https://example.org/a[1]"]);
+});
+
+Deno.test("findTextLinks: lists of links, one per line or several on one", () => {
+  const list = "Links:\n- https://a.example/one\n- https://b.example/two\n1. muster://panel/3\n";
+  assertEquals(uris(list), ["web:https://a.example/one", "web:https://b.example/two", "muster:muster://panel/3"]);
+  assertEquals(uris("https://a.example https://b.example,https://c.example;http://d.example"), [
+    "web:https://a.example",
+    "web:https://b.example",
+    "web:https://c.example",
+    "web:http://d.example",
+  ]);
+  assertEquals(uris("https://a.example,muster://note/7;muster://agent/reviewer"), [
+    "web:https://a.example",
+    "muster:muster://note/7",
+    "muster:muster://agent/reviewer",
+  ]);
+  // Markdown links side by side are two.
+  assertEquals(uris("[one](https://one.example)[two](https://two.example/x)"), [
+    "web:https://one.example",
+    "web:https://two.example/x",
+  ]);
+  // An address in a query value stays part of the address it is in.
+  assertEquals(uris("https://a.example/login?next=https://b.example/x,y"), ["web:https://a.example/login?next=https://b.example/x,y"]);
+  const lines = findTextLinks(list);
+  for (const l of lines) assertEquals(list.slice(l.start, l.end), l.uri);
+});
+
+Deno.test("findTextLinks: anything else is no link", () => {
+  for (
+    const bad of [
+      "",
+      "no links here",
+      "https://",
+      "https://.",
+      "https:///path",
+      "xhttps://example.org",
+      "file:///etc/passwd",
+      "ftp://example.org",
+      "javascript:alert(1)",
+      "mailto:someone@example.org",
+      "www.example.org",
+      "muster://note/0",
+    ]
+  ) assertEquals(uris(bad), [], bad);
+});
+
+Deno.test("findTextLinks: a Muster address inside a web address is part of it", () => {
+  assertEquals(uris("https://example.org/muster://note/1"), ["web:https://example.org/muster://note/1"]);
+});
+
+Deno.test("findTextLinks: an address may end in _ * ~ unless markup wraps it", () => {
+  assertEquals(uris("https://files.example/download?token=abc_"), ["web:https://files.example/download?token=abc_"]);
+  assertEquals(uris("https://example.org/~user/a~"), ["web:https://example.org/~user/a~"]);
+  assertEquals(uris("https://example.org/a*"), ["web:https://example.org/a*"]);
+  assertEquals(uris("**https://example.org/a**."), ["web:https://example.org/a"]);
+  assertEquals(uris("~~https://example.org/a~~"), ["web:https://example.org/a"]);
+  assertEquals(uris("*https://example.org/a_*"), ["web:https://example.org/a_"]);
+});
+
+Deno.test("findTextLinks: a long run of brackets or links takes linear time", () => {
+  const brackets = "https://example.org/" + ")".repeat(200_000) + "]".repeat(200_000);
+  let t = performance.now();
+  assertEquals(uris(brackets), ["web:https://example.org/"]);
+  const opens = "https://example.org/" + "(".repeat(400_000);
+  assertEquals(findTextLinks(opens).length, 1);
+  const many = "https://a.example/ muster://note/1 ".repeat(20_000);
+  assertEquals(findTextLinks(many).length, 40_000);
+  t = performance.now() - t;
+  if (t > 1500) throw new Error(`took ${t.toFixed(0)} ms`);
+});
+
+Deno.test("linkAt: the link the caret is in, on its own line", () => {
+  const text = "one\nsee https://example.org/a. and muster://note/7\nlast";
+  const web = text.indexOf("https");
+  assertEquals(linkAt(text, web)?.uri, "https://example.org/a");
+  assertEquals(linkAt(text, web + 5)?.uri, "https://example.org/a");
+  assertEquals(linkAt(text, web + 21)?.uri, "https://example.org/a", "right after its last character");
+  assertEquals(linkAt(text, web + 22), null, "after the full stop");
+  assertEquals(linkAt(text, web - 1), null);
+  assertEquals(linkAt(text, web + 2, web + 10)?.uri, "https://example.org/a", "a selection inside it");
+  assertEquals(linkAt(text, web - 2, web + 3), null, "a selection reaching outside it");
+  const m = linkAt(text, text.indexOf("muster://") + 3);
+  assertEquals([m?.uri, m && text.slice(m.start, m.end)], ["muster://note/7", "muster://note/7"]);
+  assertEquals(linkAt(text, 0), null);
+  assertEquals(linkAt(text, text.length), null);
+  assertEquals(linkAt("https://a.example", 0)?.uri, "https://a.example");
 });

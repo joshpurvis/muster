@@ -134,3 +134,101 @@ function gone(d: LinkDeps, text: string): false {
   d.notify(text);
   return false;
 }
+
+/** A link in a note's text (docs/UI.md "Notes"): `[start, end)` offsets into the text. `web` is an
+ * http or https address, opened in the browser; `muster` an address above, shown in Muster. */
+export interface TextLink {
+  start: number;
+  end: number;
+  uri: string;
+  kind: "web" | "muster";
+}
+
+/** Where a web address starts: `http://` or `https://`, not glued to a word before it
+ * (`xhttp://` is none). */
+const WEB_START = /https?:\/\//gi;
+/** Characters no address holds unescaped: it ends before them. */
+const WEB_STOP = /[\s<>"`]/;
+/** Characters that end a sentence or a quote rather than an address: `see https://a.org/x.`
+ * is a link to `https://a.org/x`. */
+const TRAILING = ".,;:!?'";
+/** Markup around an address (`**https://a.org/x**`): trimmed only as far as the same run before
+ * it, since an address may end in these (`?token=abc_`). */
+const WRAP = "*_~";
+/** Another address starting right after a comma or semicolon (`https://a.org,muster://note/7`). */
+const NEXT_ADDRESS = /^(?:https?:\/\/|muster:\/\/)/i;
+const OPEN: Record<string, string> = { "(": ")", "[": "]", "{": "}" };
+const CLOSE: Record<string, string> = { ")": "(", "]": "[", "}": "{" };
+
+/** Where the web address starting at `from` (just after `://`) ends. A closing bracket the address
+ * didn't open ends it (`(https://a.org/x)`, Markdown `[t](https://a.org/x)[u](…)`), one it opened
+ * stays (`https://en.wikipedia.org/wiki/Rust_(language)`), and so does a comma or semicolon right
+ * before another address, web or Muster (`https://a.org,https://b.org` is two). One pass, so a long run of
+ * brackets costs no more than its length. */
+function webEnd(text: string, start: number, from: number): number {
+  const depth: Record<string, number> = { "(": 0, "[": 0, "{": 0 };
+  let i = from;
+  for (; i < text.length; i++) {
+    const c = text[i];
+    if (WEB_STOP.test(c)) break;
+    if (c in OPEN) depth[c]++;
+    else if (c in CLOSE) {
+      if (depth[CLOSE[c]] === 0) break;
+      depth[CLOSE[c]]--;
+    } else if ((c === "," || c === ";") && NEXT_ADDRESS.test(text.slice(i + 1, i + 10))) break;
+  }
+  // Sentence ends and quotes after it; then markup as far as the same run before it.
+  let end = i;
+  while (end > from && TRAILING.includes(text[end - 1])) end--;
+  let before = start - 1;
+  while (end > from && before >= 0 && WRAP.includes(text[end - 1]) && text[before] === text[end - 1]) {
+    end--;
+    before--;
+    while (end > from && TRAILING.includes(text[end - 1])) end--;
+  }
+  return end;
+}
+
+/** Every link in `text`, in order: web addresses (http, https) and Muster addresses. Nothing else
+ * (`file://`, `ftp://`, `javascript:`) is a link. A Muster address inside a web address is part of
+ * that address, not a link of its own. */
+export function findTextLinks(text: string): TextLink[] {
+  const web: TextLink[] = [];
+  if (!text.includes("://")) return web;
+  const re = new RegExp(WEB_START.source, WEB_START.flags);
+  for (let m = re.exec(text); m; m = re.exec(text)) {
+    const start = m.index;
+    if (start > 0 && /[A-Za-z0-9]/.test(text[start - 1])) continue;
+    const end = webEnd(text, start, start + m[0].length);
+    re.lastIndex = Math.max(re.lastIndex, end);
+    const uri = text.slice(start, end);
+    // A host must follow the slashes: `https://` alone, or `https://.`, is none.
+    if (!/^https?:\/\/[^/?#]/i.test(uri)) continue;
+    web.push({ start, end, uri, kind: "web" });
+  }
+  // Both lists are in order, so one walk drops the Muster addresses inside web ones.
+  const out: TextLink[] = [];
+  let w = 0;
+  for (const l of findMusterLinks(text)) {
+    while (w < web.length && web[w].end <= l.start) out.push(web[w++]);
+    if (w < web.length && web[w].start < l.end) continue;
+    out.push({ ...l, kind: "muster" });
+  }
+  while (w < web.length) out.push(web[w++]);
+  return out;
+}
+
+/** The link the caret is in (`from` to `to`, a selection inside one link counts), looked for on the
+ * caret's line only: an address never spans lines. A caret right after an address's last
+ * character is in it. */
+export function linkAt(text: string, from: number, to = from): TextLink | null {
+  const start = text.lastIndexOf("\n", from - 1) + 1;
+  const nl = text.indexOf("\n", from);
+  const line = text.slice(start, nl < 0 ? text.length : nl);
+  for (const l of findTextLinks(line)) {
+    if (l.start + start <= from && to <= l.end + start) {
+      return { ...l, start: l.start + start, end: l.end + start };
+    }
+  }
+  return null;
+}

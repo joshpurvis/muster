@@ -1,6 +1,7 @@
 // A note's editor (docs/UI.md "Notes"): a plain <textarea> that saves itself, plus a status line
 // with who edited it last, the save state and the caret position. The text, caret and undo history
-// live in the note's draft (notes.ts), so moving the tab between groups keeps them.
+// live in the note's draft (notes.ts), so moving the tab between groups keeps them. Web and Muster
+// addresses in the text open on Ctrl+click (⌘-click on a Mac); a plain click places the caret.
 import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
 import { authorName, draftOf, draftsChanged, editDraft, ensureBody, flushDraft, isDirty, notes, undoDraft } from "../notes.ts";
 import { mapOffset } from "../note_merge.ts";
@@ -8,7 +9,9 @@ import { clean, endGroup, kindOf } from "../note_undo.ts";
 import { ago } from "../agents.ts";
 import { connStatus } from "../rpc.ts";
 import { schedules } from "../state.ts";
-import { setNoteTriggers } from "../actions.ts";
+import { setNoteTriggers, showLink } from "../actions.ts";
+import { linkAt, parseMusterLink, type TextLink } from "../links.ts";
+import { type LinkHit, NoteLinks } from "../note_links.ts";
 import { IconZap } from "../icons.tsx";
 import { cx, isMac } from "../util.ts";
 
@@ -88,6 +91,30 @@ function reveal(el: HTMLTextAreaElement, at: number) {
   }
 }
 
+/** The key that makes a click open a link: ⌘ on a Mac (where Ctrl+click is a right click), Ctrl
+ * elsewhere. */
+const linkMod = (e: { ctrlKey: boolean; metaKey: boolean }) => isMac ? e.metaKey : e.ctrlKey;
+const MOD_CLICK = isMac ? "⌘-click" : "Ctrl+click";
+const MOD_ENTER = isMac ? "⌘Enter" : "Ctrl+Enter";
+
+/** Open a link from a note: a web address in the browser (from the native window, the system
+ * browser), a Muster address in Muster, as a click on it in a terminal does. */
+function openLink(l: TextLink) {
+  if (l.kind === "web") {
+    globalThis.open(l.uri, "_blank", "noopener,noreferrer");
+    return;
+  }
+  const m = parseMusterLink(l.uri);
+  if (m) showLink(m);
+}
+
+/** What the status line says a link under the pointer opens: a note by its title. */
+function linkLabel(l: TextLink): string {
+  const m = l.kind === "muster" ? parseMusterLink(l.uri) : null;
+  const n = m?.kind === "note" ? notes.value.get(m.id) : undefined;
+  return n ? `note “${n.title}”` : l.uri;
+}
+
 /** Note `id`'s editor. Every note tab of a group keeps its editor mounted (`hidden` while it isn't
  * the visible tab), so switching tabs keeps the textarea and its scroll. */
 export function NoteView({ id, hidden = false }: { id: number; hidden?: boolean }) {
@@ -98,6 +125,13 @@ export function NoteView({ id, hidden = false }: { id: number; hidden?: boolean 
   /** Where the selection started before the edit on its way (for undo; `beforeinput`). */
   const from = useRef<number | null>(null);
   const [pos, setPos] = useState({ line: 1, col: 1 });
+  /** The link under the pointer, and whether the key that opens it is down (it is underlined). */
+  const [hover, setHover] = useState<{ hit: LinkHit; mod: boolean } | null>(null);
+  /** The link the caret is in (Ctrl+Enter opens it). */
+  const [atCaret, setAtCaret] = useState<TextLink | null>(null);
+  /** Look for the link under the pointer again: the text changed without an input event (an
+   * agent's change, undo), so the status line must not name what is no longer there. */
+  const relook = useRef(() => {});
   const d = n ? draftOf(n) : undefined;
   // Only its summary is known yet (hello carries no text): fetch the text.
   useEffect(() => {
@@ -110,7 +144,10 @@ export function NoteView({ id, hidden = false }: { id: number; hidden?: boolean 
 
   const track = () => {
     const el = ref.current;
-    if (el) setPos(caret(el.value, el.selectionStart));
+    if (!el) return;
+    setPos(caret(el.value, el.selectionStart));
+    const l = linkAt(el.value, el.selectionStart, el.selectionEnd);
+    setAtCaret((p) => p?.start === l?.start && p?.uri === l?.uri ? p : l);
   };
 
   // Ctrl+Z / Ctrl+Shift+Z: the note's own history (note_undo.ts), never the browser's, which
@@ -123,6 +160,7 @@ export function NoteView({ id, hidden = false }: { id: number; hidden?: boolean 
     el.setSelectionRange(c.sel[0], c.sel[1]);
     reveal(el, c.sel[0]);
     track();
+    relook.current();
   };
 
   useLayoutEffect(() => {
@@ -139,6 +177,7 @@ export function NoteView({ id, hidden = false }: { id: number; hidden?: boolean 
       el.setSelectionRange(mapOffset(before, after, s), mapOffset(before, after, e));
       el.scrollTop = top;
       track();
+      relook.current();
     };
     const onBefore = (e: InputEvent) => {
       // The browser's own Undo and Redo (its context menu, when it offers them there, which it
@@ -161,6 +200,107 @@ export function NoteView({ id, hidden = false }: { id: number; hidden?: boolean 
     };
   }, [id, !!d]);
 
+  // Links under the pointer: found on a move, on Ctrl going down or up while the pointer rests,
+  // and when the text scrolls, changes or reflows under it. A press with Ctrl on one is kept from
+  // the textarea (no caret move, no selection); its release on the same link opens it, unless the
+  // pointer moved away from where it was pressed, or the text changed, in between.
+  useEffect(() => {
+    const el = ref.current;
+    if (!el || !d) return;
+    const map = new NoteLinks(el);
+    let at: { x: number; y: number } | null = null;
+    let mod = false;
+    let pressed: { link: TextLink; x: number; y: number } | null = null;
+    let frame = 0;
+    let shown = "";
+    const look = () => {
+      frame = 0;
+      const hit = at ? map.at(at.x, at.y) : null;
+      const key = hit ? `${hit.link.start}|${hit.link.uri}|${mod}|${JSON.stringify(hit.boxes)}` : "";
+      el.classList.toggle("on-link", !!hit && mod);
+      if (key === shown) return;
+      shown = key;
+      setHover(hit ? { hit, mod } : null);
+    };
+    const soon = () => {
+      if (!frame) frame = requestAnimationFrame(look);
+    };
+    const changed = () => {
+      pressed = null;
+      soon();
+    };
+    relook.current = changed;
+    const moved = (p: { x: number; y: number }, e: MouseEvent) => Math.hypot(e.clientX - p.x, e.clientY - p.y) > 4;
+    const onMove = (e: PointerEvent) => {
+      at = { x: e.clientX, y: e.clientY };
+      if (pressed && moved(pressed, e)) pressed = null;
+      mod = linkMod(e);
+      soon();
+    };
+    // Leaving the editor ends a press too: a drag out and back is a drag.
+    const onLeave = () => {
+      at = null;
+      pressed = null;
+      soon();
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Control" && e.key !== "Meta") return;
+      mod = linkMod(e);
+      if (at) soon();
+    };
+    const onBlur = () => {
+      mod = false;
+      pressed = null;
+      soon();
+    };
+    const onDown = (e: MouseEvent) => {
+      pressed = null;
+      if (e.button !== 0 || !linkMod(e)) return;
+      const hit = map.at(e.clientX, e.clientY);
+      if (!hit) return;
+      e.preventDefault();
+      pressed = { link: hit.link, x: e.clientX, y: e.clientY };
+    };
+    // On the window, so a release anywhere else ends the press too.
+    const onUp = (e: MouseEvent) => {
+      const p = pressed;
+      pressed = null;
+      if (!p || e.button !== 0 || e.target !== el || moved(p, e)) return;
+      const hit = map.at(e.clientX, e.clientY);
+      if (hit && hit.link.start === p.link.start && hit.link.uri === p.link.uri) openLink(p.link);
+    };
+    const resized = new ResizeObserver(soon);
+    resized.observe(el);
+    el.addEventListener("pointermove", onMove);
+    el.addEventListener("pointerleave", onLeave);
+    el.addEventListener("scroll", soon);
+    el.addEventListener("input", changed);
+    el.addEventListener("pointercancel", onBlur);
+    el.addEventListener("mousedown", onDown);
+    globalThis.addEventListener("mouseup", onUp, true);
+    globalThis.addEventListener("keydown", onKey, true);
+    globalThis.addEventListener("keyup", onKey, true);
+    globalThis.addEventListener("blur", onBlur);
+    return () => {
+      cancelAnimationFrame(frame);
+      el.removeEventListener("pointermove", onMove);
+      el.removeEventListener("pointerleave", onLeave);
+      el.removeEventListener("scroll", soon);
+      el.removeEventListener("input", changed);
+      el.removeEventListener("pointercancel", onBlur);
+      el.removeEventListener("mousedown", onDown);
+      globalThis.removeEventListener("mouseup", onUp, true);
+      resized.disconnect();
+      relook.current = () => {};
+      globalThis.removeEventListener("keydown", onKey, true);
+      globalThis.removeEventListener("keyup", onKey, true);
+      globalThis.removeEventListener("blur", onBlur);
+      el.classList.remove("on-link");
+      map.dispose();
+      setHover(null);
+    };
+  }, [id, !!d]);
+
   if (!n) return <div class="note-view note-missing" hidden={hidden}>This note was deleted.</div>;
   if (!d) return <div class="note-view note-missing" hidden={hidden}>Loading note…</div>;
 
@@ -178,6 +318,7 @@ export function NoteView({ id, hidden = false }: { id: number; hidden?: boolean 
         class="note-text"
         data-note-id={id}
         aria-label={`Note: ${n.title}`}
+        aria-describedby={`note-links-help-${id}`}
         spellcheck={false}
         placeholder="Type here. Agents read and add to this note too (note_read, note_append)."
         disabled={connStatus.value === "incompatible"}
@@ -213,6 +354,16 @@ export function NoteView({ id, hidden = false }: { id: number; hidden?: boolean 
             e.preventDefault();
             flushDraft(id);
           }
+          // Ctrl+Enter (⌘Enter) opens the link the caret is in, as Ctrl+click does.
+          if (linkMod(e) && !e.altKey && !e.shiftKey && e.key === "Enter" && !e.isComposing) {
+            const el = e.currentTarget as HTMLTextAreaElement;
+            const l = linkAt(el.value, el.selectionStart, el.selectionEnd);
+            if (l) {
+              e.preventDefault();
+              e.stopPropagation();
+              openLink(l);
+            }
+          }
           // Undo; redo on Ctrl+Shift+Z or Ctrl+Y (⌘Z, ⇧⌘Z and ⌘Y on a Mac). Kept from the
           // browser's own undo and from every other key handler.
           const mod = isMac ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey;
@@ -223,6 +374,23 @@ export function NoteView({ id, hidden = false }: { id: number; hidden?: boolean 
           }
         }}
       />
+      <span id={`note-links-help-${id}`} class="sr-only">
+        {MOD_ENTER} or {MOD_CLICK} on a web or Muster address opens it.
+      </span>
+      {hover?.mod && ref.current && (
+        <div
+          class="note-link-lines"
+          aria-hidden="true"
+          style={{
+            left: ref.current.offsetLeft + ref.current.clientLeft,
+            top: ref.current.offsetTop + ref.current.clientTop,
+            width: ref.current.clientWidth,
+            height: ref.current.clientHeight,
+          }}
+        >
+          {hover.hit.boxes.map((b, i) => <div key={i} style={{ left: b.x, top: b.y + b.h - 2, width: b.w }} />)}
+        </div>
+      )}
       {d.restored && (
         <div class="note-merge" role="status">
           Brought back typing that wasn't saved when this window last closed or reloaded; it is being saved now.
@@ -233,13 +401,22 @@ export function NoteView({ id, hidden = false }: { id: number; hidden?: boolean 
           Your typing and {d.conflictWith}'s change touched the same lines. Both are kept: theirs is between the ──── lines.
         </div>
       )}
-      <div class="note-status">
+      <div class={cx("note-status", (hover || atCaret) && "linking")}>
         <span class={d.error || over ? "note-state err" : dirty || d.inflight ? "note-state busy" : "note-state"} role="status">
           {over ? "Too long to save: a note holds at most 1 MB" : state}
         </span>
-        <span class="note-by" title={new Date(n.updated_at).toLocaleString()}>
-          edited by {authorName(by)} · {ago(n.updated_at, now)}
-        </span>
+        {hover || atCaret
+          ? (
+            <span class="note-link-hint">
+              <span class="how">{hover ? (hover.mod ? "Click" : MOD_CLICK) : MOD_ENTER} to open</span>{" "}
+              <span class="dest">{linkLabel(hover ? hover.hit.link : atCaret!)}</span>
+            </span>
+          )
+          : (
+            <span class="note-by" title={new Date(n.updated_at).toLocaleString()}>
+              edited by {authorName(by)} · {ago(n.updated_at, now)}
+            </span>
+          )}
         <span class="note-spacer" />
         {n.triggers !== undefined && <TriggerSwitch id={id} on={!!n.triggers} title={n.title} />}
         <span class="note-pos">Ln {pos.line}, Col {pos.col}</span>

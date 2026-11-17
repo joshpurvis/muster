@@ -254,6 +254,22 @@ docs/MCP.md "Notes") and `muster note` (docs/CLI.md); the human types in it.
   failed (deleted, reconnecting, over 1 MB), "edited by you" or "edited by Claude (fix auth)"
   with how long ago, the caret's line and column, and the size. Every note tab of a group keeps
   its editor (hidden behind the visible tab), so switching tabs keeps its scroll.
+- **Links**: web addresses (`http://`, `https://`) and Muster addresses (`muster://note/91`, see
+  "Links") in a note's text open on Ctrl+click (⌘-click on a Mac); a plain click places the caret,
+  as in any text. Ctrl+Enter (⌘Enter) opens the one the caret is in. Hovering one puts
+  "Ctrl+click to open …" in the status line (a note by its title), and with the caret in one,
+  "Ctrl+Enter to open …"; in a narrow note the caret's place and the triggers switch step aside
+  while it shows. With Ctrl down the link under the pointer is underlined and the pointer becomes
+  a hand. A press that turns into a drag opens nothing, and an agent's change under a resting
+  pointer updates what the status line names. A web address opens in the browser (from the
+  native window, the system browser); a Muster address shows what it names, as a click on it in
+  a terminal does. Punctuation after an address in prose is not part of it
+  (`see https://example.org/a.`), nor is a bracket it didn't open (`(https://example.org/a)`, a
+  Markdown `[guide](https://example.org/a)`), nor markup around it (`**https://example.org/a**`);
+  a comma or semicolon right before another address splits the two; a bracket it did open stays
+  (`https://en.wikipedia.org/wiki/Rust_(language)`). Other schemes (`file://`, `mailto:`) and bare
+  `www.` names are plain text (`findTextLinks` in web/src/links.ts; the editor stays a plain
+  textarea, and web/src/note_links.ts finds which address is under the pointer).
 - **Undo**: Ctrl+Z undoes the human's own edits in the note, Ctrl+Shift+Z or Ctrl+Y redoes them
   (⌘Z, ⇧⌘Z or ⌘Y on a Mac; on other keyboard layouts the keys in those places). Undo and redo
   are keyboard only: the browser's context menu greys its Undo and Redo by its own history, so
@@ -394,6 +410,8 @@ transcripts and pasted elsewhere (src/links.rs, web/src/links.ts):
   middle-click (paste) or a click with a modifier does what it always did. Web links are as
   before: Ctrl+click (⌘-click) on an address, and xterm's "Do you want to navigate…" question
   for a hyperlink. Other hyperlinks (`file://`, …) do nothing.
+- **In a note**: the same addresses in a note's text, and web addresses, open on Ctrl+click or
+  Ctrl+Enter ("Notes", "Links").
 - **Gone**: a link to a deleted note, a closed panel or tab, or an agent that doesn't exist (or
   has never started) shows a short message saying so.
 - **Only shows**: following a link selects a tab, opens a note's tab or raises a window, nothing

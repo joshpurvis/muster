@@ -229,13 +229,15 @@ Deno.test("the Questions tab starts first in the first group of whichever channe
 
 Deno.test("Questions follows the window to the unfiled note tabs (channel 0) and back", () => {
   const known = (id: number) => id === 10 || id === 20;
-  equal([followingChannel(10, known), followingChannel(0, known), followingChannel(30, known)], [10, 0, null]);
-  equal([followingChannel(null, known), followingChannel(undefined, known)], [null, null]);
+  equal([followingChannel(10, known, true), followingChannel(0, known, true), followingChannel(30, known, true)], [10, 0, null]);
+  equal([followingChannel(null, known, true), followingChannel(undefined, known, true)], [null, null]);
+  // No unfiled notes left: the empty unfiled workspace isn't kept open for Questions.
+  equal(followingChannel(0, known, false), null);
   const Q = -(2 ** 52);
   // Channel 10 shows Questions and a terminal; an unfiled note (channel 0) has a layout of its own.
   const tabs = (active: number): TabHome[] => [
     { id: 1, channel: 10 }, { id: noteTab(7), channel: 0 },
-    { id: Q, channel: followingChannel(active, known), questions: true },
+    { id: Q, channel: followingChannel(active, known, true), questions: true },
   ];
   let w = loadChannelLayout({ v: 2, active: 10, layouts: {}, sidebar: {} }, [10, 20], tabs(10));
   equal(sig(w.layouts[10].root), `[${Q},1]`);
@@ -252,6 +254,19 @@ Deno.test("Questions follows the window to the unfiled note tabs (channel 0) and
     { id: 1, channel: 10 }, { id: noteTab(7), channel: 0 }, { id: Q, channel: null, questions: true },
   ]);
   equal(sig(stale.layouts[10].root), `[${Q},1]`);
+  // Reloaded while the unfiled tabs are shown: the saved place of Questions there is kept while
+  // the window loads (it isn't shown yet), not dropped.
+  const there = reconcileChannels({ ...w, active: 0 }, [10, 20], tabs(0));
+  const reloaded = loadChannelLayout(JSON.parse(JSON.stringify(there)), [10, 20], [
+    { id: 1, channel: 10 }, { id: noteTab(7), channel: 0 }, { id: Q, channel: null, questions: true, kept: true },
+  ]);
+  equal(sig(reloaded.layouts[0].root), `[${Q},${noteTab(7)}]`);
+  // The last unfiled note closed: Questions goes back to a channel and the unfiled workspace closes.
+  const closed = reconcileChannels({ ...there, active: 0 }, [10, 20], [
+    { id: 1, channel: 10 }, { id: Q, channel: followingChannel(0, known, false), questions: true },
+  ]);
+  equal(closed.layouts[0], undefined);
+  assert(allSessions(closed.layouts[10].root).includes(Q), "Questions is back in channel 10");
 });
 
 const QTAB = -(2 ** 52);

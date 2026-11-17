@@ -701,12 +701,15 @@ export function releaseNewSessions() {
 
 const liveTabs = computed((): TabHome[] => {
   const valid = (id: number | null | undefined) => id != null && channelById.value.has(id) ? id : null;
-  const shown = followingChannel(activeChannelId.value, (id) => channelById.value.has(id));
+  const notes = windowNotes.value.map((n) => ({ id: noteTab(n.id),
+    channel: n.channel_id != null ? valid(n.channel_id) ?? 0 : null, beside: n.beside }));
+  // Notes without a channel may also land in the unfiled tabs (reconcileChannels).
+  const unfiled = notes.some((t) => t.channel === 0 || t.channel === null);
+  const shown = followingChannel(activeChannelId.value, (id) => channelById.value.has(id), unfiled);
   return [
     ...windowSessions.value.map((s) => ({ id: s.id, channel: s.channel_id })),
     ...windowPanels.value.map((p) => ({ id: panelTab(p.id), channel: p.channel_id, beside: p.session_id })),
-    ...windowNotes.value.map((n) => ({ id: noteTab(n.id),
-      channel: n.channel_id != null ? valid(n.channel_id) ?? 0 : null, beside: n.beside })),
+    ...notes,
     // In whichever channel is shown, the unfiled note tabs included (never one archived meanwhile:
     // then the channel that takes its place), arriving at that channel's own place, else where the
     // human last put it.

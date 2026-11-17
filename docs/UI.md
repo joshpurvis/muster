@@ -369,8 +369,7 @@ human"); the **Questions** tab is where the human sees and answers them (`web/sr
   closed panel or a missing note says so in a short message); a web link opens in the browser
   (only http(s), with a host and no user name before it). An image (`![alt](url)`) or an escaped
   bracket stays as written. In an option, a click on its link follows the link and leaves the
-  option as it was; the keyboard reaches those links again under **Send answer**, beside the
-  question's links. The answer preview ("Sends a) …") shows a link as its label.
+  option as it was; the keyboard reaches those links again on an "In the options:" line under them. The answer preview ("Sends a) …") shows a link as its label.
 - **Answering**: click an option (pick several: tick any number; a chosen option clicked again is
   unchosen) or type, then **Send answer** (or Ctrl+Enter in the box). The first words typed replace
   the chosen options ("or answer in your own words": typing "No, hold it" under a preselected "Yes,

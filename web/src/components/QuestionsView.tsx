@@ -256,7 +256,8 @@ function InlineLink({ part, inButton }: { part: LinkPart; inButton: boolean }) {
 }
 
 /** The links inside the options, once each: a button inside an option's button can't take the
- * keyboard, so they are offered again among the card's links. */
+ * keyboard, so they are offered again on a line under the options (not in the sticky footer, which
+ * many of them could grow over the answer box). */
 function optionLinks(q: Question): { label: string; url: string }[] {
   const seen = new Set<string>();
   const out: { label: string; url: string }[] = [];
@@ -306,7 +307,7 @@ function Links({ q }: { q: Question }) {
   const { session } = askerSession(q);
   return (
     <span class="qv-links">
-      {[...(q.links ?? []), ...optionLinks(q)]
+      {(q.links ?? [])
         .filter((l) => parseMusterLink(l.url) || webAddress(l.url))
         .map((l, i) => (
           <button key={i} type="button" class="qv-link" data-tip={l.url} data-tip-focus aria-description={l.url}
@@ -318,6 +319,22 @@ function Links({ q }: { q: Question }) {
         <button type="button" class="qv-link" onClick={() => A.gotoSession(session.id)}>Open {q.asker.label}'s tab</button>
       )}
     </span>
+  );
+}
+
+function OptionLinks({ q }: { q: Question }) {
+  const list = optionLinks(q);
+  if (!list.length) return null;
+  return (
+    <p class="qv-opt-links">
+      In the options:{" "}
+      {list.map((l, i) => (
+        <span key={l.url}>
+          {i > 0 && " · "}
+          <InlineLink part={{ label: l.label, url: l.url, muster: parseMusterLink(l.url) }} inButton={false} />
+        </span>
+      ))}
+    </p>
   );
 }
 
@@ -392,6 +409,7 @@ function Answering({ q }: { q: Question }) {
               );
             })}
           </div>
+          <OptionLinks q={q} />
         </>
       )}
       <div class="qv-say">

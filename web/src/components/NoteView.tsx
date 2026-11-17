@@ -10,7 +10,7 @@ import { ago } from "../agents.ts";
 import { connStatus } from "../rpc.ts";
 import { schedules } from "../state.ts";
 import { setNoteTriggers, showLink } from "../actions.ts";
-import { parseMusterLink, type TextLink } from "../links.ts";
+import { linkAt, parseMusterLink, type TextLink } from "../links.ts";
 import { type LinkHit, NoteLinks } from "../note_links.ts";
 import { IconZap } from "../icons.tsx";
 import { cx, isMac } from "../util.ts";
@@ -94,7 +94,8 @@ function reveal(el: HTMLTextAreaElement, at: number) {
 /** The key that makes a click open a link: ⌘ on a Mac (where Ctrl+click is a right click), Ctrl
  * elsewhere. */
 const linkMod = (e: { ctrlKey: boolean; metaKey: boolean }) => isMac ? e.metaKey : e.ctrlKey;
-const MOD_NAME = isMac ? "⌘-click" : "Ctrl+click";
+const MOD_CLICK = isMac ? "⌘-click" : "Ctrl+click";
+const MOD_ENTER = isMac ? "⌘Enter" : "Ctrl+Enter";
 
 /** Open a link from a note: a web address in the browser (from the native window, the system
  * browser), a Muster address in Muster, as a click on it in a terminal does. */
@@ -126,6 +127,11 @@ export function NoteView({ id, hidden = false }: { id: number; hidden?: boolean 
   const [pos, setPos] = useState({ line: 1, col: 1 });
   /** The link under the pointer, and whether the key that opens it is down (it is underlined). */
   const [hover, setHover] = useState<{ hit: LinkHit; mod: boolean } | null>(null);
+  /** The link the caret is in (Ctrl+Enter opens it). */
+  const [atCaret, setAtCaret] = useState<TextLink | null>(null);
+  /** Look for the link under the pointer again: the text changed without an input event (an
+   * agent's change, undo), so the status line must not name what is no longer there. */
+  const relook = useRef(() => {});
   const d = n ? draftOf(n) : undefined;
   // Only its summary is known yet (hello carries no text): fetch the text.
   useEffect(() => {
@@ -138,7 +144,10 @@ export function NoteView({ id, hidden = false }: { id: number; hidden?: boolean 
 
   const track = () => {
     const el = ref.current;
-    if (el) setPos(caret(el.value, el.selectionStart));
+    if (!el) return;
+    setPos(caret(el.value, el.selectionStart));
+    const l = linkAt(el.value, el.selectionStart, el.selectionEnd);
+    setAtCaret((p) => p?.start === l?.start && p?.uri === l?.uri ? p : l);
   };
 
   // Ctrl+Z / Ctrl+Shift+Z: the note's own history (note_undo.ts), never the browser's, which
@@ -151,6 +160,7 @@ export function NoteView({ id, hidden = false }: { id: number; hidden?: boolean 
     el.setSelectionRange(c.sel[0], c.sel[1]);
     reveal(el, c.sel[0]);
     track();
+    relook.current();
   };
 
   useLayoutEffect(() => {
@@ -167,6 +177,7 @@ export function NoteView({ id, hidden = false }: { id: number; hidden?: boolean 
       el.setSelectionRange(mapOffset(before, after, s), mapOffset(before, after, e));
       el.scrollTop = top;
       track();
+      relook.current();
     };
     const onBefore = (e: InputEvent) => {
       // The browser's own Undo and Redo (its context menu, when it offers them there, which it
@@ -190,15 +201,16 @@ export function NoteView({ id, hidden = false }: { id: number; hidden?: boolean 
   }, [id, !!d]);
 
   // Links under the pointer: found on a move, on Ctrl going down or up while the pointer rests,
-  // and when the text scrolls or changes under it. A press with Ctrl on one is kept from the textarea (no
-  // caret move, no selection) and its release on the same link opens it.
+  // and when the text scrolls, changes or reflows under it. A press with Ctrl on one is kept from
+  // the textarea (no caret move, no selection); its release on the same link opens it, unless the
+  // pointer moved away from where it was pressed, or the text changed, in between.
   useEffect(() => {
     const el = ref.current;
     if (!el || !d) return;
     const map = new NoteLinks(el);
     let at: { x: number; y: number } | null = null;
     let mod = false;
-    let pressed: TextLink | null = null;
+    let pressed: { link: TextLink; x: number; y: number } | null = null;
     let frame = 0;
     let shown = "";
     const look = () => {
@@ -213,8 +225,15 @@ export function NoteView({ id, hidden = false }: { id: number; hidden?: boolean 
     const soon = () => {
       if (!frame) frame = requestAnimationFrame(look);
     };
+    const changed = () => {
+      pressed = null;
+      soon();
+    };
+    relook.current = changed;
+    const moved = (p: { x: number; y: number }, e: MouseEvent) => Math.hypot(e.clientX - p.x, e.clientY - p.y) > 4;
     const onMove = (e: PointerEvent) => {
       at = { x: e.clientX, y: e.clientY };
+      if (pressed && moved(pressed, e)) pressed = null;
       mod = linkMod(e);
       soon();
     };
@@ -238,21 +257,25 @@ export function NoteView({ id, hidden = false }: { id: number; hidden?: boolean 
       const hit = map.at(e.clientX, e.clientY);
       if (!hit) return;
       e.preventDefault();
-      pressed = hit.link;
+      pressed = { link: hit.link, x: e.clientX, y: e.clientY };
     };
+    // On the window, so a release anywhere else ends the press too.
     const onUp = (e: MouseEvent) => {
       const p = pressed;
       pressed = null;
-      if (!p || e.button !== 0) return;
+      if (!p || e.button !== 0 || e.target !== el || moved(p, e)) return;
       const hit = map.at(e.clientX, e.clientY);
-      if (hit && hit.link.start === p.start && hit.link.uri === p.uri) openLink(p);
+      if (hit && hit.link.start === p.link.start && hit.link.uri === p.link.uri) openLink(p.link);
     };
+    const resized = new ResizeObserver(soon);
+    resized.observe(el);
     el.addEventListener("pointermove", onMove);
     el.addEventListener("pointerleave", onLeave);
     el.addEventListener("scroll", soon);
-    el.addEventListener("input", soon);
+    el.addEventListener("input", changed);
+    el.addEventListener("pointercancel", onBlur);
     el.addEventListener("mousedown", onDown);
-    el.addEventListener("mouseup", onUp);
+    globalThis.addEventListener("mouseup", onUp, true);
     globalThis.addEventListener("keydown", onKey, true);
     globalThis.addEventListener("keyup", onKey, true);
     globalThis.addEventListener("blur", onBlur);
@@ -261,9 +284,12 @@ export function NoteView({ id, hidden = false }: { id: number; hidden?: boolean 
       el.removeEventListener("pointermove", onMove);
       el.removeEventListener("pointerleave", onLeave);
       el.removeEventListener("scroll", soon);
-      el.removeEventListener("input", soon);
+      el.removeEventListener("input", changed);
+      el.removeEventListener("pointercancel", onBlur);
       el.removeEventListener("mousedown", onDown);
-      el.removeEventListener("mouseup", onUp);
+      globalThis.removeEventListener("mouseup", onUp, true);
+      resized.disconnect();
+      relook.current = () => {};
       globalThis.removeEventListener("keydown", onKey, true);
       globalThis.removeEventListener("keyup", onKey, true);
       globalThis.removeEventListener("blur", onBlur);
@@ -290,6 +316,7 @@ export function NoteView({ id, hidden = false }: { id: number; hidden?: boolean 
         class="note-text"
         data-note-id={id}
         aria-label={`Note: ${n.title}`}
+        aria-describedby={`note-links-help-${id}`}
         spellcheck={false}
         placeholder="Type here. Agents read and add to this note too (note_read, note_append)."
         disabled={connStatus.value === "incompatible"}
@@ -325,6 +352,16 @@ export function NoteView({ id, hidden = false }: { id: number; hidden?: boolean 
             e.preventDefault();
             flushDraft(id);
           }
+          // Ctrl+Enter (⌘Enter) opens the link the caret is in, as Ctrl+click does.
+          if (linkMod(e) && !e.altKey && !e.shiftKey && e.key === "Enter" && !e.isComposing) {
+            const el = e.currentTarget as HTMLTextAreaElement;
+            const l = linkAt(el.value, el.selectionStart, el.selectionEnd);
+            if (l) {
+              e.preventDefault();
+              e.stopPropagation();
+              openLink(l);
+            }
+          }
           // Undo; redo on Ctrl+Shift+Z or Ctrl+Y (⌘Z, ⇧⌘Z and ⌘Y on a Mac). Kept from the
           // browser's own undo and from every other key handler.
           const mod = isMac ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey;
@@ -335,6 +372,9 @@ export function NoteView({ id, hidden = false }: { id: number; hidden?: boolean 
           }
         }}
       />
+      <span id={`note-links-help-${id}`} class="sr-only">
+        {MOD_ENTER} or {MOD_CLICK} on a web or Muster address opens it.
+      </span>
       {hover?.mod && ref.current && (
         <div
           class="note-link-lines"
@@ -359,14 +399,15 @@ export function NoteView({ id, hidden = false }: { id: number; hidden?: boolean 
           Your typing and {d.conflictWith}'s change touched the same lines. Both are kept: theirs is between the ──── lines.
         </div>
       )}
-      <div class="note-status">
+      <div class={cx("note-status", (hover || atCaret) && "linking")}>
         <span class={d.error || over ? "note-state err" : dirty || d.inflight ? "note-state busy" : "note-state"} role="status">
           {over ? "Too long to save: a note holds at most 1 MB" : state}
         </span>
-        {hover
+        {hover || atCaret
           ? (
             <span class="note-link-hint">
-              {hover.mod ? "Click" : MOD_NAME} to open {linkLabel(hover.hit.link)}
+              <span class="how">{hover ? (hover.mod ? "Click" : MOD_CLICK) : MOD_ENTER} to open</span>{" "}
+              <span class="dest">{linkLabel(hover ? hover.hit.link : atCaret!)}</span>
             </span>
           )
           : (

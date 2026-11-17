@@ -5187,10 +5187,17 @@ body.dragging .panel-view { pointer-events: none; }
 .note-state.busy { color: var(--accent-strong); }
 .note-state.err { color: var(--st-error); }
 .note-by { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
-.note-link-hint { overflow: hidden; text-overflow: ellipsis; min-width: 0; color: var(--text-muted); }
+/* "Ctrl+click to open <where>": the instruction keeps its width, the address is cut short. */
+.note-link-hint { display: flex; gap: 0.4em; min-width: 0; overflow: hidden; color: var(--text-muted); }
+.note-link-hint .how { flex: none; }
+.note-link-hint .dest { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .note-spacer { flex: 1; }
 @container (max-width: 420px) {
   .note-size { display: none; }
+  /* While a link is named, the instruction comes first: the caret place and the triggers switch
+     step aside until the pointer or caret leaves the link. */
+  .note-status.linking .note-pos,
+  .note-status.linking .note-trig { display: none; }
   .note-text { padding: 10px 12px 12px; }
 }
 .notes-list .sw-item { height: auto; min-height: 40px; padding-top: 4px; padding-bottom: 4px; }

@@ -144,51 +144,89 @@ export interface TextLink {
   kind: "web" | "muster";
 }
 
-/** A web address runs from `http://` or `https://` to a space or a character no address holds
- * unescaped (`<>"` and backtick). Not glued to a word before it (`xhttp://` is none). */
-const WEB_IN_TEXT = /https?:\/\/[^\s<>"`]+/gi;
-
+/** Where a web address starts: `http://` or `https://`, not glued to a word before it
+ * (`xhttp://` is none). */
+const WEB_START = /https?:\/\//gi;
+/** Characters no address holds unescaped: it ends before them. */
+const WEB_STOP = /[\s<>"`]/;
 /** Characters that end a sentence or a quote rather than an address: `see https://a.org/x.`
  * is a link to `https://a.org/x`. */
-const TRAILING = /[.,;:!?'*_~]$/;
+const TRAILING = ".,;:!?'";
+/** Markup around an address (`**https://a.org/x**`): trimmed only as far as the same run before
+ * it, since an address may end in these (`?token=abc_`). */
+const WRAP = "*_~";
+const OPEN: Record<string, string> = { "(": ")", "[": "]", "{": "}" };
 const CLOSE: Record<string, string> = { ")": "(", "]": "[", "}": "{" };
 
-/** Trim what follows an address in prose: sentence ends, quotes, and a closing bracket the address
- * didn't open (`(https://a.org/x)` and the Markdown `[t](https://a.org/x)` end before the `)`;
- * `https://en.wikipedia.org/wiki/Rust_(language)` keeps its own). */
-function trimAddress(s: string): string {
-  for (;;) {
-    const last = s[s.length - 1];
-    if (TRAILING.test(s)) s = s.slice(0, -1);
-    else if (last in CLOSE && count(s, last) > count(s, CLOSE[last])) s = s.slice(0, -1);
-    else return s;
+/** Where the web address starting at `from` (just after `://`) ends. A closing bracket the address
+ * didn't open ends it (`(https://a.org/x)`, Markdown `[t](https://a.org/x)[u](…)`), one it opened
+ * stays (`https://en.wikipedia.org/wiki/Rust_(language)`), and so does a comma or semicolon right
+ * before another address (`https://a.org,https://b.org` is two). One pass, so a long run of
+ * brackets costs no more than its length. */
+function webEnd(text: string, start: number, from: number): number {
+  const depth: Record<string, number> = { "(": 0, "[": 0, "{": 0 };
+  let i = from;
+  for (; i < text.length; i++) {
+    const c = text[i];
+    if (WEB_STOP.test(c)) break;
+    if (c in OPEN) depth[c]++;
+    else if (c in CLOSE) {
+      if (depth[CLOSE[c]] === 0) break;
+      depth[CLOSE[c]]--;
+    } else if ((c === "," || c === ";") && /^https?:\/\//i.test(text.slice(i + 1, i + 9))) break;
   }
-}
-
-function count(s: string, ch: string): number {
-  let n = 0;
-  for (const c of s) if (c === ch) n++;
-  return n;
+  // Sentence ends and quotes after it; then markup as far as the same run before it.
+  let end = i;
+  while (end > from && TRAILING.includes(text[end - 1])) end--;
+  let before = start - 1;
+  while (end > from && before >= 0 && WRAP.includes(text[end - 1]) && text[before] === text[end - 1]) {
+    end--;
+    before--;
+    while (end > from && TRAILING.includes(text[end - 1])) end--;
+  }
+  return end;
 }
 
 /** Every link in `text`, in order: web addresses (http, https) and Muster addresses. Nothing else
  * (`file://`, `ftp://`, `javascript:`) is a link. A Muster address inside a web address is part of
  * that address, not a link of its own. */
 export function findTextLinks(text: string): TextLink[] {
-  const out: TextLink[] = [];
-  if (!text.includes("://")) return out;
-  for (const m of text.matchAll(WEB_IN_TEXT)) {
-    const start = m.index ?? 0;
-    if (start > 0 && /[A-Za-z0-9_]/.test(text[start - 1])) continue;
-    const uri = trimAddress(m[0]);
+  const web: TextLink[] = [];
+  if (!text.includes("://")) return web;
+  const re = new RegExp(WEB_START.source, WEB_START.flags);
+  for (let m = re.exec(text); m; m = re.exec(text)) {
+    const start = m.index;
+    if (start > 0 && /[A-Za-z0-9]/.test(text[start - 1])) continue;
+    const end = webEnd(text, start, start + m[0].length);
+    re.lastIndex = Math.max(re.lastIndex, end);
+    const uri = text.slice(start, end);
     // A host must follow the slashes: `https://` alone, or `https://.`, is none.
     if (!/^https?:\/\/[^/?#]/i.test(uri)) continue;
-    out.push({ start, end: start + uri.length, uri, kind: "web" });
+    web.push({ start, end, uri, kind: "web" });
   }
-  const web = out.slice();
+  // Both lists are in order, so one walk drops the Muster addresses inside web ones.
+  const out: TextLink[] = [];
+  let w = 0;
   for (const l of findMusterLinks(text)) {
-    if (web.some((w) => l.start < w.end && l.end > w.start)) continue;
+    while (w < web.length && web[w].end <= l.start) out.push(web[w++]);
+    if (w < web.length && web[w].start < l.end) continue;
     out.push({ ...l, kind: "muster" });
   }
-  return out.sort((a, b) => a.start - b.start);
+  while (w < web.length) out.push(web[w++]);
+  return out;
+}
+
+/** The link the caret is in (`from` to `to`, a selection inside one link counts), looked for on the
+ * caret's line only: an address never spans lines. A caret right after an address's last
+ * character is in it. */
+export function linkAt(text: string, from: number, to = from): TextLink | null {
+  const start = text.lastIndexOf("\n", from - 1) + 1;
+  const nl = text.indexOf("\n", from);
+  const line = text.slice(start, nl < 0 ? text.length : nl);
+  for (const l of findTextLinks(line)) {
+    if (l.start + start <= from && to <= l.end + start) {
+      return { ...l, start: l.start + start, end: l.end + start };
+    }
+  }
+  return null;
 }

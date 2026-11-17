@@ -248,6 +248,57 @@ export async function noteLinkChecks(a: Browser, shots: string, ok: (m: string) 
   const after = await R("note.get", { id: note.id });
   check(after.body === body, "the note's text is unchanged by the clicks");
   ok("the note's text is unchanged");
+
+  // ---- a Ctrl press that turns into a drag, even one back onto the link, opens nothing
+  await a.send("Input.dispatchMouseEvent", { type: "mousePressed", x: gx, y: gy, button: "left", clickCount: 1, buttons: 1, modifiers: CTRL });
+  await a.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: gx + 40, y: gy, buttons: 1, modifiers: CTRL });
+  await a.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: gx + 2, y: gy, buttons: 1, modifiers: CTRL });
+  await a.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: gx + 2, y: gy, button: "left", clickCount: 1, modifiers: CTRL });
+  await a.sleep(150);
+  check((await opened()).length === 2, "a Ctrl press dragged away and back opens nothing");
+  ok("a Ctrl press that becomes a drag opens nothing");
+
+  // ---- the keyboard: the caret in an address names it in the status line; Ctrl+Enter opens it
+  await a.eval(`(() => { const el = document.querySelector('${ta}'); el.focus();
+    const at = el.value.indexOf('example.org/board'); el.setSelectionRange(at, at); })()`);
+  await a.key("Right");
+  await move(10, 10);
+  await a.wait(`(document.querySelector('.note-link-hint')?.textContent ?? '').startsWith('Ctrl+Enter to open https://example.org/board?tab=open')`, 2000);
+  await shot("note-links-4-caret");
+  await a.key("Ctrl+Enter");
+  o = await opened();
+  check(o.length === 3 && o[2][0] === "https://example.org/board?tab=open", `Ctrl+Enter opened: ${JSON.stringify(o)}`);
+  check((await a.eval(`document.querySelector('${ta}').value`)) === body, "Ctrl+Enter typed no new line");
+  check(
+    (await a.eval(`document.getElementById(document.querySelector('${ta}').getAttribute('aria-describedby'))?.textContent ?? ''`))
+      .includes("Ctrl+Enter or Ctrl+click"),
+    "the editor tells screen readers how links open",
+  );
+  ok("with the caret in an address, the status line names it and Ctrl+Enter opens it");
+
+  // ---- an agent changes the address under a resting pointer with Ctrl down: the status line follows
+  await move(gx, gy, CTRL);
+  await ctrlKey(true);
+  await a.wait(`(document.querySelector('.note-link-hint')?.textContent ?? '').includes('https://example.org/guide')`, 2000);
+  const cur = await R("note.get", { id: note.id });
+  await R("note.write", { id: note.id, base_rev: cur.rev, body: body.replace("https://example.org/guide", "https://example.net/other") });
+  await a.wait(`(document.querySelector('.note-link-hint')?.textContent ?? '').includes('https://example.net/other')`, 3000);
+  await ctrlKey(false);
+  ok("an agent's change under the pointer updates what the status line says opens");
+
+  // ---- a narrow window: the instruction stays whole, the address is cut short
+  await a.size(960, 700);
+  await a.sleep(400);
+  const [nx, ny] = await at(1, "- Guide: https://".length + 2);
+  await move(nx - 4, ny);
+  await move(nx, ny);
+  await a.wait(`(document.querySelector('.note-link-hint')?.textContent ?? '').startsWith('Ctrl+click to open')`, 2000);
+  const how = await a.eval(`(() => { const h = document.querySelector('.note-link-hint .how'); return h.scrollWidth <= h.clientWidth + 1 && h.getBoundingClientRect().width > 0; })()`);
+  check(how, "the instruction fits in a narrow note");
+  check(await a.eval(`document.querySelector('${ta}').clientWidth < 420`), "the note is narrow");
+  await shot("note-links-5-narrow");
+  await a.size(1440, 900);
+  ok("in a narrow note the status line keeps “Ctrl+click to open” whole");
 }
 
 if (import.meta.main) {

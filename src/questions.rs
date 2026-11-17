@@ -516,10 +516,13 @@ pub fn check(q: NewQuestion) -> Result<Checked, Vec<String>> {
         let label = clean(&l.label);
         let url = l.url.trim().to_string();
         field(&mut p, &format!("link {}'s label", i + 1), &label, 2, 80, true, "what it opens");
-        if !(url.starts_with("https://") || url.starts_with("http://")) || url.len() > 2000
-            || url.chars().any(|c| c.is_whitespace() || c.is_control())
-        {
-            p.push(format!("link {}: an http(s) address without spaces", i + 1));
+        // A web page (opened in the browser) or a Muster link (shown in the window, as a click in a
+        // terminal does: src/links.rs).
+        if !web_address(&url) && !crate::links::is_link(&url) {
+            p.push(format!(
+                "link {}: an http(s) address without spaces, or a Muster link such as muster://panel/12",
+                i + 1
+            ));
         }
         links.push(Link { label, url });
     }
@@ -528,6 +531,19 @@ pub fn check(q: NewQuestion) -> Result<Checked, Vec<String>> {
     }
     Ok(Checked { question, context, example, kind: q.kind, options, pick, if_no_answer, note_to_self, holding_up,
         product, area: q.area, details, pictures, links })
+}
+
+/// An http(s) address a card may open (as web/src/links.ts `webAddress`): no spaces, control
+/// characters or backslashes, a host, and no user name or password before it
+/// (`https://docs.example@other.example/` reads as the first and goes to the second).
+fn web_address(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://")) else { return false };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    url.len() <= 2000
+        && !url.chars().any(|c| c.is_whitespace() || c.is_control() || c == '\\')
+        && !authority.is_empty()
+        && !authority.starts_with(':')
+        && !authority.contains('@')
 }
 
 // ----- who -----
@@ -1551,6 +1567,26 @@ mod tests {
         let mut v = good();
         v.as_object_mut().unwrap().remove(key);
         v
+    }
+
+    #[test]
+    fn links_are_web_pages_or_muster_links() {
+        let with = |urls: &[&str]| {
+            let mut v = good();
+            v["links"] = json!(urls.iter().map(|u| json!({"label": "Open it", "url": u})).collect::<Vec<_>>());
+            checked(v)
+        };
+        assert!(with(&["http://127.0.0.1:8750/promote?x=1#top"]).is_ok());
+        let ok = with(&["https://x.example/pr/1", "muster://panel/393", "muster://note/91", "muster://agent/writer"]).unwrap();
+        assert_eq!(ok.links.iter().map(|l| l.url.as_str()).collect::<Vec<_>>(),
+            ["https://x.example/pr/1", "muster://panel/393", "muster://note/91", "muster://agent/writer"]);
+        assert!(with(&[" muster://tab/12 "]).is_ok(), "trimmed like the other fields");
+        for bad in ["muster://panel/0", "muster://panel/3?x=1", "muster://window/1", "javascript:alert(1)", "file:///etc/passwd",
+            "/relative", "https://x.example/a b", "https://", "https:///path", "https://docs.example@other.example/",
+            "https://x.example/report\\", "http://:80/"] {
+            let e = with(&[bad]).unwrap_err();
+            assert!(e.iter().any(|p| p.contains("link 1: an http(s) address without spaces, or a Muster link")), "{bad}: {e:?}");
+        }
     }
 
     #[test]

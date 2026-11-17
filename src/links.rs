@@ -33,6 +33,26 @@ pub fn agent(name: &str) -> String {
     format!("muster://agent/{name}")
 }
 
+/// Whether `s` is exactly one Muster link, the shapes web/src/links.ts `parseMusterLink` opens:
+/// `muster://note/<id>`, `panel/<id>`, `tab/<id>` (a positive id without leading zeros, at most 15
+/// digits) or `agent/<name>` (a name as `agents::check_name` allows: a letter or digit, then
+/// letters, digits, `-` or `_`, at most 40). Nothing after it: no query, fragment or second path.
+pub fn is_link(s: &str) -> bool {
+    let Some(rest) = s.strip_prefix("muster://") else { return false };
+    let Some((kind, tail)) = rest.split_once('/') else { return false };
+    match kind {
+        "note" | "panel" | "tab" => {
+            !tail.is_empty() && tail.len() <= 15 && !tail.starts_with('0') && tail.bytes().all(|b| b.is_ascii_digit())
+        }
+        "agent" => {
+            tail.len() <= 40
+                && tail.bytes().next().is_some_and(|b| b.is_ascii_alphanumeric())
+                && tail.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        }
+        _ => false,
+    }
+}
+
 /// `[title](link)`, with the title on one line and its Markdown characters escaped, so it can't
 /// end the link early or turn into formatting. An empty title shows the address.
 pub fn mention(title: &str, link: &str) -> String {
@@ -83,6 +103,24 @@ mod tests {
         assert_eq!(panel(3), "muster://panel/3");
         assert_eq!(tab(12), "muster://tab/12");
         assert_eq!(agent("reviewer"), "muster://agent/reviewer");
+    }
+
+    #[test]
+    fn is_link_takes_exactly_what_the_window_opens() {
+        for ok in ["muster://note/91", "muster://panel/393", "muster://tab/1", "muster://agent/reviewer",
+            "muster://agent/PR_reviewer-2", "muster://note/123456789012345"] {
+            assert!(is_link(ok), "{ok}");
+        }
+        for bad in ["muster://note/", "muster://note/0", "muster://note/007", "muster://note/-1", "muster://note/1.5",
+            "muster://note/1234567890123456", "muster://note/9/2", "muster://note/9?a=b", "muster://note/9#x",
+            "muster://panel/9 ", "muster://window/1", "muster://agent/", "muster://agent/-x", "muster://agent/a b",
+            &format!("muster://agent/{}", "a".repeat(41)), "muster:/note/1", "MUSTER://note/1", "https://x.example/"] {
+            assert!(!is_link(bad), "{bad}");
+        }
+        // Every address this module makes is one.
+        for made in [note(5), panel(6), tab(7), agent("writer")] {
+            assert!(is_link(&made), "{made}");
+        }
     }
 
     #[test]

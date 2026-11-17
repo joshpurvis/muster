@@ -1,4 +1,4 @@
-import { findMusterLinks, findTextLinks, linkAt, followLink, type LinkDeps, linkColumns, linkRanges, type MusterLink, parseMusterLink } from "./links.ts";
+import { findMusterLinks, findTextLinks, linkAt, followLink, type LinkDeps, linkColumns, linkLabels, linkRanges, markdownLinks, type MusterLink, parseMusterLink } from "./links.ts";
 
 function assertEquals<T>(actual: T, expected: T, msg?: string) {
   const a = JSON.stringify(actual), e = JSON.stringify(expected);
@@ -290,4 +290,82 @@ Deno.test("linkAt: the link the caret is in, on its own line", () => {
   assertEquals(linkAt(text, 0), null);
   assertEquals(linkAt(text, text.length), null);
   assertEquals(linkAt("https://a.example", 0)?.uri, "https://a.example");
+});
+
+Deno.test("markdownLinks: Muster and web links in an agent's text become links; nothing else does", () => {
+  // The shape agents write (`muster link panel 393` prints it), and the tool's `mention` escapes.
+  assertEquals(markdownLinks("Read it first: [Read the words](muster://panel/393). Then pick."), [
+    "Read it first: ",
+    { label: "Read the words", url: "muster://panel/393", muster: { kind: "panel", id: 393 } },
+    ". Then pick.",
+  ]);
+  assertEquals(markdownLinks(String.raw`[a\]b\[c \*x\* \\](muster://note/1)`), [
+    { label: String.raw`a]b[c *x* \ `.trim(), url: "muster://note/1", muster: { kind: "note", id: 1 } },
+  ]);
+  assertEquals(markdownLinks("[PR](https://x.example/pr/1) and [Bread](https://en.wikipedia.org/wiki/Bread_(food))"), [
+    { label: "PR", url: "https://x.example/pr/1", muster: null },
+    " and ",
+    { label: "Bread", url: "https://en.wikipedia.org/wiki/Bread_(food)", muster: null },
+  ]);
+  assertEquals(markdownLinks("[agent](muster://agent/writer)")[0], {
+    label: "agent", url: "muster://agent/writer", muster: { kind: "agent", name: "writer" },
+  });
+  // Everything else stays exactly as written: other schemes, bad Muster links, empty labels,
+  // a bare address, other Markdown.
+  for (
+    const plain of [
+      "no links here",
+      "[x](javascript:alert(1))",
+      "[x](file:///etc/passwd)",
+      "[x](/relative/path)",
+      "[x](muster://panel/0)",
+      "[x](muster://panel/3?a=b)",
+      "[x](muster://window/1)",
+      "[ ](muster://note/1)",
+      "[x] (muster://note/1)",
+      "[x](https://a b)",
+      "muster://note/1 on its own",
+      "**bold** and `code` and ![img](https://x.example/a.png",
+      "[two\nlines](muster://note/1)",
+      // An image, an escaped bracket, an escaped ")" that would change the address, a user name
+      // before the host, no host.
+      "see ![mock-up](https://x.example/card.png) here",
+      String.raw`\[Draft](muster://note/91)`,
+      String.raw`[Report](https://example.com/report\))`,
+      "[x](https://docs.example@other.example/)",
+      "[x](https://)",
+    ]
+  ) {
+    assertEquals(markdownLinks(plain), [plain], plain);
+  }
+  // A link beside a refused one: only the good one is a link, the rest is the text as written.
+  assertEquals(markdownLinks("[bad](javascript:x) [good](muster://note/2)"), [
+    "[bad](javascript:x) ",
+    { label: "good", url: "muster://note/2", muster: { kind: "note", id: 2 } },
+  ]);
+  assertEquals(markdownLinks(""), []);
+  // An even run of backslashes escapes itself, not the bracket.
+  assertEquals(markdownLinks(String.raw`\\[a](muster://note/3)`)[1], { label: "a", url: "muster://note/3", muster: { kind: "note", id: 3 } });
+  // Any escaped ASCII punctuation in a label.
+  assertEquals(markdownLinks(String.raw`[Shipping \& handling](muster://note/91)`)[0], {
+    label: "Shipping & handling", url: "muster://note/91", muster: { kind: "note", id: 91 },
+  });
+});
+
+Deno.test("markdownLinks reads what src/links.rs mention writes", () => {
+  // The exact outputs src/links.rs `mentions_stay_one_markdown_link` asserts for odd titles.
+  for (
+    const [mention, label, url] of [
+      ["[Pairs to review](muster://note/91)", "Pairs to review", "muster://note/91"],
+      [String.raw`[a\]b\[c](muster://note/1)`, "a]b[c", "muster://note/1"],
+      ["[\\*bold\\* \\`code\\` \\<x\\> \\\\](muster://panel/2)", "*bold* `code` <x> \\", "muster://panel/2"],
+      ["[muster://tab/4](muster://tab/4)", "muster://tab/4", "muster://tab/4"],
+    ]
+  ) {
+    const parts = markdownLinks(`Read ${mention} first.`);
+    assertEquals(parts.length, 3, mention);
+    const link = parts[1] as { label: string; url: string };
+    assertEquals([link.label, link.url], [label, url], mention);
+  }
+  assertEquals(linkLabels("Keep [the old card](muster://panel/9) as it is"), "Keep the old card as it is");
 });

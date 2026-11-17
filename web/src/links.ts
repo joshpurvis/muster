@@ -232,3 +232,65 @@ export function linkAt(text: string, from: number, to = from): TextLink | null {
   }
   return null;
 }
+
+/** A piece of text with its `[label](url)` links found: plain text, or a link (`muster` set for a
+ * Muster link, null for a web one). */
+export type TextPart = string | { label: string; url: string; muster: MusterLink | null };
+
+/** `[label](url)`: a label with `\`-escapes (as `src/links.rs` `mention` writes them) and no bare
+ * brackets or line break; a url without spaces, with at most one level of balanced parentheses
+ * (`https://en.wikipedia.org/wiki/Bread_(food)`). */
+const MD_LINK = /\[((?:\\[^\n]|[^\\\[\]\n])+)\]\(((?:[^\s()]|\([^\s()]*\))+)\)/g;
+
+/** Unescape a Markdown label: a backslash before any ASCII punctuation (`\[`, `\&`, `\\`). */
+function unescapeLabel(s: string): string {
+  return s.replace(/\\([!-\/:-@\[-`{-~])/g, "$1");
+}
+
+/** An http(s) address a card may open: parses, has a host, carries no user name or password
+ * (`https://docs.example@other.example/` reads as the first and goes to the second) and no
+ * backslash (a Markdown escape, `report\)`, would make it another address than the one written). */
+export function webAddress(url: string): boolean {
+  if (url.length > 2000 || /[\s\\]/.test(url) || !/^https?:\/\//.test(url)) return false;
+  try {
+    const u = new URL(url);
+    return (u.protocol === "https:" || u.protocol === "http:") && !!u.hostname && !u.username && !u.password;
+  } catch {
+    return false;
+  }
+}
+
+/** `text` as it reads on a card: each link as its label (for a plain-text line such as an answer
+ * preview). */
+export function linkLabels(text: string): string {
+  return markdownLinks(text).map((p) => (typeof p === "string" ? p : p.label)).join("");
+}
+
+/** Find the `[label](url)` links in `text` whose url is a Muster link or an http(s) address, for
+ * the Questions tab (and anywhere else text from an agent shows). Nothing else from Markdown is
+ * read: any other link (`javascript:`, `file:`, a relative path) and all other syntax stay as they
+ * were written. Adjacent plain text comes back as one string. */
+export function markdownLinks(text: string): TextPart[] {
+  const out: TextPart[] = [];
+  let plain = "";
+  let at = 0;
+  for (const m of text.matchAll(MD_LINK)) {
+    const url = m[2];
+    const start = m.index ?? 0;
+    // An image (`![alt](url)`) or an escaped bracket (`\[x](url)`, an odd run of backslashes)
+    // is not a link.
+    const slashes = /\\*$/.exec(text.slice(0, start))![0].length;
+    if (text[start - 1] === "!" || slashes % 2 === 1) continue;
+    const muster = parseMusterLink(url);
+    const label = unescapeLabel(m[1]).trim();
+    if ((!muster && !webAddress(url)) || !label) continue;
+    plain += text.slice(at, m.index);
+    if (plain) out.push(plain);
+    plain = "";
+    out.push({ label, url, muster });
+    at = (m.index ?? 0) + m[0].length;
+  }
+  plain += text.slice(at);
+  if (plain) out.push(plain);
+  return out;
+}

@@ -361,6 +361,15 @@ human"); the **Questions** tab is where the human sees and answers them (`web/sr
   not running, and so how the answer reaches it), **Send answer**, the question's links and
   **Open <asker>'s tab**. **Details** (closed) has the asker's details, its note to itself (which
   comes back with the answer), the picture paths and what it is about (a merge, money, …).
+- **Links on a card**: a `[label](url)` in the context, the example or an option shows as its
+  label, underlined, when the url is a Muster link (`muster://panel/393`, `note/`, `tab/`,
+  `agent/`; [Links](#links)) or an http(s) address; nothing else from Markdown is read, so any
+  other text shows as written. The question's links (under **Send answer**) take the same two
+  kinds. A Muster link shows what it names in this window, as a click in a terminal does (a
+  closed panel or a missing note says so in a short message); a web link opens in the browser
+  (only http(s), with a host and no user name before it). An image (`![alt](url)`) or an escaped
+  bracket stays as written. In an option, a click on its link follows the link and leaves the
+  option as it was; the keyboard reaches those links again on an "In the options:" line under them. The answer preview ("Sends a) …") shows a link as its label.
 - **Answering**: click an option (pick several: tick any number; a chosen option clicked again is
   unchosen) or type, then **Send answer** (or Ctrl+Enter in the box). The first words typed replace
   the chosen options ("or answer in your own words": typing "No, hold it" under a preselected "Yes,
@@ -405,7 +414,10 @@ transcripts and pasted elsewhere (src/links.rs, web/src/links.ts):
   that prints a terminal hyperlink (OSC 8) to a Muster address gets the same. Claude Code is not
   asked to print hyperlinks (`FORCE_HYPERLINK`): a terminal redrawn by the daemon (after a resize,
   then a reload or reconnect) drops them, and the title alone would lose its address.
-- **Click**: a left click without a modifier follows a Muster link. Muster takes the press and
+- **On a question card**: the same Markdown in a question's context, example or options shows as
+  the title, underlined; a plain click shows what it names, and a web link opens in the browser.
+  So do the question's own links ([Questions](#questions), "Links on a card").
+- **Click in a terminal**: a left click without a modifier follows a Muster link. Muster takes the press and
   release itself, so a program with mouse reporting on gets no click, no selection starts, and a
   middle-click (paste) or a click with a modifier does what it always did. Web links are as
   before: Ctrl+click (⌘-click) on an address, and xterm's "Do you want to navigate…" question

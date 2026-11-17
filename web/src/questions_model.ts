@@ -1,6 +1,7 @@
 // The Questions tab's pure part (docs/UI.md "Questions"): ordering, drafts and the words on the
 // page, with no signals, RPC or DOM, so tests import it alone. questions.ts re-exports it.
 
+import { linkLabels } from "./links.ts";
 import type { AgentState, Question, SessionInfo } from "./types.ts";
 
 /** How long an answer waits before it is sent (`questions::TAB_HOLD`), for the words on screen. */
@@ -43,9 +44,10 @@ export function typeWords(d: Draft, words: string): Draft {
   return { pick: d.words.trim() === "" && words.trim() !== "" ? [] : d.pick, words };
 }
 
-/** What Send would send, in words, under the box. */
+/** What Send would send, in words, under the box: options as the card shows them (a link as its
+ * label, links.ts `linkLabels`). */
 export function sendsText(q: Question, d: Draft): string {
-  const picked = pickedText(q, d.pick);
+  const picked = pickedText(q, d.pick).map(linkLabels);
   const words = d.words.trim();
   if (!picked.length) return words ? "Sends your words only." : "";
   return words ? `Sends ${picked.join(", ")}, with your words.` : `Sends ${picked.join(", ")}.`;

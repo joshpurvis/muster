@@ -56,6 +56,9 @@ Deno.test("the draft starts at the asker's pick; picking several ticks and untic
   equal(sendsText(one, both), "Sends b) Heading two, with your words.");
   equal(typeWords(both, "No, hold it for now").pick, ["b"]);
   equal(sendsText(one, d), "Sends a) Heading one.");
+  // An option's link reads as its label in the preview, as on the card.
+  const linked = q(4, { options: [{ letter: "a", text: "Keep [the old card](muster://panel/9)" }, { letter: "b", text: "New" }] });
+  equal(sendsText(linked, { pick: ["a"], words: "" }), "Sends a) Keep the old card.");
   // Clicking the chosen option again unchooses it.
   equal(choose(one, d, "a").pick, []);
   equal(whoText(q(4, { passed_on_by: { label: "lead", session_id: 1, kind: "claude" } })), "writer, passed on by lead");

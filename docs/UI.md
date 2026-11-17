@@ -1030,3 +1030,12 @@ An add-on can post a title and badge, open a bounded number of HTTPS links, and 
 to its ticked agents. It cannot read sessions, notes, questions or credentials through the bridge.
 Registration and changes require the window, like answering Questions. See [Add-on tabs](ADDONS.md)
 for the message protocol, origin checks, limits and Counter demo.
+
+## Screenshots
+
+The desktop window draws with WebKitGTK, so pictures of the desktop UI for pull requests, these
+docs and design reviews are taken in WebKitGTK against the mock: `deno task shot:desktop
+<steps.json> <dir>` (`web/dev/webkit_shot.sh`; steps format in `web/dev/webkit_shot.py`, example
+`web/dev/webkit_shots/palette.json`). Headless Chromium stays for the behaviour checks in
+`web/dev/`, and for the phone page, which runs in a phone's browser. The rules are in AGENTS.md,
+"Screenshots of the UI".

@@ -1,0 +1,6 @@
+[
+  {"until": "globalThis.__muster?.windowId?.value != null", "settle": 0.8, "shot": "window"},
+  {"js": "(document.activeElement || document.body).dispatchEvent(new KeyboardEvent('keydown', {key: 'P', code: 'KeyP', ctrlKey: true, shiftKey: true, bubbles: true}));", "until": "document.querySelector('[role=dialog][aria-label=\"Command palette\"]')"},
+  {"shot": "palette", "crop": "[role=dialog][aria-label=\"Command palette\"]", "pad": 24},
+  {"js": "return {title: document.title, theme: document.documentElement.dataset.theme};"}
+]

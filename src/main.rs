@@ -309,7 +309,7 @@ Example: muster keys 12 esc text:/compact enter")]
     },
     /// Open a new tab and start an agent in it; prints the new session id.
     #[command(after_help = "Arguments after `--` go to the agent CLI, after muster's permission flags:\n  \
-muster new . --kind codex --prompt \"hi\" -- -m gpt-6-sol -c model_reasoning_effort=xhigh\n  \
+muster new . --kind codex --prompt \"hi\" -- -m gpt-6.2-sol -c model_reasoning_effort=xhigh\n  \
 muster new --kind claude -- --model haiku")]
     New {
         /// Folder or repo (default: current directory).
@@ -2107,12 +2107,12 @@ mod tests {
     #[test]
     fn new_passes_args_after_double_dash() {
         let (path, prompt, args) = agent_args(&[
-            "new", ".", "--kind", "codex", "--prompt", "hi", "--", "-m", "gpt-6-sol", "-c",
+            "new", ".", "--kind", "codex", "--prompt", "hi", "--", "-m", "gpt-6.2-sol", "-c",
             "model_reasoning_effort=xhigh",
         ]);
         assert_eq!(path, Some(PathBuf::from(".")));
         assert_eq!(prompt.as_deref(), Some("hi"));
-        assert_eq!(args, ["-m", "gpt-6-sol", "-c", "model_reasoning_effort=xhigh"]);
+        assert_eq!(args, ["-m", "gpt-6.2-sol", "-c", "model_reasoning_effort=xhigh"]);
         // Without a path, and flags after `--` are never muster's own.
         let (path, _, args) = agent_args(&["new", "--agent", "shell", "--", "--json", "-c", "echo hi"]);
         assert_eq!(path, None);
@@ -2128,7 +2128,7 @@ mod tests {
     fn new_help_shows_agent_args() {
         let help = Cli::command().find_subcommand_mut("new").unwrap().render_help().to_string();
         assert!(help.contains("[-- <AGENT_ARGS>...]"), "{help}");
-        assert!(help.contains("gpt-6-sol"), "{help}");
+        assert!(help.contains("gpt-6.2-sol"), "{help}");
     }
 
     #[test]

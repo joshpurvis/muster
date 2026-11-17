@@ -1,4 +1,3 @@
-import { loadedFramePolicy, refreshFramePolicy } from "./frame_policy.ts";
 // Entry point: wires rpc -> state -> terminals, renders the shell.
 import "@xterm/xterm/css/xterm.css";
 import "./styles.css";
@@ -121,7 +120,6 @@ terms.onMusterLink((link, sid) => {
 
 rpc.onHello = async (h, reconnect) => {
   applyHello(h);
-  refreshFramePolicy(loadedFramePolicy.panel, h.panel_origin, A.reloadWindow);
   A.deliveriesNeedReview(h.paused_deliveries ?? []);
   if (reconnect) {
     A.backendRestarted();

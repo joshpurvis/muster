@@ -3,6 +3,7 @@
 // persist to localStorage.
 
 import { addons, addonRevision, type AddonRegistry } from "./addons.ts";
+import { loadedFramePolicy, needsFramePolicyReload } from "./frame_policy.ts";
 import { addonTab, isPinnedTab } from "./layout/tree.ts";
 import { batch, computed, effect, signal } from "@preact/signals";
 import type {
@@ -85,6 +86,8 @@ export const channels = signal<Channel[]>([]);
 export const sessions = signal<Map<SessionId, SessionInfo>>(new Map());
 export const panels = signal<Map<number, Panel>>(new Map());
 export const panelOrigin = signal("");
+/** The reload banner clears if a later hello returns to the origin this page permits. */
+export const panelReloadNeeded = computed(() => needsFramePolicyReload(loadedFramePolicy.panel, panelOrigin.value));
 /** Bumped by every hello (connect and reconnect): panels retry a resource that failed to load. */
 export const helloEpoch = signal(0);
 

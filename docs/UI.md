@@ -537,6 +537,13 @@ after the restart. The banner is hidden while a dialog is open, and has its own 
 region (apart from the toasts' status region) that announces each update once. `×` dismisses that update (per viewer, in localStorage) until a different one
 of the same kind arrives; the next waiting update shows meanwhile.
 
+If a backend restart changes the panel-server origin, this slot instead shows “Muster's backend
+restarted. Reload this window to show panels and previews again.” Its **Reload window** button calls
+the same action as Ctrl+Shift+R, including the unsaved-note guard. The window never reloads automatically
+on reconnect, so Questions answers and Memory edits stay in place. This banner is hidden while a dialog
+is open or Muster is stopping or restarting, and disappears if the origin returns to the one the page
+loaded with; otherwise it stays until the user reloads.
+
 ### Window and shutdown
 - **Reload window** (Ctrl+Shift+R, palette, `⋯`): saves a pending layout change, then reloads.
   Plain Ctrl+R stays with the terminal.

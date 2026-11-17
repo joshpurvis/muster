@@ -15,9 +15,8 @@ export const loadedFramePolicy = framePolicy(
     ? ""
     : document.querySelector<HTMLMetaElement>('meta[name="muster-frame-policy"]')?.content ?? "",
 );
-/** Reuse the window's note-saving guard, including its existing prompt when storage fails. */
-export function refreshFramePolicy(loaded: string, current: string | undefined, reload: () => void): boolean {
-  if (!loaded || !current || loaded === current) return false;
-  reload();
-  return true;
+/** Offer a manual reload when the panel server moves outside this page's fixed CSP.
+ * Never reload on reconnect: Questions answers and Memory edits may exist only in this page. */
+export function needsFramePolicyReload(loaded: string, current: string | undefined): boolean {
+  return !!loaded && !!current && loaded !== current;
 }

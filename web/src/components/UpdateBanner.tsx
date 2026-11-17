@@ -4,7 +4,16 @@
 // update until a different one arrives. Hidden while a dialog is open (nothing behind a modal
 // may be clicked) and while Muster stops or restarts, and announced once per update by its own
 // live region, apart from the toasts' status region.
-import { daemonRestarting, daemonStopped, dismissedUpdates, loadedRelease, overlay, updateStatus } from "../state.ts";
+// A changed panel origin takes this slot until the user reloads or the origin changes back.
+import {
+  daemonRestarting,
+  daemonStopped,
+  dismissedUpdates,
+  loadedRelease,
+  overlay,
+  panelReloadNeeded,
+  updateStatus,
+} from "../state.ts";
 import { connStatus } from "../rpc.ts";
 import * as A from "../actions.ts";
 import { pickUpdate } from "../updates.ts";
@@ -19,12 +28,33 @@ const ANNOUNCE = {
   host: "Terminal host update. Installing it needs a restart of Muster, which ends all sessions.",
 } as const;
 
+const PANEL_RELOAD_TITLE = "Muster's backend restarted.";
+const PANEL_RELOAD_TEXT = "Reload this window to show panels and previews again.";
+
 export function UpdateBanner() {
   const pending = pickUpdate(updateStatus.value, loadedRelease, dismissedUpdates.value);
-  const u = daemonStopped.value || daemonRestarting.value ? null : pending;
+  const hidden = daemonStopped.value || !!daemonRestarting.value;
+  const reloadPanels = !hidden && panelReloadNeeded.value;
+  const u = hidden || reloadPanels ? null : pending;
   return (
     <>
-      <div class="sr-only" aria-live="polite">{u ? ANNOUNCE[u.kind] : ""}</div>
+      <div class="sr-only" aria-live="polite">
+        {reloadPanels ? `${PANEL_RELOAD_TITLE} ${PANEL_RELOAD_TEXT}` : u ? ANNOUNCE[u.kind] : ""}
+      </div>
+      {reloadPanels && !overlay.value && (
+        <div class="toast update-banner" role="region" aria-label={PANEL_RELOAD_TITLE}>
+          <span class="toast-dot" />
+          <div class="update-text">
+            <strong>{PANEL_RELOAD_TITLE}</strong>
+            <span>{PANEL_RELOAD_TEXT}</span>
+            <div class="update-actions">
+              <button type="button" class="btn btn-sm btn-primary" onClick={() => A.reloadWindow()}>
+                Reload window
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       {u && !overlay.value && <Banner u={u} />}
     </>
   );

@@ -51,10 +51,12 @@ origin. Omit an incompatible `X-Frame-Options` header. The app must be running w
 Frames remain mounted while switching channels, moving tabs, hiding tabs, zooming and opening panels beside
 them. The tab menu’s **Reload** retries just that add-on by loading its address again in the same frame node.
 Reloading or closing the window reloads or ends all its frames. Saving the registry reloads the window so it
-receives a fresh CSP. A changed panel-server origin after a backend reload also reloads the window through
-the usual unsaved-note guard, or prompts if typing cannot be kept. While an add-on frame has focus, keys go
-to the add-on. To leave fullscreen, use Muster’s own **Exit fullscreen** button. Apps on the same origin share
-the browser’s normal same-origin trust.
+receives a fresh CSP. If a backend restart changes the panel-server origin, the window stays open and shows
+“Muster's backend restarted. Reload this window to show panels and previews again.” in the update banner's
+place. Its **Reload window** button uses the same action as Ctrl+Shift+R, including the unsaved-note guard.
+There is no automatic reload; the banner disappears if the origin changes back to the one the page loaded
+with. While an add-on frame has focus, keys go to the add-on. To leave fullscreen, use Muster’s own
+**Exit fullscreen** button. Apps on the same origin share the browser’s normal same-origin trust.
 
 ## Message protocol
 

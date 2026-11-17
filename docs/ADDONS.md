@@ -137,8 +137,8 @@ bash scripts/isolated.sh deno task test:addon-names
 
 The name lint reads the real `$XDG_DATA_HOME/muster/addons.json` or `~/.local/share/muster/addons.json`
 read-only, ignoring the isolated `MUSTER_DATA_DIR`. `MUSTER_ADDON_LINT_NAMES` may name an additional text file
-with one private name per line. It scans every feature file listed in `web/dev/addon_files.json`,
-case-insensitively, ignores Counter, and reports file and line without printing private names. Without a
+with one private name per line. It scans the files that exist only for add-ons, listed in
+`web/dev/addon_files.json`, for each name as a whole word in any case, ignores Counter, and reports file and line without printing private names. Without a
 registry or optional file it prints `skipped: no registry`. Its launcher grants reads only for those files,
 the registry and the optional file, and access only to `HOME`, `XDG_DATA_HOME` and `MUSTER_ADDON_LINT_NAMES`
 in the environment.

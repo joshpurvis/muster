@@ -19,6 +19,7 @@ import { isAsleep } from "../agents.ts";
 import { wakeCold } from "../cache.ts";
 import * as A from "../actions.ts";
 import { cx } from "../util.ts";
+import { markdownLinks, parseMusterLink, type TextPart } from "../links.ts";
 
 /** Below this width the list and the question take turns (the phone layout of the mock). */
 const NARROW_PX = 760;
@@ -216,6 +217,37 @@ function Lightbox({ src, caption, onClose }: { src: string; caption: string; onC
   );
 }
 
+type LinkPart = Exclude<TextPart, string>;
+
+/** Follow a link from a card: a Muster link shows what it names in this window, a web link opens
+ * in the browser. */
+function openLink(url: string) {
+  const link = parseMusterLink(url);
+  if (link) A.showLink(link);
+  else globalThis.open(url, "_blank", "noopener,noreferrer");
+}
+
+/** The asker's text with its `[label](url)` links clickable (links.ts `markdownLinks`: Muster and
+ * http(s) links only; nothing else from Markdown is read, so everything else shows as written).
+ * `inButton`: inside an option's button, where a link can't be a control of its own: it looks like
+ * one, and a click on it follows it instead of choosing the option. */
+function LinkedText({ text, inButton = false }: { text: string; inButton?: boolean }) {
+  const parts = markdownLinks(text);
+  if (!parts.some((p) => typeof p !== "string")) return <>{text}</>;
+  return <>{parts.map((p, i) => (typeof p === "string" ? p : <InlineLink key={i} part={p} inButton={inButton} />))}</>;
+}
+
+function InlineLink({ part, inButton }: { part: LinkPart; inButton: boolean }) {
+  const follow = (e: Event) => {
+    e.preventDefault();
+    e.stopPropagation();
+    openLink(part.url);
+  };
+  return inButton
+    ? <span class="qv-inline-link" data-tip={part.url} onClick={follow}>{part.label}</span>
+    : <a class="qv-inline-link" href={part.url} data-tip={part.url} onClick={follow}>{part.label}</a>;
+}
+
 function Head({ q, now, narrow, onBack }: { q: Question; now: number; narrow: boolean; onBack: () => void }) {
   return (
     <>
@@ -229,8 +261,8 @@ function Head({ q, now, narrow, onBack }: { q: Question; now: number; narrow: bo
       </div>
       {/* Non-breaking hyphens: a balanced title never breaks "sign-up" across lines. */}
       <h2 class="qv-q" tabIndex={-1}>{q.question.replaceAll("-", "\u2011")}</h2>
-      <p class="qv-ctx">{q.context}</p>
-      <p class="qv-ex"><b>Example</b>{q.example}</p>
+      <p class="qv-ctx"><LinkedText text={q.context} /></p>
+      <p class="qv-ex"><b>Example</b><LinkedText text={q.example} /></p>
     </>
   );
 }
@@ -253,8 +285,7 @@ function Links({ q }: { q: Question }) {
   return (
     <span class="qv-links">
       {(q.links ?? []).map((l, i) => (
-        <a key={i} href={l.url} data-tip={l.url}
-          onClick={(e) => { e.preventDefault(); globalThis.open(l.url, "_blank", "noopener,noreferrer"); }}>
+        <a key={i} href={l.url} data-tip={l.url} onClick={(e) => { e.preventDefault(); openLink(l.url); }}>
           {l.label}
         </a>
       ))}
@@ -327,7 +358,7 @@ function Answering({ q }: { q: Question }) {
                   <span class="qv-letter" aria-hidden="true">{o.letter}</span>
                   {many && <span class="qv-box" aria-hidden="true">{on ? "✓" : ""}</span>}
                   <span class="qv-txt">
-                    <span class="qv-lbl">{o.text}</span>
+                    <span class="qv-lbl"><LinkedText text={o.text} inButton /></span>
                     {o.why && <span class="qv-why">{o.why}</span>}
                   </span>
                   {theirs && !many && <span class="qv-pick">{q.asker.label}'s pick</span>}
@@ -399,10 +430,14 @@ function Answered({ q, now }: { q: Question; now: number }) {
     <>
       <div class="qv-answered">
         <div class="qv-ah">{a.how === "tab" ? "Your answer" : "The answer"}</div>
-        {chosen.map((c) => <div key={c} class="qv-a">{c}</div>)}
+        {chosen.map((c) => <div key={c} class="qv-a"><LinkedText text={c} /></div>)}
         {a.words && <div class={cx("qv-words", !chosen.length && "qv-a")}>{chosen.length ? `“${a.words}”` : a.words}</div>}
       </div>
-      {rest.length > 0 && <p class="qv-other">Not chosen: {rest.join(" · ")}</p>}
+      {rest.length > 0 && (
+        <p class="qv-other">
+          Not chosen: {rest.map((t, i) => <span key={i}>{i > 0 && " · "}<LinkedText text={t} /></span>)}
+        </p>
+      )}
       <div class="qv-fate">
         <div><span>How</span><span>{howText(q, now)}</span></div>
         <div><span>What happened</span><span class={cx(happened.warn && "qv-warn")}>{happened.text}</span></div>

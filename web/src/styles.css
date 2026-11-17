@@ -6506,6 +6506,10 @@ fieldset.sch-then > legend {
 .qv-links { margin-left: auto; display: flex; gap: 14px; flex-wrap: wrap; justify-content: flex-end; font-size: 12px; }
 .qv-links a, .qv-link { color: var(--accent-strong); text-decoration: none; }
 .qv-links a:hover, .qv-link:hover { text-decoration: underline; }
+/* A [label](url) link inside the asker's text (context, example, options). */
+.qv-inline-link { color: var(--accent-strong); text-decoration: underline; text-decoration-thickness: 1px;
+  text-underline-offset: 2px; cursor: pointer; }
+.qv-inline-link:hover { text-decoration-thickness: 2px; }
 .qv-details { margin: 12px 0 28px; color: var(--text-faint); font-size: 12px; }
 .qv-details summary { cursor: pointer; width: max-content; }
 .qv-details p { font-family: var(--font-mono); font-size: 11.5px; margin: 6px 0 0; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }

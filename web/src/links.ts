@@ -232,3 +232,49 @@ export function linkAt(text: string, from: number, to = from): TextLink | null {
   }
   return null;
 }
+
+/** A piece of text with its `[label](url)` links found: plain text, or a link (`muster` set for a
+ * Muster link, null for a web one). */
+export type TextPart = string | { label: string; url: string; muster: MusterLink | null };
+
+/** `[label](url)`: a label with `\`-escapes (as `src/links.rs` `mention` writes them) and no bare
+ * brackets or line break; a url without spaces, with at most one level of balanced parentheses
+ * (`https://en.wikipedia.org/wiki/Bread_(food)`). */
+const MD_LINK = /\[((?:\\[^\n]|[^\\\[\]\n])+)\]\(((?:[^\s()]|\([^\s()]*\))+)\)/g;
+const WEB = /^https?:\/\/[^\s]+$/;
+
+/** Unescape a Markdown label: `\[` -> `[`, `\\` -> `\` (only Markdown's punctuation). */
+function unescapeLabel(s: string): string {
+  return s.replace(/\\([\\`*_{}\[\]()#+\-.!<>|~])/g, "$1");
+}
+
+/** Find the `[label](url)` links in `text` whose url is a Muster link or an http(s) address, for
+ * the Questions tab (and anywhere else text from an agent shows). Nothing else from Markdown is
+ * read: any other link (`javascript:`, `file:`, a relative path) and all other syntax stay as they
+ * were written. Adjacent plain text comes back as one string. */
+export function markdownLinks(text: string): TextPart[] {
+  const out: TextPart[] = [];
+  let plain = "";
+  let at = 0;
+  for (const m of text.matchAll(MD_LINK)) {
+    const url = m[2];
+    const muster = parseMusterLink(url);
+    let web = false;
+    if (!muster && WEB.test(url) && url.length <= 2000) {
+      try {
+        const u = new URL(url);
+        web = u.protocol === "https:" || u.protocol === "http:";
+      } catch { /* not a link */ }
+    }
+    const label = unescapeLabel(m[1]).trim();
+    if ((!muster && !web) || !label) continue;
+    plain += text.slice(at, m.index);
+    if (plain) out.push(plain);
+    plain = "";
+    out.push({ label, url, muster });
+    at = (m.index ?? 0) + m[0].length;
+  }
+  plain += text.slice(at);
+  if (plain) out.push(plain);
+  return out;
+}

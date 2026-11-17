@@ -9,6 +9,11 @@ this add-on.” Use its **Reload** button. Each window keeps its own hidden tabs
 places. Use the tab menu's **Hide** and the
 palette's **Show Counter** to hide and restore the demo. The phone page does not show add-ons.
 
+![An add-on tab with its badge, beside Questions](screenshots/addons-counter-tab-dark.webp)
+
+![The Add-on tabs dialog](screenshots/addons-settings-dark.webp)
+
+
 The registry is `addons.json` in the data directory. It is private local data, never a repository file. It
 contains an array of `{id, name, url, icon, agents}`. IDs are lower-case letter/digit/hyphen slugs, 1–40 ASCII
 characters, starting and ending with a letter or digit. The dialog assigns a stable ID. Names are 1–40

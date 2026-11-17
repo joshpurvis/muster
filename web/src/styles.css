@@ -6508,7 +6508,12 @@ fieldset.sch-then > legend {
 .qv-links a:hover, .qv-link:hover { text-decoration: underline; }
 /* A [label](url) link inside the asker's text (context, example, options). */
 .qv-inline-link { color: var(--accent-strong); text-decoration: underline; text-decoration-thickness: 1px;
-  text-underline-offset: 2px; cursor: pointer; }
+  text-underline-offset: 2px; cursor: pointer; overflow-wrap: anywhere;
+  /* A button that reads as a link inside a sentence. */
+  appearance: none; background: none; border: 0; padding: 0; margin: 0; font: inherit; line-height: inherit;
+  text-align: inherit; display: inline; }
+.qv-inline-link:focus-visible { outline: 2px solid var(--accent-strong); outline-offset: 2px; border-radius: 2px; }
+.qv-links .qv-link { overflow-wrap: anywhere; }
 .qv-inline-link:hover { text-decoration-thickness: 2px; }
 .qv-details { margin: 12px 0 28px; color: var(--text-faint); font-size: 12px; }
 .qv-details summary { cursor: pointer; width: max-content; }

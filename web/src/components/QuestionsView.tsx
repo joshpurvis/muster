@@ -19,7 +19,7 @@ import { isAsleep } from "../agents.ts";
 import { wakeCold } from "../cache.ts";
 import * as A from "../actions.ts";
 import { cx } from "../util.ts";
-import { markdownLinks, parseMusterLink, type TextPart } from "../links.ts";
+import { markdownLinks, parseMusterLink, type TextPart, webAddress } from "../links.ts";
 
 /** Below this width the list and the question take turns (the phone layout of the mock). */
 const NARROW_PX = 760;
@@ -229,8 +229,10 @@ function openLink(url: string) {
 
 /** The asker's text with its `[label](url)` links clickable (links.ts `markdownLinks`: Muster and
  * http(s) links only; nothing else from Markdown is read, so everything else shows as written).
- * `inButton`: inside an option's button, where a link can't be a control of its own: it looks like
- * one, and a click on it follows it instead of choosing the option. */
+ * A link is a button, never an `<a href>`: the desktop window's "Open Link" menu would otherwise
+ * load the address itself. `inButton`: inside an option's button, where a link can't be a control
+ * of its own: it looks like one, a click on it follows it instead of choosing the option, and the
+ * keyboard reaches it among the card's links (`optionLinks`). */
 function LinkedText({ text, inButton = false }: { text: string; inButton?: boolean }) {
   const parts = markdownLinks(text);
   if (!parts.some((p) => typeof p !== "string")) return <>{text}</>;
@@ -245,7 +247,27 @@ function InlineLink({ part, inButton }: { part: LinkPart; inButton: boolean }) {
   };
   return inButton
     ? <span class="qv-inline-link" data-tip={part.url} onClick={follow}>{part.label}</span>
-    : <a class="qv-inline-link" href={part.url} data-tip={part.url} onClick={follow}>{part.label}</a>;
+    : (
+      <button type="button" class="qv-inline-link" data-tip={part.url} data-tip-focus aria-description={part.url}
+        onClick={follow}>
+        {part.label}
+      </button>
+    );
+}
+
+/** The links inside the options, once each: a button inside an option's button can't take the
+ * keyboard, so they are offered again among the card's links. */
+function optionLinks(q: Question): { label: string; url: string }[] {
+  const seen = new Set<string>();
+  const out: { label: string; url: string }[] = [];
+  for (const o of q.options) {
+    for (const p of markdownLinks(o.text)) {
+      if (typeof p === "string" || seen.has(p.url) || (q.links ?? []).some((l) => l.url === p.url)) continue;
+      seen.add(p.url);
+      out.push({ label: p.label, url: p.url });
+    }
+  }
+  return out;
 }
 
 function Head({ q, now, narrow, onBack }: { q: Question; now: number; narrow: boolean; onBack: () => void }) {
@@ -284,11 +306,14 @@ function Links({ q }: { q: Question }) {
   const { session } = askerSession(q);
   return (
     <span class="qv-links">
-      {(q.links ?? []).map((l, i) => (
-        <a key={i} href={l.url} data-tip={l.url} onClick={(e) => { e.preventDefault(); openLink(l.url); }}>
-          {l.label}
-        </a>
-      ))}
+      {[...(q.links ?? []), ...optionLinks(q)]
+        .filter((l) => parseMusterLink(l.url) || webAddress(l.url))
+        .map((l, i) => (
+          <button key={i} type="button" class="qv-link" data-tip={l.url} data-tip-focus aria-description={l.url}
+            onClick={() => openLink(l.url)}>
+            {l.label}
+          </button>
+        ))}
       {session && (
         <button type="button" class="qv-link" onClick={() => A.gotoSession(session.id)}>Open {q.asker.label}'s tab</button>
       )}

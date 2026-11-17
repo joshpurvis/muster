@@ -49,6 +49,16 @@ pub fn run_window(
     }
 }
 
+/// Whether a new-window request from the native window goes to the system browser: an http(s)
+/// address only. Anything else (`file:`, `muster:`, a custom scheme a desktop app registered) is
+/// dropped, since `xdg-open` would hand it to whatever program claims it.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+pub fn opens_in_browser(target: &str) -> bool {
+    let lower = target.get(..8).unwrap_or(target).to_ascii_lowercase();
+    (lower.starts_with("https://") || lower.starts_with("http://"))
+        && !target.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
 /// The shared "system title bar" preference (`prefs.get`), read before the window is built so
 /// it never appears with the wrong frame. An older daemon without it: shown.
 #[cfg(feature = "gui")]
@@ -759,11 +769,13 @@ mod native {
                     let _ = ipc_proxy.send_event(UserEvent::Ipc(m));
                 }
             })
-            // Links that try to open a new window go to the system browser.
+            // Links that try to open a new window go to the system browser: web pages only.
             .with_new_window_req_handler(|target, _features| {
-                let mut c = std::process::Command::new(if cfg!(target_os = "macos") { "open" } else { "xdg-open" });
-                c.arg(target);
-                let _ = super::spawn_detached(c, None);
+                if super::opens_in_browser(&target) {
+                    let mut c = std::process::Command::new(if cfg!(target_os = "macos") { "open" } else { "xdg-open" });
+                    c.arg(target);
+                    let _ = super::spawn_detached(c, None);
+                }
                 NewWindowResponse::Deny
             })
             // Keep the window on the daemon's own origin; panel frames load only the panel
@@ -984,6 +996,17 @@ mod tests {
         assert!(s.contains(r#"window.__musterNative={ipc:3,secret:"secret"};"#), "{s}");
         let s = super::init_script("http://127.0.0.1:7433", "t", Some(3), "secret");
         assert!(s.contains(r#"sessionStorage.setItem("muster.window","3");"#), "{s}");
+    }
+
+    #[test]
+    fn only_web_pages_go_to_the_browser() {
+        for ok in ["https://x.example/pr/1", "http://127.0.0.1:8750/promote", "HTTPS://X.EXAMPLE/"] {
+            assert!(super::opens_in_browser(ok), "{ok}");
+        }
+        for bad in ["file:///etc/passwd", "muster://panel/3", "javascript:alert(1)", "mailto:a@x.example", "ssh://x",
+            "", "https://x.example/a b", "https://x.example/\n"] {
+            assert!(!super::opens_in_browser(bad), "{bad}");
+        }
     }
 
     #[test]

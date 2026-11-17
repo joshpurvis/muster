@@ -237,8 +237,10 @@ export function NoteView({ id, hidden = false }: { id: number; hidden?: boolean 
       mod = linkMod(e);
       soon();
     };
+    // Leaving the editor ends a press too: a drag out and back is a drag.
     const onLeave = () => {
       at = null;
+      pressed = null;
       soon();
     };
     const onKey = (e: KeyboardEvent) => {

@@ -155,13 +155,15 @@ const TRAILING = ".,;:!?'";
 /** Markup around an address (`**https://a.org/x**`): trimmed only as far as the same run before
  * it, since an address may end in these (`?token=abc_`). */
 const WRAP = "*_~";
+/** Another address starting right after a comma or semicolon (`https://a.org,muster://note/7`). */
+const NEXT_ADDRESS = /^(?:https?:\/\/|muster:\/\/)/i;
 const OPEN: Record<string, string> = { "(": ")", "[": "]", "{": "}" };
 const CLOSE: Record<string, string> = { ")": "(", "]": "[", "}": "{" };
 
 /** Where the web address starting at `from` (just after `://`) ends. A closing bracket the address
  * didn't open ends it (`(https://a.org/x)`, Markdown `[t](https://a.org/x)[u](…)`), one it opened
  * stays (`https://en.wikipedia.org/wiki/Rust_(language)`), and so does a comma or semicolon right
- * before another address (`https://a.org,https://b.org` is two). One pass, so a long run of
+ * before another address, web or Muster (`https://a.org,https://b.org` is two). One pass, so a long run of
  * brackets costs no more than its length. */
 function webEnd(text: string, start: number, from: number): number {
   const depth: Record<string, number> = { "(": 0, "[": 0, "{": 0 };
@@ -173,7 +175,7 @@ function webEnd(text: string, start: number, from: number): number {
     else if (c in CLOSE) {
       if (depth[CLOSE[c]] === 0) break;
       depth[CLOSE[c]]--;
-    } else if ((c === "," || c === ";") && /^https?:\/\//i.test(text.slice(i + 1, i + 9))) break;
+    } else if ((c === "," || c === ";") && NEXT_ADDRESS.test(text.slice(i + 1, i + 10))) break;
   }
   // Sentence ends and quotes after it; then markup as far as the same run before it.
   let end = i;

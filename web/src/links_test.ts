@@ -215,6 +215,11 @@ Deno.test("findTextLinks: lists of links, one per line or several on one", () =>
     "web:https://c.example",
     "web:http://d.example",
   ]);
+  assertEquals(uris("https://a.example,muster://note/7;muster://agent/reviewer"), [
+    "web:https://a.example",
+    "muster:muster://note/7",
+    "muster:muster://agent/reviewer",
+  ]);
   // Markdown links side by side are two.
   assertEquals(uris("[one](https://one.example)[two](https://two.example/x)"), [
     "web:https://one.example",

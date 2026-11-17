@@ -159,7 +159,7 @@ is found it falls back to `xdg-open`.
 ```sh
 muster ls                                # ID  WIN  TAB  NAME  KIND  STATE  FOR  DETAIL
 muster new ~/src/app --prompt "fix the flaky test"   # prints the new session id
-muster new . --kind codex -- -m gpt-6-sol            # args after -- go to the agent CLI
+muster new . --kind codex -- -m gpt-6.2-sol          # args after -- go to the agent CLI
 muster send fix-auth "run the tests" --wait          # prompt, then wait until it settles
 muster read fix-auth -n 100              # last 100 lines of output, plain text
 muster wait 12 --until needs_human       # block until it needs you (exit 124 on timeout)

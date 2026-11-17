@@ -115,7 +115,7 @@ pub fn tool_definitions() -> Vec<Value> {
                     "kind": {"type": "string", "enum": ["claude", "codex", "shell"], "description": "What to run."},
                     "prompt": {"type": "string", "description": "Initial task for the agent (or command for a shell)."},
                     "name": {"type": "string", "description": "Display name for the session."},
-                    "model": {"type": "string", "description": "Model for the agent, e.g. 'sonnet' or 'opus' (claude), 'gpt-6-sol' (codex). Default: the CLI's own default."},
+                    "model": {"type": "string", "description": "Model for the agent, e.g. 'sonnet' or 'opus' (claude), 'gpt-6.2-sol' (codex). Default: the CLI's own default."},
                     "effort": {"type": "string", "description": "Reasoning effort, e.g. 'low', 'medium', 'high' (claude --effort), 'xhigh' (codex model_reasoning_effort)."},
                     "args": {"type": "array", "items": {"type": "string"}, "description": "Extra CLI arguments for the agent. Only an allowlist is accepted (claude: --model, --effort, --fallback-model, --append-system-prompt, --continue, --resume, --verbose, --debug; codex: -m, -c with model/model_reasoning_* keys, -i, --no-alt-screen); permissions always come from the channel's profile."},
                     "channel_id": {"type": "integer", "description": "Existing channel to spawn in. Mutually exclusive with new_channel."},

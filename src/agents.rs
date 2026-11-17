@@ -2940,6 +2940,8 @@ pub fn model_catalog() -> Value {
     };
     let codex = KindModels {
         models: vec![
+            m("gpt-6.2-sol", None),
+            m("gpt-6.2-astra", None),
             m("gpt-6.1-sol", None),
             m("gpt-6-astra", None),
             m("gpt-6-sol", None),

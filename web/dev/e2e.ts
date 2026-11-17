@@ -821,7 +821,7 @@ try {
       "switching to Codex reset the custom model and kept a level Codex has",
     );
     // Effort follows the model: gpt-6-luna has no "ultra", so picking it resets a picked ultra.
-    await choose(ms, "gpt-6.1-sol");
+    await choose(ms, "gpt-6.2-sol");
     await choose(es, "ultra");
     await choose(ms, "gpt-6-luna");
     await a.sleep(100);

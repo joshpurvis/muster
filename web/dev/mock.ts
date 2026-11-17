@@ -617,7 +617,7 @@ const AGENT_MODELS = {
   },
   codex: {
     models: [
-      { id: "gpt-6.1-sol", note: null, efforts: null },
+      { id: "gpt-6.2-sol", note: null, efforts: null },
       { id: "gpt-6-luna", note: null, efforts: ["low", "medium", "high", "xhigh", "max"] },
     ],
     efforts: ["low", "medium", "high", "xhigh", "max", "ultra"],

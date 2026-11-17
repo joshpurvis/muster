@@ -2,7 +2,7 @@
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
  Accessing workspace:
 
- /tmp/claude-1000/-home-josh-projects-muster/465b39be-8c1a-42fd-9c93-4e1ebb9537a4/scratchpad/repo1
+ /tmp/claude-1000/-home-user-projects-muster/465b39be-8c1a-42fd-9c93-4e1ebb9537a4/scratchpad/repo1
 
  Quick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open source
  project, or work from your team). If not, take a moment to review what's in this folder first.

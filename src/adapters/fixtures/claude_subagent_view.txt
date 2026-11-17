@@ -1,7 +1,7 @@
 
  ▐▛███▛█   Claude Code v2.1.316
 ▝▜██████▀  Sonnet 5.5 with low effort · Claude Max
- ▝▝   ▝▝   /tmp/claude-1000/-home-josh-projects-muster/f5f340d1-322d-4d8c-8b02-3c5697e7c90a/scratchpad/repo1
+ ▝▝   ▝▝   /tmp/claude-1000/-home-user-projects-muster/f5f340d1-322d-4d8c-8b02-3c5697e7c90a/scratchpad/repo1
 
 
 ● Running 1 shell command · 21s…
@@ -23,7 +23,7 @@
 ❯ Message @general-purpose…
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
   ⚠ Transcript saving is off — inherited CLAUDE_CODE_CHILD_SESSION marker · restart with CLAUDE_CODE_FORCE_SESSION_PE…
-  [josh@ra repo1] Haiku 5.5
+  [user@host repo1] Haiku 5.5
   ↑/↓ to select
 
   ◯ main

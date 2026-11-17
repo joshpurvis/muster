@@ -1,6 +1,6 @@
  ▐▛███▛█   Claude Code v2.1.280
 ▝▜██████▀  Haiku 4.5 · Claude Max
-  ▝▝ ▝▝    /tmp/claude-1000/-home-josh-projects-muster/465b39be-8c1a-42fd-9c93-4e1ebb9537a4/scratchpad/repo1
+  ▝▝ ▝▝    /tmp/claude-1000/-home-user-projects-muster/465b39be-8c1a-42fd-9c93-4e1ebb9537a4/scratchpad/repo1
 
 
 ❯ Call the AskUserQuestion tool now with one question: "Which color?" options red and blue.

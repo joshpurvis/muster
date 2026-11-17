@@ -153,7 +153,8 @@ try {
   await selectChannel(first);
   check(shape(await root()) === firstShape, "First channel keeps its place");
   await selectChannel(second);
-  check(shape(await root()) === secondShape, "Second channel keeps its place");
+  const back = shape(await root());
+  check(back === secondShape, `Second channel keeps its place: ${back} != ${secondShape}`);
   await menu("Hide");
   await b.wait(`!document.querySelector('[data-addon]')`);
   await palette("Show Counter");

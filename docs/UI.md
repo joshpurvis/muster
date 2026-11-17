@@ -69,6 +69,19 @@ caching off". The phone UI still shows idle green. Inter 13px UI, JetBrains Mono
 13px terminal, no web font downloads. Radii 6/10px, hairline borders, 120–160ms motion,
 `prefers-reduced-motion` respected, inline SVG icons.
 
+### Form controls
+
+The desktop window is WebKitGTK. A select that keeps its native look gets GTK theme padding that
+CSS can't see or size, and its line-height is forced to "normal", so in a fixed-height field the
+bottom of its text is cut off. Headless Chromium (e2e runs and screenshots) draws it fine. So every
+select draws its own closed control: one rule in `web/src/styles.css` gives each select
+`appearance: none` and the themed chevron (`--select-chevron`, IconChevronDown in
+`--text-muted`), whether or not it sits in a `.select-wrap`; the options list and keys stay
+native. No rule gives a select a fixed `height` (`.field select` has `min-height: 32px`). A new
+dialog needs nothing extra: a bare `<select>` is right. `web/src/form_controls_test.ts` (part of
+`deno task test`) fails if the stylesheet breaks either rule; `web/dev/e2e_form_controls.ts` checks
+every select and field in the dialogs after they render.
+
 ## Layout
 
 ```

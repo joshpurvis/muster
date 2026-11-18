@@ -1020,6 +1020,14 @@ pub fn unfinished(hub: &Hub) -> Vec<i64> {
     })
 }
 
+/// `ids` (`unfinished`) split into the answers that had started an agent in a new conversation
+/// (delivered first at daemon start, before late replies, as that conversation's first message)
+/// and the rest (after late replies, as before).
+pub fn started_first(hub: &Hub, ids: Vec<i64>) -> (Vec<i64>, Vec<i64>) {
+    ids.into_iter().partition(|id| hub.store().question(*id).ok().flatten()
+        .is_some_and(|q| q.answer.is_some_and(|a| a.delivery.fresh.is_some())))
+}
+
 /// At daemon start: deliver the answers in `ids` (`unfinished`). Those that had started an agent
 /// in a new conversation go first, so no other answer takes that conversation's first message.
 pub async fn resume(hub: &Arc<Hub>, mut ids: Vec<i64>) {
@@ -2033,9 +2041,12 @@ mod tests {
         for _ in 0..crate::mcp::guard::AGENT_DAILY_PROMPT_CAP {
             hub.store().insert_agent_message(&agents::message_record(&a, "lead", None, route, "x")).unwrap();
         }
+        // The restart came after the start had forgotten the conversation, before a new run.
+        hub.agents().update(hub.store(), a.id, |b| b.resume_id = None).unwrap();
         resume(&hub, unfinished(&hub)).await;
         let d = hub.store().question(n).unwrap().unwrap().answer.unwrap().delivery;
         assert_eq!((d.status, d.fresh.clone()), (DeliveryStatus::Refused, None), "{d:?}");
+        // The refusal settles it first: the old conversation is the agent's again.
         assert_eq!(resume_of(&hub, &a).as_deref(), Some("conv-old"));
     }
 

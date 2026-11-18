@@ -323,6 +323,8 @@ pub struct FreshFacts {
     pub typing: bool,
     /// When the human last had a prompt of their own taken in by it.
     pub human_prompt_at: Option<i64>,
+    /// Its next start is a new conversation already (a reset or a move the owner chose).
+    pub reset_due: bool,
     pub now: i64,
 }
 
@@ -350,6 +352,9 @@ pub fn fresh_verdict(f: &FreshFacts, asked: bool) -> Verdict {
     }
     if f.typing {
         return Keep("the human is typing into it");
+    }
+    if f.reset_due {
+        return Keep("its next start is a new conversation already");
     }
     if asked {
         return Verdict::Fresh { why: "the human asked for a fresh start".into(), size_k: None };
@@ -390,6 +395,7 @@ pub fn fresh_facts(hub: &Hub, a: &Agent, session: Option<&SessionInfo>, now: i64
         others_waiting: !f.queue_idle || f.deliveries > 0 || f.waking,
         typing: keys || (idle && f.draft),
         human_prompt_at: hub.agents().human_prompt_at(a.id),
+        reset_due: a.reset_on_next_start || a.handoff.is_some(),
         now,
     }
 }
@@ -488,13 +494,19 @@ async fn rule_lock(hub: &Hub, agent: i64) -> tokio::sync::OwnedMutexGuard<()> {
 async fn deliver_to_agent(hub: &Arc<Hub>, l: &Letter<'_>, to: Agent, note: Option<String>) -> Delivery {
     let Some(rule) = &l.fresh else { return send_to_agent(hub, l, &to, note.as_deref(), None, None).await };
     let _one = rule_lock(hub, to.id).await;
+    // Deciding, restarting, giving a conversation back and queuing the answer all happen under
+    // one hold of the start lock: no other start (Start fresh, a message waking it) gets between.
+    let held = hub.agents().start_lock.lock().await;
     let Some(now) = agent_then(hub, to.id, Some(to.created_at)) else {
         // Removed meanwhile: the send refuses it, saying so.
-        return send_to_agent(hub, l, &to, note.as_deref(), None, None).await;
+        return send_to_agent(hub, l, &to, note.as_deref(), None, Some(&held)).await;
     };
-    // Refused: nothing was restarted for it (a decision saved before a backend restart is
-    // weighed again when it is sent again).
+    // Refused: nothing is restarted for it. A fresh start a backend restart cut off is settled
+    // first, so the refusal leaves no conversation forgotten.
     if let Err(e) = agents::precheck(hub, &now, &(l.text)(note.as_deref()), &l.from, l.from_session, l.prov, None) {
+        if let Some(f) = rule.decided {
+            settle_cut_off(hub, &now, f);
+        }
         return failed(&now, None, e);
     }
     let (fresh, expect, sized, asked) = match fresh_plan(hub, &now, rule) {
@@ -504,17 +516,16 @@ async fn deliver_to_agent(hub: &Arc<Hub>, l: &Letter<'_>, to: Agent, note: Optio
             d.to = Some(now.name.clone());
             return d;
         }
-        Ok(Plan::Current) => return send_to_agent(hub, l, &now, note.as_deref(), None, None).await,
-        Ok(Plan::Started(f)) => return send_to_agent(hub, l, &now, note.as_deref(), Some(f), None).await,
+        Ok(Plan::Current) => return send_to_agent(hub, l, &now, note.as_deref(), None, Some(&held)).await,
+        Ok(Plan::Started(f)) => return send_to_agent(hub, l, &now, note.as_deref(), Some(f), Some(&held)).await,
         Ok(Plan::Start { fresh, expect, sized, asked }) => (fresh, expect, sized, asked),
     };
     let current = |hub: &Hub| agent_then(hub, to.id, Some(to.created_at));
-    // Checked again with the start lock held, for an asleep agent too, and once more by the start
-    // itself for a running one (with no await in between): the conversation is still the one
-    // decided on, and the rule still holds.
+    // Checked again here, for an asleep agent too, and once more by the start itself for a
+    // running one (with no await in between): the conversation is still the one decided on, and
+    // the rule still holds.
     let ok = |s: &SessionInfo| current(hub).is_some_and(|a| a.resume_id == expect
         && matches!(fresh_verdict(&fresh_facts(hub, &sized_as(&a, &sized), Some(s), now_ms()), asked), Verdict::Fresh { .. }));
-    let held = hub.agents().start_lock.lock().await;
     let still = now.session_id.and_then(|s| hub.session(s)).is_some_and(|s| ok(&s));
     let why = if !still {
         "it is no longer resting".to_string()
@@ -525,21 +536,18 @@ async fn deliver_to_agent(hub: &Arc<Hub>, l: &Letter<'_>, to: Agent, note: Optio
             Err(e) => format!("{e:#}"),
         }
     };
-    drop(held);
     // Not started. A new run that holds a new conversation stays (the answer goes to it, saying
     // so); otherwise a conversation the failed start forgot is the agent's again (its old run
     // still there, or none running), and the answer goes into it.
-    if let Some(a) = current(hub)
-        && a.resume_id != fresh.replaces && fresh.replaces.is_some()
-    {
-        let new_run = a.session_id.is_some_and(|s| hub.live_session_ids().contains(&s)) && !old_run_alive(hub, &a, &fresh);
-        if new_run {
-            return send_to_agent(hub, l, &now, note.as_deref(), Some(fresh), None).await;
-        }
-        if let Err(e) = take_back(hub, &a, &fresh) {
+    if let Some(a) = current(hub) {
+        if new_run(hub, &a, &fresh) {
+            if a.resume_id != fresh.replaces && fresh.replaces.is_some() {
+                return send_to_agent(hub, l, &now, note.as_deref(), Some(fresh), Some(&held)).await;
+            }
+        } else if let Err(e) = take_back(hub, &a, &fresh) {
             // Forgotten for good: its next run starts a new conversation, as the answer says.
             tracing::warn!(agent = now.name, "couldn't give it its conversation back: {e:#}");
-            return send_to_agent(hub, l, &now, note.as_deref(), Some(fresh), None).await;
+            return send_to_agent(hub, l, &now, note.as_deref(), Some(fresh), Some(&held)).await;
         }
     }
     tracing::info!(agent = now.name, "an answer goes into the current conversation after all: {why}");
@@ -549,7 +557,22 @@ async fn deliver_to_agent(hub: &Arc<Hub>, l: &Letter<'_>, to: Agent, note: Optio
         d.to = Some(now.name.clone());
         return d;
     }
-    send_to_agent(hub, l, &now, note.as_deref(), None, None).await
+    send_to_agent(hub, l, &now, note.as_deref(), None, Some(&held)).await
+}
+
+/// Is a run other than the one fresh start `f` replaces live for agent `a` now?
+fn new_run(hub: &Hub, a: &Agent, f: &Fresh) -> bool {
+    a.session_id.is_some_and(|s| hub.live_session_ids().contains(&s)) && !old_run_alive(hub, a, f)
+}
+
+/// An answer whose saved fresh start `f` (from before a backend restart) won't go ahead: unless a
+/// new run took over, agent `a` gets its old conversation back. The caller holds the start lock.
+fn settle_cut_off(hub: &Hub, a: &Agent, f: &Fresh) {
+    if !new_run(hub, a, f)
+        && let Err(e) = take_back(hub, a, f)
+    {
+        tracing::warn!(agent = a.name, "couldn't give it its conversation back: {e:#}");
+    }
 }
 
 /// A delivery to agent `to` that failed with `e` (a guard's refusal, or an error).
@@ -611,7 +634,15 @@ pub async fn deliver(hub: &Arc<Hub>, l: &Letter<'_>) -> Delivery {
         && let Err(why) = check_reach(hub, r, &t)
     {
         let mut d = outcome(DeliveryStatus::Refused, format!("not delivered: {why}"));
-        if let Target::Agent(to, _) = &t { d.to = Some(to.name.clone()); }
+        if let Target::Agent(to, _) = &t {
+            d.to = Some(to.name.clone());
+            if let Some(f) = l.fresh.as_ref().and_then(|r| r.decided) {
+                let _held = hub.agents().start_lock.lock().await;
+                if let Some(a) = agent_then(hub, to.id, Some(to.created_at)) {
+                    settle_cut_off(hub, &a, f);
+                }
+            }
+        }
         return d;
     }
     match t {
@@ -703,7 +734,7 @@ mod tests {
     fn cold_large() -> FreshFacts {
         FreshFacts {
             claude: true, idle: true, working: false, asleep: false, cold_for: Some(3 * HOUR), tokens: Some(216_003),
-            others_waiting: false, typing: false, human_prompt_at: None, now: NOW,
+            others_waiting: false, typing: false, human_prompt_at: None, reset_due: false, now: NOW,
         }
     }
 
@@ -738,6 +769,9 @@ mod tests {
         assert_eq!(keep(&FreshFacts { working: true, ..c() }, false), "it has a sub-agent, a background task or a new turn under way");
         assert_eq!(keep(&FreshFacts { others_waiting: true, ..c() }, false), "other prompts are waiting for it");
         assert_eq!(keep(&FreshFacts { typing: true, ..c() }, false), "the human is typing into it");
+        // A reset the owner chose is due at its next start: that start keeps it, not this rule
+        // (a failed fresh start could otherwise hand the old conversation back without it).
+        assert_eq!(keep(&FreshFacts { reset_due: true, ..c() }, true), "its next start is a new conversation already");
         assert_eq!(keep(&FreshFacts { human_prompt_at: Some(NOW - 23 * HOUR), ..c() }, false),
             "the human worked in this conversation in the last 24 hours");
         // No session at all.

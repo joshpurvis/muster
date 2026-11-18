@@ -1045,7 +1045,8 @@ lock, before any other message can start the agent. Every delivery check (accept
 limit, daily and spend caps) runs first, so a refused answer leaves the conversation as it was.
 Only while the agent rests (idle with an empty input queue and no sub-agent, background task or
 just-typed turn under way, or asleep), with nothing else on its way to it, nobody typing into it
-(a draft in its input box, or keys in the last two minutes), and no prompt of the human's own
+(a draft in its input box, or keys in the last two minutes), no reset or account move the owner
+chose already due at its next start, and no prompt of the human's own
 taken in by that agent in the last 24 hours, in whichever tab (typed at its input box, or sent as
 the human's from a terminal or the window; messages and answers don't count). Whatever Muster can't tell (no size reported yet for that conversation, a
 Codex agent, a status line Muster doesn't run) keeps the current conversation, as do warm or
@@ -1058,7 +1059,9 @@ restarted, so a backend restart in between neither restarts it twice nor types t
 twice (a restart that finds the old run still there decides again, on the old conversation's
 size and the human's prompts in it), and answers that had started a new conversation are
 finished first, before late replies. A fresh start that fails before a new run takes over gives
-the agent its old conversation back, and the answer goes into it, with no new-conversation line. A second answer to the same agent waits for
+the agent its old conversation back, and the answer goes into it, with no new-conversation line;
+an answer refused after a backend restart cut its fresh start off gives it back too. Deciding,
+restarting, giving back and queuing happen under one hold of the start lock. A second answer to the same agent waits for
 the first and goes into the new conversation. The Questions tab's "After you answer" line comes
 from the same rule (`asker_now.new_conversation`), naming the lead when the answer goes there.
 An answer whose `into` is `fresh` (nothing sets it yet) gets a new conversation whatever the size,

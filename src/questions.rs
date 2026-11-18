@@ -1065,15 +1065,11 @@ pub fn asker_now(hub: &Hub, q: &Question) -> Value {
     let now = now_ms();
     let agent = q.asker.agent_id.and_then(|id| agent_then(hub, id, q.asker.agent_created_at));
     let sid = agent.as_ref().and_then(|a| a.session_id).unwrap_or(q.asker.session_id);
-    let live = hub.live_session_ids().contains(&sid);
-    let Some(s) = hub.session(sid) else {
-        return json!({"state": "gone", "running": false, "asleep": false, "cold": false});
-    };
-    let running = live && s.state != AgentState::Exited;
+    let all: HashSet<SessionId> = hub.live_session_ids().into_iter().collect();
     // An answer now would start its recipient (the asker, or the lead of an asker that ended) in a
     // new conversation (src/relay.rs: the rule its delivery applies, so the tab's line before the
-    // answer and the delivery after it agree). `to`: the lead's name when it goes there.
-    let all: HashSet<SessionId> = hub.live_session_ids().into_iter().collect();
+    // answer and the delivery after it agree). `to`: the lead's name when it goes there. Worked
+    // out first: an asker whose tab is gone still has its answer go to its lead.
     let fresh = match target(hub, q, None, &all) {
         Target::Agent(a, note) => {
             let info = a.session_id.and_then(|id| hub.session(id));
@@ -1085,6 +1081,10 @@ pub fn asker_now(hub: &Hub, q: &Question) -> Value {
         }
         _ => None,
     };
+    let Some(s) = hub.session(sid) else {
+        return json!({"state": "gone", "running": false, "asleep": false, "cold": false, "new_conversation": fresh});
+    };
+    let running = all.contains(&sid) && s.state != AgentState::Exited;
     json!({
         "session_id": sid,
         "state": s.state,
@@ -1960,13 +1960,16 @@ mod tests {
     /// `name`, a Claude agent on session `sid` (the fixture's 2), asleep in conversation
     /// "conv-old", its last turn `idle` ago (its 60-minute cache gone once that is over an hour),
     /// with `tokens` reported by its status line for that conversation (None: never reported).
+    /// A fresh start forgets its conversation and reports done (the fixture has no terminal
+    /// host): `Registry::fake_fresh_start`.
     fn resting_claude(hub: &Arc<Hub>, name: &str, sid: SessionId, tokens: Option<u64>, idle: i64) -> Agent {
+        hub.agents().fake_fresh_start.store(true, std::sync::atomic::Ordering::Relaxed);
         let a = agent(hub, name, SessionKind::Claude, sid);
         hub.agents().update(hub.store(), a.id, |b| b.resume_id = Some("conv-old".into())).unwrap();
         let now = now_ms();
         hub.agents().set_asleep(hub.store(), a.id, Some(now - idle), None).unwrap();
         if let Some(t) = tokens {
-            hub.agents().note_context(a.id, "conv-old", t, None, None).unwrap();
+            hub.agents().note_context(a.id, "conv-old", t, 1, 1.0).unwrap();
         }
         hub.edit_session_for_test(sid, |i| {
             i.state = AgentState::Exited;
@@ -2002,10 +2005,38 @@ mod tests {
             ("the old one was cold and large, about 216k tokens and idle 3 h 1 m", Some("conv-old")));
         // Started the way Start fresh starts it: the old conversation is forgotten.
         assert_eq!(resume_of(&hub, &a), None);
-        // This fixture has no terminal host, so the start itself fails here (the smoke test runs it
-        // for real); what the human reads says the conversation was replaced either way.
-        assert_eq!(d.status, DeliveryStatus::Undelivered, "{d:?}");
+        // This fixture has no terminal host, so the message itself isn't typed in here (the smoke
+        // test runs it for real); what the human reads says the conversation was replaced.
         assert_eq!(d.to.as_deref(), Some("builder-2"));
+    }
+
+    #[tokio::test]
+    async fn a_fresh_start_that_fails_gives_the_agent_its_conversation_back() {
+        let hub = fixture();
+        let a = resting_claude(&hub, "builder-2", 2, Some(216_003), 3 * 60 * MIN);
+        // The real start, which fails here after forgetting the conversation (no terminal host).
+        hub.agents().fake_fresh_start.store(false, std::sync::atomic::Ordering::Relaxed);
+        let n = ask_n(&hub, 2, 1);
+        let d = answered(&hub, n).await;
+        // Nothing replaced it: its next start resumes it, and the card claims no new conversation.
+        assert_eq!(resume_of(&hub, &a).as_deref(), Some("conv-old"));
+        assert_eq!(d.fresh, None, "{d:?}");
+    }
+
+    #[tokio::test]
+    async fn a_refusal_after_a_restart_never_claims_a_new_conversation() {
+        let hub = fixture();
+        let a = resting_claude(&hub, "builder-2", 2, Some(216_003), 3 * 60 * MIN);
+        let n = ask_n(&hub, 2, 1);
+        stopped_after_deciding(&hub, n, &decided());
+        let route = agents::Route { origin: Origin::Human, hop: 0, reply_to: None };
+        for _ in 0..crate::mcp::guard::AGENT_DAILY_PROMPT_CAP {
+            hub.store().insert_agent_message(&agents::message_record(&a, "lead", None, route, "x")).unwrap();
+        }
+        resume(&hub, unfinished(&hub)).await;
+        let d = hub.store().question(n).unwrap().unwrap().answer.unwrap().delivery;
+        assert_eq!((d.status, d.fresh.clone()), (DeliveryStatus::Refused, None), "{d:?}");
+        assert_eq!(resume_of(&hub, &a).as_deref(), Some("conv-old"));
     }
 
     #[tokio::test]
@@ -2065,6 +2096,11 @@ mod tests {
         let n = ask_n(&hub, 5, 1);
         let now = asker_now(&hub, &hub.store().question(n).unwrap().unwrap());
         assert_eq!((now["new_conversation"]["to"].as_str(), now["new_conversation"]["size_k"].as_u64()), (Some("builder-2"), Some(216)));
+        // Its tab closed too (the session row gone): the answer still goes to the lead, and says so.
+        hub.remove_session(5).unwrap();
+        let now = asker_now(&hub, &hub.store().question(n).unwrap().unwrap());
+        assert_eq!(now["state"], "gone");
+        assert_eq!(now["new_conversation"]["to"].as_str(), Some("builder-2"), "{now}");
     }
 
     #[tokio::test]
@@ -2090,7 +2126,7 @@ mod tests {
         // Reported for another conversation (before a /clear): not this one's size.
         let hub = fixture();
         let a = resting_claude(&hub, "builder-2", 2, None, 3 * 60 * MIN);
-        hub.agents().note_context(a.id, "conv-before", 300_000, None, None).unwrap();
+        hub.agents().note_context(a.id, "conv-before", 300_000, 1, 1.0).unwrap();
         let n = ask_n(&hub, 2, 1);
         assert_eq!(answered(&hub, n).await.fresh, None);
         assert_eq!(resume_of(&hub, &a).as_deref(), Some("conv-old"));

@@ -401,8 +401,28 @@ enum Plan {
     /// A new conversation, started before a backend restart.
     Started(Fresh),
     /// Start a new conversation now: the agent's `resume_id` must still be `expect`, and the rule
-    /// must still hold (`asked`: by its resting checks only).
-    Start { fresh: Fresh, expect: Option<String>, asked: bool },
+    /// must still hold (`asked`: by its resting checks only) for conversation `sized` (`expect`,
+    /// or the one a start cut off by a backend restart had already forgotten).
+    Start { fresh: Fresh, expect: Option<String>, sized: Option<String>, asked: bool },
+}
+
+/// `a` as the rule weighs it: resuming conversation `sized` (its size, read for that one).
+fn sized_as(a: &Agent, sized: &Option<String>) -> Agent {
+    Agent { resume_id: sized.clone(), ..a.clone() }
+}
+
+/// A fresh start of agent `a` that stopped before a new run took over: it resumes `f.replaces`
+/// again (unless it has another conversation by now), and the replaced run's hooks count again.
+fn take_back(hub: &Hub, a: &Agent, f: &Fresh) -> anyhow::Result<()> {
+    let Some(old) = &f.replaces else { return Ok(()) };
+    if let Some(back) = hub.agents().restore_conversation(hub.store(), a.id, old)? {
+        tracing::info!(agent = a.name, "the fresh start for an answer stopped; it keeps its conversation");
+        agents::publish(hub, &back);
+    }
+    if let Some(sid) = a.session_id {
+        hub.unfence_conversation(sid, f.run);
+    }
+    Ok(())
 }
 
 /// Is `f`'s replaced run (the process that held the old conversation) still the agent's live run?
@@ -416,35 +436,40 @@ fn old_run_alive(hub: &Hub, a: &Agent, f: &Fresh) -> bool {
 /// is restarted. Err: a decision Muster couldn't undo in its record.
 fn fresh_plan(hub: &Hub, to: &Agent, rule: &FreshRule<'_>) -> Result<Plan, String> {
     let undo = || (rule.save)(None).map_err(|e| format!("couldn't record that it stays in the current conversation: {e:#}"));
-    let mut asked = rule.asked;
+    let asked = rule.asked;
+    let mut sized = to.resume_id.clone();
     if let Some(f) = rule.decided {
         // A fresh start forgets the old conversation before it replaces the run. Forgotten and
         // the run replaced: done. Forgotten but the old run still there (the restart was cut
-        // off): finish it, by the resting checks alone (the size went with the conversation).
+        // off): decided again, on the old conversation's facts (its size, the human's prompts),
+        // since the human may have worked in that run meanwhile.
         let forgotten = to.resume_id != f.replaces || f.replaces.is_none();
         if forgotten && !old_run_alive(hub, to, f) {
             return Ok(Plan::Started(f.clone()));
         }
-        asked |= forgotten;
+        if to.resume_id.is_none() {
+            sized.clone_from(&f.replaces);
+        }
     }
     let session = to.session_id.and_then(|s| hub.session(s));
-    match (fresh_verdict(&fresh_facts(hub, to, session.as_ref(), now_ms()), asked), rule.decided) {
+    match (fresh_verdict(&fresh_facts(hub, &sized_as(to, &sized), session.as_ref(), now_ms()), asked), rule.decided) {
         (Verdict::Keep(why), decided) => {
             tracing::debug!(agent = to.name, "an answer goes into the current conversation: {why}");
-            if decided.is_some() {
+            if let Some(f) = decided {
+                take_back(hub, to, f).map_err(|e| format!("couldn't give it its conversation back: {e:#}"))?;
                 undo()?;
             }
             Ok(Plan::Current)
         }
         // A decision saved before a restart keeps its words (the message is found by them).
-        (Verdict::Fresh { .. }, Some(f)) => Ok(Plan::Start { fresh: f.clone(), expect: to.resume_id.clone(), asked }),
+        (Verdict::Fresh { .. }, Some(f)) => Ok(Plan::Start { fresh: f.clone(), expect: to.resume_id.clone(), sized, asked }),
         (Verdict::Fresh { why, .. }, None) => {
             let fresh = Fresh { why, replaces: to.resume_id.clone(), run: to.session_id.and_then(|s| hub.pty_generation(s)) };
             if let Err(e) = (rule.save)(Some(&fresh)) {
                 tracing::warn!(agent = to.name, "not starting a new conversation: saving the decision failed: {e:#}");
                 return Ok(Plan::Current);
             }
-            Ok(Plan::Start { fresh, expect: to.resume_id.clone(), asked })
+            Ok(Plan::Start { fresh, expect: to.resume_id.clone(), sized, asked })
         }
     }
 }
@@ -465,12 +490,14 @@ async fn deliver_to_agent(hub: &Arc<Hub>, l: &Letter<'_>, to: Agent, note: Optio
     let _one = rule_lock(hub, to.id).await;
     let Some(now) = agent_then(hub, to.id, Some(to.created_at)) else {
         // Removed meanwhile: the send refuses it, saying so.
-        return send_to_agent(hub, l, &to, note.as_deref(), rule.decided.cloned(), None).await;
+        return send_to_agent(hub, l, &to, note.as_deref(), None, None).await;
     };
+    // Refused: nothing was restarted for it (a decision saved before a backend restart is
+    // weighed again when it is sent again).
     if let Err(e) = agents::precheck(hub, &now, &(l.text)(note.as_deref()), &l.from, l.from_session, l.prov, None) {
-        return failed(&now, rule.decided.cloned(), e);
+        return failed(&now, None, e);
     }
-    let (fresh, expect, asked) = match fresh_plan(hub, &now, rule) {
+    let (fresh, expect, sized, asked) = match fresh_plan(hub, &now, rule) {
         Err(why) => {
             // Nothing was sent: sent again later, it is decided afresh.
             let mut d = outcome(DeliveryStatus::Undelivered, format!("not delivered: {why}"));
@@ -479,14 +506,14 @@ async fn deliver_to_agent(hub: &Arc<Hub>, l: &Letter<'_>, to: Agent, note: Optio
         }
         Ok(Plan::Current) => return send_to_agent(hub, l, &now, note.as_deref(), None, None).await,
         Ok(Plan::Started(f)) => return send_to_agent(hub, l, &now, note.as_deref(), Some(f), None).await,
-        Ok(Plan::Start { fresh, expect, asked }) => (fresh, expect, asked),
+        Ok(Plan::Start { fresh, expect, sized, asked }) => (fresh, expect, sized, asked),
     };
     let current = |hub: &Hub| agent_then(hub, to.id, Some(to.created_at));
     // Checked again with the start lock held, for an asleep agent too, and once more by the start
     // itself for a running one (with no await in between): the conversation is still the one
     // decided on, and the rule still holds.
     let ok = |s: &SessionInfo| current(hub).is_some_and(|a| a.resume_id == expect
-        && matches!(fresh_verdict(&fresh_facts(hub, &a, Some(s), now_ms()), asked), Verdict::Fresh { .. }));
+        && matches!(fresh_verdict(&fresh_facts(hub, &sized_as(&a, &sized), Some(s), now_ms()), asked), Verdict::Fresh { .. }));
     let held = hub.agents().start_lock.lock().await;
     let still = now.session_id.and_then(|s| hub.session(s)).is_some_and(|s| ok(&s));
     let why = if !still {
@@ -499,12 +526,21 @@ async fn deliver_to_agent(hub: &Arc<Hub>, l: &Letter<'_>, to: Agent, note: Optio
         }
     };
     drop(held);
-    // Not started. A conversation the failed start forgot is gone all the same, unless its run is
-    // still there: say which.
+    // Not started. A new run that holds a new conversation stays (the answer goes to it, saying
+    // so); otherwise a conversation the failed start forgot is the agent's again (its old run
+    // still there, or none running), and the answer goes into it.
     if let Some(a) = current(hub)
-        && a.resume_id != fresh.replaces && fresh.replaces.is_some() && !old_run_alive(hub, &a, &fresh)
+        && a.resume_id != fresh.replaces && fresh.replaces.is_some()
     {
-        return send_to_agent(hub, l, &now, note.as_deref(), Some(fresh), None).await;
+        let new_run = a.session_id.is_some_and(|s| hub.live_session_ids().contains(&s)) && !old_run_alive(hub, &a, &fresh);
+        if new_run {
+            return send_to_agent(hub, l, &now, note.as_deref(), Some(fresh), None).await;
+        }
+        if let Err(e) = take_back(hub, &a, &fresh) {
+            // Forgotten for good: its next run starts a new conversation, as the answer says.
+            tracing::warn!(agent = now.name, "couldn't give it its conversation back: {e:#}");
+            return send_to_agent(hub, l, &now, note.as_deref(), Some(fresh), None).await;
+        }
     }
     tracing::info!(agent = now.name, "an answer goes into the current conversation after all: {why}");
     if let Err(e) = (rule.save)(None) {

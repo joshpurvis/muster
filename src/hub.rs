@@ -1227,9 +1227,10 @@ impl Hub {
         if let Some(c) = body.get("context")
             && let (Some(conv), Some(tokens)) = (c.get("conversation").and_then(|v| v.as_str()), c.get("tokens").and_then(|v| v.as_u64()))
             && crate::agents::valid_resume_id(conv)
+            && let Some(api_ms) = report.api_ms
             && let Some(agent) = self.agents.by_session(session)
         {
-            self.agents.note_context(agent.id, conv, tokens, Some(generation), report.api_ms)?;
+            self.agents.note_context(agent.id, conv, tokens, generation, api_ms)?;
         }
         // A report with only the API time (before the run's first response) is the baseline
         // the next one is measured against.
@@ -3634,6 +3635,16 @@ impl Hub {
         }
     }
 
+    /// The fresh start that fenced run `generation` of session `id` stopped before replacing it:
+    /// its hooks change the agent's conversation again.
+    pub fn unfence_conversation(&self, id: SessionId, generation: Option<u64>) {
+        if let Some(e) = self.inner.lock().sessions.get_mut(&id)
+            && generation.is_some_and(|g| e.generation == g && e.fenced_generation == Some(g))
+        {
+            e.fenced_generation = None;
+        }
+    }
+
     /// Session `id`'s next (re)start runs on Claude profile `profile` (None: Default): a named
     /// agent's tab follows its agent's account (`agents::run_agent`). Its running process, if
     /// any, keeps the account it started with.
@@ -5282,6 +5293,13 @@ mod tests {
         assert_eq!(hub.agents.context_size(&hub.agents.by_id(a.id).unwrap()), Some(216_003));
         // A forged conversation id is never stored.
         hub.record_usage("claude-run", &serde_json::json!({"context": {"conversation": "--x", "tokens": 9}})).unwrap();
+        assert_eq!(hub.agents.context_size(&hub.agents.by_id(a.id).unwrap()), Some(216_003));
+        // One without the run's API time can't be ordered against the kept one (a redraw from
+        // before a compaction, arriving late): dropped.
+        let mut late = body.clone();
+        late["api_duration_ms"] = serde_json::Value::Null;
+        late["context"]["tokens"] = serde_json::json!(40_000);
+        hub.record_usage("claude-run", &late).unwrap();
         assert_eq!(hub.agents.context_size(&hub.agents.by_id(a.id).unwrap()), Some(216_003));
     }
 

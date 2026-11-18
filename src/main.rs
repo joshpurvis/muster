@@ -1959,8 +1959,10 @@ async fn daemon_main(openrouter_key: Option<openrouter::ApiKey>, launch: Option<
         let cards = prs::unfinished(&hub);
         tokio::spawn(async move {
             agents::autostart(&hub).await;
-            agent_reply::resume(&hub, unfinished).await;
+            // Answers before late replies: one that had started its agent in a new conversation
+            // is that conversation's first message (src/questions.rs `resume`).
             questions::resume(&hub, answers).await;
+            agent_reply::resume(&hub, unfinished).await;
             prs::resume(&hub, cards).await;
         });
     }

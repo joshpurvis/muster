@@ -1037,7 +1037,8 @@ before it is typed in is refused (as every agent message now is).
 conversation is cold (its prompt cache has likely expired by its lifetime in `prefs.cache_ttl`,
 whether or not the cold warnings are shown: docs/PROTOCOL.md "Cold prompt cache") and at least
 100,000 tokens (its last request's input, as its status line reported it for that conversation;
-a report that arrives after a newer one is dropped), Muster starts the agent in a new
+a report that arrives after a newer one, or without the run's API time to order it by, is
+dropped), Muster starts the agent in a new
 conversation first, the way Start fresh does (persona, memory and the start lock as usual), and
 the answer is that conversation's first message: it is queued under the same hold of the start
 lock, before any other message can start the agent. Every delivery check (accepted origins, hop
@@ -1054,8 +1055,10 @@ your memory/ notes first; the message below has everything it is about.`, and th
 delivery says so (`delivery.fresh: {why, replaces, run}`; its note starts `started <agent> in a new
 conversation, because ...`). The decision is saved with the delivery, with the run it replaces, before the agent is
 restarted, so a backend restart in between neither restarts it twice nor types the answer in
-twice (a restart that finds the old run still there finishes the fresh start), and answers that
-had started a new conversation are finished first. A second answer to the same agent waits for
+twice (a restart that finds the old run still there decides again, on the old conversation's
+size and the human's prompts in it), and answers that had started a new conversation are
+finished first, before late replies. A fresh start that fails before a new run takes over gives
+the agent its old conversation back, and the answer goes into it, with no new-conversation line. A second answer to the same agent waits for
 the first and goes into the new conversation. The Questions tab's "After you answer" line comes
 from the same rule (`asker_now.new_conversation`), naming the lead when the answer goes there.
 An answer whose `into` is `fresh` (nothing sets it yet) gets a new conversation whatever the size,

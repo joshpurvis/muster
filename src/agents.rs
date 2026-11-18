@@ -957,6 +957,10 @@ pub struct Registry {
     context: Mutex<HashMap<i64, ContextSize>>,
     /// One answer at a time per agent through the cold-answer rule (src/relay.rs `rule_lock`).
     pub(crate) answer_locks: Mutex<HashMap<i64, Arc<tokio::sync::Mutex<()>>>>,
+    /// Tests without a terminal host: `start_fresh_if_held` forgets the conversation as a start
+    /// does and reports the start done, without running anything.
+    #[cfg(test)]
+    pub(crate) fake_fresh_start: std::sync::atomic::AtomicBool,
 }
 
 /// The sessions `rt` says are doing unattended work.
@@ -1017,22 +1021,27 @@ impl Registry {
                 None
             }).unwrap_or_default()),
             answer_locks: Default::default(),
+            #[cfg(test)]
+            fake_fresh_start: Default::default(),
         })
     }
 
     /// Agent `id`'s status line reported its conversation `conversation` at `tokens`, from run
-    /// `run` at API time `api_ms`. Saved only when it changed (a status line redraws often); a
-    /// report older than the one kept for the same conversation (it arrived late) is dropped.
-    pub(crate) fn note_context(&self, id: i64, conversation: &str, tokens: u64, run: Option<u64>, api_ms: Option<f64>)
+    /// `run` at API time `api_ms` (which orders reports within a run; a report without it can't
+    /// be ordered, so the caller drops it and the size stays as it was). Saved only when it
+    /// changed (a status line redraws often); a report older than the one kept for the same
+    /// conversation (it arrived late) is dropped.
+    pub(crate) fn note_context(&self, id: i64, conversation: &str, tokens: u64, run: u64, api_ms: f64)
         -> anyhow::Result<()> {
         // Agents removed since are dropped with the next save.
         let known: HashSet<i64> = self.inner.lock().agents.keys().copied().collect();
         let mut g = self.context.lock();
-        let next = ContextSize { conversation: conversation.to_string(), tokens, run, api_ms };
+        let next = ContextSize { conversation: conversation.to_string(), tokens, run: Some(run), api_ms: Some(api_ms) };
         if let Some(kept) = g.get(&id).filter(|k| k.conversation == conversation) {
-            let older = match (kept.run, run) {
-                (Some(k), Some(r)) if r != k => r < k,
-                _ => matches!((kept.api_ms, api_ms), (Some(k), Some(a)) if a < k),
+            let older = match (kept.run, kept.api_ms) {
+                (Some(k), _) if k != run => run < k,
+                (_, Some(k)) => api_ms < k,
+                _ => false,
             };
             if older || *kept == next {
                 return Ok(());
@@ -1124,6 +1133,20 @@ impl Registry {
         a.resume_id = None;
         a.reset_on_next_start = false;
         Ok(a.clone())
+    }
+
+    /// A fresh start of agent `id` stopped before a new run took over (src/relay.rs): it resumes
+    /// `conversation` again, unless something set another conversation meanwhile. The record, when
+    /// it is set back.
+    pub(crate) fn restore_conversation(&self, store: &Store, id: i64, conversation: &str) -> anyhow::Result<Option<Agent>> {
+        let mut g = self.inner.lock();
+        let a = g.agents.get_mut(&id).ok_or_else(|| anyhow::anyhow!("agent {id} was removed"))?;
+        if a.resume_id.is_some() {
+            return Ok(None);
+        }
+        store.update_agent_runtime(a.id, a.channel_id, a.session_id, Some(conversation))?;
+        a.resume_id = Some(conversation.to_string());
+        Ok(Some(a.clone()))
     }
 
     /// `agent.update`: the configuration fields of `next` (model, effort, persona, profile,
@@ -1930,11 +1953,30 @@ pub(crate) type StartHeld<'a> = tokio::sync::MutexGuard<'a, ()>;
 /// `start_fresh_if` for a caller holding the start lock (`_held`).
 pub(crate) async fn start_fresh_if_held(hub: &Arc<Hub>, name: &str, ok: &(dyn Fn(&SessionInfo) -> bool + Sync),
     _held: &StartHeld<'_>) -> anyhow::Result<AgentSession> {
+    #[cfg(test)]
+    if hub.agents().fake_fresh_start.load(std::sync::atomic::Ordering::Relaxed) {
+        return fake_fresh_start(hub, name, ok);
+    }
     let r = start_locked(hub, name, true, None, Some(ok)).await;
     if let Ok(s) = &r {
         publish(hub, &s.agent);
     }
     r
+}
+
+/// `Registry::fake_fresh_start`: `start_once`'s checks and its forgetting of the conversation,
+/// then a start reported done (the agent's session as it is; nothing runs).
+#[cfg(test)]
+fn fake_fresh_start(hub: &Arc<Hub>, name: &str, ok: &(dyn Fn(&SessionInfo) -> bool + Sync)) -> anyhow::Result<AgentSession> {
+    let agent = hub.agents().get(name).ok_or_else(|| no_agent(hub, name))?;
+    let sid = agent.session_id.ok_or_else(|| anyhow::anyhow!("no session"))?;
+    let session = hub.session(sid).ok_or_else(|| anyhow::anyhow!("no session"))?;
+    if session.state != AgentState::Exited && hub.live_session_ids().contains(&sid) && !ok(&session) {
+        return Err(NotIdle.into());
+    }
+    hub.fence_conversation(sid);
+    let agent = hub.agents().reset_for_start(hub.store(), agent.id, &agent.working_location)?;
+    Ok(AgentSession { agent, session, started: true, woke: None })
 }
 
 async fn start_guarded(hub: &Arc<Hub>, name: &str, fresh: bool, window: Option<WindowId>,
@@ -3735,13 +3777,13 @@ mod tests {
         let reg = Registry::load(&store).unwrap();
         let a = reg.by_id(a.id).unwrap();
         assert_eq!(reg.context_size(&a), None, "nothing reported yet");
-        reg.note_context(a.id, "conv-1", 216_003, None, None).unwrap();
+        reg.note_context(a.id, "conv-1", 216_003, 1, 1.0).unwrap();
         assert_eq!(reg.context_size(&a), Some(216_003));
         // Kept across a backend restart.
         let reg = Registry::load(&store).unwrap();
         assert_eq!(reg.context_size(&a), Some(216_003));
         // Reported for another conversation (a /clear, a fresh start): not the one it resumes.
-        reg.note_context(a.id, "conv-2", 1_000, None, None).unwrap();
+        reg.note_context(a.id, "conv-2", 1_000, 1, 1.0).unwrap();
         assert_eq!(reg.context_size(&a), None);
         let mut fresh = a.clone();
         fresh.resume_id = None;
@@ -3750,7 +3792,7 @@ mod tests {
         assert_eq!(reg.context_size(&fresh), Some(1_000));
         // A removed agent's entry goes with the next save.
         reg.remove(&store, a.id).unwrap();
-        reg.note_context(a.id + 1, "conv-9", 5, None, None).unwrap();
+        reg.note_context(a.id + 1, "conv-9", 5, 1, 1.0).unwrap();
         let saved: HashMap<i64, ContextSize> = store.load_runtime(CONTEXT_KEY).unwrap().unwrap();
         assert!(saved.is_empty(), "{saved:?}");
     }
@@ -3803,15 +3845,15 @@ mod tests {
         let reg = Registry::load(&store).unwrap();
         let a = reg.by_id(a.id).unwrap();
         // Compacted: 40k at API time 900 of run 3.
-        reg.note_context(a.id, "conv-1", 40_000, Some(3), Some(900.0)).unwrap();
+        reg.note_context(a.id, "conv-1", 40_000, 3, 900.0).unwrap();
         // The redraw from before the compaction (API time 500) lands after it: dropped.
-        reg.note_context(a.id, "conv-1", 216_000, Some(3), Some(500.0)).unwrap();
+        reg.note_context(a.id, "conv-1", 216_000, 3, 500.0).unwrap();
         assert_eq!(reg.context_size(&a), Some(40_000));
         // An older run's report too.
-        reg.note_context(a.id, "conv-1", 216_000, Some(2), Some(9_000.0)).unwrap();
+        reg.note_context(a.id, "conv-1", 216_000, 2, 9_000.0).unwrap();
         assert_eq!(reg.context_size(&a), Some(40_000));
         // A newer run of the same conversation starts its API time again: taken.
-        reg.note_context(a.id, "conv-1", 41_000, Some(4), Some(10.0)).unwrap();
+        reg.note_context(a.id, "conv-1", 41_000, 4, 10.0).unwrap();
         assert_eq!(reg.context_size(&a), Some(41_000));
         // Unreadable sizes are dropped at load, never a failed start.
         store.save_runtime(CONTEXT_KEY, &json!("not a map")).unwrap();

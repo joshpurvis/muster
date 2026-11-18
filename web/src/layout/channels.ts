@@ -107,6 +107,19 @@ export function sidebarRatio(value: number): number {
   return Number.isFinite(value) ? Math.max(0.2, Math.min(0.8, value)) : 0.45;
 }
 
+/** The channel a tab that follows the shown channel (Questions, an add-on tab) belongs in: the
+ * shown one when it is one of the window's channels, or the unfiled note tabs (channel 0, the
+ * Notes button's "Show unfiled note tabs") while there are some (`unfiled`: else that workspace
+ * closes, and the tab must not keep it open); otherwise none. */
+export function followingChannel(
+  active: number | null | undefined,
+  known: (id: number) => boolean,
+  unfiled: boolean,
+): number | null {
+  if (active === 0) return unfiled ? 0 : null;
+  return active != null && known(active) ? active : null;
+}
+
 /** Find the saved home of a tab; useful for notes predating channel membership. */
 export function savedChannel(s: WindowLayoutState, tab: number): number | null {
   for (const [id, l] of Object.entries(s.layouts)) {
@@ -148,9 +161,11 @@ export function reconcileChannels(s: WindowLayoutState, channels: number[], tabs
   for (const t of tabs) {
     if (drawerIds.has(t.id) || (t.pinned && s.pinned?.[t.pinned]?.hidden)) continue;
     const saved = t.channel === null ? savedChannel(s, t.id) : null;
-    if (t.kept && (saved === null || !ids.has(saved))) continue;
+    // Kept (its saved place while the window loads): in a channel, or in the unfiled note tabs.
+    if (t.kept && (saved === null || (!ids.has(saved) && saved !== 0))) continue;
     const beside = t.beside == null ? null : tabs.find((x) => x.id === t.beside)?.channel;
-    const channel = t.channel ?? beside ?? (saved !== null && ids.has(saved) ? saved : null) ??
+    const home = saved !== null && (ids.has(saved) || (t.kept && saved === 0)) ? saved : null;
+    const channel = t.channel ?? beside ?? home ??
       (s.active !== null && ids.has(s.active) ? s.active : channels[0]) ?? 0;
     if (!groups.has(channel)) groups.set(channel, []);
     groups.get(channel)!.push(t);

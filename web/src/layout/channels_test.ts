@@ -1,6 +1,6 @@
 import {
-  changeChannelLayout, folderChannel, loadChannelLayout, reconcileChannels, rememberPlace, savedChannel,
-  sidebarRatio, type TabHome, type WindowLayoutState,
+  changeChannelLayout, folderChannel, followingChannel, loadChannelLayout, reconcileChannels, rememberPlace,
+  savedChannel, sidebarRatio, type TabHome, type WindowLayoutState,
 } from "./channels.ts";
 import {
   addTab, allPanes, allSessions, emptyLayout, findPane, noteTab, panelTab,
@@ -225,6 +225,48 @@ Deno.test("the Questions tab starts first in the first group of whichever channe
   equal(hidden.questions, false);
   equal(sig(hidden.layouts[20].root), "[2]");
   equal(loadChannelLayout(JSON.parse(JSON.stringify(w)), [10, 20], tabs(20)).questions, undefined);
+});
+
+Deno.test("Questions follows the window to the unfiled note tabs (channel 0) and back", () => {
+  const known = (id: number) => id === 10 || id === 20;
+  equal([followingChannel(10, known, true), followingChannel(0, known, true), followingChannel(30, known, true)], [10, 0, null]);
+  equal([followingChannel(null, known, true), followingChannel(undefined, known, true)], [null, null]);
+  // No unfiled notes left: the empty unfiled workspace isn't kept open for Questions.
+  equal(followingChannel(0, known, false), null);
+  const Q = -(2 ** 52);
+  // Channel 10 shows Questions and a terminal; an unfiled note (channel 0) has a layout of its own.
+  const tabs = (active: number): TabHome[] => [
+    { id: 1, channel: 10 }, { id: noteTab(7), channel: 0 },
+    { id: Q, channel: followingChannel(active, known, true), questions: true },
+  ];
+  let w = loadChannelLayout({ v: 2, active: 10, layouts: {}, sidebar: {} }, [10, 20], tabs(10));
+  equal(sig(w.layouts[10].root), `[${Q},1]`);
+  // "Show unfiled note tabs": Questions leaves channel 10 and shows beside the note.
+  w = reconcileChannels({ ...w, active: 0 }, [10, 20], tabs(0));
+  equal(sig(w.layouts[10].root), "[1]");
+  equal(sig(w.layouts[0].root), `[${Q},${noteTab(7)}]`);
+  // Back in channel 10, it is there again and gone from the unfiled tabs.
+  w = reconcileChannels({ ...w, active: 10 }, [10, 20], tabs(10));
+  equal(sig(w.layouts[10].root), `[${Q},1]`);
+  equal(sig(w.layouts[0].root), `[${noteTab(7)}]`);
+  // The bug this guards (a null channel for 0): the tab stayed where it was.
+  const stale = reconcileChannels({ ...w, active: 0 }, [10, 20], [
+    { id: 1, channel: 10 }, { id: noteTab(7), channel: 0 }, { id: Q, channel: null, questions: true },
+  ]);
+  equal(sig(stale.layouts[10].root), `[${Q},1]`);
+  // Reloaded while the unfiled tabs are shown: the saved place of Questions there is kept while
+  // the window loads (it isn't shown yet), not dropped.
+  const there = reconcileChannels({ ...w, active: 0 }, [10, 20], tabs(0));
+  const reloaded = loadChannelLayout(JSON.parse(JSON.stringify(there)), [10, 20], [
+    { id: 1, channel: 10 }, { id: noteTab(7), channel: 0 }, { id: Q, channel: null, questions: true, kept: true },
+  ]);
+  equal(sig(reloaded.layouts[0].root), `[${Q},${noteTab(7)}]`);
+  // The last unfiled note closed: Questions goes back to a channel and the unfiled workspace closes.
+  const closed = reconcileChannels({ ...there, active: 0 }, [10, 20], [
+    { id: 1, channel: 10 }, { id: Q, channel: followingChannel(0, known, false), questions: true },
+  ]);
+  equal(closed.layouts[0], undefined);
+  assert(allSessions(closed.layouts[10].root).includes(Q), "Questions is back in channel 10");
 });
 
 const QTAB = -(2 ** 52);

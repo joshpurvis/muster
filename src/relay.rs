@@ -9,6 +9,16 @@
 //!   the words (`check_reach`).
 //! - One delivery (`deliver`), and, after a restart that came while one was under way, whether it
 //!   got through (`found_after_restart`), so it is neither lost nor typed in twice.
+//! - The cold-answer rule (`FreshRule`, `fresh_verdict`), for answers to questions only: a named
+//!   agent whose conversation is cold (past its cache lifetime, src/cache.rs) and large (at least
+//!   `cache::FRESH_ANSWER_MIN_TOKENS`, from its status line: src/statusline.rs) gets the answer
+//!   in a new conversation, started the way Start fresh starts one (`agents::start_fresh_if`).
+//!   Only while it rests (idle or asleep) with nothing else waiting for it, and not when the
+//!   human typed into it in the last two minutes or had a prompt of their own taken in by it in
+//!   the last 24 hours. Whatever Muster can't tell keeps the current conversation. The decision
+//!   is saved with the delivery (`Delivery::fresh`) before the agent is restarted, and the
+//!   message says so in its first line, so a backend restart in between neither restarts the
+//!   agent twice nor types the answer in twice.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -73,12 +83,26 @@ pub struct Delivery {
     pub session_id: Option<SessionId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub at: Option<i64>,
+    /// The new conversation Muster started the recipient in for it (`FreshRule`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fresh: Option<Fresh>,
+}
+
+/// A new conversation Muster starts a recipient in for one delivery. Saved with the delivery
+/// before the agent is restarted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Fresh {
+    /// Why, in a few words: "the old one was cold and large, about 216k tokens and idle 3 h".
+    pub why: String,
+    /// The conversation it replaces (None: the agent had none Muster knew of).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaces: Option<String>,
 }
 
 impl Delivery {
     /// Not sent yet, with why it waits.
     pub fn pending(note: Option<String>) -> Delivery {
-        Delivery { status: DeliveryStatus::Pending, note, to: None, msg_id: None, session_id: None, at: None }
+        Delivery { status: DeliveryStatus::Pending, note, to: None, msg_id: None, session_id: None, at: None, fresh: None }
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -208,7 +232,7 @@ pub fn check_reach(hub: &Hub, recorder: SessionId, t: &Target) -> Result<(), Str
 }
 
 pub fn outcome(status: DeliveryStatus, note: String) -> Delivery {
-    Delivery { status, note: Some(note), to: None, msg_id: None, session_id: None, at: Some(now_ms()) }
+    Delivery { status, note: Some(note), to: None, msg_id: None, session_id: None, at: Some(now_ms()), fresh: None }
 }
 
 /// A delivery the backend's shutdown cut off before it reached a queue: pending again, so the
@@ -236,6 +260,188 @@ pub struct Letter<'a> {
     pub envelope: &'a (dyn Fn(&str, Origin, u32) -> String + Sync),
     /// How that first line starts, whatever the sender (to find it in a queue).
     pub prefix: String,
+    /// The cold-answer rule, for the deliveries it covers (answers to questions; None for the rest).
+    pub fresh: Option<FreshRule<'a>>,
+}
+
+/// The cold-answer rule for one delivery (see the module notes).
+pub struct FreshRule<'a> {
+    /// The human asked for a new conversation (`questions::Answer::into`): no size or cold check,
+    /// the other checks still apply.
+    pub asked: bool,
+    /// The decision already saved with this delivery (a backend restart came since).
+    pub decided: Option<&'a Fresh>,
+    /// Save the decision with the delivery (None: undone), before the agent is restarted.
+    pub save: &'a (dyn Fn(Option<&Fresh>) -> anyhow::Result<()> + Sync),
+}
+
+/// The first line of a message that starts a new conversation.
+pub fn fresh_line(f: &Fresh) -> String {
+    format!("Muster started you in a new conversation for this message, because {}. \
+             Read your memory/ notes first; the message below has everything it is about.", f.why)
+}
+
+/// The words `l` carries (given `note`, as `Letter::text`), after the new-conversation line when
+/// one was decided: the same text whenever it is built for the same decision, so a restart finds
+/// the message it sent.
+fn letter_text(l: &Letter<'_>, fresh: Option<&Fresh>, note: Option<&str>) -> String {
+    let text = (l.text)(note);
+    match fresh {
+        Some(f) => format!("{}\n\n{text}", fresh_line(f)),
+        None => text,
+    }
+}
+
+/// An answer to a question waiting this long since the human's own prompt in the conversation
+/// leaves that conversation alone (they worked in it lately).
+pub const HUMAN_RECENT_MS: i64 = 24 * 60 * 60 * 1000;
+/// Keys typed into the agent this recently: the human is at it (as for a schedule's fresh start).
+const HUMAN_TYPING_MS: u128 = 120_000;
+
+/// What `fresh_verdict` decides on, read from the hub (`fresh_facts`).
+#[derive(Debug, Clone, Default)]
+pub struct FreshFacts {
+    pub claude: bool,
+    /// Running and resting: idle, nothing queued.
+    pub idle: bool,
+    /// Asleep: its run was stopped, its conversation kept.
+    pub asleep: bool,
+    /// How long it has been idle, once its cache has likely expired (src/sleep.rs `wake_cost`).
+    pub cold_for: Option<i64>,
+    /// Its conversation's size in tokens (None: unknown).
+    pub tokens: Option<u64>,
+    /// Something else is waiting to reach it: prompts in its queue, another delivery under way.
+    pub others_waiting: bool,
+    /// The human is at it: a draft in its input box, or keys typed in the last two minutes.
+    pub typing: bool,
+    /// When the human last had a prompt of their own taken in by it.
+    pub human_prompt_at: Option<i64>,
+    pub now: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verdict {
+    /// The current conversation, and why.
+    Keep(&'static str),
+    /// A new conversation: why in a few words, and the old one's size in thousands of tokens
+    /// (None: the human asked, whatever the size). The delivery's words and the Questions tab's
+    /// line before an answer both come from here, so they give the same number.
+    Fresh { why: String, size_k: Option<u64> },
+}
+
+/// The cold-answer rule. `asked`: the human asked for a new conversation.
+pub fn fresh_verdict(f: &FreshFacts, asked: bool) -> Verdict {
+    use Verdict::Keep;
+    if !f.idle && !f.asleep {
+        return Keep("it is in a turn, starting, or not running");
+    }
+    if f.others_waiting {
+        return Keep("other prompts are waiting for it");
+    }
+    if f.typing {
+        return Keep("the human is typing into it");
+    }
+    if asked {
+        return Verdict::Fresh { why: "the human asked for a fresh start".into(), size_k: None };
+    }
+    if !f.claude {
+        return Keep("only Claude agents report their conversation's size");
+    }
+    let Some(idle) = f.cold_for else { return Keep("its prompt cache is still warm") };
+    let Some(tokens) = f.tokens else { return Keep("its conversation's size is unknown") };
+    if tokens < crate::cache::FRESH_ANSWER_MIN_TOKENS {
+        return Keep("its conversation is small");
+    }
+    if f.human_prompt_at.is_some_and(|t| f.now - t < HUMAN_RECENT_MS) {
+        return Keep("the human worked in this conversation in the last 24 hours");
+    }
+    let size_k = (tokens + 500) / 1000;
+    Verdict::Fresh { why: format!("the old one was cold and large, about {size_k}k tokens and idle {}", crate::cache::idle_text(idle)),
+        size_k: Some(size_k) }
+}
+
+/// `fresh_verdict`'s facts for agent `a` (its record as it is now) at `now`, with `session` its
+/// session as the caller read it (None: it has none).
+pub fn fresh_facts(hub: &Hub, a: &Agent, session: Option<&SessionInfo>, now: i64) -> FreshFacts {
+    let Some(info) = session else { return FreshFacts { now, ..FreshFacts::default() } };
+    let live = info.state != AgentState::Exited && hub.live_session_ids().contains(&info.id);
+    let keys = hub.human_input_of(info.id).is_some_and(|(_, at)| at.elapsed().as_millis() < HUMAN_TYPING_MS);
+    FreshFacts {
+        claude: a.kind == SessionKind::Claude,
+        idle: live && agents::session_idle(info),
+        asleep: !live && a.asleep_at.is_some(),
+        cold_for: crate::sleep::wake_cost(info, now),
+        tokens: hub.agents().context_size(a),
+        others_waiting: !crate::inject::queue_idle(hub, info.id) || hub.agents().sleep.deliveries(a.id) > 0,
+        typing: keys || (live && agents::session_idle(info) && crate::inject::has_draft(hub, info.id)),
+        human_prompt_at: hub.agents().human_prompt_at(info.id),
+        now,
+    }
+}
+
+/// Apply the cold-answer rule to agent `to` before a delivery: Ok(Some) when the delivery goes
+/// into a new conversation (started now, or before a backend restart), Ok(None) for the current
+/// one. Err: a decision Muster couldn't undo in its record (the delivery must not go: its text
+/// would say what didn't happen).
+async fn fresh_start(hub: &Arc<Hub>, to: &Agent, rule: &FreshRule<'_>) -> Result<Option<Fresh>, String> {
+    let current = |hub: &Hub| agent_then(hub, to.id, Some(to.created_at));
+    // As it is now, with the answer lock held: an answer just before this one may have started
+    // it fresh since `to` was read.
+    let Some(to) = current(hub) else { return Ok(rule.decided.cloned()) };
+    let to = &to;
+    let decided = match rule.decided {
+        // Decided before a restart: done already unless the agent still has the conversation
+        // it was to replace (a fresh start forgets it before the agent is restarted).
+        Some(f) if to.resume_id != f.replaces || f.replaces.is_none() => {
+            return Ok(Some(f.clone()));
+        }
+        // Not done yet: checked again below, as it is now.
+        Some(f) => f.clone(),
+        None => Fresh { why: String::new(), replaces: to.resume_id.clone() },
+    };
+    let session = to.session_id.and_then(|s| hub.session(s));
+    let decided = match fresh_verdict(&fresh_facts(hub, to, session.as_ref(), now_ms()), rule.asked) {
+        Verdict::Keep(why) => {
+            tracing::debug!(agent = to.name, "an answer goes into the current conversation: {why}");
+            if rule.decided.is_some() {
+                (rule.save)(None).map_err(|e| format!("couldn't record that it stays in the current conversation: {e:#}"))?;
+            }
+            return Ok(None);
+        }
+        // A decision saved before a restart keeps its words (the message is found by them).
+        Verdict::Fresh { .. } if rule.decided.is_some() => decided,
+        Verdict::Fresh { why, .. } => {
+            let f = Fresh { why, ..decided };
+            if let Err(e) = (rule.save)(Some(&f)) {
+                tracing::warn!(agent = to.name, "not starting a new conversation: saving the decision failed: {e:#}");
+                return Ok(None);
+            }
+            f
+        }
+    };
+    // Checked again under the start lock with the restart (nothing can slip in between): the
+    // conversation is still the one decided on, and the rule still holds for it.
+    let ok = |s: &SessionInfo| current(hub).is_some_and(|a| a.resume_id == decided.replaces
+        && matches!(fresh_verdict(&fresh_facts(hub, &a, Some(s), now_ms()), rule.asked), Verdict::Fresh { .. }));
+    let why = match agents::start_fresh_if(hub, &to.name, &ok).await {
+        Ok(_) => return Ok(Some(decided)),
+        Err(e) if e.downcast_ref::<agents::NotIdle>().is_some() => "it is no longer resting".to_string(),
+        Err(e) => format!("{e:#}"),
+    };
+    // Not started. A conversation the failed start forgot is gone all the same: say so.
+    if current(hub).is_none_or(|a| a.resume_id != decided.replaces) && decided.replaces.is_some() {
+        return Ok(Some(decided));
+    }
+    tracing::info!(agent = to.name, "an answer goes into the current conversation after all: {why}");
+    (rule.save)(None).map_err(|e| format!("couldn't record that it stays in the current conversation: {e:#}"))?;
+    Ok(None)
+}
+
+/// Serializes the deliveries the cold-answer rule covers per agent, so a second answer sees what
+/// the first did (and goes into the new conversation, after the first).
+async fn rule_lock(hub: &Hub, agent: i64) -> tokio::sync::OwnedMutexGuard<()> {
+    let m = hub.agents().answer_locks.lock().entry(agent).or_default().clone();
+    m.lock_owned().await
 }
 
 /// Deliver `l`: the delivery with its final status.
@@ -259,9 +465,28 @@ pub async fn deliver(hub: &Arc<Hub>, l: &Letter<'_>) -> Delivery {
         Target::NotNeeded(why) => outcome(DeliveryStatus::NotNeeded, why),
         Target::Gone(why) => outcome(DeliveryStatus::Undelivered, format!("not delivered: {why}")),
         Target::Agent(to, note) => {
-            let text = (l.text)(note.as_deref());
+            let _one = match &l.fresh {
+                Some(_) => Some(rule_lock(hub, to.id).await),
+                None => None,
+            };
+            let fresh = match &l.fresh {
+                Some(rule) => match fresh_start(hub, &to, rule).await {
+                    Ok(f) => f,
+                    Err(why) => {
+                        // Nothing was sent: sent again later, it is decided afresh.
+                        let mut d = outcome(DeliveryStatus::Undelivered, format!("not delivered: {why}"));
+                        d.to = Some(to.name.clone());
+                        return d;
+                    }
+                },
+                None => None,
+            };
+            let text = letter_text(l, fresh.as_ref(), note.as_deref());
             let mut d = outcome(DeliveryStatus::Delivered, String::new());
             d.to = Some(to.name.clone());
+            d.fresh = fresh.clone();
+            let started = fresh.as_ref().map(|f| format!("started {} in a new conversation, because {}; ", to.name, f.why))
+                .unwrap_or_default();
             // Delivered by name, as late replies are: an agent removed and another made with its
             // name in the moment between `target` and the start would get it (only the human
             // removes and makes agents).
@@ -270,9 +495,9 @@ pub async fn deliver(hub: &Arc<Hub>, l: &Letter<'_>) -> Delivery {
                     d.msg_id = Some(sent.msg_id);
                     d.session_id = Some(sent.session_id);
                     d.note = Some(if sent.delivered {
-                        format!("typed into {} as message {}", to.name, sent.msg_id)
+                        format!("{started}typed into {} as message {}", to.name, sent.msg_id)
                     } else {
-                        format!("queued for {} as message {}: typed in when it is between steps", to.name, sent.msg_id)
+                        format!("{started}queued for {} as message {}: typed in when it is between steps", to.name, sent.msg_id)
                     });
                 }
                 Err(e) if e.downcast_ref::<agents::Refused>().is_some() => {
@@ -281,9 +506,10 @@ pub async fn deliver(hub: &Arc<Hub>, l: &Letter<'_>) -> Delivery {
                 }
                 Err(e) if e.downcast_ref::<crate::inject::DeliveryPending>().is_some() => {
                     d.msg_id = hub.store().find_question_delivery(to.id, &l.from, &text).ok().flatten();
-                    d.note = Some(format!("queued for {}; Muster is confirming its delivery", to.name));
+                    d.note = Some(format!("{started}queued for {}; Muster is confirming its delivery", to.name));
                 }
-                Err(_) if hub.is_shutting_down() => return interrupted(),
+                // The decision stays with it: the restart finds the agent restarted already.
+                Err(_) if hub.is_shutting_down() => return Delivery { fresh, ..interrupted() },
                 Err(e) => {
                     d.status = DeliveryStatus::Undelivered;
                     d.note = Some(format!("not delivered to {}: {e:#}", to.name));
@@ -333,16 +559,19 @@ pub fn found_after_restart(hub: &Arc<Hub>, l: &Letter<'_>) -> anyhow::Result<Opt
     let live: HashSet<SessionId> = hub.live_session_ids().into_iter().collect();
     Ok(match target(hub, l.poster, l.recorder, &live) {
         Target::Agent(to, note) => {
-            match hub.store().find_question_delivery(to.id, &l.from, &(l.text)(note.as_deref()))? {
+            let fresh = l.fresh.as_ref().and_then(|r| r.decided);
+            match hub.store().find_question_delivery(to.id, &l.from, &letter_text(l, fresh, note.as_deref()))? {
                 None => None,
                 Some(n) => match hub.store().agent_message(n)? {
-                    Some(c) if c.refused.is_some() => Some(Delivery { msg_id: Some(n), to: Some(to.name.clone()),
+                    Some(c) if c.refused.is_some() => Some(Delivery { msg_id: Some(n), to: Some(to.name.clone()), fresh: fresh.cloned(),
                         ..outcome(DeliveryStatus::Refused, format!("not delivered to {}: {}", to.name, c.refused.unwrap_or_default())) }),
                     Some(c) if c.reply.is_some() || hub.store().agent_message_delivered_at(n)?.is_some()
                         || crate::inject::holds_message(hub, n) =>
                     {
-                        Some(Delivery { msg_id: Some(n), to: Some(to.name.clone()),
-                            ..outcome(DeliveryStatus::Delivered, format!("delivered to {} as message {n}", to.name)) })
+                        let started = fresh.map(|f| format!("started {} in a new conversation, because {}; ", to.name, f.why))
+                            .unwrap_or_default();
+                        Some(Delivery { msg_id: Some(n), to: Some(to.name.clone()), fresh: fresh.cloned(),
+                            ..outcome(DeliveryStatus::Delivered, format!("{started}delivered to {} as message {n}", to.name)) })
                     }
                     // Recorded, but the restart came before it was queued: nothing will type it
                     // in. Drop that row (as a failed delivery does) and send it again.
@@ -360,4 +589,87 @@ pub fn found_after_restart(hub: &Arc<Hub>, l: &Letter<'_>) -> anyhow::Result<Opt
                 ..outcome(DeliveryStatus::Delivered, format!("queued for session {} before a backend restart", s.id)) }),
         _ => None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NOW: i64 = 1_800_000_000_000;
+    const HOUR: i64 = 3_600_000;
+
+    /// A named Claude agent at rest, its cache gone 3 hours ago, 216k tokens, nothing else going on.
+    fn cold_large() -> FreshFacts {
+        FreshFacts {
+            claude: true, idle: true, asleep: false, cold_for: Some(3 * HOUR), tokens: Some(216_003),
+            others_waiting: false, typing: false, human_prompt_at: None, now: NOW,
+        }
+    }
+
+    fn keep(f: &FreshFacts, asked: bool) -> &'static str {
+        match fresh_verdict(f, asked) {
+            Verdict::Keep(why) => why,
+            v => panic!("{v:?} for {f:?}"),
+        }
+    }
+
+    #[test]
+    fn a_cold_large_resting_conversation_is_replaced_and_says_why() {
+        assert_eq!(fresh_verdict(&cold_large(), false), Verdict::Fresh {
+            why: "the old one was cold and large, about 216k tokens and idle 3 h".into(), size_k: Some(216) });
+        // Asleep (its run stopped) counts as resting too.
+        let asleep = FreshFacts { idle: false, asleep: true, ..cold_large() };
+        assert!(matches!(fresh_verdict(&asleep, false), Verdict::Fresh { .. }));
+        // The line is the constant, inclusive; the human's prompt over a day ago doesn't count.
+        let edge = FreshFacts { tokens: Some(crate::cache::FRESH_ANSWER_MIN_TOKENS), human_prompt_at: Some(NOW - HUMAN_RECENT_MS), ..cold_large() };
+        assert!(matches!(fresh_verdict(&edge, false), Verdict::Fresh { .. }));
+    }
+
+    #[test]
+    fn every_other_case_keeps_the_conversation() {
+        let c = cold_large;
+        assert_eq!(keep(&FreshFacts { cold_for: None, ..c() }, false), "its prompt cache is still warm");
+        assert_eq!(keep(&FreshFacts { tokens: Some(99_999), ..c() }, false), "its conversation is small");
+        assert_eq!(keep(&FreshFacts { tokens: None, ..c() }, false), "its conversation's size is unknown");
+        assert_eq!(keep(&FreshFacts { claude: false, ..c() }, false), "only Claude agents report their conversation's size");
+        // Mid-turn, starting, waiting on the human, exited without being asleep: never restarted.
+        assert_eq!(keep(&FreshFacts { idle: false, ..c() }, false), "it is in a turn, starting, or not running");
+        assert_eq!(keep(&FreshFacts { others_waiting: true, ..c() }, false), "other prompts are waiting for it");
+        assert_eq!(keep(&FreshFacts { typing: true, ..c() }, false), "the human is typing into it");
+        assert_eq!(keep(&FreshFacts { human_prompt_at: Some(NOW - 23 * HOUR), ..c() }, false),
+            "the human worked in this conversation in the last 24 hours");
+        // No session at all.
+        assert_eq!(keep(&FreshFacts { now: NOW, ..FreshFacts::default() }, false), "it is in a turn, starting, or not running");
+    }
+
+    #[test]
+    fn a_fresh_start_the_human_asked_for_skips_only_the_size_checks() {
+        let warm_small = FreshFacts { cold_for: None, tokens: Some(5_000), human_prompt_at: Some(NOW - HOUR), claude: false, ..cold_large() };
+        assert_eq!(fresh_verdict(&warm_small, true), Verdict::Fresh { why: "the human asked for a fresh start".into(), size_k: None });
+        assert!(matches!(fresh_verdict(&FreshFacts { tokens: None, ..cold_large() }, true), Verdict::Fresh { .. }));
+        // Never mid-turn, over other prompts or what the human is typing.
+        assert_eq!(keep(&FreshFacts { idle: false, ..warm_small.clone() }, true), "it is in a turn, starting, or not running");
+        assert_eq!(keep(&FreshFacts { others_waiting: true, ..warm_small.clone() }, true), "other prompts are waiting for it");
+        assert_eq!(keep(&FreshFacts { typing: true, ..warm_small }, true), "the human is typing into it");
+    }
+
+    #[test]
+    fn the_new_conversation_line_comes_first_and_the_old_text_is_unchanged_without_one() {
+        let text = |n: Option<&str>| format!("Answer to your question Q1: a.{}", n.unwrap_or(""));
+        let envelope = |_: &str, _: Origin, _: u32| String::new();
+        let save = |_: Option<&Fresh>| Ok(());
+        let poster = Who { label: "builder-2".into(), session_id: 2, kind: SessionKind::Claude, agent_id: None,
+            agent_created_at: None, parent_id: None, parent_agent_id: None, parent_agent_created_at: None };
+        let l = Letter { poster: &poster, recorder: None, from: "human".into(), from_session: None, prov: None,
+            text: &text, envelope: &envelope, prefix: String::new(),
+            fresh: Some(FreshRule { asked: false, decided: None, save: &save }) };
+        assert_eq!(letter_text(&l, None, None), "Answer to your question Q1: a.");
+        let f = Fresh { why: "the old one was cold and large, about 216k tokens and idle 3 h".into(), replaces: Some("c-1".into()) };
+        let t = letter_text(&l, Some(&f), None);
+        assert!(t.starts_with("Muster started you in a new conversation for this message, because the old one was cold and large, \
+            about 216k tokens and idle 3 h. Read your memory/ notes first;"), "{t}");
+        assert!(t.ends_with("\n\nAnswer to your question Q1: a."), "{t}");
+        // Built again for the same decision (after a restart): the same text, so it is found.
+        assert_eq!(t, letter_text(&l, Some(&f.clone()), None));
+    }
 }

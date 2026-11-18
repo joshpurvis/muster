@@ -3,7 +3,9 @@
 // `mock.question_hold` changes it), then is "delivered": read at once by an idle asker, queued
 // (and so still undoable) for a working one. `mock.question_post` and `mock.question_record`
 // stand in for the agents' `post_question` and a lead's `record_answer`. dev/mock.ts routes
-// `question.*` here.
+// `question.*` here. A question posted with `cold_k` has an asker whose conversation is cold and
+// that large (thousands of tokens): the tab says the answer starts it in a new conversation, and
+// its delivery does (src/relay.rs, the cold-answer rule).
 
 import type { Question } from "../src/types.ts";
 
@@ -28,13 +30,17 @@ export function questionMock(d: QuestionDeps) {
   const all = new Map<number, Question>();
   let next = 1;
   let holdMs = 8000;
+  /** Questions whose asker's conversation is cold and large: its size in thousands of tokens. */
+  const coldK = new Map<number, number>();
+  const freshWhy = (k: number) => `the old one was cold and large, about ${k}k tokens and idle 3 h`;
 
   const view = (q: Question): Question => {
     const s = d.session(q.asker.session_id);
     const out: Question = { ...q, number: `Q${q.id}` };
     if (q.status === "open") {
       out.asker_now = s
-        ? { session_id: q.asker.session_id, state: s.state as never, running: s.state !== "exited", asleep: false, cold: false }
+        ? { session_id: q.asker.session_id, state: s.state as never, running: s.state !== "exited", asleep: false, cold: coldK.has(q.id),
+          new_conversation: coldK.has(q.id) && s.state === "idle" ? { why: freshWhy(coldK.get(q.id)!), size_k: coldK.get(q.id)! } : null }
         : { state: "gone", running: false, asleep: false, cold: false };
     }
     return out;
@@ -62,6 +68,7 @@ export function questionMock(d: QuestionDeps) {
       links: p.links, details: p.details, note_to_self: p.note_to_self ?? "On a: update the card and rebuild the recipe pages.",
     };
     all.set(id, q);
+    if (p.cold_k) coldK.set(id, Number(p.cold_k));
     publish(q);
     return view(q);
   }
@@ -71,8 +78,11 @@ export function questionMock(d: QuestionDeps) {
     if (!a || a.delivery.status !== "pending") return;
     const s = d.session(q.asker.session_id);
     const busy = !!s && ["working", "starting", "needs_approval", "asking_question"].includes(s.state);
+    const k = busy ? undefined : coldK.get(q.id);
+    const started = k ? `started ${q.asker.label} in a new conversation, because ${freshWhy(k)}; ` : "";
     a.delivery = { status: "delivered", to: q.asker.label, msg_id: 9000 + q.id, at: d.now(),
-      note: busy ? `queued for ${q.asker.label}: typed in when it is between steps` : `typed into ${q.asker.label}` };
+      note: busy ? `queued for ${q.asker.label}: typed in when it is between steps` : `${started}typed into ${q.asker.label}`,
+      ...(k ? { fresh: { why: freshWhy(k), replaces: "conv-old" } } : {}) };
     q.can_undo = busy;
     q.read_at = busy ? null : d.now();
     q.updated_at = d.now();

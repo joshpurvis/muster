@@ -885,7 +885,26 @@ struct Attributions {
     active: HashMap<SessionId, i64>,
     delivered: HashMap<i64, (SessionId, i64)>,
     human_seen: HashSet<SessionId>,
+    /// When the human last had a prompt of their own taken in by each session (Unix ms): typed
+    /// at its input box, or sent from a terminal or the window as the human's (`on_delivered`
+    /// with `Source::Human`). Messages from agents, schedules and answers are not. Read by the
+    /// cold-answer rule (src/relay.rs `fresh_for_answer`): a conversation the human worked in
+    /// the last day is left alone.
+    #[serde(default)]
+    human_prompt_at: HashMap<SessionId, i64>,
 }
+
+/// A named agent's conversation size, as its status line last reported it (src/statusline.rs).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextSize {
+    /// The conversation it was measured in (Claude's session id, what `resume_id` holds).
+    pub conversation: String,
+    /// The input tokens of its last model request: what resuming it re-reads.
+    pub tokens: u64,
+}
+
+/// Runtime key of the agents' conversation sizes.
+const CONTEXT_KEY: &str = "agent-context-size";
 
 #[derive(Default)]
 struct RegInner {
@@ -926,6 +945,11 @@ pub struct Registry {
     unattended: Mutex<HashSet<SessionId>>,
     /// Fresh starts agents asked for that haven't happened yet (src/self_handoff.rs).
     pub(crate) self_handoff: crate::self_handoff::State,
+    /// Each named agent's conversation size by agent id (`note_context`), saved when it changes
+    /// so a backend restart keeps it for agents that sit idle. A leaf lock.
+    context: Mutex<HashMap<i64, ContextSize>>,
+    /// One answer at a time per agent through the cold-answer rule (src/relay.rs `rule_lock`).
+    pub(crate) answer_locks: Mutex<HashMap<i64, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 /// The sessions `rt` says are doing unattended work.
@@ -979,7 +1003,41 @@ impl Registry {
             unattended,
             sleep,
             self_handoff: Default::default(),
+            context: Mutex::new(store.load_runtime(CONTEXT_KEY)?.unwrap_or_default()),
+            answer_locks: Default::default(),
         })
+    }
+
+    /// Agent `id`'s status line reported its conversation `conversation` at `tokens`. Saved only
+    /// when it changed (a status line redraws often).
+    pub(crate) fn note_context(&self, id: i64, conversation: &str, tokens: u64) -> anyhow::Result<()> {
+        // Agents removed since are dropped with the next save.
+        let known: HashSet<i64> = self.inner.lock().agents.keys().copied().collect();
+        let mut g = self.context.lock();
+        let next = ContextSize { conversation: conversation.to_string(), tokens };
+        if g.get(&id) == Some(&next) {
+            return Ok(());
+        }
+        let mut all = g.clone();
+        all.insert(id, next);
+        all.retain(|a, _| known.contains(a));
+        self.store.save_runtime(CONTEXT_KEY, &all)?;
+        *g = all;
+        Ok(())
+    }
+
+    /// The size of the conversation agent `a` would resume, when its status line reported one
+    /// for that conversation (None: unknown, a Codex agent, no conversation, or the last report
+    /// was about another one).
+    pub fn context_size(&self, a: &Agent) -> Option<u64> {
+        let resume = a.resume_id.as_deref()?;
+        self.context.lock().get(&a.id).filter(|c| c.conversation == resume).map(|c| c.tokens)
+    }
+
+    /// When the human last had a prompt of their own taken in by session `id` (Unix ms), as far
+    /// as any backend saw.
+    pub fn human_prompt_at(&self, id: SessionId) -> Option<i64> {
+        self.inner.lock().runtime.human_prompt_at.get(&id).copied()
     }
 
     /// Persist before publishing attribution or allowing the corresponding input.
@@ -1156,7 +1214,11 @@ impl Registry {
         self.edit_runtime(|state| {
             state.human_seen.remove(&id);
             match source {
-                Source::Human => { state.prov.remove(&id); state.active.remove(&id); }
+                Source::Human => {
+                    state.prov.remove(&id);
+                    state.active.remove(&id);
+                    state.human_prompt_at.insert(id, now);
+                }
                 Source::Chain(prov) => {
                     state.prov.insert(id, prov);
                     match prov.msg_id {
@@ -1244,6 +1306,7 @@ impl Registry {
             state.prov.remove(&id);
             state.active.remove(&id);
             state.human_seen.remove(&id);
+            state.human_prompt_at.remove(&id);
             state.delivered.retain(|_, (session, _)| *session != id);
         }) {
             tracing::warn!(session = id, "forgetting attribution: {error:#}");
@@ -1297,6 +1360,7 @@ impl Registry {
                         if first <= arrival {
                             // The human typed before this prompt: it is theirs.
                             next.prov.remove(&info.id);
+                            next.human_prompt_at.insert(info.id, now_ms());
                             if last > arrival {
                                 // And again since: that input belongs to the next prompt.
                                 stamp = Some((last, last));
@@ -3585,6 +3649,65 @@ mod tests {
         let reg = Registry::load(&store).unwrap();
         assert_eq!(reg.get("alpha").unwrap().accepts_origins, vec![Origin::Human]);
         assert!(reg.insert(&store, a).unwrap_err().to_string().contains("accepts allows only"));
+    }
+
+    #[test]
+    fn a_conversations_size_belongs_to_that_conversation_and_survives_a_restart() {
+        let store = Store::open_memory().unwrap();
+        let mut a = agent(SessionKind::Claude);
+        a.name = "alpha".into();
+        a.resume_id = Some("conv-1".into());
+        a.id = store.insert_agent(&a).unwrap();
+        let reg = Registry::load(&store).unwrap();
+        let a = reg.by_id(a.id).unwrap();
+        assert_eq!(reg.context_size(&a), None, "nothing reported yet");
+        reg.note_context(a.id, "conv-1", 216_003).unwrap();
+        assert_eq!(reg.context_size(&a), Some(216_003));
+        // Kept across a backend restart.
+        let reg = Registry::load(&store).unwrap();
+        assert_eq!(reg.context_size(&a), Some(216_003));
+        // Reported for another conversation (a /clear, a fresh start): not the one it resumes.
+        reg.note_context(a.id, "conv-2", 1_000).unwrap();
+        assert_eq!(reg.context_size(&a), None);
+        let mut fresh = a.clone();
+        fresh.resume_id = None;
+        assert_eq!(reg.context_size(&fresh), None, "no conversation, no size");
+        fresh.resume_id = Some("conv-2".into());
+        assert_eq!(reg.context_size(&fresh), Some(1_000));
+        // A removed agent's entry goes with the next save.
+        reg.remove(&store, a.id).unwrap();
+        reg.note_context(a.id + 1, "conv-9", 5).unwrap();
+        let saved: HashMap<i64, ContextSize> = store.load_runtime(CONTEXT_KEY).unwrap().unwrap();
+        assert!(saved.is_empty(), "{saved:?}");
+    }
+
+    #[test]
+    fn the_humans_own_prompts_are_dated_and_kept_but_not_messages() {
+        let store = Store::open_memory().unwrap();
+        // Attribution saved by an older backend, before the field existed, still loads.
+        store.save_runtime("agent-attribution", &json!({"prov": {}, "active": {}, "delivered": {}, "human_seen": []})).unwrap();
+        let reg = Registry::load(&store).unwrap();
+        let mut info = test_session(5, None);
+        info.kind = SessionKind::Claude;
+        assert_eq!(reg.human_prompt_at(5), None);
+        // A message from an agent or the Questions tab is not the human's prompt.
+        let m = msg(&store, 1, 5, Origin::Human, 0);
+        reg.on_delivered(5, Source::Chain(Prov { origin: Origin::Human, hop: 0, msg_id: Some(m) }), 100).unwrap();
+        reg.on_hook(&store, &info, "UserPromptSubmit", &json!({"prompt": envelope(m, "x", Origin::Human, 0)})).unwrap();
+        assert_eq!(reg.human_prompt_at(5), None);
+        // A prompt Muster types as the human's (`muster send`, the window): dated when typed.
+        reg.on_delivered(5, Source::Human, 200).unwrap();
+        assert_eq!(reg.human_prompt_at(5), Some(200));
+        // One the human typed at the input box: dated when its hook arrives.
+        let before = now_ms();
+        reg.note_human_input(5).unwrap();
+        reg.on_hook(&store, &info, "UserPromptSubmit", &json!({"prompt": "look at the logs"})).unwrap();
+        assert!(reg.human_prompt_at(5).is_some_and(|t| t >= before));
+        // Kept across a backend restart; forgotten with the session.
+        let typed = reg.human_prompt_at(5);
+        assert_eq!(Registry::load(&store).unwrap().human_prompt_at(5), typed);
+        reg.forget_session(5);
+        assert_eq!(reg.human_prompt_at(5), None);
     }
 
     #[test]

@@ -96,6 +96,8 @@ const PROMPT: ReadonlySet<AgentState> = new Set(["needs_approval", "asking_quest
  * "After you answer": where the asker is now, and so how the answer reaches it. `s` is the
  * asker's session as this window has it (live), `asleep` whether that named agent sleeps, `cold`
  * whether its prompt cache has gone cold (the next message re-reads its whole conversation).
+ * When the backend says an answer now starts it in a new conversation (`asker_now.new_conversation`,
+ * the rule its delivery applies: cold and large), the line says so instead.
  */
 export function afterAnswer(q: Question, s: SessionInfo | undefined, asleep: boolean, cold: boolean, agentGone = false):
   { tone: "warm" | "busy" | "cold" | "gone"; text: string } {
@@ -104,7 +106,12 @@ export function afterAnswer(q: Question, s: SessionInfo | undefined, asleep: boo
   if (named && agentGone) {
     return { tone: "gone", text: `The agent ${who} was removed, so your answer would reach nobody. It is kept here.` };
   }
+  const fresh = q.asker_now?.new_conversation;
+  const startsFresh = (state: string) =>
+    `${who} is ${state} and its conversation has gone cold and is large${fresh?.size_k != null ? ` (about ${fresh.size_k}k)` : ""}: ` +
+    "your answer starts it in a new conversation, which reads its notes first.";
   if (asleep) {
+    if (fresh) return { tone: "cold", text: startsFresh("asleep") };
     return { tone: "cold", text: `${who} is asleep. Your answer wakes it${cold ? "; its memory of this has gone cold, so it re-reads its conversation first" : ""}.` };
   }
   if (!s || s.state === "exited") {
@@ -121,6 +128,7 @@ export function afterAnswer(q: Question, s: SessionInfo | undefined, asleep: boo
   if (s.state === "stuck" || s.state === "error") {
     return { tone: "busy", text: `${who} looks stuck. Your answer waits until it is between steps.` };
   }
+  if (fresh) return { tone: "cold", text: startsFresh("idle") };
   if (cold) {
     return { tone: "cold", text: `${who} is idle and its memory of this has gone cold: your answer makes it re-read its conversation first.` };
   }
@@ -143,14 +151,17 @@ export function whatHappened(q: Question, now: number = Date.now()): { text: str
   const a = q.answer;
   if (!a) return { text: "" };
   const to = a.delivery.to ?? q.asker.label;
+  // A new conversation Muster started for it (src/relay.rs): said first, whatever came after.
+  const fresh = a.delivery.fresh ? `Muster started ${to} in a new conversation for it, because ${a.delivery.fresh.why}. ` : "";
   switch (a.delivery.status) {
     case "pending":
       return { text: `Goes to ${to} in a few seconds. Until then, and until ${to} reads it, you can undo it.` };
     case "delivering":
       return { text: `On its way to ${to} now.` };
     case "delivered":
-      if (q.read_at) return { text: `${to} read it at ${clockText(q.read_at, now)}.` };
-      if (q.can_undo) return { text: `Waiting for ${to} to finish its current step. Until it reads the answer you can undo it.` };
+      if (q.read_at) return { text: `${fresh}${to} read it at ${clockText(q.read_at, now)}.` };
+      if (q.can_undo) return { text: `${fresh}Waiting for ${to} to finish its current step. Until it reads the answer you can undo it.` };
+      if (fresh) return { text: `${fresh}Delivered to ${to}.` };
       return { text: a.delivery.note ? `Delivered: ${a.delivery.note}.` : `Delivered to ${to}.` };
     case "not_needed":
       return { text: a.delivery.note ?? "Nothing to send: the one who recorded it is the asker." };
@@ -158,7 +169,7 @@ export function whatHappened(q: Question, now: number = Date.now()): { text: str
     case "undelivered":
       return {
         warn: true,
-        text: `It didn't reach ${to}: ${(a.delivery.note ?? "no reason given").replace(/^not delivered( to [^:]+)?: /, "")}.` +
+        text: `${fresh}It didn't reach ${to}: ${(a.delivery.note ?? "no reason given").replace(/^not delivered( to [^:]+)?: /, "")}.` +
           (q.can_undo ? " Undo it to answer again." : ""),
       };
   }

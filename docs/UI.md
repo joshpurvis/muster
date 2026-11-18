@@ -358,7 +358,11 @@ human"); the **Questions** tab is where the human sees and answers them (`web/sr
   the asker's pick is marked "<asker>'s pick" and starts out chosen), a box for the human's own
   words (every question; the only box for an "own words" question), then **If you don't answer**,
   **Holding up** and **After you answer** (where the asker is now: working, idle, cold, asleep or
-  not running, and so how the answer reaches it), **Send answer**, the question's links and
+  not running, and so how the answer reaches it; when its conversation is cold and large, that the
+  answer starts it in a new conversation: "builder-2 is idle and its conversation has gone cold and
+  is large (about 216k): your answer starts it in a new conversation, which reads its notes
+  first.", read from the backend's `asker_now.new_conversation` again whenever the asker's state
+  or cold mark changes, so it matches what the delivery then does), **Send answer**, the question's links and
   **Open <asker>'s tab**. **Details** (closed) has the asker's details, its note to itself (which
   comes back with the answer), the picture paths and what it is about (a merge, money, …).
 - **Links on a card**: a `[label](url)` in the context, the example or an option shows as its
@@ -386,7 +390,9 @@ human"); the **Questions** tab is where the human sees and answers them (`web/sr
 - **Answered**: the 50 answered last; each page shows **Your answer** (or "The answer" when a lead
   recorded it from chat), what was not chosen, **How** (here, or told to a lead in chat) and
   **What happened** (on its way, waiting for the asker's current step, read at a time, or why it
-  didn't arrive).
+  didn't arrive; first, when Muster started the asker in a new conversation for it, that and why:
+  "Muster started builder-2 in a new conversation for it, because the old one was cold and large,
+  about 216k tokens and idle 3 h.", docs/MCP.md "Questions for the human").
 - **Narrow** (the tab's group under 760px wide): the list and the question take turns; **‹
   Questions** goes back, and the send button spans the width.
 - Later steps add the key sheet and one-key answers, Later and Skip, filters by product and age,

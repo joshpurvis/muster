@@ -345,17 +345,22 @@ function QuestionPage({ q, now, narrow, onBack, onZoom }: {
     <div class="qv-card">
       <Head q={q} now={now} narrow={narrow} onBack={onBack} />
       <Pictures q={q} onZoom={onZoom} />
-      {q.status === "answered" ? <Answered q={q} now={now} /> : <Answering q={q} />}
+      {q.status === "answered" ? <Answered q={q} now={now} /> : <Answering q={q} now={now} />}
       <Details q={q} />
     </div>
   );
 }
 
-function Answering({ q }: { q: Question }) {
+function Answering({ q, now }: { q: Question; now: number }) {
   const d = draftFor(q, drafts.value);
   const [busy, setBusy] = useState(false);
   const { agent, gone, session } = askerSession(q);
-  const after = afterAnswer(q, session, isAsleep(agent, session), session ? wakeCold(session, Date.now()) : false, gone);
+  const asleep = isAsleep(agent, session);
+  const cold = session ? wakeCold(session, now) : false;
+  // Whether an answer now starts a new conversation is the backend's call (`asker_now`): read it
+  // again when the asker rests, wakes, works or goes cold, so the line below stays true.
+  useEffect(() => refreshQuestion(q.id), [q.id, session?.state, asleep, cold]);
+  const after = afterAnswer(q, session, asleep, cold, gone);
   const ready = readyToSend(q, d);
   const many = q.kind === "pick_several";
   const update = (next: Draft) => setDraft(q.id, next);

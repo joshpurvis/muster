@@ -182,7 +182,7 @@ impl State {
         self.inner.lock().failed.get(&id).cloned()
     }
 
-    fn deliveries(&self, agent: i64) -> u32 {
+    pub(crate) fn deliveries(&self, agent: i64) -> u32 {
         self.inner.lock().deliveries.get(&agent).copied().unwrap_or(0)
     }
 

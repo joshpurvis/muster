@@ -77,6 +77,15 @@ Deno.test("after you answer: how the answer will reach the asker as it is now", 
   const child = q(3, { asker: { label: "Claude (fix)", session_id: 9, kind: "claude", parent_id: 2 } });
   assert(afterAnswer(child, undefined, false, false).text.includes("session that started it"), "an ended plain session");
   equal(afterAnswer(one, session("idle"), false, false, true).tone, "gone");
+  // The backend says an answer now starts a new conversation (cold and large): said instead.
+  const big = { ...one, asker_now: { state: "idle" as const, running: true, asleep: false, cold: true,
+    new_conversation: { why: "the old one was cold and large, about 216k tokens and idle 3 h", size_k: 216 } } };
+  equal(afterAnswer(big, session("idle"), false, true).text, "writer is idle and its conversation has gone cold and is large (about 216k): " +
+    "your answer starts it in a new conversation, which reads its notes first.");
+  equal(afterAnswer(big, session("exited"), true, true).text, "writer is asleep and its conversation has gone cold and is large (about 216k): " +
+    "your answer starts it in a new conversation, which reads its notes first.");
+  // Busy right now: the busy line, whatever an older reading said.
+  equal(afterAnswer(big, session("working"), false, true).tone, "busy");
 });
 
 Deno.test("an answer's how and what happened, in plain words", () => {
@@ -100,6 +109,17 @@ Deno.test("an answer's how and what happened, in plain words", () => {
     answer: { ...base, how: "tab", delivery: { status: "refused", to: "writer", note: "not delivered to writer: the daily cap" } },
   });
   equal(whatHappened(failed, now), { warn: true, text: "It didn't reach writer: the daily cap. Undo it to answer again." });
+  // Started in a new conversation for it: said first, read or not.
+  const fresh = { why: "the old one was cold and large, about 216k tokens and idle 3 h", replaces: "c-1" };
+  const started = q(5, {
+    status: "answered",
+    answer: { ...base, how: "tab", delivery: { status: "delivered", to: "builder-2", msg_id: 9, fresh,
+      note: "started builder-2 in a new conversation, because the old one was cold and large, about 216k tokens and idle 3 h; typed into builder-2 as message 9" } },
+  });
+  equal(whatHappened(started, now).text, "Muster started builder-2 in a new conversation for it, because the old one was cold and large, " +
+    "about 216k tokens and idle 3 h. Delivered to builder-2.");
+  equal(whatHappened({ ...started, read_at: at }, now).text, "Muster started builder-2 in a new conversation for it, because the old one " +
+    "was cold and large, about 216k tokens and idle 3 h. builder-2 read it at 14:02.");
 });
 
 Deno.test("ages read like the mock", () => {

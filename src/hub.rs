@@ -1213,6 +1213,15 @@ impl Hub {
             anyhow::ensure!(e.info.kind == SessionKind::Claude, "usage reports come from Claude sessions");
             (id, e.generation)
         };
+        // A named agent's conversation size, for the cold-answer rule (src/relay.rs). Kept with
+        // the conversation it was measured in, so a fresh start or /clear never inherits it.
+        if let Some(c) = body.get("context")
+            && let (Some(conv), Some(tokens)) = (c.get("conversation").and_then(|v| v.as_str()), c.get("tokens").and_then(|v| v.as_u64()))
+            && crate::agents::valid_resume_id(conv)
+            && let Some(agent) = self.agents.by_session(session)
+        {
+            self.agents.note_context(agent.id, conv, tokens)?;
+        }
         // A report with only the API time (before the run's first response) is the baseline
         // the next one is measured against.
         if report.windows.is_empty() && report.api_ms.is_none() {
@@ -1857,6 +1866,12 @@ impl Hub {
     #[cfg(test)]
     pub(crate) fn set_state_for_test(&self, id: SessionId, state: AgentState) {
         if let Some(e) = self.inner.lock().sessions.get_mut(&id) { e.info.state = state; }
+    }
+
+    /// Tests: change a restored session's info without a terminal.
+    #[cfg(test)]
+    pub(crate) fn edit_session_for_test(&self, id: SessionId, f: impl FnOnce(&mut SessionInfo)) {
+        if let Some(e) = self.inner.lock().sessions.get_mut(&id) { f(&mut e.info); }
     }
 
     #[cfg(test)]
@@ -5235,6 +5250,30 @@ mod tests {
             openrouter_key,
         };
         Hub::new(cfg, store).unwrap()
+    }
+
+    /// A status-line report's conversation size goes to the named agent on that run (by its
+    /// token), for the conversation it names; a plain session's is not kept.
+    #[test]
+    fn a_status_line_report_keeps_a_named_agents_conversation_size() {
+        let hub = fixture(None);
+        hub.inner.lock().tokens.insert("claude-run".into(), 2);
+        let real: serde_json::Value = serde_json::from_str(include_str!("fixtures/claude_statusline_2.1.318.json")).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&crate::statusline::report_body(real.to_string().as_bytes()).unwrap()).unwrap();
+        // Not a named agent yet: nothing kept, no error.
+        hub.record_usage("claude-run", &body).unwrap();
+        let a = crate::agents::create(&hub, crate::agents::NewAgent {
+            working_location: None, account_profile: None, provider: None, name: "alpha".into(), kind: Some(SessionKind::Claude),
+            model: None, effort: None, persona: None, accepts: None, permissions: None, autostart: false, sleep_after_min: None,
+        }).unwrap();
+        assert!(hub.agents.context_size(&a).is_none());
+        hub.agents.link_session(&hub.store, a.id, Some(2)).unwrap();
+        hub.agents.update(&hub.store, a.id, |b| b.resume_id = Some("11111111-2222-4333-8444-555555555555".into())).unwrap();
+        hub.record_usage("claude-run", &body).unwrap();
+        assert_eq!(hub.agents.context_size(&hub.agents.by_id(a.id).unwrap()), Some(216_003));
+        // A forged conversation id is never stored.
+        hub.record_usage("claude-run", &serde_json::json!({"context": {"conversation": "--x", "tokens": 9}})).unwrap();
+        assert_eq!(hub.agents.context_size(&hub.agents.by_id(a.id).unwrap()), Some(216_003));
     }
 
     /// Usage reports are attributed by the run's token alone: to that session's pinned profile,

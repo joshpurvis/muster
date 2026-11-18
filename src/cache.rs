@@ -21,6 +21,12 @@ use crate::openrouter::Provider;
 /// Longest cache lifetime one can set, in minutes (a day). 0 means it never goes cold.
 pub const TTL_MAX_MIN: u32 = 24 * 60;
 
+/// An answer to a named agent's question starts it in a new conversation when its old one is
+/// cold and at least this large (tokens of its last request): resuming would re-read all of it
+/// uncached, to act on one message that repeats the whole question (src/relay.rs
+/// `fresh_verdict`).
+pub const FRESH_ANSWER_MIN_TOKENS: u64 = 100_000;
+
 /// How long each CLI/provider pair keeps a conversation cached, in minutes.
 ///
 /// Defaults (researched 2026-10, see docs/PROTOCOL.md "Cold prompt cache"):

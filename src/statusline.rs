@@ -4,13 +4,15 @@
 //! background, with its output discarded: nothing here can change, delay or break what the
 //! user sees, and an older Muster binary that rejects the subcommand is harmless too.
 //!
-//! It POSTs only `rate_limits.five_hour` / `seven_day` and `cost.total_api_duration_ms` (the
-//! daemon's evidence that the numbers came with a newer API response) to
-//! `$MUSTER_URL/usage/claude` with the session token, through `hookcmd::post`, which connects
-//! only to a loopback address. Never the rest of the payload. Before the run's first response
-//! there are no windows yet and it sends the API time alone, the baseline the next report is
-//! measured against. The daemon attributes it by token; the payload names no account. It prints
-//! nothing, always exits 0 and gives up after [`POST_BUDGET`].
+//! It POSTs only `rate_limits.five_hour` / `seven_day`, `cost.total_api_duration_ms` (the
+//! daemon's evidence that the numbers came with a newer API response) and the conversation's
+//! size (`context`: its id, `session_id`, and the tokens of its last request,
+//! `context_window.current_usage`, see [`context_of`]) to `$MUSTER_URL/usage/claude` with the
+//! session token, through `hookcmd::post`, which connects only to a loopback address. Never the
+//! rest of the payload. Before the run's first response there are no windows yet and it sends the
+//! API time alone, the baseline the next report is measured against. The daemon attributes it by
+//! token; the payload names no account. It prints nothing, always exits 0 and gives up after
+//! [`POST_BUDGET`].
 
 use std::time::Duration;
 
@@ -35,7 +37,25 @@ pub fn run(agent: &str) -> i32 {
     0
 }
 
-/// Only the documented usage windows and the run's API time; None when it has neither.
+/// The conversation's size as its last model request saw it: the conversation id (`session_id`,
+/// the id Claude Code resumes) and `context_window.current_usage`'s input + cache-write +
+/// cache-read tokens, the sum Claude Code's own `total_input_tokens` and context percentage use.
+/// None before the conversation's first response (`current_usage` is null then) or when a field
+/// is missing. Shape checked against Claude Code 2.1.318's real status-line input
+/// (src/fixtures/claude_statusline_2.1.318.json, values invented). `total_input_tokens` itself is
+/// not read: older versions summed the whole session there.
+pub(crate) fn context_of(v: &Value) -> Option<Value> {
+    let id = v.get("session_id").and_then(Value::as_str).filter(|s| crate::agents::valid_resume_id(s))?;
+    let u = v.get("context_window")?.get("current_usage")?;
+    let mut tokens: u64 = 0;
+    for key in ["input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"] {
+        tokens = tokens.checked_add(u.get(key)?.as_u64()?)?;
+    }
+    Some(json!({"conversation": id, "tokens": tokens}))
+}
+
+/// Only the documented usage windows, the run's API time and the conversation's size; None when
+/// it has none of them.
 pub(crate) fn report_body(input: &[u8]) -> Option<Vec<u8>> {
     let v: Value = serde_json::from_slice(input).ok()?;
     let mut windows = serde_json::Map::new();
@@ -46,10 +66,15 @@ pub(crate) fn report_body(input: &[u8]) -> Option<Vec<u8>> {
         windows.insert(key.into(), json!({"used_percentage": used, "resets_at": resets}));
     }
     let api = v.get("cost").and_then(|c| c.get("total_api_duration_ms")).filter(|x| x.is_number());
-    if windows.is_empty() && api.is_none() {
+    let context = context_of(&v);
+    if windows.is_empty() && api.is_none() && context.is_none() {
         return None;
     }
-    serde_json::to_vec(&json!({"rate_limits": windows, "api_duration_ms": api})).ok()
+    let mut body = json!({"rate_limits": windows, "api_duration_ms": api});
+    if let Some(c) = context {
+        body["context"] = c;
+    }
+    serde_json::to_vec(&body).ok()
 }
 
 #[cfg(test)]
@@ -82,5 +107,34 @@ mod tests {
             br#"{"rate_limits": {"seven_day": {"used_percentage": 5, "resets_at": 9}}}"#).unwrap()).unwrap();
         assert_eq!(partial, json!({"rate_limits": {"seven_day": {"used_percentage": 5, "resets_at": 9}},
             "api_duration_ms": null}));
+    }
+
+    /// Claude Code 2.1.318's real status-line input (paths and numbers invented): the
+    /// conversation id and the three input counts of its last request, nothing else of it.
+    #[test]
+    fn the_report_carries_the_conversations_size_from_the_real_input() {
+        let real = include_str!("fixtures/claude_statusline_2.1.318.json");
+        let body: Value = serde_json::from_slice(&report_body(real.as_bytes()).unwrap()).unwrap();
+        assert_eq!(body["context"], json!({"conversation": "11111111-2222-4333-8444-555555555555", "tokens": 216_003}));
+        let text = body.to_string();
+        assert!(!text.contains("alpha") && !text.contains("demo-app") && !text.contains("opus"), "{text}");
+        // Before the conversation's first response Claude Code sends `current_usage: null`.
+        let mut start: Value = serde_json::from_str(real).unwrap();
+        start["context_window"]["current_usage"] = Value::Null;
+        assert_eq!(context_of(&start), None);
+        let body: Value = serde_json::from_slice(&report_body(start.to_string().as_bytes()).unwrap()).unwrap();
+        assert!(body.get("context").is_none());
+        // A missing count, a non-number or an id that isn't a conversation id: no size.
+        let mut v: Value = serde_json::from_str(real).unwrap();
+        v["context_window"]["current_usage"]["cache_read_input_tokens"] = json!("x");
+        assert_eq!(context_of(&v), None);
+        let mut v: Value = serde_json::from_str(real).unwrap();
+        v["session_id"] = json!("--resume");
+        assert_eq!(context_of(&v), None);
+        // The size alone is still sent (no usage windows yet, no API time).
+        let only = json!({"session_id": "abc-1", "context_window": {"current_usage":
+            {"input_tokens": 1, "cache_creation_input_tokens": 2, "cache_read_input_tokens": 3, "output_tokens": 9}}});
+        let body: Value = serde_json::from_slice(&report_body(only.to_string().as_bytes()).unwrap()).unwrap();
+        assert_eq!(body["context"], json!({"conversation": "abc-1", "tokens": 6}));
     }
 }

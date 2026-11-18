@@ -108,13 +108,17 @@ export function afterAnswer(q: Question, s: SessionInfo | undefined, asleep: boo
   }
   const fresh = q.asker_now?.new_conversation;
   const startsFresh = (state: string) =>
-    `${who} is ${state} and its conversation has gone cold and is large${fresh?.size_k != null ? ` (about ${fresh.size_k}k)` : ""}: ` +
+    `${fresh?.to ?? who} is ${state} and its conversation has gone cold and is large${fresh?.size_k != null ? ` (about ${fresh.size_k}k)` : ""}: ` +
     "your answer starts it in a new conversation, which reads its notes first.";
   if (asleep) {
     if (fresh) return { tone: "cold", text: startsFresh("asleep") };
     return { tone: "cold", text: `${who} is asleep. Your answer wakes it${cold ? "; its memory of this has gone cold, so it re-reads its conversation first" : ""}.` };
   }
   if (!s || s.state === "exited") {
+    // The answer goes to the lead of the asker that ended, and starts the lead afresh.
+    if (fresh?.to) {
+      return { tone: "cold", text: `The session that asked has ended, so your answer goes to the session that started it. ${startsFresh(fresh.asleep ? "asleep" : "idle")}` };
+    }
     return named
       ? { tone: "cold", text: `${who} isn't running. Your answer starts it and reaches it by name.` }
       : q.asker.parent_id == null

@@ -738,6 +738,15 @@ impl Hub {
         (saved.0 == resume).then_some(saved.1)
     }
 
+    /// When `info`'s prompt cache likely expired (or expires), by its provider's lifetime, whether
+    /// or not the cold warnings are shown (the cold-answer rule, src/relay.rs, follows the cache,
+    /// not the warning switch).
+    pub fn cache_gone_at(&self, info: &SessionInfo) -> Option<i64> {
+        let mut rules = *self.cache_rules.lock();
+        rules.enabled = true;
+        rules.cold_at(info)
+    }
+
     /// Session `id`'s next message would re-read its whole conversation uncached (src/cache.rs):
     /// how long it has been idle, else None.
     pub fn cache_cold(&self, id: SessionId, now: i64) -> Option<i64> {
@@ -1220,7 +1229,7 @@ impl Hub {
             && crate::agents::valid_resume_id(conv)
             && let Some(agent) = self.agents.by_session(session)
         {
-            self.agents.note_context(agent.id, conv, tokens)?;
+            self.agents.note_context(agent.id, conv, tokens, Some(generation), report.api_ms)?;
         }
         // A report with only the API time (before the run's first response) is the baseline
         // the next one is measured against.

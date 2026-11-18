@@ -86,6 +86,13 @@ Deno.test("after you answer: how the answer will reach the asker as it is now", 
     "your answer starts it in a new conversation, which reads its notes first.");
   // Busy right now: the busy line, whatever an older reading said.
   equal(afterAnswer(big, session("working"), false, true).tone, "busy");
+  // An ended session's answer goes to its lead, which it starts afresh: the lead is named.
+  const ended = q(6, { asker: { label: "Claude (fix)", session_id: 9, kind: "claude", parent_id: 2 },
+    asker_now: { state: "exited", running: false, asleep: false, cold: false,
+      new_conversation: { why: "the old one was cold and large, about 150k tokens and idle 2 h", size_k: 150, asleep: false, to: "lead" } } });
+  equal(afterAnswer(ended, undefined, false, false).text, "The session that asked has ended, so your answer goes to the session that " +
+    "started it. lead is idle and its conversation has gone cold and is large (about 150k): your answer starts it in a new conversation, " +
+    "which reads its notes first.");
 });
 
 Deno.test("an answer's how and what happened, in plain words", () => {

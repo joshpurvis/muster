@@ -8,6 +8,7 @@
   {"js": "[...document.querySelectorAll('.qv-row')].find((r) => r.textContent.includes('footer')).click();", "until": "document.body.textContent.includes('your answer starts it in a new conversation')", "settle": 1.0, "shot": "before-answer"},
   {"js": "[...document.querySelectorAll('.qv-btn.primary')].find((b) => b.textContent.includes('Send')).click();", "until": "[...document.querySelectorAll('.qv-chip')].some((b) => b.textContent.includes('Answered'))", "settle": 1.0},
   {"js": "[...document.querySelectorAll('.qv-chip')].find((b) => b.textContent.includes('Answered')).click();", "until": "document.querySelector('.qv-row')", "settle": 0.6},
-  {"js": "[...document.querySelectorAll('.qv-row')].find((r) => r.textContent.includes('footer')).click();", "until": "document.body.textContent.includes('Muster started builder-2 in a new conversation for it')", "settle": 1.0, "shot": "after-answer"},
+  {"js": "[...document.querySelectorAll('.qv-row')].find((r) => r.textContent.includes('footer')).click();", "until": "document.body.textContent.includes('Muster started builder-2 in a new conversation for it')", "settle": 1.0},
+  {"js": "document.querySelectorAll('.toast .toast-x').forEach((b) => b.click()); return document.querySelectorAll('.toast').length;", "until": "!document.querySelector('.toast')", "timeout": 15, "settle": 0.8, "shot": "after-answer"},
   {"js": "return {theme: document.documentElement.dataset.theme, text: [...document.querySelectorAll('.qv-card')].map((c) => c.textContent).join(' ').slice(0, 2000)};"}
 ]

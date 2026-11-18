@@ -536,8 +536,9 @@ pub fn post(hub: &Hub, caller: SessionId, args: Value) -> anyhow::Result<Value> 
         "status": "open",
         "answer_goes_to": to,
         "note": format!("Posted as Q{id}. Nothing waits for it: carry on with other work or end your turn. \
-            When the human answers, Muster sends you a message that starts \"Answer to your question Q{id}\" and repeats \
-            the question and your note_to_self, so you can act on it even after a restart. Your questions: list_questions with mine=true."),
+            When the human answers, Muster sends you a message with \"Answer to your question Q{id}\" that repeats \
+            the question and your note_to_self, so you can act on it even after a restart (if your conversation was cold and \
+            large, Muster starts you in a new one for it and its first line says so). Your questions: list_questions with mine=true."),
     }))
 }
 
@@ -1019,8 +1020,12 @@ pub fn unfinished(hub: &Hub) -> Vec<i64> {
     })
 }
 
-/// At daemon start: deliver the answers in `ids` (`unfinished`).
-pub async fn resume(hub: &Arc<Hub>, ids: Vec<i64>) {
+/// At daemon start: deliver the answers in `ids` (`unfinished`). Those that had started an agent
+/// in a new conversation go first, so no other answer takes that conversation's first message.
+pub async fn resume(hub: &Arc<Hub>, mut ids: Vec<i64>) {
+    let started = |id: &i64| hub.store().question(*id).ok().flatten()
+        .is_some_and(|q| q.answer.is_some_and(|a| a.delivery.fresh.is_some()));
+    ids.sort_by_key(|id| (!started(id), *id));
     for id in ids {
         if let Err(e) = resume_one(hub, id).await {
             tracing::warn!(question = id, "finishing an answer's delivery: {e:#}");
@@ -1034,7 +1039,7 @@ async fn resume_one(hub: &Arc<Hub>, id: i64) -> anyhow::Result<()> {
     if a.delivery.status == DeliveryStatus::Delivering {
         // The restart came while it was being delivered: what got through?
         let found = deliver_with(hub, &q, &a, |l| crate::relay::found_after_restart(hub, l))?;
-        hub.store().update_question(id, |q| {
+        let (q, ()) = hub.store().update_question(id, |q| {
             if let Some(a) = q.answer.as_mut()
                 && a.delivery.status == DeliveryStatus::Delivering
             {
@@ -1045,6 +1050,8 @@ async fn resume_one(hub: &Arc<Hub>, id: i64) -> anyhow::Result<()> {
             }
             Ok(())
         })?;
+        // A window open since sees it settled (`finish` below has nothing left to send).
+        publish(hub, &q);
     }
     finish(hub, id).await?;
     Ok(())
@@ -1063,12 +1070,21 @@ pub fn asker_now(hub: &Hub, q: &Question) -> Value {
         return json!({"state": "gone", "running": false, "asleep": false, "cold": false});
     };
     let running = live && s.state != AgentState::Exited;
-    // An answer now would start it in a new conversation (src/relay.rs: the rule its delivery
-    // applies, so the tab's line before the answer and the delivery after it agree).
-    let fresh = agent.as_ref().and_then(|a| match crate::relay::fresh_verdict(&crate::relay::fresh_facts(hub, a, Some(&s), now), false) {
-        crate::relay::Verdict::Fresh { why, size_k } => Some(json!({"why": why, "size_k": size_k})),
-        crate::relay::Verdict::Keep(_) => None,
-    });
+    // An answer now would start its recipient (the asker, or the lead of an asker that ended) in a
+    // new conversation (src/relay.rs: the rule its delivery applies, so the tab's line before the
+    // answer and the delivery after it agree). `to`: the lead's name when it goes there.
+    let all: HashSet<SessionId> = hub.live_session_ids().into_iter().collect();
+    let fresh = match target(hub, q, None, &all) {
+        Target::Agent(a, note) => {
+            let info = a.session_id.and_then(|id| hub.session(id));
+            match crate::relay::fresh_verdict(&crate::relay::fresh_facts(hub, &a, info.as_ref(), now), false) {
+                crate::relay::Verdict::Fresh { why, size_k } => Some(json!({"why": why, "size_k": size_k,
+                    "asleep": a.asleep_at.is_some(), "to": note.is_some().then_some(&a.name)})),
+                crate::relay::Verdict::Keep(_) => None,
+            }
+        }
+        _ => None,
+    };
     json!({
         "session_id": sid,
         "state": s.state,
@@ -1950,7 +1966,7 @@ mod tests {
         let now = now_ms();
         hub.agents().set_asleep(hub.store(), a.id, Some(now - idle), None).unwrap();
         if let Some(t) = tokens {
-            hub.agents().note_context(a.id, "conv-old", t).unwrap();
+            hub.agents().note_context(a.id, "conv-old", t, None, None).unwrap();
         }
         hub.edit_session_for_test(sid, |i| {
             i.state = AgentState::Exited;
@@ -1982,8 +1998,8 @@ mod tests {
         let n = ask_n(&hub, 2, 1);
         let d = answered(&hub, n).await;
         let f = d.fresh.clone().expect("a new conversation");
-        assert_eq!(f, crate::relay::Fresh {
-            why: "the old one was cold and large, about 216k tokens and idle 3 h 1 m".into(), replaces: Some("conv-old".into()) });
+        assert_eq!((f.why.as_str(), f.replaces.as_deref()),
+            ("the old one was cold and large, about 216k tokens and idle 3 h 1 m", Some("conv-old")));
         // Started the way Start fresh starts it: the old conversation is forgotten.
         assert_eq!(resume_of(&hub, &a), None);
         // This fixture has no terminal host, so the start itself fails here (the smoke test runs it
@@ -1999,7 +2015,7 @@ mod tests {
         let n = ask_n(&hub, 2, 1);
         let before = asker_now(&hub, &hub.store().question(n).unwrap().unwrap());
         assert_eq!(before["new_conversation"], json!({
-            "why": "the old one was cold and large, about 216k tokens and idle 3 h 1 m", "size_k": 216}));
+            "why": "the old one was cold and large, about 216k tokens and idle 3 h 1 m", "size_k": 216, "asleep": true, "to": null}));
         let d = answered(&hub, n).await;
         assert_eq!(d.fresh.map(|f| f.why).as_deref(), before["new_conversation"]["why"].as_str());
         // Warm, or the size unknown: nothing to say (the tab keeps its usual line).
@@ -2007,6 +2023,48 @@ mod tests {
         resting_claude(&hub, "builder-2", 2, None, 3 * 60 * MIN);
         let n = ask_n(&hub, 2, 1);
         assert!(asker_now(&hub, &hub.store().question(n).unwrap().unwrap())["new_conversation"].is_null());
+    }
+
+    #[tokio::test]
+    async fn a_refused_answer_leaves_the_conversation_alone() {
+        let hub = fixture();
+        let a = resting_claude(&hub, "builder-2", 2, Some(216_003), 3 * 60 * MIN);
+        let n = ask_n(&hub, 2, 1);
+        // The agent's daily message cap is used up: the answer is refused before anything restarts.
+        let route = agents::Route { origin: Origin::Human, hop: 0, reply_to: None };
+        for _ in 0..crate::mcp::guard::AGENT_DAILY_PROMPT_CAP {
+            hub.store().insert_agent_message(&agents::message_record(&a, "lead", None, route, "x")).unwrap();
+        }
+        let d = answered(&hub, n).await;
+        assert_eq!((d.status, d.fresh.clone()), (DeliveryStatus::Refused, None), "{d:?}");
+        assert_eq!(resume_of(&hub, &a).as_deref(), Some("conv-old"));
+    }
+
+    #[tokio::test]
+    async fn after_a_restart_the_answer_that_started_a_new_conversation_goes_first() {
+        let hub = fixture();
+        let a = resting_claude(&hub, "builder-2", 2, Some(216_003), 3 * 60 * MIN);
+        let (one, two) = (ask_n(&hub, 2, 1), ask_n(&hub, 2, 2));
+        // Q1 waits; Q2 had decided on a new conversation when the backend stopped.
+        let pending = Answer { picked: vec!["a".into()], words: String::new(), how: How::Tab, recorded_by: None, at: now_ms(),
+            prov: None, from_label: Some(HUMAN.into()), into: Conversation::Current, delivery: Delivery::pending(None) };
+        hub.store().update_question(one, |q| { q.status = Status::Answered; q.answer = Some(pending.clone()); Ok(()) }).unwrap();
+        stopped_after_deciding(&hub, two, &decided());
+        resume(&hub, unfinished(&hub)).await;
+        let fresh_of = |n| hub.store().question(n).unwrap().unwrap().answer.unwrap().delivery.fresh;
+        // Q2 went first and started it; Q1 then found the new conversation (no second restart).
+        assert_eq!((fresh_of(one), fresh_of(two)), (None, Some(decided())));
+        assert_eq!(resume_of(&hub, &a), None);
+    }
+
+    #[tokio::test]
+    async fn the_tab_names_the_lead_an_ended_sessions_answer_restarts() {
+        let hub = fixture();
+        resting_claude(&hub, "builder-2", 2, Some(216_003), 3 * 60 * MIN);
+        // Session 5 (not a named agent, started by builder-2's session) asks, and has ended.
+        let n = ask_n(&hub, 5, 1);
+        let now = asker_now(&hub, &hub.store().question(n).unwrap().unwrap());
+        assert_eq!((now["new_conversation"]["to"].as_str(), now["new_conversation"]["size_k"].as_u64()), (Some("builder-2"), Some(216)));
     }
 
     #[tokio::test]
@@ -2032,7 +2090,7 @@ mod tests {
         // Reported for another conversation (before a /clear): not this one's size.
         let hub = fixture();
         let a = resting_claude(&hub, "builder-2", 2, None, 3 * 60 * MIN);
-        hub.agents().note_context(a.id, "conv-before", 300_000).unwrap();
+        hub.agents().note_context(a.id, "conv-before", 300_000, None, None).unwrap();
         let n = ask_n(&hub, 2, 1);
         assert_eq!(answered(&hub, n).await.fresh, None);
         assert_eq!(resume_of(&hub, &a).as_deref(), Some("conv-old"));
@@ -2112,7 +2170,8 @@ mod tests {
     }
 
     fn decided() -> crate::relay::Fresh {
-        crate::relay::Fresh { why: "the old one was cold and large, about 216k tokens and idle 3 h".into(), replaces: Some("conv-old".into()) }
+        crate::relay::Fresh { why: "the old one was cold and large, about 216k tokens and idle 3 h".into(), replaces: Some("conv-old".into()),
+            run: None }
     }
 
     #[tokio::test]

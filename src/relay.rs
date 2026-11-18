@@ -97,6 +97,10 @@ pub struct Fresh {
     /// The conversation it replaces (None: the agent had none Muster knew of).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replaces: Option<String>,
+    /// The run (terminal generation) that held it, when it was running: a backend restart that
+    /// finds that run still there knows the fresh start didn't happen yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<u64>,
 }
 
 impl Delivery {
@@ -304,6 +308,9 @@ pub struct FreshFacts {
     pub claude: bool,
     /// Running and resting: idle, nothing queued.
     pub idle: bool,
+    /// Running, but a sub-agent, a background task or a turn just typed in is under way (the
+    /// screen can look idle meanwhile): a restart would cut it off.
+    pub working: bool,
     /// Asleep: its run was stopped, its conversation kept.
     pub asleep: bool,
     /// How long it has been idle, once its cache has likely expired (src/sleep.rs `wake_cost`).
@@ -335,6 +342,9 @@ pub fn fresh_verdict(f: &FreshFacts, asked: bool) -> Verdict {
     if !f.idle && !f.asleep {
         return Keep("it is in a turn, starting, or not running");
     }
+    if f.working {
+        return Keep("it has a sub-agent, a background task or a new turn under way");
+    }
     if f.others_waiting {
         return Keep("other prompts are waiting for it");
     }
@@ -361,80 +371,82 @@ pub fn fresh_verdict(f: &FreshFacts, asked: bool) -> Verdict {
 }
 
 /// `fresh_verdict`'s facts for agent `a` (its record as it is now) at `now`, with `session` its
-/// session as the caller read it (None: it has none).
+/// session as the caller read it (None: it has none). Resting is what a sleep needs too
+/// (src/sleep.rs `blocker`): no sub-agent, background task, turn just typed in or wake under way.
 pub fn fresh_facts(hub: &Hub, a: &Agent, session: Option<&SessionInfo>, now: i64) -> FreshFacts {
     let Some(info) = session else { return FreshFacts { now, ..FreshFacts::default() } };
     let live = info.state != AgentState::Exited && hub.live_session_ids().contains(&info.id);
     let keys = hub.human_input_of(info.id).is_some_and(|(_, at)| at.elapsed().as_millis() < HUMAN_TYPING_MS);
+    let (_, f) = crate::sleep::facts(hub, a);
+    let idle = live && agents::session_idle(info);
     FreshFacts {
         claude: a.kind == SessionKind::Claude,
-        idle: live && agents::session_idle(info),
+        idle,
+        working: live && (info.subagents > 0 || info.background > 0 || f.active_at.is_some_and(|at| at >= info.state_since)),
         asleep: !live && a.asleep_at.is_some(),
-        cold_for: crate::sleep::wake_cost(info, now),
+        // By the cache's lifetime, whether or not the cold warnings are shown.
+        cold_for: hub.cache_gone_at(info).filter(|t| now >= *t).map(|_| now - info.last_turn_at.unwrap_or(now)),
         tokens: hub.agents().context_size(a),
-        others_waiting: !crate::inject::queue_idle(hub, info.id) || hub.agents().sleep.deliveries(a.id) > 0,
-        typing: keys || (live && agents::session_idle(info) && crate::inject::has_draft(hub, info.id)),
-        human_prompt_at: hub.agents().human_prompt_at(info.id),
+        others_waiting: !f.queue_idle || f.deliveries > 0 || f.waking,
+        typing: keys || (idle && f.draft),
+        human_prompt_at: hub.agents().human_prompt_at(a.id),
         now,
     }
 }
 
-/// Apply the cold-answer rule to agent `to` before a delivery: Ok(Some) when the delivery goes
-/// into a new conversation (started now, or before a backend restart), Ok(None) for the current
-/// one. Err: a decision Muster couldn't undo in its record (the delivery must not go: its text
-/// would say what didn't happen).
-async fn fresh_start(hub: &Arc<Hub>, to: &Agent, rule: &FreshRule<'_>) -> Result<Option<Fresh>, String> {
-    let current = |hub: &Hub| agent_then(hub, to.id, Some(to.created_at));
-    // As it is now, with the answer lock held: an answer just before this one may have started
-    // it fresh since `to` was read.
-    let Some(to) = current(hub) else { return Ok(rule.decided.cloned()) };
-    let to = &to;
-    let decided = match rule.decided {
-        // Decided before a restart: done already unless the agent still has the conversation
-        // it was to replace (a fresh start forgets it before the agent is restarted).
-        Some(f) if to.resume_id != f.replaces || f.replaces.is_none() => {
-            return Ok(Some(f.clone()));
+/// What the cold-answer rule decided for one delivery (`fresh_plan`).
+enum Plan {
+    /// The current conversation.
+    Current,
+    /// A new conversation, started before a backend restart.
+    Started(Fresh),
+    /// Start a new conversation now: the agent's `resume_id` must still be `expect`, and the rule
+    /// must still hold (`asked`: by its resting checks only).
+    Start { fresh: Fresh, expect: Option<String>, asked: bool },
+}
+
+/// Is `f`'s replaced run (the process that held the old conversation) still the agent's live run?
+fn old_run_alive(hub: &Hub, a: &Agent, f: &Fresh) -> bool {
+    let Some(sid) = a.session_id else { return false };
+    f.run.is_some() && hub.live_session_ids().contains(&sid) && hub.pty_generation(sid) == f.run
+}
+
+/// The cold-answer rule for agent `to` (as it is now): a decision saved before a backend restart
+/// is finished or undone; otherwise the rule is applied and a new decision saved before anything
+/// is restarted. Err: a decision Muster couldn't undo in its record.
+fn fresh_plan(hub: &Hub, to: &Agent, rule: &FreshRule<'_>) -> Result<Plan, String> {
+    let undo = || (rule.save)(None).map_err(|e| format!("couldn't record that it stays in the current conversation: {e:#}"));
+    let mut asked = rule.asked;
+    if let Some(f) = rule.decided {
+        // A fresh start forgets the old conversation before it replaces the run. Forgotten and
+        // the run replaced: done. Forgotten but the old run still there (the restart was cut
+        // off): finish it, by the resting checks alone (the size went with the conversation).
+        let forgotten = to.resume_id != f.replaces || f.replaces.is_none();
+        if forgotten && !old_run_alive(hub, to, f) {
+            return Ok(Plan::Started(f.clone()));
         }
-        // Not done yet: checked again below, as it is now.
-        Some(f) => f.clone(),
-        None => Fresh { why: String::new(), replaces: to.resume_id.clone() },
-    };
+        asked |= forgotten;
+    }
     let session = to.session_id.and_then(|s| hub.session(s));
-    let decided = match fresh_verdict(&fresh_facts(hub, to, session.as_ref(), now_ms()), rule.asked) {
-        Verdict::Keep(why) => {
+    match (fresh_verdict(&fresh_facts(hub, to, session.as_ref(), now_ms()), asked), rule.decided) {
+        (Verdict::Keep(why), decided) => {
             tracing::debug!(agent = to.name, "an answer goes into the current conversation: {why}");
-            if rule.decided.is_some() {
-                (rule.save)(None).map_err(|e| format!("couldn't record that it stays in the current conversation: {e:#}"))?;
+            if decided.is_some() {
+                undo()?;
             }
-            return Ok(None);
+            Ok(Plan::Current)
         }
         // A decision saved before a restart keeps its words (the message is found by them).
-        Verdict::Fresh { .. } if rule.decided.is_some() => decided,
-        Verdict::Fresh { why, .. } => {
-            let f = Fresh { why, ..decided };
-            if let Err(e) = (rule.save)(Some(&f)) {
+        (Verdict::Fresh { .. }, Some(f)) => Ok(Plan::Start { fresh: f.clone(), expect: to.resume_id.clone(), asked }),
+        (Verdict::Fresh { why, .. }, None) => {
+            let fresh = Fresh { why, replaces: to.resume_id.clone(), run: to.session_id.and_then(|s| hub.pty_generation(s)) };
+            if let Err(e) = (rule.save)(Some(&fresh)) {
                 tracing::warn!(agent = to.name, "not starting a new conversation: saving the decision failed: {e:#}");
-                return Ok(None);
+                return Ok(Plan::Current);
             }
-            f
+            Ok(Plan::Start { fresh, expect: to.resume_id.clone(), asked })
         }
-    };
-    // Checked again under the start lock with the restart (nothing can slip in between): the
-    // conversation is still the one decided on, and the rule still holds for it.
-    let ok = |s: &SessionInfo| current(hub).is_some_and(|a| a.resume_id == decided.replaces
-        && matches!(fresh_verdict(&fresh_facts(hub, &a, Some(s), now_ms()), rule.asked), Verdict::Fresh { .. }));
-    let why = match agents::start_fresh_if(hub, &to.name, &ok).await {
-        Ok(_) => return Ok(Some(decided)),
-        Err(e) if e.downcast_ref::<agents::NotIdle>().is_some() => "it is no longer resting".to_string(),
-        Err(e) => format!("{e:#}"),
-    };
-    // Not started. A conversation the failed start forgot is gone all the same: say so.
-    if current(hub).is_none_or(|a| a.resume_id != decided.replaces) && decided.replaces.is_some() {
-        return Ok(Some(decided));
     }
-    tracing::info!(agent = to.name, "an answer goes into the current conversation after all: {why}");
-    (rule.save)(None).map_err(|e| format!("couldn't record that it stays in the current conversation: {e:#}"))?;
-    Ok(None)
 }
 
 /// Serializes the deliveries the cold-answer rule covers per agent, so a second answer sees what
@@ -442,6 +454,111 @@ async fn fresh_start(hub: &Arc<Hub>, to: &Agent, rule: &FreshRule<'_>) -> Result
 async fn rule_lock(hub: &Hub, agent: i64) -> tokio::sync::OwnedMutexGuard<()> {
     let m = hub.agents().answer_locks.lock().entry(agent).or_default().clone();
     m.lock_owned().await
+}
+
+/// Deliver `l` to agent `to` (`note`: why it isn't the poster), with the cold-answer rule when
+/// `l` has it. Every delivery check runs before anything is restarted, so a refused answer leaves
+/// the conversation as it was; the fresh start and the answer's place in the new run's queue are
+/// taken under one hold of the start lock, so no other message gets in first.
+async fn deliver_to_agent(hub: &Arc<Hub>, l: &Letter<'_>, to: Agent, note: Option<String>) -> Delivery {
+    let Some(rule) = &l.fresh else { return send_to_agent(hub, l, &to, note.as_deref(), None, None).await };
+    let _one = rule_lock(hub, to.id).await;
+    let Some(now) = agent_then(hub, to.id, Some(to.created_at)) else {
+        // Removed meanwhile: the send refuses it, saying so.
+        return send_to_agent(hub, l, &to, note.as_deref(), rule.decided.cloned(), None).await;
+    };
+    if let Err(e) = agents::precheck(hub, &now, &(l.text)(note.as_deref()), &l.from, l.from_session, l.prov, None) {
+        return failed(&now, rule.decided.cloned(), e);
+    }
+    let (fresh, expect, asked) = match fresh_plan(hub, &now, rule) {
+        Err(why) => {
+            // Nothing was sent: sent again later, it is decided afresh.
+            let mut d = outcome(DeliveryStatus::Undelivered, format!("not delivered: {why}"));
+            d.to = Some(now.name.clone());
+            return d;
+        }
+        Ok(Plan::Current) => return send_to_agent(hub, l, &now, note.as_deref(), None, None).await,
+        Ok(Plan::Started(f)) => return send_to_agent(hub, l, &now, note.as_deref(), Some(f), None).await,
+        Ok(Plan::Start { fresh, expect, asked }) => (fresh, expect, asked),
+    };
+    let current = |hub: &Hub| agent_then(hub, to.id, Some(to.created_at));
+    // Checked again with the start lock held, for an asleep agent too, and once more by the start
+    // itself for a running one (with no await in between): the conversation is still the one
+    // decided on, and the rule still holds.
+    let ok = |s: &SessionInfo| current(hub).is_some_and(|a| a.resume_id == expect
+        && matches!(fresh_verdict(&fresh_facts(hub, &a, Some(s), now_ms()), asked), Verdict::Fresh { .. }));
+    let held = hub.agents().start_lock.lock().await;
+    let still = now.session_id.and_then(|s| hub.session(s)).is_some_and(|s| ok(&s));
+    let why = if !still {
+        "it is no longer resting".to_string()
+    } else {
+        match agents::start_fresh_if_held(hub, &now.name, &ok, &held).await {
+            Ok(_) => return send_to_agent(hub, l, &now, note.as_deref(), Some(fresh), Some(&held)).await,
+            Err(e) if e.downcast_ref::<agents::NotIdle>().is_some() => "it is no longer resting".to_string(),
+            Err(e) => format!("{e:#}"),
+        }
+    };
+    drop(held);
+    // Not started. A conversation the failed start forgot is gone all the same, unless its run is
+    // still there: say which.
+    if let Some(a) = current(hub)
+        && a.resume_id != fresh.replaces && fresh.replaces.is_some() && !old_run_alive(hub, &a, &fresh)
+    {
+        return send_to_agent(hub, l, &now, note.as_deref(), Some(fresh), None).await;
+    }
+    tracing::info!(agent = now.name, "an answer goes into the current conversation after all: {why}");
+    if let Err(e) = (rule.save)(None) {
+        let mut d = outcome(DeliveryStatus::Undelivered,
+            format!("not delivered: couldn't record that it stays in the current conversation: {e:#}"));
+        d.to = Some(now.name.clone());
+        return d;
+    }
+    send_to_agent(hub, l, &now, note.as_deref(), None, None).await
+}
+
+/// A delivery to agent `to` that failed with `e` (a guard's refusal, or an error).
+fn failed(to: &Agent, fresh: Option<Fresh>, e: anyhow::Error) -> Delivery {
+    let status = if e.downcast_ref::<agents::Refused>().is_some() { DeliveryStatus::Refused } else { DeliveryStatus::Undelivered };
+    Delivery { to: Some(to.name.clone()), fresh, ..outcome(status, format!("not delivered to {}: {e:#}", to.name)) }
+}
+
+/// Send `l` to agent `to` by name (`fresh`: in the new conversation Muster started for it;
+/// `held`: the caller holds the start lock).
+async fn send_to_agent(hub: &Arc<Hub>, l: &Letter<'_>, to: &Agent, note: Option<&str>, fresh: Option<Fresh>,
+    held: Option<&agents::StartHeld<'_>>) -> Delivery {
+    let text = letter_text(l, fresh.as_ref(), note);
+    let mut d = outcome(DeliveryStatus::Delivered, String::new());
+    d.to = Some(to.name.clone());
+    d.fresh = fresh.clone();
+    let started = fresh.as_ref().map(|f| format!("started {} in a new conversation, because {}; ", to.name, f.why))
+        .unwrap_or_default();
+    // Delivered by name, as late replies are: an agent removed and another made with its name in
+    // the moment between `target` and the start would get it (only the human removes and makes
+    // agents).
+    let sent = match held {
+        Some(held) => agents::send_checked_held(hub, to, text.clone(), l.from.clone(), l.from_session, l.prov, held).await,
+        None => agents::send_checked(hub, to, text.clone(), l.from.clone(), l.from_session, l.prov, None).await,
+    };
+    match sent {
+        Ok((sent, _)) => {
+            d.msg_id = Some(sent.msg_id);
+            d.session_id = Some(sent.session_id);
+            d.note = Some(if sent.delivered {
+                format!("{started}typed into {} as message {}", to.name, sent.msg_id)
+            } else {
+                format!("{started}queued for {} as message {}: typed in when it is between steps", to.name, sent.msg_id)
+            });
+            d
+        }
+        Err(e) if e.downcast_ref::<crate::inject::DeliveryPending>().is_some() => {
+            d.msg_id = hub.store().find_question_delivery(to.id, &l.from, &text).ok().flatten();
+            d.note = Some(format!("{started}queued for {}; Muster is confirming its delivery", to.name));
+            d
+        }
+        // The decision stays with it: the restart finds the agent restarted already.
+        Err(_) if hub.is_shutting_down() => Delivery { fresh, ..interrupted() },
+        Err(e) => failed(to, fresh, e),
+    }
 }
 
 /// Deliver `l`: the delivery with its final status.
@@ -464,59 +581,7 @@ pub async fn deliver(hub: &Arc<Hub>, l: &Letter<'_>) -> Delivery {
     match t {
         Target::NotNeeded(why) => outcome(DeliveryStatus::NotNeeded, why),
         Target::Gone(why) => outcome(DeliveryStatus::Undelivered, format!("not delivered: {why}")),
-        Target::Agent(to, note) => {
-            let _one = match &l.fresh {
-                Some(_) => Some(rule_lock(hub, to.id).await),
-                None => None,
-            };
-            let fresh = match &l.fresh {
-                Some(rule) => match fresh_start(hub, &to, rule).await {
-                    Ok(f) => f,
-                    Err(why) => {
-                        // Nothing was sent: sent again later, it is decided afresh.
-                        let mut d = outcome(DeliveryStatus::Undelivered, format!("not delivered: {why}"));
-                        d.to = Some(to.name.clone());
-                        return d;
-                    }
-                },
-                None => None,
-            };
-            let text = letter_text(l, fresh.as_ref(), note.as_deref());
-            let mut d = outcome(DeliveryStatus::Delivered, String::new());
-            d.to = Some(to.name.clone());
-            d.fresh = fresh.clone();
-            let started = fresh.as_ref().map(|f| format!("started {} in a new conversation, because {}; ", to.name, f.why))
-                .unwrap_or_default();
-            // Delivered by name, as late replies are: an agent removed and another made with its
-            // name in the moment between `target` and the start would get it (only the human
-            // removes and makes agents).
-            match agents::send_checked(hub, &to, text.clone(), l.from.clone(), l.from_session, l.prov, None).await {
-                Ok((sent, _)) => {
-                    d.msg_id = Some(sent.msg_id);
-                    d.session_id = Some(sent.session_id);
-                    d.note = Some(if sent.delivered {
-                        format!("{started}typed into {} as message {}", to.name, sent.msg_id)
-                    } else {
-                        format!("{started}queued for {} as message {}: typed in when it is between steps", to.name, sent.msg_id)
-                    });
-                }
-                Err(e) if e.downcast_ref::<agents::Refused>().is_some() => {
-                    d.status = DeliveryStatus::Refused;
-                    d.note = Some(format!("not delivered to {}: {e:#}", to.name));
-                }
-                Err(e) if e.downcast_ref::<crate::inject::DeliveryPending>().is_some() => {
-                    d.msg_id = hub.store().find_question_delivery(to.id, &l.from, &text).ok().flatten();
-                    d.note = Some(format!("{started}queued for {}; Muster is confirming its delivery", to.name));
-                }
-                // The decision stays with it: the restart finds the agent restarted already.
-                Err(_) if hub.is_shutting_down() => return Delivery { fresh, ..interrupted() },
-                Err(e) => {
-                    d.status = DeliveryStatus::Undelivered;
-                    d.note = Some(format!("not delivered to {}: {e:#}", to.name));
-                }
-            }
-            d
-        }
+        Target::Agent(to, note) => deliver_to_agent(hub, l, to, note).await,
         Target::Session(s, note) => {
             // Never typed into a shell, whoever recorded it (`check_reach` says so too).
             if s.kind == SessionKind::Shell {
@@ -601,7 +666,7 @@ mod tests {
     /// A named Claude agent at rest, its cache gone 3 hours ago, 216k tokens, nothing else going on.
     fn cold_large() -> FreshFacts {
         FreshFacts {
-            claude: true, idle: true, asleep: false, cold_for: Some(3 * HOUR), tokens: Some(216_003),
+            claude: true, idle: true, working: false, asleep: false, cold_for: Some(3 * HOUR), tokens: Some(216_003),
             others_waiting: false, typing: false, human_prompt_at: None, now: NOW,
         }
     }
@@ -634,6 +699,7 @@ mod tests {
         assert_eq!(keep(&FreshFacts { claude: false, ..c() }, false), "only Claude agents report their conversation's size");
         // Mid-turn, starting, waiting on the human, exited without being asleep: never restarted.
         assert_eq!(keep(&FreshFacts { idle: false, ..c() }, false), "it is in a turn, starting, or not running");
+        assert_eq!(keep(&FreshFacts { working: true, ..c() }, false), "it has a sub-agent, a background task or a new turn under way");
         assert_eq!(keep(&FreshFacts { others_waiting: true, ..c() }, false), "other prompts are waiting for it");
         assert_eq!(keep(&FreshFacts { typing: true, ..c() }, false), "the human is typing into it");
         assert_eq!(keep(&FreshFacts { human_prompt_at: Some(NOW - 23 * HOUR), ..c() }, false),
@@ -664,7 +730,7 @@ mod tests {
             text: &text, envelope: &envelope, prefix: String::new(),
             fresh: Some(FreshRule { asked: false, decided: None, save: &save }) };
         assert_eq!(letter_text(&l, None, None), "Answer to your question Q1: a.");
-        let f = Fresh { why: "the old one was cold and large, about 216k tokens and idle 3 h".into(), replaces: Some("c-1".into()) };
+        let f = Fresh { why: "the old one was cold and large, about 216k tokens and idle 3 h".into(), replaces: Some("c-1".into()), run: None };
         let t = letter_text(&l, Some(&f), None);
         assert!(t.starts_with("Muster started you in a new conversation for this message, because the old one was cold and large, \
             about 216k tokens and idle 3 h. Read your memory/ notes first;"), "{t}");

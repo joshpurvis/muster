@@ -782,9 +782,10 @@ export interface Question {
     asleep: boolean;
     cold: boolean;
     idle_ms?: number | null;
-    /** An answer now would start it in a new conversation (its old one is cold and large):
-     * why, and the old one's size in thousands of tokens. Null otherwise. */
-    new_conversation?: { why: string; size_k?: number | null } | null;
+    /** An answer now would start its recipient in a new conversation (its old one is cold and
+     * large): why, the old one's size in thousands of tokens, whether it is asleep, and `to`, the
+     * lead's name when the answer goes to the lead of an asker that ended. Null otherwise. */
+    new_conversation?: { why: string; size_k?: number | null; asleep?: boolean; to?: string | null } | null;
   };
   /** Answered ones: the human may still take it back (an answer given in the tab, not yet read). */
   can_undo?: boolean;

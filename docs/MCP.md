@@ -975,9 +975,9 @@ an answer the human typed in chat with `record_answer`. Code: `src/questions.rs`
 | Tool | Arguments | Result |
 |---|---|---|
 | `post_question` | `question`, `context`, `example`, `kind?` (`pick_one` default, `yes_no`, `pick_several`, `own_words`), `options?: [{text, why?}]`, `pick?` (a letter, or a list for `pick_several`), `if_no_answer`, `note_to_self`, `holding_up?`, `product?`, `area?` (`merge`, `money`, `public`, `customer_dns`, `other` default), `details?`, `pictures?: [{path, caption}]`, `links?: [{label, url}]` | `{number, question: "Q<n>", status: "open", answer_goes_to, note}`, at once. Refused, with every problem listed: no `context` (20 to 1000 characters), no concrete `example` (20 to 800, not the context again), no `if_no_answer` (15 to 500), no `note_to_self` (30 to 4000: what the asker will do with each answer and which files to reopen), a `question` that isn't one line of 10 to 300 characters; for every kind but `own_words`, fewer than 2 or more than 6 options (`yes_no`: exactly 2), no `pick`, a pick that isn't an option, a `pick_one` or `yes_no` pick that isn't option a (the pick goes first), or a picked option without a `why`. `own_words` (a paste, a value) takes no options and no pick. Options are lettered a to f in the order given. Pictures: up to 6, absolute paths (no control characters) of existing png, jpg, gif, webp or svg files, each with a caption; links: up to 4, each an http(s) address (opened in the browser) or a Muster link (`muster://panel/<id>`, `note/<id>`, `tab/<id>`, `agent/<name>`: shown in Muster's window). In `context`, `example` and option text, a `[label](url)` with either kind of address shows on the card as a link; other Markdown shows as written. The same question still open from the same asker is refused with its number; at most 20 open per asker and 200 in all. |
-| `list_questions` | `number?`, `status?` (`open` default, `answered`, `withdrawn`, `all`), `mine?`, `limit?` (newest 200 at most) | `{questions: [{number, id, status, asker, passed_on_by, product, question, kind, options, pick, holding_up, if_no_answer, area, answer, withdrawn, asker_now}], shown, total}`, oldest first: the newest `limit` that match (`total`: how many match in all), of those the caller may read (`shown`; see "Who reads" below). `asker_now` (open ones): the asker's `state`, `running`, `asleep`, `cold` (its next message would re-read its whole conversation uncached), `idle_ms`, `new_conversation` (`{why, size_k}` when an answer now would start it in a new conversation, its old one being cold and large, see "A cold, large conversation starts fresh" below; else null). `answer`: `{picked, words, how, recorded_by, at, delivery}`. With `number`: that question whole (the asker's `note_to_self` and its ids included). `mine`: only the caller's (a named agent's across its restarts and fresh starts). |
+| `list_questions` | `number?`, `status?` (`open` default, `answered`, `withdrawn`, `all`), `mine?`, `limit?` (newest 200 at most) | `{questions: [{number, id, status, asker, passed_on_by, product, question, kind, options, pick, holding_up, if_no_answer, area, answer, withdrawn, asker_now}], shown, total}`, oldest first: the newest `limit` that match (`total`: how many match in all), of those the caller may read (`shown`; see "Who reads" below). `asker_now` (open ones): the asker's `state`, `running`, `asleep`, `cold` (its next message would re-read its whole conversation uncached), `idle_ms`, `new_conversation` (`{why, size_k, asleep, to}` when an answer now would start its recipient in a new conversation, its old one being cold and large, see "A cold, large conversation starts fresh" below; `to`: the lead's name when the answer goes to the lead of an asker that ended; else null). `answer`: `{picked, words, how, recorded_by, at, delivery}`. With `number`: that question whole (the asker's `note_to_self` and its ids included). `mine`: only the caller's (a named agent's across its restarts and fresh starts). |
 | `withdraw_question` | `number`, `reason` | `{number, question, status: "withdrawn"}`. Only the asker, only while open. |
-| `record_answer` | `number`, `words` (the human's answer, verbatim, at most 4000 characters), `pick?` | `{number, question, status: "answered", picked, delivery: {status, note, to, msg_id, session_id, at, fresh?}, delivered}` (`fresh: {why, replaces}`: the asker was started in a new conversation for it). See below. |
+| `record_answer` | `number`, `words` (the human's answer, verbatim, at most 4000 characters), `pick?` | `{number, question, status: "answered", picked, delivery: {status, note, to, msg_id, session_id, at, fresh?}, delivered}` (`fresh: {why, replaces, run}`: the asker was started in a new conversation for it). See below. |
 
 `post_question`, `withdraw_question` and `record_answer` share the post rate limit (30 per minute
 with note writes, panel updates and posts); `record_answer` also counts toward the send limit (20
@@ -1034,23 +1034,30 @@ A message for a named agent that was removed, and another made with its name, in
 before it is typed in is refused (as every agent message now is).
 
 **A cold, large conversation starts fresh.** When the answer goes to a named Claude agent whose
-conversation is cold (its prompt cache has likely expired: docs/PROTOCOL.md "Cold prompt cache")
-and at least 100,000 tokens (its last request's input, as its status line reported it for that
-conversation), Muster starts the agent in a new conversation first, the way Start fresh does
-(persona, memory and the start lock as usual), and the answer is that conversation's first
-message. Only while the agent rests (idle with an empty input queue, or asleep), with nothing
-else on its way to it, nobody typing into it (a draft in its input box, or keys in the last two
-minutes), and no prompt of the human's own taken in by that conversation in the last 24 hours
-(typed at its input box, or sent as the human's from a terminal or the window; messages and
-answers don't count). Whatever Muster can't tell (no size reported yet for that conversation, a
+conversation is cold (its prompt cache has likely expired by its lifetime in `prefs.cache_ttl`,
+whether or not the cold warnings are shown: docs/PROTOCOL.md "Cold prompt cache") and at least
+100,000 tokens (its last request's input, as its status line reported it for that conversation;
+a report that arrives after a newer one is dropped), Muster starts the agent in a new
+conversation first, the way Start fresh does (persona, memory and the start lock as usual), and
+the answer is that conversation's first message: it is queued under the same hold of the start
+lock, before any other message can start the agent. Every delivery check (accepted origins, hop
+limit, daily and spend caps) runs first, so a refused answer leaves the conversation as it was.
+Only while the agent rests (idle with an empty input queue and no sub-agent, background task or
+just-typed turn under way, or asleep), with nothing else on its way to it, nobody typing into it
+(a draft in its input box, or keys in the last two minutes), and no prompt of the human's own
+taken in by that agent in the last 24 hours, in whichever tab (typed at its input box, or sent as
+the human's from a terminal or the window; messages and answers don't count). Whatever Muster can't tell (no size reported yet for that conversation, a
 Codex agent, a status line Muster doesn't run) keeps the current conversation, as do warm or
 smaller ones. The message then starts with one line: `Muster started you in a new conversation
 for this message, because the old one was cold and large, about 216k tokens and idle 3 h. Read
 your memory/ notes first; the message below has everything it is about.`, and the answer's
-delivery says so (`delivery.fresh: {why, replaces}`; its note starts `started <agent> in a new
-conversation, because ...`). The decision is saved with the delivery before the agent is
+delivery says so (`delivery.fresh: {why, replaces, run}`; its note starts `started <agent> in a new
+conversation, because ...`). The decision is saved with the delivery, with the run it replaces, before the agent is
 restarted, so a backend restart in between neither restarts it twice nor types the answer in
-twice. A second answer to the same agent waits for the first and goes into the new conversation.
+twice (a restart that finds the old run still there finishes the fresh start), and answers that
+had started a new conversation are finished first. A second answer to the same agent waits for
+the first and goes into the new conversation. The Questions tab's "After you answer" line comes
+from the same rule (`asker_now.new_conversation`), naming the lead when the answer goes there.
 An answer whose `into` is `fresh` (nothing sets it yet) gets a new conversation whatever the size,
 under the same resting checks. Other messages (`ask_agent`, `send_message`, late replies,
 schedules, reminders, pull request cards) always go into the current conversation.

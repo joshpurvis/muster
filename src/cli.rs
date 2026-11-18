@@ -2763,17 +2763,27 @@ pub fn agent_rm(d: &Discovery, name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `muster agent start`'s line for the `agent.start` result `r`: the session id, and whether it
+/// woke the agent into its conversation (a re-read) or into a new one (`--fresh`: none).
+fn agent_start_line(r: &Value, fresh: bool) -> String {
+    let id = r["session"]["id"].as_u64().unwrap_or(0);
+    // An older daemon doesn't send `new_conversation`: `--fresh` always starts a new one.
+    let new_conversation = r["new_conversation"].as_bool().unwrap_or(fresh);
+    if r["woke"] == true && new_conversation {
+        format!("{id} (woke it into a new conversation: its old one is not re-read)")
+    } else if r["woke"] == true {
+        format!("{id} (woke it: it re-reads its conversation)")
+    } else if r["started"] == true {
+        id.to_string()
+    } else {
+        format!("{id} (already running)")
+    }
+}
+
 /// `muster agent start`: prints the session id (like `muster new`).
 pub fn agent_start(d: &Discovery, name: &str, fresh: bool) -> anyhow::Result<()> {
     let r = client::rpc_with_timeout(d, "agent.start", json!({ "name": name, "fresh": fresh }), Duration::from_secs(30))?;
-    let id = r["session"]["id"].as_u64().unwrap_or(0);
-    if r["woke"] == true {
-        println!("{id} (woke it: it re-reads its conversation)");
-    } else if r["started"] == true {
-        println!("{id}");
-    } else {
-        println!("{id} (already running)");
-    }
+    println!("{}", agent_start_line(&r, fresh));
     if let Some(line) = kept_prompts_line(&r, fresh) {
         println!("{line}");
     }
@@ -2938,6 +2948,25 @@ mod tests {
         assert_eq!(queue_wait_line(&json!({"name": "builder-2", "queued": 1, "queue_waits": null})).as_deref(),
             Some("builder-2: 1 prompt waits to be typed"));
         assert_eq!(queue_wait_line(&json!({"name": "builder-2"})), None);
+    }
+
+    /// `muster agent start`: an asleep agent woken with `--fresh` starts a new conversation, so the
+    /// line never says it re-reads the old one; a plain wake does.
+    #[test]
+    fn agent_start_line_says_which_conversation_a_wake_starts() {
+        let r = |v: Value| agent_start_line(&v, false);
+        let woke = json!({"session": {"id": 7}, "started": true, "woke": true, "new_conversation": false});
+        assert_eq!(r(woke.clone()), "7 (woke it: it re-reads its conversation)");
+        let fresh = json!({"session": {"id": 7}, "started": true, "woke": true, "new_conversation": true});
+        assert_eq!(agent_start_line(&fresh, true), "7 (woke it into a new conversation: its old one is not re-read)");
+        // A pending account move starts a new conversation without --fresh: the daemon says so.
+        assert_eq!(r(fresh), "7 (woke it into a new conversation: its old one is not re-read)");
+        // An older daemon without `new_conversation`: --fresh decides.
+        let old = json!({"session": {"id": 7}, "started": true, "woke": true});
+        assert_eq!(agent_start_line(&old, true), "7 (woke it into a new conversation: its old one is not re-read)");
+        assert_eq!(r(old), "7 (woke it: it re-reads its conversation)");
+        assert_eq!(agent_start_line(&json!({"session": {"id": 7}, "started": true, "woke": false}), true), "7");
+        assert_eq!(r(json!({"session": {"id": 7}, "started": false, "woke": false})), "7 (already running)");
     }
 
     fn snap() -> Snapshot {

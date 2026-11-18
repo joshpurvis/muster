@@ -1906,6 +1906,9 @@ pub struct AgentSession {
     pub started: bool,
     /// The agent was asleep since then (Unix ms), and this call woke it (src/sleep.rs).
     pub woke: Option<i64>,
+    /// This call started a new conversation (`fresh`, a pending account move or self-handoff),
+    /// so nothing old is re-read.
+    pub new_conversation: bool,
 }
 
 /// `agent.start`: the agent's live session, else restart its exited one, else a new session in
@@ -2017,7 +2020,7 @@ async fn start_once(hub: &Arc<Hub>, name: &str, fresh: bool, window: Option<Wind
         && session.state != AgentState::Exited
         && hub.live_session_ids().contains(&sid)
     {
-        return Ok(AgentSession { agent, session, started: false, woke: None });
+        return Ok(AgentSession { agent, session, started: false, woke: None, new_conversation: false });
     }
     // Before fresh clears the resume ID, or a restart touches a live process.
     hub.check_account_profile(agent.account_profile_id)?;
@@ -2025,7 +2028,8 @@ async fn start_once(hub: &Arc<Hub>, name: &str, fresh: bool, window: Option<Wind
     check_location(hub, &agent.working_location)?;
     // A pending move always starts a new conversation, whatever conversation id was saved since
     // it was recorded (an older backend's run on the old profile, a hook of the old run).
-    if fresh || agent.reset_on_next_start || agent.handoff.is_some() {
+    let new_conversation = fresh || agent.reset_on_next_start || agent.handoff.is_some();
+    if new_conversation {
         // First stop the old run's hooks from saving a conversation again (a turn-complete
         // still queued would otherwise undo the fresh start before the restart replaces it).
         if let Some(sid) = agent.session_id {
@@ -2053,7 +2057,10 @@ async fn start_once(hub: &Arc<Hub>, name: &str, fresh: bool, window: Option<Wind
     agent.asleep_at = None;
     let id = agent.id;
     let handoff = agent.handoff.as_ref().map(|h| h.at);
-    let r = run_agent(hub, agent, fresh, window, args, woke).await;
+    let r = run_agent(hub, agent, fresh, window, args, woke).await.map(|mut s| {
+        s.new_conversation = new_conversation && s.started;
+        s
+    });
     let r = match (r, handoff) {
         (Ok(mut s), Some(at)) if s.started => {
             handed_off(hub, id, at);
@@ -2081,7 +2088,7 @@ async fn run_agent(hub: &Arc<Hub>, mut agent: Agent, fresh: bool, window: Option
     {
         let live = info.state != AgentState::Exited && hub.live_session_ids().contains(&sid);
         if live && !fresh {
-            return Ok(AgentSession { agent, session: info, started: false, woke });
+            return Ok(AgentSession { agent, session: info, started: false, woke, new_conversation: false });
         }
         hub.set_session_extra_args(sid, args)?;
         follow_account(hub, &agent, sid)?;
@@ -2093,7 +2100,7 @@ async fn run_agent(hub: &Arc<Hub>, mut agent: Agent, fresh: bool, window: Option
         let session = restarted?;
         hub.agents().update(hub.store(), agent.id, |a| a.channel_id = Some(channel.id))?;
         agent.channel_id = Some(channel.id);
-        return Ok(AgentSession { agent, session, started: true, woke });
+        return Ok(AgentSession { agent, session, started: true, woke, new_conversation: false });
     }
     hub.agents().update(hub.store(), agent.id, |a| a.channel_id = Some(channel.id))?;
     agent.channel_id = Some(channel.id);
@@ -2117,7 +2124,7 @@ async fn run_agent(hub: &Arc<Hub>, mut agent: Agent, fresh: bool, window: Option
         })
         .await?;
     agent.session_id = Some(session.id);
-    Ok(AgentSession { agent, session, started: true, woke })
+    Ok(AgentSession { agent, session, started: true, woke, new_conversation: false })
 }
 
 /// Select a dedicated channel without changing or stopping the current run.
@@ -2757,7 +2764,7 @@ async fn deliver_inner(hub: &Arc<Hub>, mut out: Outgoing, held: Option<&StartHel
         return Err(Refused(format!("the agent {} this was for was removed, and the name now belongs to another agent", out.agent)).into());
     }
     if let Some(at) = bs.woke {
-        crate::sleep::note_woke(hub, &bs.agent, &bs.session, at, &format!("a message from {} arrived", out.from), false);
+        crate::sleep::note_woke(hub, &bs, at, &format!("a message from {} arrived", out.from), false);
     }
     let sid = bs.session.id;
     let mut msg = message_record(&bs.agent, &out.from, out.from_session, out.route, &out.text);

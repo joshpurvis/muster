@@ -1253,7 +1253,8 @@ async fn dispatch_inner(hub: &Arc<Hub>, who: &Principal, method: &str, params: V
             let p: P = parse(params)?;
             let bs = crate::agents::start(hub, &p.name, p.fresh, p.window_id).await?;
             if let Some(at) = bs.woke {
-                crate::sleep::note_woke(hub, &bs.agent, &bs.session, at, "you chose Wake", true);
+                let cause = if p.fresh { "you chose Start fresh" } else { "you chose Wake" };
+                crate::sleep::note_woke(hub, &bs, at, cause, true);
             }
             Ok(json!({
                 "agent": crate::agents::agent_json(&bs.agent, Some(&bs.session)),
@@ -1266,6 +1267,8 @@ async fn dispatch_inner(hub: &Arc<Hub>, who: &Principal, method: &str, params: V
                 "session": bs.session,
                 "started": bs.started,
                 "woke": bs.woke.is_some(),
+                // A new conversation (Start fresh, a pending move or self-handoff): nothing re-read.
+                "new_conversation": bs.new_conversation,
             }))
         }
         "agent.sleep" => {

@@ -20,7 +20,12 @@ export function addonTab(id: string): number {
   for (const c of new TextEncoder().encode(id)) hash = (Math.imul(hash, 33) ^ c) >>> 0;
   return QUESTIONS_TAB - 1 - hash;
 }
+/** The PRs to merge tab (docs/UI.md "PRs to merge"): one per window, like Questions; below every
+ * add-on tab's id (those are QUESTIONS_TAB - 1 - a 32-bit hash). */
+export const PRS_TAB = QUESTIONS_TAB - 2 ** 33;
 export const isPinnedTab = (tab: number): boolean => tab <= QUESTIONS_TAB;
+/** An add-on's tab (not Questions, not PRs to merge). */
+export const isAddonTab = (tab: number): boolean => tab < QUESTIONS_TAB && tab > PRS_TAB;
 export const panelTab = (id: number): number => -id - 1;
 export const panelId = (tab: number): number | null =>
   Number.isSafeInteger(tab) && tab <= -2 && tab > -NOTE_BASE ? -tab - 1 : null;

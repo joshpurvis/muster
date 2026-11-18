@@ -30,6 +30,7 @@ import { hasTerminalFocus, setShortcutMatcher } from "./terms.ts";
 import { noteId } from "./layout/tree.ts";
 import { notesSupported } from "./notes.ts";
 import { questionsSupported } from "./questions.ts";
+import { prsSupported } from "./prs.ts";
 import { canCloseWindow, isNative } from "./native.ts";
 import { latencyMonitorOn, setLatencyMonitor } from "./latency_monitor.ts";
 import { isMac } from "./util.ts";
@@ -174,6 +175,13 @@ export const commands: Command[] = [
     group: "Navigate",
     enabled: () => questionsSupported.value,
     run: () => A.openQuestionsTab(),
+  },
+  {
+    id: "prs",
+    title: "PRs to merge (pull requests agents posted for you)",
+    group: "Navigate",
+    enabled: () => prsSupported.value,
+    run: () => A.openPrsTab(),
   },
   {
     id: "next-tab",

@@ -6,10 +6,12 @@ import { addonTab, isPinnedTab } from "./tree.ts";
 import { KitIcon } from "../panels/KitIcon.tsx";
 import type { ComponentChildren } from "preact";
 import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
-import { noteId, noteTab, panelId, panelTab, type PaneNode, QUESTIONS_TAB } from "./tree.ts";
+import { noteId, noteTab, panelId, panelTab, type PaneNode, PRS_TAB, QUESTIONS_TAB } from "./tree.ts";
 import { PanelSlot, reloadPanel } from "../panels/PanelView.tsx";
 import { NoteView } from "../components/NoteView.tsx";
 import { QuestionsView } from "../components/QuestionsView.tsx";
+import { PrsView } from "../components/PrsView.tsx";
+import { waitingPrCount } from "../prs.ts";
 import { openQuestionCount } from "../questions.ts";
 import { notes, notesSupported } from "../notes.ts";
 import type { NoteInfo } from "../types.ts";
@@ -35,6 +37,7 @@ import {
   windowChannels,
   tabChannel,
   questionsShown,
+  prsShown,
 } from "../state.ts";
 import {
   addDismissal, CACHE_DOT_LABEL, cacheDot, coldKey, coldText, DEFAULT_CACHE_TTL, idleFor, idleText, isCold, ttlFor, ttlText,
@@ -263,11 +266,13 @@ export function Group(
   const all = sessions.value;
   const tabs = pane.tabs.filter((id) =>
     all.has(id) || panels.value.has(panelId(id) ?? -1) || notes.value.has(noteId(id) ?? -1) ||
-    (id === QUESTIONS_TAB && questionsShown.value) || addons.value.some((a) => addonTab(a.id) === id)
+    (id === QUESTIONS_TAB && questionsShown.value) || (id === PRS_TAB && prsShown.value) ||
+    addons.value.some((a) => addonTab(a.id) === id)
   );
   const active = pane.active !== null ? all.get(pane.active) ?? null : null;
   const activeAddon = addons.value.find((a) => addonTab(a.id) === pane.active);
   const activeQuestions = pane.active === QUESTIONS_TAB && tabs.includes(QUESTIONS_TAB);
+  const activePrs = pane.active === PRS_TAB && tabs.includes(PRS_TAB);
   const activePanel = pane.active !== null ? panels.value.get(panelId(pane.active) ?? -1) : undefined;
   const activeNote = pane.active !== null ? notes.value.get(noteId(pane.active) ?? -1) : undefined;
   const find = A.findOpen.value;
@@ -332,6 +337,7 @@ export function Group(
         {active && <TermHost sid={active.id} />}
         {activePanel && <PanelSlot key={activePanel.id} id={activePanel.id} />}
         {activeQuestions && <QuestionsView />}
+        {activePrs && <PrsView />}
         {activeAddon && <PanelSlot key={activeAddon.id} id={addonTab(activeAddon.id)} />}
         {tabs.map((t) => noteId(t)).filter((n): n is number => n !== null).map((n) => (
           <NoteView key={n} id={n} hidden={n !== activeNote?.id} />
@@ -463,7 +469,7 @@ function TabStrip(
       [
         { header: `${tabs.length} tabs in this group` },
         ...tabs.map((id, i): MenuItem => ({
-          label: id === QUESTIONS_TAB ? "Questions" : (addons.value.find((a) => addonTab(a.id) === id) ? addonTitle(addons.value.find((a) => addonTab(a.id) === id)!) : undefined) ?? panels.value.get(panelId(id) ?? -1)?.title ??
+          label: id === QUESTIONS_TAB ? "Questions" : id === PRS_TAB ? "PRs to merge" : (addons.value.find((a) => addonTab(a.id) === id) ? addonTitle(addons.value.find((a) => addonTab(a.id) === id)!) : undefined) ?? panels.value.get(panelId(id) ?? -1)?.title ??
             notes.value.get(noteId(id) ?? -1)?.title ?? tabText(labelOf(sessions.value.get(id)!)),
           icon: isPinnedTab(id)
             ? <IconPin size={13} />
@@ -523,8 +529,8 @@ function TabStrip(
         onKeyDown={onKeyDown}
       >
         {tabs.map((id, i) => {
-          if (id === QUESTIONS_TAB) {
-            return <PinnedTab key={id} index={i} paneId={pane.id} tabsInGroup={tabs.length} active={id === pane.active} focused={focused} />;
+          if (id === QUESTIONS_TAB || id === PRS_TAB) {
+            return <PinnedTab key={id} prs={id === PRS_TAB} index={i} paneId={pane.id} tabsInGroup={tabs.length} active={id === pane.active} focused={focused} />;
           }
           const addon = addons.value.find((a) => addonTab(a.id) === id);
           if (addon) return <PinnedTab key={id} addon={addon} index={i} paneId={pane.id} tabsInGroup={tabs.length} active={id === pane.active} focused={focused} />;
@@ -647,33 +653,34 @@ function PanelTab({ panel, paneId, index, tabsInGroup, active, focused }: {
   );
 }
 
-/** The Questions tab, with the number of open questions. It drags among the groups like any tab
- * (the window remembers where), but doesn't rename or close: its menu hides it (the palette's
- * Questions shows it again). */
-function PinnedTab({ addon, paneId, index, tabsInGroup, active, focused }: {
-  addon?: Addon; paneId: string; index: number; tabsInGroup: number; active: boolean; focused: boolean;
+/** The Questions tab, with the number of open questions, the PRs to merge tab (`prs`), with the
+ * number waiting, or an add-on's tab. It drags among the groups like any tab (the window remembers
+ * where), but doesn't rename or close: its menu hides it (the palette shows it again). */
+function PinnedTab({ addon, prs = false, paneId, index, tabsInGroup, active, focused }: {
+  addon?: Addon; prs?: boolean; paneId: string; index: number; tabsInGroup: number; active: boolean; focused: boolean;
 }) {
-  const id = addon ? addonTab(addon.id) : QUESTIONS_TAB;
-  const title = addon ? addonTitle(addon) : "Questions";
-  const n = addon ? addonLabels.value[addon.id]?.count ?? 0 : openQuestionCount.value;
-  const label = pinnedLabel(title, n, !!addon);
+  const id = addon ? addonTab(addon.id) : prs ? PRS_TAB : QUESTIONS_TAB;
+  const title = addon ? addonTitle(addon) : prs ? "PRs to merge" : "Questions";
+  const n = addon ? addonLabels.value[addon.id]?.count ?? 0 : prs ? waitingPrCount.value : openQuestionCount.value;
+  const label = prs ? `PRs to merge, ${n} waiting` : pinnedLabel(title, n, !!addon);
   const menu: MenuItem[] = [
     { label: "Split right", disabled: tabsInGroup < 2, run: () => A.splitWithTab(id, "right") },
     { label: "Split down", disabled: tabsInGroup < 2, run: () => A.splitWithTab(id, "bottom") },
     { label: "Zoom group", keys: "Alt+Z", run: () => { A.focusGroup(paneId); A.zoomToggle(); } },
     { label: "Fullscreen", icon: <IconMaximize size={14} />, keys: "Alt+Shift+Z", run: () => A.toggleFullscreen(id) },
     "sep",
-    { label: addon ? "Hide" : "Hide Questions tab", keys: "Alt+W", run: () => addon ? A.showAddon(addon.id, false) : A.hideQuestionsTab() },
+    { label: addon ? "Hide" : prs ? "Hide PRs to merge tab" : "Hide Questions tab", keys: "Alt+W",
+      run: () => addon ? A.showAddon(addon.id, false) : prs ? A.hidePrsTab() : A.hideQuestionsTab() },
   ];
   if (addon) menu.splice(4, 0, { label: "Reload", icon: <IconRestart size={14} />, run: () =>
     reloadAddonFrame(document.querySelector<HTMLIFrameElement>(`iframe[data-addon-tab="${id}"]`)) });
   return (
-    <div class={cx("tab", addon ? "addon-tab" : "questions-tab", active && "active", active && focused && "focused",
+    <div class={cx("tab", addon ? "addon-tab" : prs ? "prs-tab" : "questions-tab", active && "active", active && focused && "focused",
       drag.value?.sid === id && "dragging")}
       role="tab" aria-selected={active} aria-label={label} tabIndex={active ? 0 : -1}
       data-tab-sid={id} data-addon={addon?.id} data-tip={label}
       // A press without a drag is a click; screen readers' Activate sends only the click.
-      onPointerDown={(e) => startTabDrag(e, { id, kind: addon ? "addon" : "questions" }, title, () => {})}
+      onPointerDown={(e) => startTabDrag(e, { id, kind: addon ? "addon" : prs ? "prs" : "questions" }, title, () => {})}
       onClick={() => A.revealSession(id)}
       onContextMenu={(e) => { e.preventDefault(); openMenu({ x: e.clientX, y: e.clientY, items: menu }); }}>
       <TabIcon index={index} focused={focused}>{addon ? <KitIcon name={addon.icon} /> : <IconPin size={13} />}</TabIcon>

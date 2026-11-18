@@ -221,7 +221,7 @@ type LinkPart = Exclude<TextPart, string>;
 
 /** Follow a link from a card: a Muster link shows what it names in this window, a web link opens
  * in the browser. */
-function openLink(url: string) {
+export function openLink(url: string) {
   const link = parseMusterLink(url);
   if (link) A.showLink(link);
   else globalThis.open(url, "_blank", "noopener,noreferrer");
@@ -233,7 +233,7 @@ function openLink(url: string) {
  * load the address itself. `inButton`: inside an option's button, where a link can't be a control
  * of its own: it looks like one, a click on it follows it instead of choosing the option, and the
  * keyboard reaches it among the card's links (`optionLinks`). */
-function LinkedText({ text, inButton = false }: { text: string; inButton?: boolean }) {
+export function LinkedText({ text, inButton = false }: { text: string; inButton?: boolean }) {
   const parts = markdownLinks(text);
   if (!parts.some((p) => typeof p !== "string")) return <>{text}</>;
   return <>{parts.map((p, i) => (typeof p === "string" ? p : <InlineLink key={i} part={p} inButton={inButton} />))}</>;

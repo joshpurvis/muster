@@ -521,6 +521,27 @@ Every change (posted, answered, taken back, withdrawn, a delivery moving on) emi
 recording an answer from chat are MCP tools only (each runs as the calling session, with its
 guards); the human's own answer is `question.answer`, from the window.
 
+## Pull requests to merge
+
+Pull request cards agents posted for the human to merge (`src/prs.rs`; the agents' side is
+docs/MCP.md "Pull requests to merge"; the window's side is docs/UI.md "PRs to merge"). Stored in
+the `prs` table (migration v31), one JSON record per card; the row id is its number (P<id>).
+Desktop client token only: devices have no `pr.*` methods and get no `pr_upserted` events (the
+phone doesn't show the tab).
+
+| Method | Params | Result |
+|---|---|---|
+| `pr.list` | `{}` | `{prs: [...]}`: the open cards (waiting, merging, stale) and the 50 merged or closed ones that changed last, each as `pr.get` returns it. Withdrawn cards and those the human asked changes on are left out. |
+| `pr.get` | `{id}` | The card: what the agent posted (`repo`, `number`, `head_sha`, `summary`, `who_notices`, `pictures`, `tests`, `undo`, `after_merge`, `details`, `poster`, `post`), its `status` (`waiting`, `merging`, `merged`, `stale`, `changes_asked`, `withdrawn`, `closed`), Muster's last read of GitHub (`github`: state, draft, head, base, mergeable, title, url, author, size, checks counted; `verdict`: the four rules, each `pass`, `fail`, `warn`, `wait` or `none`, `ok` and `reason`; `read_error` when the last read failed), `refused` (the last Merge that didn't merge: `reason`, `github_said`), `merge` (the click: `at`, `sha`, `done_at`, `commit`), `later`, `changes`, `closed`, and each message to the poster's `delivery` (not its words). |
+| `pr.picture` | `{id, post, index}` (from 0) | `{src, caption}`: Muster's own copy of picture `index` of post `post` (the one the window shows; another post is refused, "look at it again") as a `data:` URI, read as `question.picture` reads one. |
+| `pr.refresh` | `{id?, force?}` | Reads GitHub again (`gh pr view`): card `id`, else every waiting, stale and changes-asked card (the last only to close it when GitHub has), each at most once a minute (with `force`, Check again: every 3 seconds), one read of a card at a time and four at once, whichever windows ask. A read older than what the card holds is dropped. With `id` it answers once that read is in; without, at once (the reads' results come as `pr_upserted`). A new head marks a waiting card stale and tells its poster once; the old head back makes it waiting again; a pull request closed, or merged by something other than this card, closes the card; a merge of exactly the commit this card's click sent to GitHub (`merge.sent_at`), whose result Muster never read back, makes it merged. A read that fails is kept in `read_error` beside the last good one. Returns what `pr.get` (with `id`) or `pr.list` returns. |
+| `pr.merge` | `{id, sha, base, post}` | The card, `merging`, at once; the result comes as `pr_upserted`: `merged` (with `merge.commit`), or back to `waiting` (or `stale`, `closed`) with `refused` (`unknown: true` when Muster asked GitHub but couldn't confirm the result). **Only a click in Muster's window** (the WebSocket checks of `question.answer`: the UI's origin, a claimed window, no `from_session`, a program outside every session); refused from `/api/rpc`, the CLI, a device and any other WebSocket. `sha`, `base`, `post`: the commit, base branch and post the human saw; anything else is refused. Claimed in one transaction (status `merging`; a second click or another window is refused), then: read GitHub again, refuse unless every rule passes, the base is still `base`, GitHub's address is still this repo and number, and it doesn't merge through a merge queue (`gh api graphql`: `isMergeQueueEnabled`, `isInMergeQueue`); record `merge.sent_at`; `gh pr merge <n> --repo=<repo> --merge --match-head-commit=<head_sha>` (60 s at most); read it back (up to three reads, 2 s apart). A restart while it runs reads GitHub at the next start: merged by this click (the write was sent), the card is merged and the poster told; otherwise it waits again: `refused.unknown` and the poster told so when the write had been sent, else `refused.not_told`. Only a merge that was under way when the backend started is treated so. The window's 5 second countdown runs before this call; nothing is sent until it ends, and not at all from a window that isn't connected then. |
+| `pr.ask_changes` | `{id, post, words}` (1 to 4000 characters) | The card, `changes_asked`: the human's words go to the poster (sender `human`). Click only, as `pr.merge`. Only for a waiting or stale card, and only for the post the human saw. |
+| `pr.later` | `{id, post, later: bool}` | The card, set aside ("Not now": `later` is when) or back. Click only, as `pr.merge`; only for the post the human saw. |
+
+Every change (posted, read, merged, refused, stale, withdrawn, a message to the poster moving on)
+emits `pr_upserted` with the card as `pr.get` returns it. Posting and withdrawing are MCP tools only.
+
 ## Schedules
 
 Recurring and one-off messages to a named agent (`src/schedules/`, docs/SCHEDULING_PLAN.md

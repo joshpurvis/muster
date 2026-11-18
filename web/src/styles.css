@@ -163,6 +163,10 @@
   --font-mono: "JetBrains Mono", "Fira Code", "Cascadia Code", "SF Mono", Menlo, ui-monospace, monospace;
   --r: 6px;
   --r-lg: 10px;
+  /* A fill white text reads on at 4.8:1 in both themes (white on --accent is 3.3:1 in dark):
+     the PRs tab's Merge button. */
+  --accent-fill: #6d5ce8;
+  --accent-fill-hover: #5a48d8;
   --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
   --t: 140ms;
   --status-h: 22px;
@@ -6577,4 +6581,177 @@ fieldset.sch-then > legend {
 
 @media (prefers-reduced-motion: no-preference) {
   .qv-row, .qv-opt, .qv-chip, .qv-btn { transition: background-color 120ms, border-color 120ms; }
+}
+
+/* ---- PRs to merge (docs/UI.md "PRs to merge"): one pull request fills the tab, pictures first; a
+   dock at the bottom holds what Muster read from GitHub (the four rules) and Merge. Shares the
+   Questions tab's pieces (qv-*); pm-* are its own, pb-* its layout. ---- */
+.prs-tab .tab-icon { color: var(--text-muted); }
+.prs-view .mono { font-family: var(--font-mono); font-size: 0.92em; }
+/* A pill's mark: the rules' glyphs, in the state's colour (never colour alone). */
+.pm-mark { display: inline-block; width: 12px; margin-right: 5px; text-align: center; font-weight: 700; font-size: 12px;
+  color: var(--ok-text); flex: none; }
+.pm-mark.none { color: var(--text-faint); font-weight: 400; }
+.pm-mark.run { color: var(--st-working); }
+.pm-mark.bad { color: var(--error-text); }
+.pm-mark.warn { color: var(--warn-text); }
+.pm-tag { font-size: 11px; font-weight: 600; padding: 1px 6px; border-radius: 4px; white-space: nowrap; background: var(--bg-3);
+  color: var(--text-muted); }
+.pm-tag.ok { background: var(--add-bg); color: var(--ok-text); }
+.pm-tag.warn { background: var(--attn-bg); color: var(--warn-text); box-shadow: inset 0 0 0 1px var(--attn-border); }
+.pm-tag.bad { background: var(--del-bg); color: var(--error-text); }
+.pm-row .qv-sub { padding-left: 0; }
+.pm-row .qv-top .pm-tag { margin-left: auto; flex: none; align-self: center; }
+
+.pm-pairs { display: grid; gap: 18px; margin: 2px 0 18px; }
+.pm-pair { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; align-items: start; }
+.pm-pair.solo { grid-template-columns: minmax(0, calc(50% - 8px)); }
+.pm-fig { margin: 0; min-width: 0; }
+.pm-side { display: flex; align-items: center; gap: 6px; font-size: 11px; font-weight: 600; letter-spacing: 0.04em;
+  text-transform: uppercase; color: var(--text-faint); margin-bottom: 5px; }
+.pm-side.after { color: var(--accent-strong); }
+.pm-side .pm-old { text-transform: none; letter-spacing: 0; }
+.pm-shot { display: block; width: 100%; padding: 0; border: 1px solid var(--border-strong); border-radius: 8px; overflow: hidden;
+  background: #f4f5f8; cursor: zoom-in; }
+/* A tall picture (a phone screen) never fills more than most of the pane: the large view shows it whole. */
+.pm-shot img { display: block; width: 100%; height: auto; max-height: min(60vh, 560px); object-fit: contain; }
+.pm-fig .qv-shot-missing { max-width: none; }
+.pm-fig figcaption { margin-top: 6px; font-size: 12px; color: var(--text-faint); }
+
+.pm-h { font-size: 11px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: var(--text-faint); }
+.pm-add { color: var(--add); font-family: var(--font-mono); font-size: 12px; }
+.pm-del { color: var(--del); font-family: var(--font-mono); font-size: 12px; }
+:root[data-theme="light"] .pm-add { color: var(--ok-text); }
+:root[data-theme="light"] .pm-del { color: var(--error-text); }
+.pm-warn-text { color: var(--warn-text); }
+
+.pm-words { border-left: 2px solid var(--border-strong); padding: 1px 0 1px 12px; margin: 0 0 16px; max-width: 66ch; }
+.pm-words .pm-h { margin-bottom: 6px; }
+.pm-words .qv-fate { border-top: 0; padding-top: 0; }
+.pm-only { color: var(--warn-text); font-size: 11.5px; display: block; margin-top: 1px; }
+.prs-view .qv-details .pm-details-text { font-family: var(--font-ui); font-size: 12px; }
+
+.pm-banner { border: 1px solid var(--attn-border); background: var(--attn-bg); border-radius: 8px; padding: 10px 14px 11px;
+  margin: 6px 0 16px; max-width: 66ch; }
+.pm-banner b { display: block; font-size: 14px; font-weight: 600; color: var(--warn-text); margin-bottom: 2px; }
+.pm-banner span { color: var(--text-muted); font-size: 12.5px; line-height: 1.5; }
+.pm-banner.refused { border-color: var(--border-strong); border-left: 3px solid var(--st-error); background: var(--del-bg); }
+.pm-banner.refused b { color: var(--error-text); }
+.pm-banner.wait, .pm-banner.closed { border-color: var(--border-strong); background: var(--bg-1); }
+.pm-banner.wait b, .pm-banner.closed b { color: var(--text); }
+
+/* Merge names its target on the button. Off: a flat grey that reads as switched off, not as a
+   dimmed live button. */
+.prs-view .qv-btn.pm-merge { height: 36px; padding: 0 16px 0 12px; }
+.prs-view .qv-btn.pm-merge:disabled { background: var(--bg-3); border-color: var(--border-strong); color: var(--text-faint); opacity: 1; }
+.prs-view .qv-btn.pm-merge:not(:disabled) { background: var(--accent-fill); border-color: var(--accent-fill); color: #fff; }
+.prs-view .qv-btn.pm-merge:not(:disabled):hover { background: var(--accent-fill-hover); border-color: var(--accent-fill-hover); }
+.pm-merge svg { width: 15px; height: 15px; flex: none; }
+.pm-target { font-size: 12px; line-height: 1.35; color: var(--text-faint); }
+.pm-drain { position: absolute; left: 0; right: 0; top: -1px; height: 3px; background: var(--border-strong); }
+.pm-drain i { display: block; height: 100%; background: var(--accent); }
+@media (prefers-reduced-motion: no-preference) {
+  .pm-drain i { transition: width 1s linear; }
+}
+.prs-view .qv-btn.pm-cancel { height: 36px; justify-content: center; font-weight: 600; background: var(--bg-2); border-color: var(--text-faint); }
+.pm-ask { display: flex; flex-direction: column; gap: 6px; }
+.pm-ask label { font-size: 12px; color: var(--text-muted); }
+.pm-ask textarea { min-height: 62px; resize: vertical; font: 13.5px/1.45 var(--font-ui); color: var(--text); background: var(--bg-2);
+  border: 1px solid var(--border-strong); border-radius: 8px; padding: 7px 10px; }
+.pm-ask textarea::placeholder { color: var(--text-faint); }
+.pm-ask textarea:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.prs-view .qv-btn.pm-send:not(:disabled) { background: var(--accent-fill); border-color: var(--accent-fill); color: #fff; }
+.prs-view .qv-btn.pm-send:not(:disabled):hover { background: var(--accent-fill-hover); border-color: var(--accent-fill-hover); }
+/* Ask for changes and Not now keep their places while Merge counts down, out of sight and reach. */
+.pm-held { visibility: hidden; }
+
+/* The large view: before and after drawn in the same box, so switching flips them in place; on a
+   solid ground, so its words read in both themes and nothing of the tab shows through. */
+.pm-lightbox { cursor: default; background: var(--bg-1); }
+.pm-box-text { color: var(--text-muted); font-size: 12px; }
+.pm-box-text.pm-cap { color: var(--text); font-size: 13px; }
+.pm-zoomed { width: min(100%, 1400px); height: calc(100vh - 170px); display: flex; align-items: center; justify-content: center;
+  flex: none; }
+.pm-zoomed img { max-width: 100%; max-height: 100%; object-fit: contain; border-radius: 8px; box-shadow: var(--shadow); background: #f4f5f8; }
+.pm-box-bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; justify-content: center; }
+.pm-box-bar .qv-btn { background: var(--bg-2); }
+.pm-seg { display: inline-flex; border: 1px solid var(--border-strong); border-radius: 7px; overflow: hidden; background: var(--bg-2); }
+.pm-seg button { height: 30px; padding: 0 12px; color: var(--text-muted); font-weight: 500; }
+.pm-seg button.on { background: var(--accent-soft); color: var(--text); box-shadow: inset 0 0 0 1px var(--accent); border-radius: 6px; }
+.pm-seg button:disabled { opacity: 0.45; cursor: default; }
+
+.pb-strip { flex: none; display: flex; gap: 4px; padding: 7px 14px; border-bottom: 1px solid var(--border); overflow-x: auto;
+  background: var(--bg-1); }
+.pb-pill { flex: none; height: 28px; padding: 0 10px; border-radius: 7px; border: 1px solid transparent; color: var(--text-muted);
+  display: inline-flex; align-items: center; white-space: nowrap; font-size: 12.5px; }
+.pb-pill:hover { background: var(--hover); }
+.pb-pill .qv-qn { margin-right: 6px; }
+.pb-pill.on { background: var(--bg-2); border-color: var(--border-strong); color: var(--text); box-shadow: inset 0 -2px 0 var(--accent); }
+.pb-pill.done, .pb-pill.later { opacity: 0.75; }
+.pb-pager { margin-left: auto; display: flex; align-items: center; gap: 4px; flex: none; }
+.pb-pager button { height: 26px; min-width: 26px; padding: 0 9px; border-radius: 6px; white-space: nowrap;
+  border: 1px solid var(--border-strong); color: var(--text-muted); font-size: 12px; }
+.pb-pager button:hover { background: var(--hover); }
+.pb-menu { position: absolute; z-index: 20; right: 14px; top: 4px; width: 360px; max-width: calc(100% - 28px);
+  background: var(--bg-overlay); border: 1px solid var(--border-strong); border-radius: var(--r-lg); box-shadow: var(--shadow);
+  overflow: hidden; }
+.pb-menu { max-height: calc(100% - 8px); display: flex; flex-direction: column; }
+.pb-menu .qv-list { width: 100%; border: 0; background: none; min-height: 0; overflow-y: auto; }
+.pb-wrap { position: relative; flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.pb-scroll { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; }
+.pb-stage { flex: 1 0 auto; width: 100%; max-width: 1080px; margin: 0 auto; padding: 20px 28px 4px; }
+.pb-dock { position: sticky; bottom: 0; background: var(--bg-1); border-top: 1px solid var(--border-strong); padding: 9px 28px 12px; }
+.pb-dock-in { max-width: 1024px; margin: 0 auto; display: grid; grid-template-columns: 1fr auto; gap: 7px 24px; align-items: end; }
+.pb-dock-in.pb-one { grid-template-columns: 1fr; }
+.pb-dock-h { grid-column: 1 / -1; display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; font-size: 12px;
+  color: var(--text-faint); min-height: 20px; line-height: 20px; }
+.pb-dock-h .what { color: var(--text-muted); }
+.pb-dock-h .qv-link:disabled { color: var(--text-faint); cursor: default; }
+.pb-ticks { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(2, minmax(0, max-content));
+  gap: 3px 26px; font-size: 12.5px; color: var(--text); }
+.pb-ticks li { display: flex; gap: 7px; align-items: baseline; min-width: 0; }
+.pb-ticks li::before { content: "✓"; color: var(--ok-text); font-weight: 700; width: 12px; flex: none; text-align: center; }
+.pb-ticks li.no::before { content: "✕"; color: var(--error-text); }
+.pb-ticks li.no { color: var(--error-text); }
+.pb-ticks li.warn::before { content: "!"; color: var(--warn-text); }
+.pb-ticks li.warn { color: var(--warn-text); }
+.pb-ticks li.none::before { content: "○"; color: var(--text-faint); font-weight: 400; }
+.pb-ticks li.run::before { content: "…"; color: var(--st-working); }
+.pb-ticks li.run { color: var(--text-muted); }
+.pb-reading { margin: 0; font-size: 12.5px; color: var(--text-muted); }
+.pb-btns { display: flex; gap: 8px; align-items: center; justify-content: flex-end; flex-wrap: wrap; }
+.pb-btns.pb-start { justify-content: flex-start; }
+.pb-fine { grid-column: 1 / -1; font-size: 12px; color: var(--text-faint); display: flex; gap: 14px; flex-wrap: wrap; }
+.pb-fine.pb-end { grid-column: auto; }
+.pb-fine .qv-links { margin-left: auto; }
+.pb-dock.counting { box-shadow: inset 0 0 0 999px var(--accent-softer); }
+.pb-big { font-size: 15px; line-height: 20px; font-weight: 600; font-variant-numeric: tabular-nums; color: var(--text); }
+/* The idle rows' contents, kept in place (hidden while it counts down) under the countdown's words. */
+.pm-idle { display: flex; flex-wrap: wrap; gap: inherit; align-items: baseline; flex: 1 1 100%; min-width: 0; }
+.pb-dock-h, .pb-fine { position: relative; }
+.pm-over { position: absolute; left: 0; right: 0; top: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pm-over-small { font-size: 12px; font-weight: 400; color: var(--text-muted); margin-left: 8px; }
+.pb-fine .pm-over { color: var(--text-muted); }
+.pb-dock .pm-cancel { min-width: 236px; height: 36px; }
+/* A short pane: the dock ends the card instead of covering it. */
+.prs-view.short .pb-dock { position: static; }
+.prs-view.narrow .pb-stage { padding: 14px 16px 4px; }
+.prs-view.narrow .pb-dock { padding: 9px 16px 12px; }
+.prs-view.narrow .pb-dock-in { grid-template-columns: 1fr; }
+.prs-view.narrow .pb-btns { justify-content: stretch; }
+.prs-view.narrow .pb-btns .qv-btn { flex: 1; justify-content: center; height: 40px; }
+.prs-view.narrow .pb-btns .pm-merge, .prs-view.narrow .pb-btns .pm-cancel { flex: 1 0 100%; order: -1; min-width: 0; }
+.prs-view.narrow .pb-fine .qv-links { margin-left: 0; }
+.prs-view.narrow .pb-menu { right: 8px; }
+.prs-view.narrow .pb-ticks { display: flex; flex-wrap: wrap; gap: 2px 14px; }
+.prs-view.narrow .pb-fine .pm-fine-text { display: none; }
+.prs-view.narrow .pb-dock-h .pm-h { display: none; }
+.prs-view.narrow .pm-ask-hint { flex-basis: 100%; }
+.prs-view.narrow .pm-pair { gap: 12px; }
+.prs-view.narrow .pm-pair.solo { grid-template-columns: minmax(0, calc(50% - 6px)); }
+.prs-view.narrow .qv-fate > div { grid-template-columns: 1fr; gap: 0; }
+.prs-view.narrow .qv-fate > div > span:first-child { margin-top: 4px; }
+.prs-view.narrow .qv-q { font-size: 19px; }
+@media (prefers-reduced-motion: no-preference) {
+  .pb-pill { transition: background-color 120ms, border-color 120ms; }
 }

@@ -392,6 +392,61 @@ human"); the **Questions** tab is where the human sees and answers them (`web/sr
 - Later steps add the key sheet and one-key answers, Later and Skip, filters by product and age,
   find, one question at a time, and pasting a picture into an answer.
 
+### PRs to merge
+
+Agents that want a pull request merged post a card for it (docs/MCP.md "Pull requests to merge");
+the **PRs to merge** tab is where the human looks at it and merges it with a click
+(`web/src/components/PrsView.tsx`, `web/src/prs.ts`, `web/src/prs_model.ts`). Muster's own code
+merges, never a model.
+
+- **The tab**: one per window, in whichever channel is shown, placed, moved, remembered per channel
+  and hidden like an add-on tab (pinned key `prs` in the saved layout). Pin icon, "PRs to merge" and
+  the number waiting in an amber badge. Shown while a card waits, or one was merged or closed in the
+  last day, and the human hasn't hidden it; its menu (and Alt+W) **Hide PRs to merge tab**; the
+  palette's **PRs to merge** shows it again. Not on the phone.
+- **Reading GitHub**: Muster reads every waiting card's pull request when the tab is shown and every
+  2 minutes while it is (never in the background), and the card's **Check again** reads it now.
+- **Layout**: a bar with **Waiting N**, **Merged N** and **All N with titles ▾** (a list grouped
+  **Ready to merge**, **Can't merge yet**, **Not now**, oldest first in each; Esc or the keyboard
+  leaving it closes it); a strip of pills, one per pull request, each with a mark for its state (✓
+  ready, ○ no checks or set aside, … checks running, ! new commits, ✕ refused or a failed check; a set-aside
+  pill is dimmed; ← and → move between them); then one
+  card fills the tab: repo, number, poster and when it was posted, the title as GitHub has it, a
+  banner when its state has one, what changes, **Who notices**, the pictures (before beside after,
+  in posting order), **<agent>'s words** (the tests it ran, how to undo it, what comes after the
+  merge: marked as the agent's claim, not Muster's reading) and **Details** (the full commit, the
+  agent's details, GitHub's words, the picture paths, the exact merge command).
+- **The dock** (at the bottom, always in view): **Read from GitHub by Muster** with when, **Check
+  again** and the size; the four rules (open and not a draft; the commit the agent posted; fits onto
+  the base without conflicts; checks), each with a mark (✓ ✕ ! … ○), never colour alone; **Ask for
+  changes**, **Not now** and **Merge <owner/repo> #<n>** (the target always on the button). Merge is
+  off, with why, unless the last read passes every rule and no refusal stands. In a pane under 620px
+  tall the dock ends the card instead of staying at the bottom.
+- **Merge**: a click (a real pointer click) or Ctrl+Enter on the focused button starts a 5 second
+  countdown: the dock keeps its layout, says **Merging in N s**, the target and the commit, and
+  **Cancel** takes Merge's exact place (a double click lands on Cancel). Cancel, Esc anywhere in the
+  tab, opening a picture or the list, leaving the card, hiding the tab or the window cancels; nothing is sent
+  until the countdown ends, and nothing at all if the window has lost its connection then. Then
+  `pr.merge`: "Asking GitHub to merge", and the card ends merged ("<repo> #<n> is in master as commit
+  abc1234", whether its poster was told, with **Next waiting** at the dock's other end), refused (a
+  red banner with why and GitHub's first line; Merge off until a read passes), or "Not known yet"
+  when Muster asked GitHub but couldn't confirm the result (Check again settles it). Plain Enter and
+  Space on Merge do nothing; Merge ignores clicks for 0.6 s after its card appears or changes, a
+  Cancel, a reorder, or the large view or list closing. There is no other shortcut for it.
+- **Stale**: when GitHub's newest commit isn't the one posted, the card says **Changed since it was
+  posted: new commits**, its pictures are marked "older version", Merge is off, and the poster is
+  told to post it again.
+- **Ask for changes**: the dock becomes a box for your words (Ctrl+Enter sends; Esc or **Back**
+  returns); they go to the poster and the card leaves the list until it is posted again. **Not now**
+  moves it down the list and shows the next waiting card; on a card set aside the button reads
+  **Undo Not now**.
+- **Pictures**: a tall picture is shown at most 60% of the window high; click (or Enter) for the
+  large view, on a solid ground with the rest of the tab out of reach: **Before | After** flips the
+  pair in place, ← and → step through before 1, after 1, before 2…, Esc or a click outside the
+  picture closes.
+- **Narrow** (under 760px): the pictures stay side by side, smaller; the dock stacks, Merge full
+  width.
+
 ### Links
 
 Agents mention a note, panel, tab or agent to the human by its title, as a link that shows it

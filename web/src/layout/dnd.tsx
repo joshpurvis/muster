@@ -24,7 +24,7 @@ export interface Target {
 interface DragState {
   sid: number;
   label: string;
-  kind: SessionInfo["kind"] | "panel" | "note" | "questions" | "addon";
+  kind: SessionInfo["kind"] | "panel" | "note" | "questions" | "prs" | "addon";
   x: number;
   y: number;
   target: Target | null;
@@ -50,7 +50,7 @@ export function startTabDrag(e: PointerEvent, s: { id: number; kind: DragState["
       document.body.classList.add("dragging");
     }
     ev.preventDefault();
-    const groupsOnly = (s.kind === "questions" || s.kind === "addon");
+    const groupsOnly = s.kind === "questions" || s.kind === "prs" || s.kind === "addon";
     const win = groupsOnly ? null : windowTarget(ev.clientX, ev.clientY);
     const row = groupsOnly ? null : document.elementFromPoint(ev.clientX, ev.clientY)?.closest<HTMLElement>("[data-channel-id]");
     const channel = row ? Number(row.dataset.channelId) : null;
@@ -229,7 +229,7 @@ function Ghost({ x, y, kind, label }: { x: number; y: number; kind: DragState["k
   return (
     <div ref={ref} class="drag-ghost" style={{ left: left + "px", top: top + "px" }}>
       {kind === "panel" ? <IconPanel size={13} /> : kind === "note" ? <IconNote size={13} />
-        : (kind === "questions" || kind === "addon") ? <IconPin size={13} /> : <KindIcon kind={kind} size={13} />}
+        : (kind === "questions" || kind === "prs" || kind === "addon") ? <IconPin size={13} /> : <KindIcon kind={kind} size={13} />}
       <span>{label}</span>
     </div>
   );

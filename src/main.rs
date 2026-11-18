@@ -39,6 +39,8 @@ mod renderer;
 mod replay_tail;
 mod pty;
 mod questions;
+mod prs;
+mod relay;
 mod rpc;
 mod schedules;
 mod self_handoff;
@@ -1953,10 +1955,13 @@ async fn daemon_main(openrouter_key: Option<openrouter::ApiKey>, launch: Option<
         let unfinished = agent_reply::unfinished(&hub);
         // Answers to questions for the human likewise (src/questions.rs).
         let answers = questions::unfinished(&hub);
+        // Pull request cards likewise: a merge a restart cut off, results on their way (src/prs.rs).
+        let cards = prs::unfinished(&hub);
         tokio::spawn(async move {
             agents::autostart(&hub).await;
             agent_reply::resume(&hub, unfinished).await;
             questions::resume(&hub, answers).await;
+            prs::resume(&hub, cards).await;
         });
     }
     // Schedules: finish runs a previous backend left, then fire on time (src/schedules/); the

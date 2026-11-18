@@ -1054,6 +1054,74 @@ at a set time (`area` is kept: merges, money, public and customer DNS will never
 delivering into a fresh start for an asker gone cold (`asker_now.cold` is the signal), answers
 for one agent sent together, and a one-line copy to the lead.
 
+### Pull requests to merge
+
+An agent that wants a pull request merged posts a card for it and carries on. The human sees every
+waiting card in the pinned **PRs to merge** tab of Muster's window (docs/UI.md "PRs to merge") and
+merges with a click there; Muster's own code does the merge, never a model. Code: `src/prs.rs`.
+
+| Tool | Arguments | Result |
+|---|---|---|
+| `post_pr` | `repo` (OWNER/NAME on GitHub), `number`, `head_sha` (the full 40-character id of the commit to merge, as pushed), `summary`, `who_notices`, `tests`, `undo`, `after_merge`, `details?`, `pictures?: [{path, caption, side: "before" \| "after"}]` | `{card: "P<n>", repo, number, head_sha, status: "waiting", replaced, result_goes_to, note}`, at once: posting never calls GitHub. Refused, with every problem listed: a repo that isn't OWNER/NAME, a number outside 1 to 2^53, a `head_sha` that isn't 40 hex digits, no `summary` (20 to 600 characters), `who_notices` (10 to 300), `tests` (10 to 1000), `undo` (10 to 500) or `after_merge` (5 to 500), unknown fields. Pictures: at most 6, absolute paths (no control characters, not a symlink) of png, jpg, gif, webp or svg files, an image by their content, 8 MiB each and 24 MiB in all, each with a one-line caption and its side; Muster copies them into its data directory (`prs/<card>/<post>/`) when the card is posted, so a later rebuild in the agent's folder can't change what the human sees. At most 20 open cards per poster and 100 in all. |
+| `withdraw_pr` | `repo`, `number`, `reason` (5 to 500 characters) | `{card, repo, number, status: "withdrawn"}`. Only its poster (a named agent across its restarts and fresh starts, else the same session), or once that poster has ended (a session) or was removed (a named agent) what started it; only while the card is open and not being merged. A withdrawn card's pictures are deleted. |
+
+Both share the post rate limit with `post_question` and the note and panel writes. Every call is
+audited (`mcp_call`).
+
+**One card per pull request.** A pull request has one open card (waiting, being merged, stale, or
+changes asked; repo names ignore case). Posting the same repo and number again replaces it,
+keeping its number: the new commit, words and pictures, and what Muster read of the old one starts
+over. Only the card's poster posts it again (or, once that poster has ended or was removed, the session
+or named agent that started it, which is where its messages went); nobody does while it is being
+merged. The new post's pictures are written before it replaces the old one: if they can't be, nothing
+changes.
+
+**What Merge does.** Only a click in Muster's window merges (docs/PROTOCOL.md "Pull requests to
+merge"): no MCP tool, CLI command or `/api/rpc` call does. On the click Muster reads the pull request
+from GitHub again (`gh pr view <n> --repo <repo> --json …`) and refuses unless all four rules pass:
+it is open, not a draft and auto-merge isn't on for it; GitHub's newest commit is `head_sha`; it
+doesn't conflict with its base (GitHub still working that out doesn't refuse on its own); and no
+GitHub check failed or is still running (a check run passes when completed with success, neutral or
+skipped, a status when success; anything else counts as failed; no checks at all passes). A reply
+missing any of those fields refuses too. It also refuses when the base branch isn't the one the
+human saw, when GitHub knows the pull request by another repo name now, and when it merges through
+a merge queue (GitHub's `isMergeQueueEnabled` for it, the question gh itself asks: there gh would
+queue it or turn on auto-merge instead of merging, and GitHub would merge it later its own way) or
+GitHub doesn't answer that. Then the one write: `gh pr merge <n> --repo=<repo> --merge
+--match-head-commit=<head_sha>`: a merge commit, never squash or rebase, never `--auto`, `--admin` or
+`--delete-branch` (GitHub still deletes the branch if the repo is set to delete merged branches);
+GitHub itself refuses if the head moved in between. Then it reads the pull request back. `gh` runs
+from Muster's own data directory with the human's GitHub login.
+
+**Messages to the poster.** Each is stored on the card first, then delivered as an answer to a
+question is (docs/MCP.md "Questions for the human", "Delivery"): to the posting agent by name, also
+after a restart or a fresh start, else the session that posted, else its lead; a restart finishes
+one on its way. They start:
+- `Merge result for <repo> #<n>: merged.`: the commit merged, the merge commit, and the card's own
+  `after_merge`, to do now.
+- `Merge result for <repo> #<n>: not merged: <reason>.`: why (with the first line of GitHub's words
+  when it said something, without gh's suggestions of other flags). Nothing was merged; don't merge it
+  yourself; post the card again once it is fixed.
+- `Merge result for <repo> #<n>: not known yet: <reason>.`: Muster asked GitHub to merge but couldn't
+  confirm the result (gh timed out, the read back failed, or GitHub accepted it and left it open). It
+  may still merge: don't push to the branch or merge it yourself; if Muster's next read finds it
+  merged, the `merged` message follows.
+- `Changed since you posted it:`: GitHub's newest commit isn't `head_sha` (the agent pushed again).
+  Merge is off until the card is posted again with the new commit and new pictures. Sent once per
+  post, with the poster's own provenance from when it posted (no click caused it), and only to the
+  poster itself: never on to a lead once the poster has ended. The results of the human's click go
+  as the human's own (origin human, hop 0). Each message's recipient and provenance are fixed when
+  it is written, so a later post of the card doesn't redirect one still on its way.
+- After a restart during a merge whose write had gone to GitHub, the poster gets the `not known yet`
+  message (and `merged` once a read finds it merged); a merge cut off before the write isn't
+  mentioned to it.
+- `Changes asked on <repo> #<n>:`: the human's own words (sender `human`); the card left the list
+  until it is posted again.
+
+Each ends with the card's number, when and by whom it was posted, the commit, what it changes and its
+`after_merge`, so an agent whose conversation was restarted since can act on it, and a line
+`(Muster's note <k> on card P<n>.)`.
+
 ### Permissions
 
 Each channel has a permission profile the human sets in the UI (`channel.set_permissions`, see

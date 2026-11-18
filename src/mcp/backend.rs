@@ -26,6 +26,10 @@ pub trait Backend: Send + Sync + 'static {
     fn question_tool(&self, _caller: SessionId, _name: &str, _args: serde_json::Value) -> impl Future<Output = anyhow::Result<serde_json::Value>> + Send {
         async { anyhow::bail!("questions unavailable in this backend") }
     }
+    /// Pull requests for the human to merge (src/prs.rs).
+    fn pr_tool(&self, _caller: SessionId, _name: &str, _args: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        anyhow::bail!("pull request cards unavailable in this backend")
+    }
     /// Persistent application guard state; absent in pure protocol fixtures.
     fn guard_store(&self) -> Option<crate::store::Store> { None }
     fn session_by_token(&self, token: &str) -> Option<SessionId>;
@@ -119,6 +123,9 @@ impl Backend for HubBackend {
     }
     async fn question_tool(&self, caller: SessionId, name: &str, args: serde_json::Value) -> anyhow::Result<serde_json::Value> {
         crate::questions::tool(&self.0, caller, name, args).await
+    }
+    fn pr_tool(&self, caller: SessionId, name: &str, args: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        crate::prs::tool(&self.0, caller, name, args)
     }
     fn guard_store(&self) -> Option<crate::store::Store> { Some(self.0.store().clone()) }
     fn session_by_token(&self, token: &str) -> Option<SessionId> {

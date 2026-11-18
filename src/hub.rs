@@ -99,6 +99,9 @@ pub enum ServerEvent {
     /// A question for the human was posted, answered, taken back, withdrawn, or its answer's
     /// delivery moved on (`questions::view`, whole). The desktop window's Questions tab.
     QuestionUpserted(serde_json::Value),
+    /// A pull request card was posted, read from GitHub, merged, refused, withdrawn, or a message
+    /// to its poster moved on (`prs::view`). The desktop window's PRs to merge tab.
+    PrUpserted(serde_json::Value),
     /// A paired device's phone-alert subscription or its delivery status changed (src/push.rs).
     /// Sent only to that device's own connections, which ask `push.status` again.
     PushChanged {

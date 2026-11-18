@@ -1,7 +1,7 @@
 // A window contains independently tiled channels. The split-tree reducers remain unchanged;
 // this envelope owns channel selection and the shared sidebar. Zero is the Notes fallback for
 // old, unassigned notes in a window with no channels (never a backend channel id).
-import { addonTab } from "./tree.ts";
+import { addonTab, PRS_TAB } from "./tree.ts";
 import {
   allPanes, allSessions, emptyLayout, FIRST_PLACE, findPane, generalPlace, type LayoutState, parseLayout,
   parseTabPlace, placeBeside, placeOf, putAt, QUESTIONS_TAB, reconcile, removeSession, sameGeneralPlace,
@@ -246,9 +246,9 @@ export function loadChannelLayout(raw: unknown, channels: number[], tabs: TabHom
     }
     const pinned: Record<string, PinnedPlace> = {};
     if (obj.pinned && typeof obj.pinned === "object") for (const [key, value] of Object.entries(obj.pinned)) {
-      if (!/^addon:[a-z0-9][a-z0-9-]{0,39}$/.test(key) || !value || typeof value !== "object") continue;
+      if ((key !== "prs" && !/^addon:[a-z0-9][a-z0-9-]{0,39}$/.test(key)) || !value || typeof value !== "object") continue;
       const p = value as PinnedPlace;
-      const tab = addonTab(key.slice(6));
+      const tab = key === "prs" ? PRS_TAB : addonTab(key.slice(6));
       const at = parseTabPlace(p.at);
       const within: Record<string, TabPlace> = {};
       if (p.in && typeof p.in === "object") for (const [channel, raw] of Object.entries(p.in)) {

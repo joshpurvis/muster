@@ -3,10 +3,13 @@
 //! many sequential `gh` calls: independent calls run in parallel here, without the model, and
 //! the JSON fits the `pr_overview` and `pr_decision` panels.
 //!
-//! Nothing here writes to GitHub. `gh` and `curl` run as child processes with an argument
-//! vector, never through a shell; only the validated OWNER/NAME, the PR number and SHAs read
-//! from GitHub reach their command lines. PR text (titles, bodies, branch names, file names,
-//! URLs) is only ever data in the output. Works without a running daemon.
+//! Also `Gh`, the PRs tab's reads and its one write (src/prs.rs): `gh pr view` of one PR, and
+//! `gh pr merge --merge --match-head-commit`, which runs only after the human's click in Muster's
+//! window. Nothing else here writes to GitHub. `gh` and `curl` run as child processes with an
+//! argument vector, never through a shell; only the validated OWNER/NAME, the PR number and SHAs
+//! (read from GitHub, or checked as 40 hex digits) reach their command lines. PR text (titles,
+//! bodies, branch names, file names, URLs) is only ever data in the output. `muster pr` works
+//! without a running daemon.
 
 use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
@@ -258,7 +261,23 @@ struct Captured {
 /// `overflow`) and killing it after `timeout`. stdin is closed, or gets `input` and is then
 /// closed (how secrets reach a child without showing in its argv, `/proc/*/cmdline`).
 fn capture(program: &OsStr, args: &[String], input: Option<&[u8]>, timeout: Duration, max_out: usize) -> std::io::Result<Captured> {
-    let mut child = Command::new(program)
+    capture_in(program, args, None, input, timeout, max_out)
+}
+
+/// [`capture`], run in directory `cwd` when given.
+fn capture_in(program: &OsStr, args: &[String], cwd: Option<&Path>, input: Option<&[u8]>, timeout: Duration, max_out: usize)
+    -> std::io::Result<Captured> {
+    use std::os::unix::process::CommandExt;
+    let mut cmd = Command::new(program);
+    if let Some(dir) = cwd {
+        // The daemon's `gh` (src/prs.rs): its own process group, so a timeout ends whatever it
+        // started too (a child still holding its output open would otherwise keep this waiting
+        // past the timeout). `muster pr` in a terminal keeps the terminal's group, so Ctrl+C
+        // still reaches its children.
+        cmd.current_dir(dir).process_group(0);
+    }
+    let own_group = cwd.is_some();
+    let mut child = cmd
         .args(args)
         .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
@@ -298,12 +317,29 @@ fn capture(program: &OsStr, args: &[String], input: Option<&[u8]>, timeout: Dura
         if let Some(s) = child.try_wait()? { break Some(s) }
         if overflow.load(Ordering::SeqCst) || Instant::now() >= deadline {
             timed_out = !overflow.load(Ordering::SeqCst);
+            if own_group {
+                // SAFETY: a plain kill(2) of the process group this child leads.
+                unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL); }
+            }
             let _ = child.kill();
             let _ = child.wait();
             break None;
         }
         std::thread::sleep(Duration::from_millis(4));
     };
+    // The daemon's gh: its output closes when everything it started is done; something it left
+    // running and holding its output is ended at the deadline, so the timeout holds.
+    if own_group && status.is_some() {
+        while !(out_t.is_finished() && err_t.is_finished()) {
+            if Instant::now() >= deadline {
+                // SAFETY: a plain kill(2) of the process group the child led.
+                unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL); }
+                timed_out = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(4));
+        }
+    }
     let stdout = out_t.join().unwrap_or_default();
     let stderr = err_t.join().unwrap_or_default();
     if let Some(t) = in_t { let _ = t.join(); }
@@ -490,15 +526,119 @@ impl Tools {
     }
 }
 
+// ----- the PRs tab (src/prs.rs) -----
+
+/// The fields `Gh::view` asks for.
+pub const VIEW_FIELDS: &str =
+    "state,isDraft,headRefOid,baseRefName,mergeable,mergeStateStatus,statusCheckRollup,title,url,author,additions,deletions,changedFiles,mergeCommit,number,autoMergeRequest";
+/// Under the window's 30 s RPC timeout, so Check again answers before the window gives up.
+const VIEW_TIMEOUT: Duration = Duration::from_secs(20);
+/// `gh pr merge` gets this long (it also waits for GitHub to finish the merge).
+pub const MERGE_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_VIEW_OUTPUT: usize = 4 << 20;
+
+/// `gh` for the PRs tab: `view` reads one pull request, `merge` merges it. Blocking: run it on a
+/// blocking thread. `cwd` is a directory of Muster's own, so `gh` never picks up a repository
+/// from wherever the daemon was started; `--repo` names the one it acts on.
+#[derive(Debug, Clone)]
+pub struct Gh {
+    pub program: OsString,
+    pub cwd: PathBuf,
+    pub view_timeout: Duration,
+    pub merge_timeout: Duration,
+}
+
+/// A PR number and SHA fit for a command line: 1 to 2^53, and 40 lowercase hex digits.
+fn pr_args_ok(repo: &str, number: u64) -> Result<(), GhError> {
+    if split_repo(repo).is_none() { return Err(GhError::Other(format!("not OWNER/NAME: {repo:?}"))) }
+    if !(1..=1 << 53).contains(&number) { return Err(GhError::Other(format!("not a pull request number: {number}"))) }
+    Ok(())
+}
+
+impl Gh {
+    pub fn new(program: impl Into<OsString>, cwd: PathBuf) -> Gh {
+        Gh { program: program.into(), cwd, view_timeout: VIEW_TIMEOUT, merge_timeout: MERGE_TIMEOUT }
+    }
+
+    fn run(&self, what: &str, args: Vec<String>, timeout: Duration) -> Result<Vec<u8>, GhError> {
+        self.run_timed(what, args, timeout).map_err(|(e, _)| e)
+    }
+
+    /// [`Gh::run`]; the error's flag: gh was killed at the timeout (it may have done its work).
+    fn run_timed(&self, what: &str, args: Vec<String>, timeout: Duration) -> Result<Vec<u8>, (GhError, bool)> {
+        let c = capture_in(&self.program, &args, Some(&self.cwd), None, timeout, MAX_VIEW_OUTPUT).map_err(|e|
+            (if e.kind() == std::io::ErrorKind::NotFound { GhError::Missing } else { GhError::Other(format!("running gh: {e}")) }, false))?;
+        if c.timed_out { return Err((GhError::Other(format!("{what}: gh took longer than {} s", timeout.as_secs())), true)) }
+        if c.overflow { return Err((GhError::Other(format!("{what}: gh's reply is larger than {} MiB", MAX_VIEW_OUTPUT >> 20)), false)) }
+        if c.code == Some(0) { return Ok(c.stdout) }
+        Err((match classify(what, None, c.code, &String::from_utf8_lossy(&c.stderr)) {
+            GhErr::Missing => GhError::Missing,
+            GhErr::Auth(d) => GhError::NotSignedIn(d),
+            GhErr::RateLimited(d, _) | GhErr::NotFound(d) | GhErr::Failed(d) | GhErr::TooLarge(d) => GhError::Other(d),
+        }, false))
+    }
+
+    /// `gh pr view <number> --repo=<repo> --json=VIEW_FIELDS`: GitHub's own JSON, unchanged.
+    pub fn view(&self, repo: &str, number: u64) -> Result<Value, GhError> {
+        pr_args_ok(repo, number)?;
+        let what = format!("reading {repo} #{number}");
+        let out = self.run(&what, vec!["pr".into(), "view".into(), number.to_string(), format!("--repo={repo}"),
+            format!("--json={VIEW_FIELDS}")], self.view_timeout)?;
+        let v: Value = serde_json::from_slice(&out).map_err(|e| GhError::Other(format!("{what}: gh's reply is not JSON: {e}")))?;
+        if !v.is_object() { return Err(GhError::Other(format!("{what}: gh's reply is not a pull request"))) }
+        Ok(v)
+    }
+
+    /// Whether pull request `repo` #`number` merges through a merge queue (`isMergeQueueEnabled`,
+    /// what gh itself asks before a merge: there `gh pr merge` queues it or turns on auto-merge
+    /// instead of merging), and whether it is in one now. A reply without both is an error.
+    pub fn queue(&self, repo: &str, number: u64) -> Result<(bool, bool), GhError> {
+        pr_args_ok(repo, number)?;
+        let (owner, name) = split_repo(repo).expect("checked");
+        let what = format!("reading whether {repo} #{number} merges through a merge queue");
+        let out = self.run(&what, vec!["api".into(), "graphql".into(), "-f".into(), format!("query={QUEUE_Q}"),
+            "-f".into(), format!("owner={owner}"), "-f".into(), format!("name={name}"), "-F".into(), format!("number={number}")],
+            self.view_timeout)?;
+        let v: Value = serde_json::from_slice(&out).map_err(|e| GhError::Other(format!("{what}: gh's reply is not JSON: {e}")))?;
+        let pr = v.pointer("/data/repository/pullRequest");
+        match (pr.and_then(|p| p.get("isMergeQueueEnabled")).and_then(Value::as_bool),
+            pr.and_then(|p| p.get("isInMergeQueue")).and_then(Value::as_bool)) {
+            (Some(enabled), Some(queued)) => Ok((enabled, queued)),
+            _ => Err(GhError::Other(format!("{what}: GitHub's reply doesn't say"))),
+        }
+    }
+
+    /// The one write: `gh pr merge <number> --repo=<repo> --merge --match-head-commit=<sha>`. A
+    /// merge commit (never squash or rebase), the branch kept (no `--delete-branch`), never
+    /// `--auto` or `--admin`; GitHub itself refuses if the head is no longer `sha`. Ok means gh
+    /// exited 0, not that it merged: the caller reads the pull request again. The error's flag: gh
+    /// was killed at the timeout, so it may have merged.
+    pub fn merge(&self, repo: &str, number: u64, sha: &str) -> Result<(), (GhError, bool)> {
+        pr_args_ok(repo, number).map_err(|e| (e, false))?;
+        if !sha_ok(sha) { return Err((GhError::Other(format!("not a commit id: {sha:?}")), false)) }
+        self.run_timed(&format!("merging {repo} #{number}"), merge_args(repo, number, sha), self.merge_timeout).map(|_| ())
+    }
+}
+
+/// `gh pr merge`'s arguments (one place, so a test can see every flag).
+pub fn merge_args(repo: &str, number: u64, sha: &str) -> Vec<String> {
+    vec!["pr".into(), "merge".into(), number.to_string(), format!("--repo={repo}"), "--merge".into(),
+        format!("--match-head-commit={sha}")]
+}
+
+/// `Gh::queue`'s question (variables, never text in the query).
+const QUEUE_Q: &str = "query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { \
+    pullRequest(number: $number) { isMergeQueueEnabled isInMergeQueue } } }";
+
 fn s<'a>(v: &'a Value, k: &str) -> &'a str { v.get(k).and_then(Value::as_str).unwrap_or("") }
 fn n(v: &Value, k: &str) -> u64 { v.get(k).and_then(Value::as_u64).unwrap_or(0) }
 fn login(v: &Value) -> String {
     v.get("author").and_then(|a| a.get("login")).and_then(Value::as_str).filter(|l| !l.is_empty()).unwrap_or("ghost").to_string()
 }
 
-fn sha_ok(sha: &str) -> bool { sha.len() == 40 && sha.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)) }
+pub fn sha_ok(sha: &str) -> bool { sha.len() == 40 && sha.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)) }
 
-fn https_url(u: &str) -> Option<&str> {
+pub(crate) fn https_url(u: &str) -> Option<&str> {
     (u.starts_with("https://") && u.len() > 8 && u.len() <= 2000 && !u.chars().any(|c| c.is_control() || c.is_whitespace()) && !u[8..].split('/').next().unwrap_or("").contains('@'))
         .then_some(u)
 }

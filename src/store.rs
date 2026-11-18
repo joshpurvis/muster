@@ -580,6 +580,27 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX questions_status ON questions(status, id);
     "#,
+    // v31: pull requests for the human to merge (src/prs.rs). The id is the card's number (P<id>);
+    // `record` is the whole card as JSON (its GitHub read, merge and messages to the poster
+    // included); `status`, the poster's ids and the pull request are copied out for queries. A
+    // pull request has one open card at a time (`prs_open`): posting it again replaces that card.
+    // `repo` is lowercase (GitHub's names ignore case). An older backend never reads the table.
+    r#"
+    CREATE TABLE prs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        status TEXT NOT NULL,
+        poster_agent INTEGER,
+        poster_session INTEGER NOT NULL,
+        repo TEXT NOT NULL,
+        number INTEGER NOT NULL,
+        head_sha TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        record TEXT NOT NULL
+    );
+    CREATE INDEX prs_status ON prs(status, id);
+    CREATE UNIQUE INDEX prs_open ON prs(repo, number) WHERE status IN ('waiting', 'merging', 'stale', 'changes_asked');
+    "#,
 ];
 
 /// The first non-blank line of `head`, trimmed, at most 120 characters (a note's preview).
@@ -1190,6 +1211,142 @@ impl Store {
         tx.execute("INSERT INTO sqlite_sequence(name, seq) VALUES ('questions', ?1)", [first - 1])?;
         tx.commit()?;
         Ok(true)
+    }
+
+    // ----- pull requests to merge (src/prs.rs) -----
+
+    /// Where card `id`'s pictures are kept (copied there when it is posted).
+    pub fn pr_dir(&self, id: i64) -> std::path::PathBuf { self.directory.join("prs").join(id.to_string()) }
+
+    /// The directory gh runs in for the PRs tab: Muster's own, never a repository.
+    pub fn prs_root(&self) -> std::path::PathBuf { self.directory.join("prs") }
+
+    fn row_pr(id: i64, record: &str) -> anyhow::Result<crate::prs::Pr> {
+        let mut p: crate::prs::Pr = serde_json::from_str(record).with_context(|| format!("pull request card {id}"))?;
+        p.id = id;
+        Ok(p)
+    }
+
+    /// Post card `new`, in one transaction: when its pull request has an open card already,
+    /// `replace` decides (it gets that card and returns the card that takes its place, keeping
+    /// its id, or a refusal); else it is stored as a new card unless its poster has `per_poster`
+    /// open or `all` are open. `write` gets the card as stored (its id known) before the
+    /// transaction commits; its error stores nothing. Returns the stored card and whether it
+    /// replaced one.
+    pub fn post_pr(&self, new: &crate::prs::Pr, per_poster: usize, all: usize,
+        replace: impl FnOnce(&crate::prs::Pr) -> Result<crate::prs::Pr, crate::prs::PostRefusal>,
+        write: impl FnOnce(&crate::prs::Pr) -> anyhow::Result<()>)
+        -> anyhow::Result<Result<(crate::prs::Pr, bool), crate::prs::PostRefusal>> {
+        use crate::prs::{OPEN_STATUSES, PostRefusal};
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let open = OPEN_STATUSES.iter().map(|s| format!("'{}'", s.as_str())).collect::<Vec<_>>().join(", ");
+        let repo = new.repo.to_ascii_lowercase();
+        let have: Option<(i64, String)> = tx.query_row(
+            &format!("SELECT id, record FROM prs WHERE repo = ?1 AND number = ?2 AND status IN ({open})"),
+            params![repo, new.number as i64], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+        if let Some((id, raw)) = have {
+            let before = Self::row_pr(id, &raw)?;
+            let mut after = match replace(&before) {
+                Ok(p) => p,
+                Err(why) => return Ok(Err(why)),
+            };
+            after.id = id;
+            after.updated_at = now_ms().max(before.updated_at + 1);
+            tx.execute("UPDATE prs SET status = ?2, poster_agent = ?3, poster_session = ?4, head_sha = ?5, updated_at = ?6,
+                record = ?7 WHERE id = ?1",
+                params![id, after.status.as_str(), after.poster.agent_id, after.poster.session_id, after.head_sha,
+                    after.updated_at, serde_json::to_string(&after)?])?;
+            write(&after)?;
+            tx.commit()?;
+            return Ok(Ok((after, true)));
+        }
+        let mine = format!("status IN ({open}) AND ((?1 IS NOT NULL AND poster_agent = ?1)
+            OR (?1 IS NULL AND poster_agent IS NULL AND poster_session = ?2))");
+        let n: i64 = tx.query_row(&format!("SELECT COUNT(*) FROM prs WHERE {mine}"),
+            params![new.poster.agent_id, new.poster.session_id], |r| r.get(0))?;
+        if n as usize >= per_poster {
+            return Ok(Err(PostRefusal::PosterFull(n as usize)));
+        }
+        let n: i64 = tx.query_row(&format!("SELECT COUNT(*) FROM prs WHERE status IN ({open})"), [], |r| r.get(0))?;
+        if n as usize >= all {
+            return Ok(Err(PostRefusal::Full(n as usize)));
+        }
+        tx.execute("INSERT INTO prs(status, poster_agent, poster_session, repo, number, head_sha, created_at, updated_at, record)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![new.status.as_str(), new.poster.agent_id, new.poster.session_id, repo, new.number as i64, new.head_sha,
+                new.created_at, new.updated_at, serde_json::to_string(new)?])?;
+        let mut stored = new.clone();
+        stored.id = tx.last_insert_rowid();
+        write(&stored)?;
+        tx.commit()?;
+        Ok(Ok((stored, false)))
+    }
+
+    pub fn pr(&self, id: i64) -> anyhow::Result<Option<crate::prs::Pr>> {
+        let raw: Option<String> = self.conn.lock()
+            .query_row("SELECT record FROM prs WHERE id = ?1", [id], |r| r.get(0)).optional()?;
+        raw.map(|r| Self::row_pr(id, &r)).transpose()
+    }
+
+    /// The open card of pull request `repo` #`number`, if any.
+    pub fn open_pr(&self, repo: &str, number: u64) -> anyhow::Result<Option<crate::prs::Pr>> {
+        let open = crate::prs::OPEN_STATUSES.iter().map(|s| format!("'{}'", s.as_str())).collect::<Vec<_>>().join(", ");
+        let row: Option<(i64, String)> = self.conn.lock().query_row(
+            &format!("SELECT id, record FROM prs WHERE repo = ?1 AND number = ?2 AND status IN ({open})"),
+            params![repo.to_ascii_lowercase(), number as i64], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+        row.map(|(id, r)| Self::row_pr(id, &r)).transpose()
+    }
+
+    /// Cards with one of `statuses`, the newest `limit` by when they last changed, oldest first.
+    pub fn prs(&self, statuses: &[crate::prs::Status], limit: usize) -> anyhow::Result<Vec<crate::prs::Pr>> {
+        let list = statuses.iter().map(|s| format!("'{}'", s.as_str())).collect::<Vec<_>>().join(", ");
+        let conn = self.conn.lock();
+        let mut st = conn.prepare(&format!(
+            "SELECT id, record FROM prs WHERE status IN ({list}) ORDER BY updated_at DESC, id DESC LIMIT ?1"))?;
+        let rows = st.query_map([limit as i64], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, record) = row?;
+            match Self::row_pr(id, &record) {
+                Ok(p) => out.push(p),
+                Err(e) => tracing::warn!("skipping a pull request card that doesn't read: {e:#}"),
+            }
+        }
+        out.reverse();
+        Ok(out)
+    }
+
+    /// Change card `id` with `edit`, read and written in one transaction (so two clicks can't both
+    /// start a merge). An error from `edit` changes nothing. Returns the card after.
+    pub fn update_pr<T>(&self, id: i64, edit: impl FnOnce(&mut crate::prs::Pr) -> anyhow::Result<T>)
+        -> anyhow::Result<(crate::prs::Pr, T)> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let raw: Option<String> = tx.query_row("SELECT record FROM prs WHERE id = ?1", [id], |r| r.get(0)).optional()?;
+        let raw = raw.with_context(|| format!("no pull request card P{id}"))?;
+        let before = Self::row_pr(id, &raw)?;
+        let mut after = before.clone();
+        let out = edit(&mut after)?;
+        if after != before {
+            // Strictly increasing: the window keeps the newest copy of a card by it.
+            after.updated_at = now_ms().max(before.updated_at + 1);
+            tx.execute("UPDATE prs SET status = ?2, head_sha = ?3, updated_at = ?4, record = ?5 WHERE id = ?1",
+                params![id, after.status.as_str(), after.head_sha, after.updated_at, serde_json::to_string(&after)?])?;
+            tx.commit()?;
+        }
+        Ok((after, out))
+    }
+
+    /// Cards a previous backend left unfinished: a merge under way, or a message to the poster
+    /// not yet delivered.
+    pub fn unfinished_prs(&self) -> anyhow::Result<Vec<i64>> {
+        let conn = self.conn.lock();
+        let mut st = conn.prepare("SELECT id FROM prs WHERE status = 'merging' OR EXISTS (
+            SELECT 1 FROM json_each(prs.record, '$.outbox') o
+            WHERE json_extract(o.value, '$.delivery.status') IN ('pending', 'delivering')) ORDER BY id")?;
+        let rows = st.query_map([], |r| r.get(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
     }
 
     // ----- agents -----

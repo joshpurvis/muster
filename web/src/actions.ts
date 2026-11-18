@@ -80,11 +80,13 @@ import {
   accountProfiles,
   accountProfilesSupported,
   questionsShown,
+  prsShown,
 } from "./state.ts";
 import { drawerHeight, folderChannel, rememberPlace, type TerminalDrawerState } from "./layout/channels.ts";
 import type { ScheduleOverlay } from "./state.ts";
 import * as native from "./native.ts";
-import { noteId, noteTab, panelId, panelTab, QUESTIONS_TAB } from "./layout/tree.ts";
+import { isAddonTab, noteId, noteTab, panelId, panelTab, PRS_TAB, QUESTIONS_TAB } from "./layout/tree.ts";
+import { prs, prsFilter, prsSupported, selectedPr, worthShowing } from "./prs.ts";
 import { openQuestionCount, questions, questionsFilter, questionsSupported, selectedQuestion } from "./questions.ts";
 import { flushAllDrafts, flushDraft, knowNote, notes, persistAllDrafts, unsavedNotes } from "./notes.ts";
 import type { HelloResult, Note } from "./types.ts";
@@ -522,6 +524,35 @@ export function hideQuestionsTab() {
   focusActiveTerminalSoon();
 }
 
+/** Show the PRs to merge tab (shown again if it was hidden), on the waiting cards, or on card `id`. */
+export function openPrsTab(id?: number) {
+  if (!prsSupported.value) return toast("info", "This Muster has no PRs to merge tab yet: restart it after updating");
+  const s = channelLayout.peek();
+  if (!s || activeChannelId.peek() === null) return toast("info", "Open a channel first: the PRs to merge tab sits in its tab strip");
+  if (s.pinned?.prs?.hidden) {
+    const { hidden: _, ...pin } = s.pinned.prs;
+    channelLayout.value = { ...s, pinned: { ...s.pinned, prs: pin } };
+  }
+  if (!worthShowing(prs.value.values(), Date.now())) {
+    return toast("info", "No pull requests are waiting for you. The tab shows when an agent posts one for your merge", 5000);
+  }
+  if (id !== undefined) {
+    selectedPr.value = id;
+    prsFilter.value = prs.value.get(id)?.status === "merged" ? "merged" : "waiting";
+  }
+  exitFullscreen(false);
+  if (prsShown.peek()) revealSession(PRS_TAB);
+}
+
+/** Hide the PRs to merge tab in this window (the palette's "PRs to merge" shows it again). */
+export function hidePrsTab() {
+  const s = channelLayout.peek();
+  if (!s) return;
+  channelLayout.value = { ...s, pinned: { ...s.pinned, prs: { ...(s.pinned?.prs ?? { tab: PRS_TAB }), hidden: true } } };
+  toast("info", "PRs to merge tab hidden. \"PRs to merge\" in the palette shows it again", 5000);
+  focusActiveTerminalSoon();
+}
+
 export function showAddon(id: string, show = true) {
   if (show && activeChannelId.peek() === null) return toast("info", "Open a channel first to show this add-on tab");
   const s = channelLayout.peek();
@@ -552,8 +583,9 @@ export function focusActiveTerminalSoon() {
         const note = tab === null ? null : noteId(tab);
         if (id !== null) document.querySelector<HTMLIFrameElement>(`iframe[data-panel-id="${id}"]`)?.focus();
         else if (note !== null) document.querySelector<HTMLTextAreaElement>(`textarea[data-note-id="${note}"]`)?.focus();
-        else if (tab !== null && tab < QUESTIONS_TAB) document.querySelector<HTMLIFrameElement>(`iframe[data-addon-tab="${tab}"]`)?.focus();
-        else if (tab === QUESTIONS_TAB) document.querySelector<HTMLElement>(".questions-view")?.focus();
+        else if (tab !== null && isAddonTab(tab)) document.querySelector<HTMLIFrameElement>(`iframe[data-addon-tab="${tab}"]`)?.focus();
+        else if (tab === QUESTIONS_TAB) document.querySelector<HTMLElement>(".questions-view:not(.prs-view)")?.focus();
+        else if (tab === PRS_TAB) document.querySelector<HTMLElement>(".prs-view")?.focus();
       }
     })
   );
@@ -604,7 +636,7 @@ export function toggleFullscreen(tab: SessionId | null = focusedTabId.value) {
   // A note's editor and the Questions tab keep Esc too (text boxes in them use it).
   const note = noteId(tab) !== null || isPinnedTab(tab);
   const terminal = panelId(tab) === null && !note;
-  toast("info", tab < QUESTIONS_TAB ? "Fullscreen. Use the Exit fullscreen button to go back."
+  toast("info", isAddonTab(tab) ? "Fullscreen. Use the Exit fullscreen button to go back."
     : terminal ? "Fullscreen. Alt+Shift+Z goes back (Esc stays with the terminal)"
     : note ? "Fullscreen. Alt+Shift+Z goes back" : "Fullscreen. Esc or Alt+Shift+Z goes back", 2500, "fullscreen");
   if (terminal || note) focusActiveTerminalSoon();
@@ -924,6 +956,7 @@ export function splitFocused(side: Side, kind: SessionKind = "shell") {
 export function closeTab(sid: SessionId, force = false) {
   // The Questions tab hides (questions stay; the palette shows it again).
   if (sid === QUESTIONS_TAB) return hideQuestionsTab();
+  if (sid === PRS_TAB) return hidePrsTab();
   const addon = addons.value.find((a) => addonTab(a.id) === sid);
   if (addon) return showAddon(addon.id, false);
   const nid = noteId(sid);

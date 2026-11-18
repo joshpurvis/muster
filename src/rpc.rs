@@ -284,6 +284,35 @@ async fn dispatch_inner(hub: &Arc<Hub>, who: &Principal, method: &str, params: V
             let p: P = parse(params)?;
             Ok(crate::questions::picture(hub, p.id, p.index)?)
         }
+        // Pull requests for the human to merge (docs/PROTOCOL.md "Pull requests to merge"): reads
+        // here (the human's client reads every card; devices have no `pr.*`), plus `pr.refresh`,
+        // which reads GitHub again. Posting and withdrawing are MCP tools only.
+        "pr.list" => {
+            require_local(who, method)?;
+            Ok(crate::prs::list(hub)?)
+        }
+        "pr.get" => {
+            require_local(who, method)?;
+            let p: IdParam<i64> = parse(params)?;
+            Ok(crate::prs::get(hub, p.id)?)
+        }
+        "pr.picture" => {
+            require_local(who, method)?;
+            #[derive(Deserialize)] #[serde(deny_unknown_fields)]
+            struct P { id: i64, post: u32, index: usize }
+            let p: P = parse(params)?;
+            Ok(crate::prs::picture(hub, p.id, p.post, p.index)?)
+        }
+        "pr.refresh" => {
+            require_local(who, method)?;
+            #[derive(Deserialize)] #[serde(deny_unknown_fields)]
+            struct P { #[serde(default)] id: Option<i64>, #[serde(default)] force: bool }
+            let p: P = parse(params)?;
+            Ok(crate::prs::refresh(hub, crate::prs::gh(hub), p.id, p.force).await?)
+        }
+        // Merging, asking for changes and setting aside: only a click in Muster's window
+        // (`pr_from_window`), never the CLI, `/api/rpc` or a script, so no agent can merge.
+        "pr.merge" | "pr.ask_changes" | "pr.later" => Err(RpcError(crate::prs::MERGE_BY_CLICK.into())),
         // Add-on registration and forwarding belong to the window (docs/ADDONS.md).
         "addon.save" | "addon.remove" | "addon.message" => Err(RpcError(crate::addon::BY_WINDOW.into())),
         "addon.list" => {
@@ -1693,6 +1722,42 @@ pub async fn question_from_window(hub: &Arc<Hub>, who: &Principal, conn: u64, li
     })
 }
 
+/// `pr.merge` (`{id, sha, base, post}`: the card, and the commit, base branch and post the human
+/// saw), `pr.ask_changes` (`{id, post,
+/// words}`) and `pr.later` (`{id, post, later}`): only with a click in the human's own window
+/// (`from_window`), never from the CLI, `/api/rpc`, a script, a device or a session. Muster merges
+/// only after this, with its own code (src/prs.rs).
+pub async fn pr_from_window(hub: &Arc<Hub>, who: &Principal, conn: u64, link: &WsLink, method: &str, params: Value)
+    -> RpcResult {
+    require_local(who, method)?;
+    // Any `from_session` at all (whatever its type) is a call made on a session's behalf.
+    let from = params.get("from_session").map(|v| v.as_u64().unwrap_or(0) as SessionId);
+    from_window(hub, who, conn, link, from).await.map_err(|why| RpcError(format!("{} ({why})", crate::prs::MERGE_BY_CLICK)))?;
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct M { id: i64, sha: String, base: String, post: u32 }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct A { id: i64, post: u32, words: String }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct L { id: i64, post: u32, later: bool }
+    Ok(match method {
+        "pr.merge" => {
+            let p: M = parse(params)?;
+            crate::prs::merge(hub, crate::prs::gh(hub), p.id, &p.sha, &p.base, p.post)?
+        }
+        "pr.ask_changes" => {
+            let p: A = parse(params)?;
+            crate::prs::ask_changes(hub, p.id, p.post, &p.words).await?
+        }
+        _ => {
+            let p: L = parse(params)?;
+            crate::prs::later(hub, p.id, p.post, p.later)?
+        }
+    })
+}
+
 /// `schedule.approve`, the owner approving an agent's proposal or a schedule made or changed
 /// outside the window: only a click in the owner's window (`from_window`), never the CLI or
 /// `/api/rpc` (`dispatch` refuses it). `seen`: the schedule's `updated_at` the owner looked at;
@@ -1732,7 +1797,7 @@ fn forwarded(own_device: Option<i64>, ev: &ServerEvent) -> bool {
             | ServerEvent::PanelUpserted(_) | ServerEvent::PanelRemoved { .. }
             | ServerEvent::AddonsChanged { .. }
             | ServerEvent::NoteUpserted(_) | ServerEvent::NoteRemoved { .. }
-            | ServerEvent::QuestionUpserted(_)
+            | ServerEvent::QuestionUpserted(_) | ServerEvent::PrUpserted(_)
         )
 }
 
@@ -2482,6 +2547,14 @@ async fn handle_request(
             let (hub, who, resp, link) = (hub.clone(), who.clone(), resp.clone(), link.clone());
             tokio::spawn(async move {
                 let r = question_from_window(&hub, &who, conn, &link, &req.method, req.params).await;
+                let _ = resp.send(Message::Text(response(&req.id, r).to_string().into())).await;
+            });
+        }
+        // Merging a pull request: only a click in a UI window (see `pr_from_window`).
+        "pr.merge" | "pr.ask_changes" | "pr.later" => {
+            let (hub, who, resp, link) = (hub.clone(), who.clone(), resp.clone(), link.clone());
+            tokio::spawn(async move {
+                let r = pr_from_window(&hub, &who, conn, &link, &req.method, req.params).await;
                 let _ = resp.send(Message::Text(response(&req.id, r).to_string().into())).await;
             });
         }

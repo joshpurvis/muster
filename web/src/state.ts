@@ -4,7 +4,7 @@
 
 import { addons, addonRevision, type AddonRegistry } from "./addons.ts";
 import { loadedFramePolicy, needsFramePolicyReload } from "./frame_policy.ts";
-import { addonTab, isPinnedTab } from "./layout/tree.ts";
+import { addonTab, isPinnedTab, PRS_TAB } from "./layout/tree.ts";
 import { batch, computed, effect, signal } from "@preact/signals";
 import type {
   AccountProfile,
@@ -34,6 +34,7 @@ import { rpc } from "./rpc.ts";
 import { sessionSizeChanged } from "./terms.ts";
 import { applyNoteRemoved, applyNotesHello, applyNoteUpsert, notes, notesSupported, restoreDrafts } from "./notes.ts";
 import { applyQuestion, loadQuestions, openQuestionCount, questionsSupported, refreshForMessage } from "./questions.ts";
+import { applyPr, loadPrs, minuteClock, prs, prsSupported, worthShowing } from "./prs.ts";
 import { debounce, load, save } from "./util.ts";
 import { upsertMessage } from "./agents.ts";
 import { newerRun, upsertRun } from "./schedules.ts";
@@ -135,6 +136,7 @@ export const windowNotes = computed(() => [...notes.value.values()].filter((n) =
 export const hereIds = computed(() => new Set([
   ...windowSessions.value.map((s) => s.id), ...windowPanels.value.map((p) => panelTab(p.id)),
   ...windowNotes.value.map((n) => noteTab(n.id)), ...(questionsShown.value ? [QUESTIONS_TAB] : []), ...shownAddons.value.map((a) => addonTab(a.id)),
+  ...(prsShown.value ? [PRS_TAB] : []),
 ]));
 
 // ---------------- updates, shared window prefs, shutdown ----------------
@@ -566,6 +568,12 @@ export const questionsShown = computed(() =>
   questionsSupported.value && channelLayout.value !== null && channelLayout.value.questions !== false &&
   activeChannelId.value !== null
 );
+/** The PRs to merge tab is in this window: the backend has pull request cards, one waits (or one
+ * was merged or closed in the last day), and the human didn't hide it (docs/UI.md "PRs to merge"). */
+export const prsShown = computed(() =>
+  prsSupported.value && channelLayout.value !== null && activeChannelId.value !== null &&
+  !channelLayout.value.pinned?.prs?.hidden && worthShowing(prs.value.values(), minuteClock.value)
+);
 export const shownAddons = computed(() => channelLayout.value && activeChannelId.value !== null
   ? addons.value.filter((a) => !channelLayout.value?.pinned?.[`addon:${a.id}`]?.hidden) : []);
 const vacantLayout = emptyLayout();
@@ -715,6 +723,7 @@ const liveTabs = computed((): TabHome[] => {
     // human last put it.
     ...(questionsShown.value ? [{ id: QUESTIONS_TAB, channel: shown, questions: true }] : []),
     ...shownAddons.value.map((a) => ({ id: addonTab(a.id), channel: shown, pinned: `addon:${a.id}` })),
+    ...(prsShown.value ? [{ id: PRS_TAB, channel: shown, pinned: "prs" }] : []),
   ].filter((t) => !held.value.has(t.id));
 });
 
@@ -767,7 +776,8 @@ effect(() => {
   const tabs = liveTabs.peek();
   const keep = tabs.some((t) => t.questions) ? [] : [{ id: QUESTIONS_TAB, channel: null, questions: true, kept: true }];
   const addonKeep = addons.peek().map((a) => ({ id: addonTab(a.id), channel: null, pinned: `addon:${a.id}`, kept: true }));
-  const stored = loadChannelLayout(w?.layout, windowChannels.peek().map((c) => c.id), [...tabs, ...keep, ...addonKeep]);
+  const prsKeep = tabs.some((t) => t.id === PRS_TAB) ? [] : [{ id: PRS_TAB, channel: null, pinned: "prs", kept: true }];
+  const stored = loadChannelLayout(w?.layout, windowChannels.peek().map((c) => c.id), [...tabs, ...keep, ...addonKeep, ...prsKeep]);
   layoutOwner = owner;
   lastSaved = w?.layout ? JSON.stringify(w.layout) : "";
   clearTimeout(saveTimer);
@@ -932,6 +942,7 @@ export function applyHello(h: HelloResult) {
   });
   loadAgents();
   loadQuestions();
+  loadPrs();
   // Seed unread state with a little history per task.
   for (const c of h.channels) {
     if (c.archived) continue;
@@ -1058,6 +1069,9 @@ export function applyEvent(ev: ServerEvent) {
       break;
     case "question_upserted":
       applyQuestion(ev.data);
+      break;
+    case "pr_upserted":
+      applyPr(ev.data);
       break;
     case "schedule_upserted": {
       // An upsert carries the schedule's own last run; one recorded since (by `schedule_run`) stays.

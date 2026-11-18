@@ -21,7 +21,7 @@ pub struct ToolOutput {
 
 /// Tool names in the order `tools/list` returns them (deterministic, per spec guidance).
 #[cfg(test)]
-pub const TOOL_NAMES: [&str; 39] = [
+pub const TOOL_NAMES: [&str; 41] = [
     "request_session", "reply_session", "session_messages", "subscribe_channel", "channel_updates",
     "whoami",
     "list_channels",
@@ -41,6 +41,7 @@ pub const TOOL_NAMES: [&str; 39] = [
     "note_list", "note_read", "note_write", "note_append", "note_open",
     "list_schedules", "propose_schedule", "set_reminder", "pause_schedule", "delete_schedule",
     "post_question", "list_questions", "withdraw_question", "record_answer",
+    "post_pr", "withdraw_pr",
 ];
 
 const STATE_NAMES: [&str; 8] = [
@@ -348,7 +349,34 @@ pub fn tool_definitions() -> Vec<Value> {
             json!({"type":"object","properties":{"schedule_id":schedule_id},"required":["schedule_id"],"additionalProperties":false}), false),
     ]);
     tools.extend(question_definitions());
+    tools.extend(pr_definitions());
     tools
+}
+
+/// The pull request tools (src/prs.rs, docs/MCP.md "Pull requests to merge").
+fn pr_definitions() -> Vec<Value> {
+    let line = |max: u32, d: &str| json!({"type":"string","maxLength":max,"description":d});
+    let repo = json!({"type":"string","maxLength":201,"description":"OWNER/NAME on GitHub, e.g. acme/notes-app."});
+    let number = json!({"type":"integer","minimum":1,"description":"The pull request's number on GitHub."});
+    vec![
+        tool("post_pr", "Post a pull request for the human to merge",
+            "Put a pull request you want merged in the human's PRs to merge tab, as a card: what changes, before and after pictures, the tests you ran, how to undo it and what comes after. The human merges it there with one click, and Muster's own code merges it (never a model): it reads the pull request from GitHub again and merges only if it is open and not a draft, its newest commit is head_sha, it fits onto its base without conflicts and no GitHub check failed or is still running; then a merge commit (never squash), the branch kept. Returns at once, without calling GitHub. You get a message starting \"Merge result for <repo> #<n>\" (merged as commit X, or not and why) or \"Changes asked on\" with the human's words, by name if you are a named agent (also after a restart or fresh start), else to this session or the one that started it. Push first: if GitHub's newest commit isn't head_sha, the card goes stale, Merge is off and you are told to post it again. Posting the same repo and number again replaces your card (new commit, new pictures). Write for someone who knows the product but not the code: no file names or internal labels in summary or who_notices (put them in details). Pictures: screenshots of what changes, before and after, posted in pairs in order (first before with first after); a new page has an after alone. Muster keeps its own copy of each picture when you post. Refused, with every problem listed, without summary, who_notices, tests, undo or after_merge, or with a bad repo, number, commit id or picture. At most 20 open cards per poster.",
+            json!({"type":"object","properties":{
+                "repo":repo,
+                "number":number,
+                "head_sha":{"type":"string","minLength":40,"maxLength":40,"description":"The full 40-character id of the commit you want merged, as pushed (git rev-parse HEAD). Merge merges only this commit."},
+                "summary":line(600, "One to three plain sentences: what changes, and why it matters."),
+                "who_notices":line(300, "Who notices it, and where (\"anyone who opens Settings\")."),
+                "pictures":{"type":"array","maxItems":6,"items":{"type":"object","properties":{"path":{"type":"string","description":"Absolute path of a png, jpg, gif, webp or svg (8 MiB at most; 24 MiB for all)."},"caption":line(200, "What it shows."),"side":{"type":"string","enum":["before","after"]}},"required":["path","caption","side"],"additionalProperties":false},"description":"Before and after pictures, in pairs in this order."},
+                "tests":line(1000, "The tests you ran and their result, in your own words (the card labels it as yours)."),
+                "undo":line(500, "How to undo it if it goes wrong."),
+                "after_merge":line(500, "What has to happen after the merge and who does it, or \"nothing\"; it comes back to you with the result."),
+                "details":line(2000, "File names, the plan, review notes: shown only when the human opens the details.")
+            },"required":["repo","number","head_sha","summary","who_notices","tests","undo","after_merge"],"additionalProperties":false}), false),
+        tool("withdraw_pr", "Withdraw a pull request card",
+            "Take back the card you posted for a pull request (it is no longer meant for merging, or you will post it again later). Only its poster can, and not while the human is merging it.",
+            json!({"type":"object","properties":{"repo":repo,"number":number,"reason":line(500, "Why, in a few words.")},"required":["repo","number","reason"],"additionalProperties":false}), false),
+    ]
 }
 
 /// The question tools (src/questions.rs, docs/MCP.md "Questions for the human").
@@ -591,6 +619,7 @@ pub async fn call_tool<B: Backend>(
         "note_list" | "note_read" | "note_write" | "note_append" | "note_open" => note_tool(st, caller, name, map),
         "list_schedules" | "propose_schedule" | "set_reminder" | "pause_schedule" | "delete_schedule" => schedule_tool(st, caller, name, map),
         "post_question" | "list_questions" | "withdraw_question" | "record_answer" => question_tool(st, caller, name, map).await,
+        "post_pr" | "withdraw_pr" => pr_tool(st, caller, name, map),
         _ => return Err(()),
     };
     Ok(match res {
@@ -679,6 +708,19 @@ async fn question_tool<B: Backend>(st: &McpState<B>, caller: SessionId, name: &s
         if let Err(error) = st.edit_guard(|g| g.sends.refund(caller)) { tracing::warn!("{error}"); }
     }
     r.map(|v| pretty(&v)).map_err(|e| format!("{e:#}"))
+}
+
+/// Pull requests for the human to merge (src/prs.rs). Posting and withdrawing share the post
+/// rate limit, so a loop can't flood the human's tab.
+fn pr_tool<B: Backend>(st: &McpState<B>, caller: SessionId, name: &str, args: &Map<String, Value>) -> TResult {
+    caller_session(st, caller)?;
+    if let Err(wait_s) = st.edit_guard(|g| g.posts.check_and_record(
+        caller, now_ms(), st.limits.post_per_window, st.limits.send_window_ms,
+    ))? {
+        return Err(format!("rate limit: at most {} cards, questions, note writes or posts per minute; try again in {wait_s}s", st.limits.post_per_window));
+    }
+    st.backend.pr_tool(caller, name, Value::Object(args.clone()))
+        .map(|v| pretty(&v)).map_err(|e| format!("{e:#}"))
 }
 
 fn target_session<B: Backend>(st: &McpState<B>, id: SessionId) -> Result<SessionInfo, String> {

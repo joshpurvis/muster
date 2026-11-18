@@ -14,6 +14,7 @@ import { hiddenCharsOrSpaces, memoryFileNameError } from "../src/agents.ts";
 import { servePanelHtml } from "./build_panels.ts";
 import { scheduleMock } from "./mock_schedules.ts";
 import { questionMock } from "./mock_questions.ts";
+import { prMock } from "./mock_prs.ts";
 
 const PORT = Number(Deno.env.get("MOCK_PORT") ?? 17744);
 const TOKEN = "dev";
@@ -854,6 +855,10 @@ const questionsMock = questionMock({
   },
 });
 
+// ---------- pull requests to merge (dev/mock_prs.ts; `mock.pr_seed` puts in the sample cards) ----------
+
+const prsMock = prMock({ now, broadcast });
+
 // ---------- schedules (dev/mock_schedules.ts) ----------
 
 const sched = scheduleMock({
@@ -1456,6 +1461,7 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
   }
   if (method.startsWith("schedule.") || method.startsWith("trigger.")) return sched.handle(method, p);
   if (method.startsWith("question.") || method.startsWith("mock.question_")) return questionsMock.handle(method, p);
+  if (method.startsWith("pr.") || method.startsWith("mock.pr_")) return prsMock.handle(method, p);
   if (method.startsWith("agent.") || method.startsWith("mock.")) return agentMethod(method, p);
   if (method.startsWith("note.")) return noteMethod(method, p);
   switch (method) {

@@ -628,6 +628,83 @@ export interface SchedulePreview {
   daily_cap_default?: number;
 }
 
+// ---------------- pull requests to merge (docs/PROTOCOL.md "Pull requests to merge") ----------------
+
+export type PrStatus = "waiting" | "merging" | "merged" | "stale" | "changes_asked" | "withdrawn" | "closed";
+/** One of the four rules: passed, failed, not failed but Merge is off, GitHub still working, nothing to check. */
+export type PrMark = "pass" | "fail" | "warn" | "wait" | "none";
+
+/** What Muster read from GitHub about a card's pull request (`gh pr view`). */
+export interface PrRead {
+  at: number;
+  /** OPEN, CLOSED or MERGED. */
+  state: string;
+  draft: boolean;
+  head_sha: string;
+  base: string;
+  mergeable: string;
+  merge_state: string;
+  title: string;
+  url: string;
+  author: string;
+  additions: number;
+  deletions: number;
+  files: number;
+  merge_commit?: string;
+  /** Auto-merge is on for it on GitHub. */
+  auto_merge?: boolean;
+  /** GitHub's reply lacked a field the rules rest on. */
+  incomplete?: boolean;
+  checks: { total: number; passed: number; failed: number; running: number; failing?: string[]; waiting?: string[] };
+}
+
+export interface PrVerdict {
+  ok: boolean;
+  state: PrMark;
+  commit: PrMark;
+  base: PrMark;
+  checks: PrMark;
+  /** Why not, after "Not merged: " ("it conflicts with master"). */
+  reason?: string;
+}
+
+/** A pull request card as `pr.list`, `pr.get` and `pr_upserted` give it. */
+export interface Pr {
+  id: number;
+  /** "P3". */
+  card: string;
+  status: PrStatus;
+  created_at: number;
+  updated_at: number;
+  poster: QuestionWho;
+  repo: string;
+  number: number;
+  /** The commit the agent posted the card for: the only one Merge merges. */
+  head_sha: string;
+  summary: string;
+  who_notices: string;
+  pictures?: { path: string; caption: string; side: "before" | "after"; file: string }[];
+  tests: string;
+  undo: string;
+  after_merge: string;
+  details?: string;
+  post: number;
+  /** "Not now": set aside at this time. */
+  later?: number;
+  github?: PrRead;
+  verdict?: PrVerdict;
+  read_error?: { at: number; text: string };
+  /** The last Merge that didn't merge. `unknown`: Muster asked GitHub but couldn't confirm the
+   * result (it may still merge); `not_told`: a restart cut it off, so the poster wasn't told. */
+  refused?: { at: number; reason: string; github_said?: string; unknown?: boolean; not_told?: boolean };
+  merge?: { at: number; sha: string; post?: number; base?: string; sent_at?: number; done_at?: number; commit?: string };
+  changes?: { at: number; words: string };
+  stale_told?: boolean;
+  withdrawn?: { at: number; reason: string };
+  closed?: { at: number; reason: string };
+  outbox?: { kind: "merged" | "refused" | "changes_asked" | "stale"; at: number; from: string; delivery: { status: QuestionDeliveryStatus; note?: string; to?: string } }[];
+}
+
 // ---------------- questions for the human (docs/PROTOCOL.md "Questions") ----------------
 
 /** A session acting on a question (the asker, a lead that passed it on, a recorder). */
@@ -738,6 +815,7 @@ export type ServerEvent =
   | { event: "prefs_changed"; data: WindowPrefs }
   | { event: "daemon_stopping"; data: { reason: string } }
   | { event: "question_upserted"; data: Question }
+  | { event: "pr_upserted"; data: Pr }
   // Connection-scoped, only to a client that asked `session.attach` for a `replay` kind.
   | {
     event: "attach_info";

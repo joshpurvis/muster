@@ -31,6 +31,8 @@ pub fn router(hub: Arc<Hub>) -> anyhow::Result<Router> {
         .route("/api/device/logout", post(device_logout))
         .route("/ws", get(ws_upgrade))
         .route("/hook/{event}", post(hook))
+        // Quiet messages for the turn a session's UserPromptSubmit hook is starting (src/quiet.rs).
+        .route("/quiet/take", post(quiet_take))
         // Status-line usage reports (src/statusline.rs): a few numbers, never a whole payload.
         .route("/usage/{agent}", post(usage_report).layer(axum::extract::DefaultBodyLimit::max(16 * 1024)))
         // Trigger URLs (src/schedules/triggers.rs): this machine only, each with its secret.
@@ -596,6 +598,22 @@ async fn hook(State(hub): State<Arc<Hub>>, Path(event): Path<String>, headers: H
     }
 }
 
+/// `POST /quiet/take` with the run's session token: the quiet messages waiting for the turn its
+/// `UserPromptSubmit` hook is starting, marked offered (src/quiet.rs). Only that session's own.
+async fn quiet_take(State(hub): State<Arc<Hub>>, headers: HeaderMap) -> Response {
+    let Some(id) = bearer(&headers).and_then(|token| hub.session_by_token(token)) else {
+        return unauthorized();
+    };
+    match crate::quiet::take(&hub, id) {
+        Ok(v) => axum::Json(v).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(json!({ "error": { "message": format!("{e:#}") } })),
+        )
+            .into_response(),
+    }
+}
+
 /// `POST /usage/claude` with the run's session token: attributed by the token alone (to that
 /// session, run and pinned profile), kept out of hooks, events and agent state.
 async fn usage_report(State(hub): State<Arc<Hub>>, Path(agent): Path<String>, headers: HeaderMap, body: Bytes) -> Response {
@@ -975,7 +993,11 @@ mod tests {
                 assert_eq!(http(port, "POST", "/usage/claude", auth, "{}").0, 401);
             }
             assert_eq!(http(port, "POST", "/api/rpc", &["Authorization: Bearer tok", FWD], hello).0, 401);
-            for path in ["/api/events", "/", "/mcp", "/api/launch-code", "/hook/x", "/usage/claude"] {
+            // Quiet messages need a session token too.
+            for auth in [&["Authorization: Bearer tok"][..], &[]] {
+                assert_eq!(http(port, "POST", "/quiet/take", auth, "{}").0, 401);
+            }
+            for path in ["/api/events", "/", "/mcp", "/api/launch-code", "/hook/x", "/usage/claude", "/quiet/take"] {
                 assert_eq!(http(port, "GET", path, &[FWD], "").0, 404, "{path}");
             }
             assert_eq!(http(port, "GET", "/m/", &["Tailscale-Funnel-Request: ?1"], "").0, 403);

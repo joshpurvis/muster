@@ -2521,6 +2521,8 @@ pub struct AgentOpts {
     pub sleep_after: Option<String>,
     /// `agent edit --self-handoff on|off`.
     pub self_handoff: Option<bool>,
+    /// `agent edit --tools-up-front on|off`.
+    pub tools_up_front: Option<bool>,
     pub claude_mode: Option<String>,
     pub codex_sandbox: Option<String>,
 }
@@ -2572,6 +2574,9 @@ impl AgentOpts {
         }
         if let Some(a) = &self.sleep_after {
             set("sleep_after_min", json!(parse_sleep_after(a)?));
+        }
+        if let Some(on) = self.tools_up_front {
+            set("tools_up_front", json!(on));
         }
         if let Some(on) = self.self_handoff {
             set("self_handoff", json!(on));
@@ -2822,7 +2827,7 @@ pub fn ask(d: &Discovery, agent: &str, words: &[String], timeout: u64, as_json: 
 /// `muster reply`: inside an agent's session, its MCP `reply` (answer message `msg_id` later),
 /// called with the session's own token: never on another session's behalf. Prints how it
 /// reached the asker; exit 1 when the delivery was refused.
-pub fn reply(d: &Discovery, msg_id: i64, words: &[String], as_json: bool) -> anyhow::Result<()> {
+pub fn reply(d: &Discovery, msg_id: i64, words: &[String], wake: bool, as_json: bool) -> anyhow::Result<()> {
     if env_session().is_none() {
         anyhow::bail!("muster reply runs inside an agent's session (it answers a message Muster delivered to that agent)");
     }
@@ -2837,7 +2842,7 @@ pub fn reply(d: &Discovery, msg_id: i64, words: &[String], as_json: bool) -> any
         std::io::stdin().lock().read_to_string(&mut s)?;
         Ok(s)
     })?;
-    let r = session_tool(d, &token, "reply", json!({"msg_id": msg_id, "text": text}))?;
+    let r = session_tool(d, &token, "reply", json!({"msg_id": msg_id, "text": text, "wake": wake}))?;
     if as_json {
         print_json(&r)?;
     } else {

@@ -44,6 +44,9 @@ struct Data {
     /// Messages delivered per agent (for the daily cap).
     agent_counts: HashMap<i64, usize>,
     deliveries: Vec<crate::agents::Outgoing>,
+    /// Messages kept for an agent's or session's next turn (src/quiet.rs).
+    quiet: Vec<crate::agents::Outgoing>,
+    quiet_sessions: Vec<(SessionId, String, crate::agents::Route, String)>,
     /// Agent session -> the reply its turns report.
     replies: HashMap<SessionId, String>,
     /// Refused messages kept for the log: (to agent, reason).
@@ -253,6 +256,17 @@ impl Backend for Arc<Mock> {
     }
     fn agent_messages_since(&self, agent_id: i64, _since: i64) -> usize {
         self.d.lock().agent_counts.get(&agent_id).copied().unwrap_or(0)
+    }
+    fn agent_quiet(&self, out: crate::agents::Outgoing) -> anyhow::Result<crate::agents::QuietSent> {
+        let mut d = self.d.lock();
+        d.quiet.push(out);
+        Ok(crate::agents::QuietSent { msg_id: 100 + d.quiet.len() as i64, session_id: Some(3), sent_at_ms: 0, waiting: d.quiet.len() })
+    }
+    fn session_quiet(&self, to: &SessionInfo, from: String, _from_session: Option<SessionId>, route: crate::agents::Route,
+        text: String) -> anyhow::Result<Value> {
+        crate::quiet::check_receiver(to.kind, &format!("session {}", to.id)).map_err(|e| anyhow::anyhow!(e))?;
+        self.d.lock().quiet_sessions.push((to.id, from, route, text));
+        Ok(json!({"session_id": to.id, "status": "waiting"}))
     }
     async fn agent_deliver(&self, out: crate::agents::Outgoing) -> anyhow::Result<crate::agents::Delivery> {
         let mut d = self.d.lock();
@@ -1678,7 +1692,7 @@ fn with_agents(m: &Mock) {
             session_id: Some(id),
             resume_id: None,
             created_at: 0,
-            autostart: false, sleep_after_min: None, asleep_at: None, self_handoff: false, self_handoff_at: None,
+            autostart: false, sleep_after_min: None, asleep_at: None, self_handoff: false, self_handoff_at: None, tools_up_front: false,
         });
         d.replies.insert(id, format!("{name} says hi"));
     }
@@ -1751,6 +1765,91 @@ async fn ask_agent_origin_rule_hops_and_cap() {
     let refused = m.d.lock().refused.clone();
     assert_eq!(refused.len(), 4, "{refused:?}");
     assert!(refused[0].1.contains("accepts only human") && refused[3].1.contains("last 24 hours"));
+}
+
+#[tokio::test]
+async fn tell_agent_wakes_or_waits_as_the_sender_says_with_ask_agents_guards() {
+    use crate::agents::Origin;
+    let (m, st) = state();
+    with_agents(&m);
+    // wake is required.
+    let (t, err) = call(&st, "tell_agent", json!({"agent": "ada", "text": "x"})).await;
+    assert!(err && t.contains("wake is required"), "{t}");
+    // wake=false: kept, nothing delivered or typed in.
+    let (t, err) = call(&st, "tell_agent", json!({"agent": "ada", "text": "PR open", "wake": false})).await;
+    assert!(!err, "{t}");
+    let v = parse(&t);
+    assert_eq!((v["status"].as_str(), v["wake"].as_bool()), (Some("waiting"), Some(false)));
+    assert!(v["note"].as_str().unwrap().contains("next turn"));
+    {
+        let d = m.d.lock();
+        assert!(d.deliveries.is_empty() && d.sends.is_empty());
+        assert_eq!((d.quiet[0].agent.as_str(), d.quiet[0].text.as_str()), ("ada", "PR open"));
+    }
+    // wake=true: delivered now, nobody waits.
+    let (t, err) = call(&st, "tell_agent", json!({"agent": "ada", "text": "act now", "wake": true})).await;
+    assert!(!err, "{t}");
+    assert_eq!(parse(&t)["status"], "delivered");
+    assert_eq!(m.d.lock().deliveries.len(), 1);
+    // A Codex agent can't take one that waits; refused before anything is kept.
+    let (t, err) = call(&st, "tell_agent", json!({"agent": "cody", "text": "x", "wake": false})).await;
+    assert!(err && t.contains("cody is a codex session") && t.contains("wake=true"), "{t}");
+    // Too long to wait for a turn.
+    let (t, err) = call(&st, "tell_agent", json!({"agent": "ada", "text": "x".repeat(6001), "wake": false})).await;
+    assert!(err && t.contains("at most 6000 characters"), "{t}");
+    // The origin rule, hop limit and cap apply as for ask_agent, with refusals logged.
+    inbound(&m, 2, Origin::Schedule, 1);
+    let (t, err) = call_as(&st, "tok2", "tell_agent", json!({"agent": "ada", "text": "x", "wake": false})).await;
+    assert!(err && t.contains("accepts only human"), "{t}");
+    m.d.lock().prov.clear();
+    inbound(&m, 1, Origin::Human, crate::mcp::guard::MAX_AGENT_HOPS);
+    let (t, err) = call(&st, "tell_agent", json!({"agent": "ada", "text": "x", "wake": false})).await;
+    assert!(err && t.contains("too deep"), "{t}");
+    m.d.lock().prov.clear();
+    m.d.lock().agent_counts.insert(3, crate::mcp::guard::AGENT_DAILY_PROMPT_CAP);
+    let (t, err) = call(&st, "tell_agent", json!({"agent": "ada", "text": "x", "wake": false})).await;
+    assert!(err && t.contains("last 24 hours"), "{t}");
+    assert_eq!(m.d.lock().refused.len(), 3);
+    assert_eq!(m.d.lock().quiet.len(), 1);
+}
+
+#[tokio::test]
+async fn send_message_with_wake_false_keeps_it_for_the_next_turn() {
+    let (m, st) = state();
+    // Session 2 is a Claude session in the caller's workspace.
+    m.d.lock().sessions.get_mut(&2).unwrap().kind = SessionKind::Claude;
+    let (t, err) = call(&st, "send_message", json!({"session_id": 2, "text": "fyi", "wake": false, "interrupt": true})).await;
+    assert!(err && t.contains("don't go together"), "{t}");
+    let (t, err) = call(&st, "send_message", json!({"session_id": 2, "text": "fyi", "wake": false})).await;
+    assert!(!err, "{t}");
+    assert_eq!(parse(&t)["status"], "waiting");
+    let d = m.d.lock();
+    assert!(d.sends.is_empty());
+    assert_eq!((d.quiet_sessions[0].0, d.quiet_sessions[0].3.as_str()), (2, "fyi"));
+}
+
+#[tokio::test]
+async fn up_front_tools_are_marked_only_for_agents_that_load_them() {
+    let (m, st) = state();
+    with_agents(&m);
+    let marked = |caller: SessionId| -> Vec<String> {
+        crate::mcp::tools::tool_list(&st, caller).iter()
+            .filter(|d| d["_meta"]["anthropic/alwaysLoad"] == true)
+            .map(|d| d["name"].as_str().unwrap().to_string()).collect()
+    };
+    assert!(marked(3).is_empty());
+    m.d.lock().agents.iter_mut().find(|a| a.name == "ada").unwrap().tools_up_front = true;
+    let mut names = marked(3);
+    names.sort();
+    let mut want: Vec<String> = crate::mcp::tools::UP_FRONT.iter().map(|s| s.to_string()).collect();
+    want.sort();
+    assert_eq!(names, want);
+    // Other callers (cody, a plain session) keep everything deferred.
+    assert!(marked(4).is_empty() && marked(1).is_empty());
+    // The rest of each definition is unchanged (the UI visibility meta stays).
+    let defs = crate::mcp::tools::tool_list(&st, 3);
+    let ask = defs.iter().find(|d| d["name"] == "ask_agent").unwrap();
+    assert_eq!(ask["_meta"]["ui"]["visibility"], json!(["model"]));
 }
 
 #[tokio::test]

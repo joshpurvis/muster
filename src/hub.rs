@@ -1872,6 +1872,16 @@ impl Hub {
         }
     }
 
+    /// Update the count of quiet messages waiting for the session's next turn (src/quiet.rs).
+    pub fn set_quiet_waiting(&self, id: SessionId, n: u32) {
+        let mut g = self.inner.lock();
+        let Some(e) = g.sessions.get_mut(&id) else { return };
+        if e.info.quiet_waiting != n {
+            e.info.quiet_waiting = n;
+            self.publish_session(&e.info);
+        }
+    }
+
     /// Tests: put a restored (exited) session in another state without a terminal.
     #[cfg(test)]
     pub(crate) fn set_state_for_test(&self, id: SessionId, state: AgentState) {
@@ -3077,7 +3087,7 @@ impl Hub {
                 exit_code: None,
                 cols,
                 rows,
-                queued: 0,
+                queued: 0, quiet_waiting: 0,
                 subagents: 0,
                 background: 0,
                 size_owner: None,
@@ -3932,6 +3942,8 @@ impl Hub {
 
     /// Kill (if alive) and forget a session, including its scrollback.
     pub fn remove_session(&self, id: SessionId) -> anyhow::Result<()> {
+        // Quiet messages waiting for its next turn go with the tab (src/quiet.rs).
+        crate::quiet::session_ended(self, id);
         let entry = {
             let mut g = self.inner.lock();
             anyhow::ensure!(g.sessions.contains_key(&id), "no such session: {id}");
@@ -5212,7 +5224,7 @@ mod tests {
                     session_id: Some(2),
                     resume_id: None,
                     created_at: 0,
-                    autostart: false, sleep_after_min: None, asleep_at: None, self_handoff: false, self_handoff_at: None,
+                    autostart: false, sleep_after_min: None, asleep_at: None, self_handoff: false, self_handoff_at: None, tools_up_front: false,
                 })
                 .unwrap();
         })
@@ -5569,7 +5581,7 @@ mod tests {
         hub.inner.lock().sessions.get_mut(&2).unwrap().generation = 42;
         let message = || hub.store.insert_agent_message(&AgentMessage { id: 0, from: "fixture".into(),
             from_session: None, to_agent: 1, to_session: Some(2), origin: Origin::Schedule, hop: 1,
-            reply_to: None, created_at: 1, reply: None, replied_at: None, text: None, refused: None, to_name: None, cold_idle_ms: None, answer: None }).unwrap();
+            reply_to: None, created_at: 1, reply: None, replied_at: None, text: None, refused: None, to_name: None, cold_idle_ms: None, answer: None, quiet: false, shown_at: None, expired_at: None }).unwrap();
         let first = message();
         let next = message();
         let source = |msg| Source::Chain(Prov { origin: Origin::Schedule, hop: 1, msg_id: Some(msg) });
@@ -5775,7 +5787,7 @@ mod tests {
                 account_profile_id: None, provider: Provider::OpenRouter, id: 0, name: "ada".into(),
                 kind: SessionKind::Claude, model: None, effort: None, persona: String::new(), home_dir: "/x".into(), working_location: Default::default(), reset_on_next_start: false, handoff: None,
                 permissions: Permissions::default(), accepts_origins: crate::agents::default_accepts(SessionKind::Claude),
-                channel_id: Some(1), session_id: Some(2), resume_id: None, created_at: 0, autostart: false, sleep_after_min: None, asleep_at: None, self_handoff: false, self_handoff_at: None,
+                channel_id: Some(1), session_id: Some(2), resume_id: None, created_at: 0, autostart: false, sleep_after_min: None, asleep_at: None, self_handoff: false, self_handoff_at: None, tools_up_front: false,
             }).unwrap();
             store.save_terminal(2, record).unwrap();
         };
@@ -6609,7 +6621,7 @@ mod tests {
                     kind: SessionKind::Codex, model: None, effort: None, persona: String::new(),
                     home_dir: "/x".into(), working_location: Default::default(), reset_on_next_start: false, handoff: None, permissions: Permissions::default(),
                     accepts_origins: crate::agents::default_accepts(SessionKind::Codex),
-                    channel_id: Some(1), session_id: Some(3), resume_id: None, created_at: 0, autostart: false, sleep_after_min: None, asleep_at: None, self_handoff: false, self_handoff_at: None,
+                    channel_id: Some(1), session_id: Some(3), resume_id: None, created_at: 0, autostart: false, sleep_after_min: None, asleep_at: None, self_handoff: false, self_handoff_at: None, tools_up_front: false,
                 }).unwrap();
             }
         });
@@ -6901,7 +6913,7 @@ mod tests {
             kind: SessionKind::Codex, model: None, effort: None, persona: String::new(),
             home_dir: "/x".into(), working_location: Default::default(), reset_on_next_start: false, handoff: None, permissions: Permissions::default(),
             accepts_origins: crate::agents::default_accepts(SessionKind::Codex),
-            channel_id: None, session_id: None, resume_id: resume.map(Into::into), created_at: 0, autostart: false, sleep_after_min: None, asleep_at: None, self_handoff: false, self_handoff_at: None,
+            channel_id: None, session_id: None, resume_id: resume.map(Into::into), created_at: 0, autostart: false, sleep_after_min: None, asleep_at: None, self_handoff: false, self_handoff_at: None, tools_up_front: false,
         };
         let legacy = store.insert_agent(&agent("old", Some("th-title"))).unwrap();
         let confirmed = store.insert_agent(&agent("new", Some("th-1"))).unwrap();
@@ -6990,7 +7002,7 @@ mod tests {
         let msg = hub.store.insert_agent_message(&AgentMessage { id: 0, from: "schedule:1".into(),
             from_session: None, to_agent: 1, to_session: Some(2), origin: Origin::Schedule, hop: 0,
             reply_to: None, created_at: 1, reply: None, replied_at: None, text: Some("digest".into()),
-            refused: None, to_name: None, cold_idle_ms: None, answer: None }).unwrap();
+            refused: None, to_name: None, cold_idle_ms: None, answer: None, quiet: false, shown_at: None, expired_at: None }).unwrap();
         let mut events = hub.subscribe();
         let prov = Prov { origin: Origin::Schedule, hop: 0, msg_id: Some(msg) };
         hub.note_cold_send(2, prov, false, &format!("msg:{msg}"), idle);

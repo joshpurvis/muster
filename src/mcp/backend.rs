@@ -99,8 +99,17 @@ pub trait Backend: Send + Sync + 'static {
     /// guard drops, a reply waits for that ask too.
     fn agent_asking(&self, _agent_id: i64, _caller: SessionId) -> Option<crate::agent_reply::WaitGuard> { None }
     /// The caller (an agent) answers a message it received, after its turn (`agent_reply::reply`).
-    fn agent_reply(&self, _caller: SessionId, _msg_id: i64, _text: String) -> impl Future<Output = anyhow::Result<serde_json::Value>> + Send {
+    fn agent_reply(&self, _caller: SessionId, _msg_id: i64, _text: String, _wake: bool) -> impl Future<Output = anyhow::Result<serde_json::Value>> + Send {
         async { anyhow::bail!("replies unavailable in this backend") }
+    }
+    /// Keep a message for the agent's next turn (`agents::quiet`, src/quiet.rs).
+    fn agent_quiet(&self, _out: Outgoing) -> anyhow::Result<crate::agents::QuietSent> {
+        anyhow::bail!("quiet messages unavailable in this backend")
+    }
+    /// Keep a message for an ordinary session's next turn (`quiet::send_session`).
+    fn session_quiet(&self, _to: &SessionInfo, _from: String, _from_session: Option<SessionId>, _route: crate::agents::Route,
+        _text: String) -> anyhow::Result<serde_json::Value> {
+        anyhow::bail!("quiet messages unavailable in this backend")
     }
     /// The caller (a promoted named agent) asks for its own fresh start (src/self_handoff.rs).
     fn agent_start_fresh(&self, _caller: SessionId, _file: &str) -> anyhow::Result<serde_json::Value> {
@@ -221,8 +230,15 @@ impl Backend for HubBackend {
     fn agent_asking(&self, agent_id: i64, caller: SessionId) -> Option<crate::agent_reply::WaitGuard> {
         Some(self.0.replies.asking(agent_id, Some(caller)))
     }
-    async fn agent_reply(&self, caller: SessionId, msg_id: i64, text: String) -> anyhow::Result<serde_json::Value> {
-        crate::agent_reply::reply(&self.0, caller, msg_id, text).await
+    async fn agent_reply(&self, caller: SessionId, msg_id: i64, text: String, wake: bool) -> anyhow::Result<serde_json::Value> {
+        crate::agent_reply::reply(&self.0, caller, msg_id, text, wake).await
+    }
+    fn agent_quiet(&self, out: Outgoing) -> anyhow::Result<crate::agents::QuietSent> {
+        crate::agents::quiet(&self.0, out)
+    }
+    fn session_quiet(&self, to: &SessionInfo, from: String, from_session: Option<SessionId>, route: crate::agents::Route,
+        text: String) -> anyhow::Result<serde_json::Value> {
+        crate::quiet::send_session(&self.0, to, from, from_session, route, text)
     }
     fn agent_start_fresh(&self, caller: SessionId, file: &str) -> anyhow::Result<serde_json::Value> {
         crate::self_handoff::request(&self.0, caller, file)

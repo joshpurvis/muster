@@ -305,7 +305,7 @@ mod tests {
             exit_code: None,
             cols: 120,
             rows: 32,
-            queued: 0,
+            queued: 0, quiet_waiting: 0,
             subagents: 0,
             background: 0,
             size_owner: None,

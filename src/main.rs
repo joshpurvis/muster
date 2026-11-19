@@ -39,6 +39,7 @@ mod renderer;
 mod replay_tail;
 mod pty;
 mod questions;
+mod quiet;
 mod prs;
 mod relay;
 mod rpc;
@@ -445,12 +446,17 @@ carries that session's origin (docs/MCP.md, \"Agents\").")]
     /// Inside an agent's session: answer a message it received, after the turn that received it.
     #[command(after_help = "Examples:\n  muster reply 42 the benchmarks finished: all green\n  cat report.md | muster reply 42 -\n\n\
 Runs the session's MCP `reply` tool: once per message, only for messages Muster delivered to this\n\
-agent. The asker gets it as a new message, or the human in the agents panel (docs/MCP.md, \"Late replies\").")]
+agent. The asker gets it as a new message, or the human in the agents panel (docs/MCP.md, \"Late replies\").\n\
+With --no-wake an asker that stopped waiting gets it at the start of its next turn instead.")]
     Reply {
         /// The message's id, from its `[muster msg <id> ...]` line.
         msg_id: i64,
         /// Words, joined by spaces. None or `-`: read stdin.
         text: Vec<String>,
+        /// Don't start a turn for it: an asker no longer waiting gets it at the start of its
+        /// next turn (docs/MCP.md, "Quiet messages").
+        #[arg(long)]
+        no_wake: bool,
         /// Print the result as JSON.
         #[arg(long)]
         json: bool,
@@ -611,6 +617,12 @@ enum AgentCmd {
         /// terminal outside Muster (refused inside any Muster tab). Anyone may turn it off.
         #[arg(long, value_name = "on|off", value_parser = ["on", "off"])]
         self_handoff: Option<String>,
+        /// Load Muster's message tools (ask_agent, tell_agent, reply, send_message, whoami,
+        /// note_read, note_append) up front in this Claude agent's sessions instead of through
+        /// tool search: about 2,000 more tokens per model call, one model call less each time
+        /// one of them would be searched for. Off by default; applies from its next start.
+        #[arg(long, value_name = "on|off", value_parser = ["on", "off"])]
+        tools_up_front: Option<String>,
         #[command(flatten)]
         perms: AgentPerms,
     },
@@ -839,6 +851,7 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
                     autostart: Some(autostart),
                     sleep_after,
                     self_handoff: None,
+                    tools_up_front: None,
                     claude_mode: perms.claude_mode,
                     codex_sandbox: perms.codex_sandbox,
                 },
@@ -858,6 +871,7 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
                 autostart,
                 sleep_after,
                 self_handoff,
+                tools_up_front,
                 perms,
             } => cli::agent_edit(
                 d,
@@ -874,6 +888,7 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
                     autostart: autostart.map(|a| a == "on"),
                     sleep_after,
                     self_handoff: self_handoff.map(|a| a == "on"),
+                    tools_up_front: tools_up_front.map(|a| a == "on"),
                     claude_mode: perms.claude_mode,
                     codex_sandbox: perms.codex_sandbox,
                 },
@@ -900,7 +915,7 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
             timeout,
             json,
         } => cli::ask(d, &agent, &text, timeout, json),
-        Cmd::Reply { msg_id, text, json } => cli::reply(d, msg_id, &text, json),
+        Cmd::Reply { msg_id, text, no_wake, json } => cli::reply(d, msg_id, &text, !no_wake, json),
         Cmd::StartFresh { file, json } => cli::start_fresh(d, &file, json),
         _ => unreachable!("dispatched in main"),
     }
@@ -1963,6 +1978,8 @@ async fn daemon_main(openrouter_key: Option<openrouter::ApiKey>, launch: Option<
             // first message; the other answers come after late replies (src/questions.rs).
             questions::resume(&hub, answers_first).await;
             agent_reply::resume(&hub, unfinished).await;
+            // The tabs' counts of messages waiting for the next turn (src/quiet.rs).
+            quiet::refresh_all(&hub);
             questions::resume(&hub, answers).await;
             prs::resume(&hub, cards).await;
         });
@@ -2078,6 +2095,7 @@ mod tests {
         // Provenance comes from the calling session, never from a flag.
         assert!(parse(&["ask", "ada", "hi", "--origin", "human"]).is_err());
         assert!(parse(&["reply", "42", "all", "green"]).is_ok());
+        assert!(parse(&["reply", "--no-wake", "42", "all", "green"]).is_ok());
         assert!(parse(&["reply", "x", "hi"]).is_err());
         assert!(matches!(parse(&["agent", "start", "ada", "--fresh"]), Ok(Cmd::Agent { .. })));
     }

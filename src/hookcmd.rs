@@ -16,9 +16,13 @@
 //! Host-managed runs use `$MUSTER_HOOK_DB`: append to the application-owned durable inbox
 //! without requiring a live backend. The backend replays it with transactional checkpoints.
 //! Legacy runs retain blocking HTTP/1.1 forwarding. Both paths have an absolute deadline.
-//! Always exits 0 and prints nothing on stdout (Claude/Codex may treat hook stdout as context
-//! or decisions). No-ops silently when MUSTER_URL / MUSTER_TOKEN are unset (and no token file
-//! stands in for MUSTER_TOKEN, see [`TOKEN_FILE`]).
+//! Always exits 0. Prints nothing on stdout (Claude/Codex treat hook stdout as context or
+//! decisions), except Claude's `UserPromptSubmit`: it first asks the backend for the quiet
+//! messages waiting for this turn (`POST /quiet/take`, src/quiet.rs) and prints them as the
+//! turn's `additionalContext`, then names them in the payload it saves (`quiet::PAYLOAD_KEY`), so
+//! the backend marks them shown when it replays the callback. No backend (a reload) means no
+//! context: they wait for the next turn. No-ops silently when MUSTER_URL / MUSTER_TOKEN are
+//! unset (and no token file stands in for MUSTER_TOKEN, see [`TOKEN_FILE`]).
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -32,6 +36,10 @@ const MAX_STRING: usize = 4000;
 /// Payload keys holding a turn's final message (Claude Stop, Codex notify), and their limit.
 const REPLY_KEYS: &[&str] = &["last_assistant_message", "last-assistant-message"];
 const MAX_REPLY: usize = 64 * 1024;
+/// How long `UserPromptSubmit` waits for the quiet messages before going on without them.
+const QUIET_WAIT: Duration = Duration::from_millis(1000);
+/// The most of the backend's answer read for them (a turn's context is under 8,000 characters).
+const QUIET_MAX_RESPONSE: usize = 256 * 1024;
 
 /// Where a run whose CLI strips credentials from its hooks' environment finds its session token
 /// (`<session dir>/hook-token`, private, rewritten at each start): an OpenRouter Claude session
@@ -64,7 +72,10 @@ pub fn run(agent: &str, event: &str, payload_arg: Option<String>) -> i32 {
         Some(p) => p.into_bytes(),
         None => read_stdin(),
     };
-    let body = shrink_payload(&raw);
+    let mut body = shrink_payload(&raw);
+    if agent == "claude" && event == "UserPromptSubmit" {
+        body = quiet_messages(&url, &token, agent, body, &mut std::io::stdout());
+    }
     if let Some(path) = std::env::var_os("MUSTER_HOOK_DB") {
         let (tx, rx) = std::sync::mpsc::channel();
         let event = event.to_string();
@@ -97,6 +108,94 @@ pub fn run(agent: &str, event: &str, payload_arg: Option<String>) -> i32 {
         eprintln!("muster hook: {e}");
     }
     0
+}
+
+/// Claude's `UserPromptSubmit` (src/quiet.rs): fetch the quiet messages waiting for this turn,
+/// write them to `out` as the hook's `additionalContext`, and return the payload naming them.
+/// Any failure (no backend, a slow answer, a slash command) leaves `body` as it was and writes
+/// nothing: the messages keep waiting.
+fn quiet_messages(url: &str, token: &str, agent: &str, body: Vec<u8>, out: &mut impl Write) -> Vec<u8> {
+    let Ok(mut payload) = serde_json::from_slice::<serde_json::Value>(&body) else { return body };
+    // A slash command (/clear, /compact) may never reach the model: they wait for a real prompt.
+    if payload.get("prompt").and_then(|p| p.as_str()).is_some_and(|p| p.trim_start().starts_with('/')) {
+        return body;
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (url, token, agent) = (url.to_string(), token.to_string(), agent.to_string());
+    std::thread::spawn(move || {
+        let _ = tx.send(post_read(&url, "/quiet/take", &token, &agent, b"{}", QUIET_MAX_RESPONSE));
+    });
+    let Ok(Ok((200, answer))) = rx.recv_timeout(QUIET_WAIT) else { return body };
+    let Ok(answer) = serde_json::from_slice::<serde_json::Value>(&answer) else { return body };
+    let Some(context) = answer.get("context").and_then(|c| c.as_str()).filter(|c| !c.is_empty()) else { return body };
+    let hook = serde_json::json!({
+        "hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": context}
+    });
+    if writeln!(out, "{hook}").and_then(|()| out.flush()).is_err() {
+        return body;
+    }
+    if let Some(o) = payload.as_object_mut() {
+        o.insert(crate::quiet::PAYLOAD_KEY.into(), answer.get("quiet").cloned().unwrap_or_default());
+    }
+    serde_json::to_vec(&payload).unwrap_or(body)
+}
+
+/// `post`, reading the answer: its status and body (at most `max` bytes; `Connection: close`,
+/// so the body runs to the end, by `Content-Length` when given).
+fn post_read(url: &str, path: &str, token: &str, agent: &str, body: &[u8], max: usize) -> Result<(u16, Vec<u8>), String> {
+    let (host, port, base) = parse_url(url)?;
+    let addr = loopback_addr(&host, port)?;
+    let mut s = TcpStream::connect_timeout(&addr, TIMEOUT).map_err(|e| format!("connect {addr}: {e}"))?;
+    s.set_read_timeout(Some(TIMEOUT)).ok();
+    s.set_write_timeout(Some(TIMEOUT)).ok();
+    let agent = if valid_name(agent) { agent } else { "unknown" };
+    let head = format!(
+        "POST {base}{path} HTTP/1.1\r\nHost: {host}:{port}\r\nAuthorization: Bearer {token}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\nX-Muster-Agent: {agent}\r\n\
+         Connection: close\r\n\r\n",
+        body.len()
+    );
+    s.write_all(head.as_bytes()).map_err(|e| format!("write: {e}"))?;
+    s.write_all(body).map_err(|e| format!("write: {e}"))?;
+    s.flush().ok();
+    let mut got = Vec::new();
+    s.take(max as u64 + 4096).read_to_end(&mut got).map_err(|e| format!("read: {e}"))?;
+    let split = got.windows(4).position(|w| w == b"\r\n\r\n").ok_or("bad response")?;
+    let head = String::from_utf8_lossy(&got[..split]).to_string();
+    let status = head.split_whitespace().nth(1).and_then(|c| c.parse::<u16>().ok()).ok_or("bad response")?;
+    let mut rest = got[split + 4..].to_vec();
+    let header = |name: &str| head.lines().skip(1).find_map(|l| {
+        let (k, v) = l.split_once(':')?;
+        k.trim().eq_ignore_ascii_case(name).then(|| v.trim().to_ascii_lowercase())
+    });
+    if header("transfer-encoding").is_some_and(|v| v.contains("chunked")) {
+        rest = unchunk(&rest).ok_or("bad chunked body")?;
+    } else if let Some(n) = header("content-length").and_then(|v| v.parse::<usize>().ok()) {
+        if rest.len() < n {
+            return Err("short body".into());
+        }
+        rest.truncate(n);
+    }
+    if rest.len() > max {
+        return Err("answer too large".into());
+    }
+    Ok((status, rest))
+}
+
+/// A chunked HTTP/1.1 body, decoded (None when malformed).
+fn unchunk(mut b: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    loop {
+        let eol = b.windows(2).position(|w| w == b"\r\n")?;
+        let size = std::str::from_utf8(&b[..eol]).ok()?.split(';').next()?.trim();
+        let n = usize::from_str_radix(size, 16).ok()?;
+        b = &b[eol + 2..];
+        if n == 0 {
+            return Some(out);
+        }
+        out.extend_from_slice(b.get(..n)?);
+        b = b.get(n + 2..)?;
+    }
 }
 
 fn valid_name(s: &str) -> bool {
@@ -367,6 +466,72 @@ mod tests {
         assert!(req.contains("Authorization: Bearer tok\r\n"));
         assert!(req.contains("X-Muster-Agent: codex\r\n"));
         assert!(req.ends_with(r#"{"type":"agent-turn-complete"}"#));
+    }
+
+    /// A one-request server answering `response`; returns what it was sent.
+    fn answer_once(response: &'static [u8]) -> (u16, std::thread::JoinHandle<String>) {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let h = std::thread::spawn(move || {
+            let (mut c, _) = l.accept().unwrap();
+            c.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+            let mut req = Vec::new();
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = c.read(&mut buf) {
+                if n == 0 { break }
+                req.extend_from_slice(&buf[..n]);
+                if req.ends_with(b"{}") { break }
+            }
+            c.write_all(response).unwrap();
+            String::from_utf8(req).unwrap()
+        });
+        (port, h)
+    }
+
+    #[test]
+    fn a_prompt_gets_the_waiting_quiet_messages_as_context_and_names_them() {
+        let (port, h) = answer_once(
+            b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 74\r\n\r\n{\"context\":\"Messages for you\",\"quiet\":{\"agent\":[7],\"session\":[]},\"left\":0}",
+        );
+        let mut out = Vec::new();
+        let body = quiet_messages(&format!("http://127.0.0.1:{port}"), "tok", "claude", br#"{"prompt":"hi"}"#.to_vec(), &mut out);
+        let req = h.join().unwrap();
+        assert!(req.starts_with("POST /quiet/take HTTP/1.1\r\n") && req.contains("Authorization: Bearer tok\r\n"), "{req}");
+        // Claude Code's hook output: one JSON object on stdout.
+        let printed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(printed, serde_json::json!({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": "Messages for you"}}));
+        let saved: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(saved["prompt"], "hi");
+        assert_eq!(saved[crate::quiet::PAYLOAD_KEY], serde_json::json!({"agent": [7], "session": []}));
+    }
+
+    #[test]
+    fn quiet_messages_wait_when_there_is_nothing_to_show_or_no_backend() {
+        let payload = br#"{"prompt":"hi"}"#.to_vec();
+        // None waiting (a chunked answer, decoded).
+        let (port, h) = answer_once(
+            b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n1a\r\n{\"context\":null,\"left\":0}\r\n0\r\n\r\n",
+        );
+        let mut out = Vec::new();
+        assert_eq!(quiet_messages(&format!("http://127.0.0.1:{port}"), "t", "claude", payload.clone(), &mut out), payload);
+        h.join().unwrap();
+        assert!(out.is_empty());
+        // No backend (a reload): quick, nothing printed, payload as it was.
+        let closed = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let t = std::time::Instant::now();
+        assert_eq!(quiet_messages(&format!("http://127.0.0.1:{closed}"), "t", "claude", payload.clone(), &mut out), payload);
+        assert!(out.is_empty() && t.elapsed() < Duration::from_secs(2));
+        // An error answer.
+        let (port, h) = answer_once(b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 2\r\n\r\n{}");
+        assert_eq!(quiet_messages(&format!("http://127.0.0.1:{port}"), "t", "claude", payload.clone(), &mut out), payload);
+        h.join().unwrap();
+        assert!(out.is_empty());
+        // A slash command never asks: nothing listens on this port, and nothing is tried.
+        let slash = br#"{"prompt":"  /clear"}"#.to_vec();
+        assert_eq!(quiet_messages(&format!("http://127.0.0.1:{closed}"), "t", "claude", slash.clone(), &mut out), slash);
+        assert!(out.is_empty());
+        assert_eq!(unchunk(b"3\r\nabc\r\n0\r\n\r\n").unwrap(), b"abc");
+        assert!(unchunk(b"zz\r\n").is_none());
     }
 
     #[test]

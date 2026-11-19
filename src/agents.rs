@@ -194,6 +194,9 @@ pub struct Agent {
     pub self_handoff: bool,
     /// When it last cleared its own conversation that way (Unix ms): the rate limit.
     pub self_handoff_at: Option<i64>,
+    /// Its sessions load Muster's message tools up front instead of through tool search
+    /// (`mcp::tools::UP_FRONT`). Off by default; applies from its next start.
+    pub tools_up_front: bool,
 }
 
 /// One message muster delivered to an agent (or refused to: `refused`).
@@ -224,6 +227,11 @@ pub struct AgentMessage {
     pub cold_idle_ms: Option<i64>,
     /// The agent's later answer through `reply`, and how it reached the asker (src/agent_reply.rs).
     pub answer: Option<crate::agent_reply::Answer>,
+    /// Sent with wake=false (src/quiet.rs): it waits for the agent's next turn instead of being
+    /// typed in. `shown_at`: the turn that showed it; `expired_at`: never shown, given up.
+    pub quiet: bool,
+    pub shown_at: Option<i64>,
+    pub expired_at: Option<i64>,
 }
 
 /// A session's provenance: origin and hop of the message it is handling, and that message's
@@ -330,7 +338,7 @@ pub fn persona_text(name: &str, kind: SessionKind, persona: &str) -> String {
          your final message for that turn goes back to the sender. If the answer needs longer (a long \
          job), say so in that reply, and once you have it answer with the muster MCP tool `reply` \
          (`msg_id` from the header): one reply per message, delivered to the sender. To ask other \
-         agents, use the muster MCP tools `list_agents` and `ask_agent`.\n\n\
+         agents, use the muster MCP tools `list_agents` and `ask_agent`. {quiet}\n\n\
          ## Schedules\n\n\
          To follow something up later yourself (\"check CI again in 20 minutes\"), use `set_reminder`: a \
          one-off for you, up to 24 hours ahead, no approval needed. For anything recurring or later, use \
@@ -339,6 +347,7 @@ pub fn persona_text(name: &str, kind: SessionKind, persona: &str) -> String {
         kind = kind.as_str(),
         resume = " resumes your conversation when you restart",
         links = crate::links::INSTRUCTION,
+        quiet = QUIET_INSTRUCTION,
         persona = if persona.is_empty() { "(none given)" } else { persona },
     )
 }
@@ -526,6 +535,32 @@ pub fn rename_old_tools(text: &str) -> Option<String> {
         out = res;
     }
     (out != text).then_some(out)
+}
+
+/// The persona's sentence on messages that wait for the next turn (src/quiet.rs).
+pub const QUIET_INSTRUCTION: &str = "To report or pass something on without waiting for an answer, use `tell_agent`; \
+with wake=false it waits for the agent's next turn instead of starting one. Messages that arrived that way come at the \
+start of a turn, after the prompt, under a line saying the human did not type them. After a long job, `reply` with \
+wake=false unless the asker must act now.";
+
+/// The sentence that ends the generated "## Messages" section before `QUIET_INSTRUCTION`.
+const MESSAGES_END: &str = "To ask other agents, use the muster MCP tools `list_agents` and `ask_agent`.";
+
+/// An agent made before quiet messages has a persona file whose "## Messages" section doesn't
+/// mention them. At its next start Muster adds `QUIET_INSTRUCTION` once after that section's last
+/// sentence, in a file it generated (`add_links_section`'s rule); a file changed there by hand is
+/// left alone. Best effort.
+fn add_quiet_sentence(path: &Path) {
+    let Ok(text) = std::fs::read_to_string(path) else { return };
+    if text.contains("`tell_agent`") || !text.contains("a persistent muster agent") {
+        return;
+    }
+    let Some(i) = text.find(MESSAGES_END) else { return };
+    let at = i + MESSAGES_END.len();
+    let next = format!("{} {QUIET_INSTRUCTION}{}", &text[..at], &text[at..]);
+    if let Err(e) = refuse_symlink(path).and_then(|()| Ok(paths::write_private(path, next.as_bytes())?)) {
+        tracing::warn!("adding the quiet message sentence to {}: {e:#}", path.display());
+    }
 }
 
 /// An agent made before links (src/links.rs) has a persona file without "## Links". At its next
@@ -877,6 +912,8 @@ pub struct HookEffects {
     pub replied: Option<i64>,
     /// This agent's record changed (its conversation id).
     pub agent: Option<i64>,
+    /// The turn showed these quiet messages (src/quiet.rs).
+    pub quiet: Option<crate::quiet::Shown>,
 }
 
 #[derive(Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1168,6 +1205,7 @@ impl Registry {
         a.account_profile_id = next.account_profile_id;
         a.handoff = next.handoff.clone();
         a.self_handoff = next.self_handoff;
+        a.tools_up_front = next.tools_up_front;
         store.update_agent_config(&a)?;
         *b = a.clone();
         Ok(a)
@@ -1423,6 +1461,19 @@ impl Registry {
                 }
                 _ => {},
             }
+            // Quiet messages the hook put in front of this turn (src/quiet.rs): only those
+            // offered to this session, never shown before. The turn takes on their route.
+            let named_ids = crate::quiet::Shown::from_payload(payload);
+            if !named_ids.is_empty() {
+                let shown = store.quiet_offered(named, info.id, &named_ids)?;
+                if !shown.is_empty() {
+                    let cur = next.prov.get(&info.id).copied();
+                    if let Some(p) = shown.raise(cur) {
+                        next.prov.insert(info.id, p);
+                    }
+                    fx.quiet = Some(shown);
+                }
+            }
         }
         // A Codex sub-agent's turn ending is not the agent's reply (`HookSession::child`).
         let child = session.is_some_and(|(_, runtime)| runtime.child);
@@ -1451,8 +1502,10 @@ impl Registry {
             }
         }
         let changed_agent = agent.as_ref().filter(|agent| fx.agent == Some(agent.id));
-        if next != g.runtime || reply.is_some() || changed_agent.is_some() || cursor.is_some() || session.is_some() {
-            store.commit_hook(&next, reply.as_ref().map(|(id, reply)| (*id, reply.as_str())), changed_agent, cursor, session)?;
+        if next != g.runtime || reply.is_some() || changed_agent.is_some() || cursor.is_some() || session.is_some()
+            || fx.quiet.is_some() {
+            store.commit_hook(&next, reply.as_ref().map(|(id, reply)| (*id, reply.as_str())), changed_agent, cursor, session,
+                fx.quiet.as_ref())?;
             self.mark(&next);
             g.runtime = next;
             if let Some(agent) = changed_agent { g.agents.insert(agent.id, agent.clone()); }
@@ -1620,6 +1673,7 @@ pub fn create(hub: &Hub, req: NewAgent) -> anyhow::Result<Agent> {
             asleep_at: None,
             self_handoff: false,
             self_handoff_at: None,
+            tools_up_front: false,
         },
     )?;
     publish(hub, &a);
@@ -1674,6 +1728,9 @@ pub struct AgentUpdate {
     /// Turning it on needs `by_owner`; turning it off works from anywhere.
     #[serde(default)]
     pub self_handoff: Option<bool>,
+    /// Load Muster's message tools up front in its sessions (`Agent::tools_up_front`).
+    #[serde(default)]
+    pub tools_up_front: Option<bool>,
     /// The call is the human's own: a click in Muster's window, or the CLI from a terminal
     /// outside every Muster session (`rpc::owner_terminal`). Set by the RPC layer, never by
     /// the caller (not a request field).
@@ -1780,6 +1837,9 @@ pub fn update_switch(hub: &Hub, req: AgentUpdate, outside: bool) -> anyhow::Resu
             crate::self_handoff::check_grant(&cur, req.by_owner)?;
         }
         next.self_handoff = on;
+    }
+    if let Some(on) = req.tools_up_front {
+        next.tools_up_front = on;
     }
     if outside && let Some(why) = widens_unattended(hub, &cur, &next) {
         anyhow::bail!("{why}");
@@ -2044,6 +2104,7 @@ async fn start_once(hub: &Arc<Hub>, name: &str, fresh: bool, window: Option<Wind
         Ok(Some(_)) => {
             refuse_symlink(&persona)?;
             add_links_section(&persona);
+            add_quiet_sentence(&persona);
         }
         Err(e) => anyhow::bail!("can't read {}: {e}", persona.display()),
     }
@@ -2652,6 +2713,9 @@ pub fn message_record(agent: &Agent, from: &str, from_session: Option<SessionId>
         to_name: None,
         cold_idle_ms: None,
         answer: None,
+        quiet: false,
+        shown_at: None,
+        expired_at: None,
     }
 }
 
@@ -2774,6 +2838,8 @@ async fn deliver_inner(hub: &Arc<Hub>, mut out: Outgoing, held: Option<&StartHel
                         .unwrap_or_else(|| "daily cap reached".into())
                 }
                 crate::store::CapHit::Unattended(n) => guard::unattended_cap_refusal(&bs.agent.name, n, ucap.unwrap_or(0)),
+                // Only quiet messages have a waiting cap (`quiet`).
+                crate::store::CapHit::Waiting(n) => format!("{} has {n} messages waiting", bs.agent.name),
             };
             record_refused(hub, &msg, &why);
             return Err(Refused(why).into());
@@ -2807,6 +2873,78 @@ async fn deliver_inner(hub: &Arc<Hub>, mut out: Outgoing, held: Option<&StartHel
             Err(e)
         }
     }
+}
+
+/// What a quiet message to an agent became (`quiet`).
+#[derive(Debug, Clone, Serialize)]
+pub struct QuietSent {
+    pub msg_id: i64,
+    /// The agent's session when it was stored (it may change before its next turn).
+    pub session_id: Option<SessionId>,
+    pub sent_at_ms: i64,
+    /// How many now wait for its next turn, this one included.
+    pub waiting: usize,
+}
+
+/// The stored half of `deliver` for a message sent with wake=false (src/quiet.rs): the spend
+/// caps, the agent's kind, both daily caps and the waiting cap, then the message is kept for the
+/// agent's next turn. Never starts, wakes or types into the agent. The caller checked the route
+/// (`route` / `precheck`) and the permission width, as for `deliver`. A cap refusal is `Refused`.
+pub fn quiet(hub: &Hub, out: Outgoing) -> anyhow::Result<QuietSent> {
+    let text = crate::mcp::tools::clean_text(&out.text);
+    let a = hub.agents().get(&out.agent).ok_or_else(|| no_agent(hub, &out.agent))?;
+    if out.agent_id.is_some_and(|id| id != a.id) {
+        return Err(Refused(format!("the agent {} this was for was removed, and the name now belongs to another agent", out.agent)).into());
+    }
+    let refuse = |why: String| -> anyhow::Error {
+        record_refused(hub, &message_record(&a, &out.from, out.from_session, out.route, &text), &why);
+        Refused(why).into()
+    };
+    if let Err(why) = crate::quiet::check_receiver(a.kind, &a.name) {
+        return Err(refuse(why));
+    }
+    // A late reply carries its "Late reply to your message" line too (src/agent_reply.rs).
+    let room = if out.route.reply_to.is_some() { crate::quiet::REPLY_ROOM } else { 0 };
+    crate::quiet::check_size(&text, room).map_err(|e| anyhow::anyhow!(e))?;
+    if crate::spend::applies(hub, &a, out.route.origin)
+        && let Err(why) = hub.spend.check(hub, &a, &hub.schedules.settings())
+    {
+        return Err(refuse(why));
+    }
+    let mut msg = message_record(&a, &out.from, out.from_session, out.route, &text);
+    msg.quiet = true;
+    let now = msg.created_at;
+    let ucap = unattended_cap(hub, out.route);
+    let waiting_after = crate::quiet::after(now);
+    let id = match hub.store().insert_agent_message_capped_waiting(
+        &msg,
+        now - guard::AGENT_CAP_WINDOW_MS,
+        guard::AGENT_DAILY_PROMPT_CAP,
+        ucap.map(|c| c as usize),
+        Some((waiting_after, crate::quiet::WAITING_MAX)),
+    )? {
+        Ok(id) => id,
+        Err(hit) => {
+            let why = match hit {
+                crate::store::CapHit::All(n) => guard::check_agent_delivery(&a.name, &a.accepts_origins, out.route.origin, out.route.hop, n)
+                    .err()
+                    .unwrap_or_else(|| "daily cap reached".into()),
+                crate::store::CapHit::Unattended(n) => guard::unattended_cap_refusal(&a.name, n, ucap.unwrap_or(0)),
+                crate::store::CapHit::Waiting(n) => format!(
+                    "{} has {n} messages waiting for its next turn already; send with wake=true, or use ask_agent if it must act now",
+                    a.name
+                ),
+            };
+            return Err(refuse(why));
+        }
+    };
+    publish_message(hub, id);
+    crate::quiet::refresh_agent(hub, a.id);
+    let waiting = a.session_id
+        .map(|s| hub.store().quiet_count(Some(a.id), s, waiting_after))
+        .transpose()?
+        .unwrap_or(1);
+    Ok(QuietSent { msg_id: id, session_id: a.session_id, sent_at_ms: now, waiting })
 }
 
 /// Route a message from sender `from` (provenance `prov`, or the daemon's own `forced` origin),
@@ -3035,6 +3173,7 @@ pub fn agent_json(b: &Agent, session: Option<&SessionInfo>) -> Value {
         "asleep_at": b.asleep_at,
         "self_handoff": b.self_handoff,
         "self_handoff_at": b.self_handoff_at,
+        "tools_up_front": b.tools_up_front,
     })
 }
 
@@ -3057,6 +3196,9 @@ pub fn message_json(m: &AgentMessage) -> Value {
         "refused": m.refused,
         "cold_idle_ms": m.cold_idle_ms,
         "answer": m.answer,
+        "quiet": m.quiet,
+        "shown_at": m.shown_at,
+        "expired_at": m.expired_at,
     })
 }
 
@@ -3709,7 +3851,7 @@ mod tests {
             session_id: Some(9),
             resume_id: None,
             created_at: 0,
-            autostart: false, sleep_after_min: None, asleep_at: None, self_handoff: false, self_handoff_at: None,
+            autostart: false, sleep_after_min: None, asleep_at: None, self_handoff: false, self_handoff_at: None, tools_up_front: false,
         }
     }
 
@@ -3731,7 +3873,7 @@ mod tests {
                 refused: None,
                 to_name: None,
                 cold_idle_ms: None,
-                answer: None,
+                answer: None, quiet: false, shown_at: None, expired_at: None,
             })
             .unwrap()
     }

@@ -40,6 +40,7 @@ import {
   feedFor,
   firstLine,
   carriesLateReply,
+  quietAnswerText,
   quietStatus,
   keepForKind,
   lateText,
@@ -256,7 +257,7 @@ function AgentRow({ a, now, selected }: { a: Agent; now: number; selected: boole
           {st.since !== null && ` · ${ago(st.since, now)}`}
           {a.autostart && <span class="ap-auto" data-tip="Starts with the daemon">auto</span>}
           {a.sleep_after_min != null && !st.asleep && (
-            <span class="ap-auto" data-tip={`Sleeps after ${idleText(a.sleep_after_min * 60_000)} idle; the next message wakes it`}>
+            <span class="ap-auto" data-tip={`Sleeps after ${idleText(a.sleep_after_min * 60_000)} idle; the next message sent with wake on wakes it`}>
               sleeps
             </span>
           )}
@@ -414,10 +415,14 @@ function QuietChip({ m }: { m: AgentMessage }) {
 }
 
 function FeedEntry({ m, now }: { m: AgentMessage; now: number }) {
+  // A quiet message's status sentence, on the focusable row itself: the chip's tooltip is
+  // pointer-only.
+  const quiet = quietStatus(m);
   return (
     <button
       type="button"
       class={cx("ap-msg", m.refused && "refused")}
+      aria-description={quiet?.text}
       data-msg={m.id}
       onClick={() => (overlay.value = { kind: "agent_message", id: m.id })}
     >
@@ -1489,7 +1494,7 @@ export function AgentDialog(
                   <span class="toggle-thumb" />
                 </span>
                 <span>
-                  Sleep when idle <span class="muted">(stop its process; the next message wakes it)</span>
+                  Sleep when idle <span class="muted">(stop its process; a message sent with wake on wakes it)</span>
                 </span>
               </label>
               {d.sleep && (
@@ -1557,10 +1562,9 @@ export function AgentDialog(
                   </span>
                 </label>
                 <span id="tools-up-front-hint" class="field-hint sleep-after">
-                  Its sessions get Muster's seven message tools (ask_agent, tell_agent, reply, send_message, whoami,
-                  note_read, note_append) in the prompt from the start, instead of looking each one up before first
-                  use. Adds about 2,000 tokens to every request, mostly read from the cache. Applies from its next
-                  start.
+                  Puts Muster's message tools (ask_agent, tell_agent, reply and four more) in its prompt from the
+                  start, so it doesn't look each one up first. About 2,200 more tokens on every request, mostly
+                  cached. Applies from its next start.
                 </span>
               </div>
             )}
@@ -2068,6 +2072,8 @@ export function MessageDialog({ id, Modal, close }: { id: number; Modal: ModalT;
   // This message carried another one's late reply.
   const carried = carriesLateReply(m);
   const quiet = quietStatus(m);
+  // The message that carried its later reply, when that went quietly: where it stands now.
+  const carrier = m.answer?.msg != null ? agentMessages.value.find((x) => x.id === m.answer!.msg) : undefined;
   return (
     <Modal class="dialog dialog-scroll dlg-calm msg-dlg" label={`Message ${m.id}`}>
       <div class="dlg-head">
@@ -2125,7 +2131,7 @@ export function MessageDialog({ id, Modal, close }: { id: number; Modal: ModalT;
                 m.answer.status === "refused" || m.answer.status === "undelivered" ? "form-error" : "muted",
               )}
             >
-              {lateText(m.answer)}
+              {quietAnswerText(m.answer, carrier) ?? lateText(m.answer)}
             </span>
           </div>
         )}

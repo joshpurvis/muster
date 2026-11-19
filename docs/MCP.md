@@ -89,7 +89,7 @@ and targets in them are refused.
 | `list_channels` | — | Non-archived channels: id, name, workspace, cwd, branch, base_branch, `permissions`, `state` (aggregate), `sessions`, `live_sessions`. |
 | `list_sessions` | `channel_id?` | All sessions (including exited): id, channel_id, kind, name, state, detail, state_since_ms, queued, quiet_waiting (quiet messages waiting for its next turn, see "Quiet messages" below), parent_id, title, exit_code, is_me, `link`, `mention` (see "Links" below). |
 | `spawn_session` (alias `spawn_agent`, its old name: still accepted, not listed) | `kind` (`claude`\|`codex`\|`shell`), `prompt?`, `name?`, `model?`, `effort?`, `args?: string[]`, `channel_id?` **or** `new_channel?: {name?, worktree? = true, base?}` | New session (`parent_id` = caller) plus its channel. Default: caller's channel. The new session is a tab in the caller's window. `new_channel` is created in the caller's workspace, in the caller's window (else its channel's), with the caller's channel's permission profile. Without a `name` it is auto-named like any unnamed channel (docs/PROTOCOL.md), usually from the agent's title or the `prompt`. Unlike `channel.create`, `worktree` defaults to `true` here, so parallel agents don't share a checkout. `kind: shell` with a `prompt` or any `args` is refused unless shell commands are allowed (arguments to a shell are a command too). `model`/`effort` become `--model`/`--effort` (claude) or `-m`/`-c model_reasoning_effort=` (codex); `args` are extra CLI arguments; all of them go through the agent-argument allowlist (docs/PROTOCOL.md, "Channel permissions"), so they can't widen the profile. |
-| `send_message` | `session_id`, `text`, `interrupt? = false`, `wake? = true` | `{delivered, queued, sent_at_ms}`. Goes through the injection queue (`inject::send`, `from = "session:<caller>"`). With `wake: false` it is kept for the session's next turn instead (`{session_id, quiet_id, wake: false, status: "waiting", note, sent_at_ms}`; Claude sessions only, not with `interrupt`; see "Quiet messages" below). Like any first prompt, it names an auto-named channel. Shell targets are refused unless shell commands are allowed; when allowed, the text is preceded by a line clear (Ctrl-E Ctrl-U) so it doesn't append to a half-typed command. |
+| `send_message` | `session_id`, `text`, `interrupt? = false`, `wake? = true` | `{delivered, queued, sent_at_ms}`. Goes through the injection queue (`inject::send`, `from = "session:<caller>"`). With `wake: false` it is kept for the session's next turn instead (`{session_id, quiet_id, wake: false, status: "waiting", note, sent_at_ms}`; Claude sessions only, not with `interrupt`; see "Quiet messages" below). A named agent's session is refused: it takes messages through `ask_agent`, or `tell_agent` for a note that doesn't need an answer. Like any first prompt, it names an auto-named channel. Shell targets are refused unless shell commands are allowed; when allowed, the text is preceded by a line clear (Ctrl-E Ctrl-U) so it doesn't append to a half-typed command. |
 | `read_screen` | `session_id` | `[session N (kind) state=S]` header, then the visible screen. |
 | `get_recent_output` | `session_id`, `lines? = 100` (max 2000) | Last N lines, ANSI stripped. |
 | `wait_for_state` | `session_id`, `states?`, `timeout_seconds? = 300` (max 1800), `after_ms?` | `{state, detail, reached, timed_out, ended, waited_ms, queued, …}`. |
@@ -98,7 +98,7 @@ and targets in them are refused.
 | `list_agents` | — | `{agents: [{id, name, kind, model, effort, persona, permissions, accepts_origins, autostart, home_dir, channel_id, session_id, state, detail, resumable, created_at, sleep_after_min, asleep, asleep_at, self_handoff, self_handoff_at, tools_up_front, is_me}], your_origin: {origin, hop}}`. All agents, whatever the caller's workspace. `asleep`: its process was stopped while idle (state `exited`, detail `asleep`); asking it wakes it, which re-reads its whole conversation (docs/PROTOCOL.md "Sleep and wake"). Listing never wakes anyone. |
 | `ask_agent` | `agent` (name, case-insensitive), `text`, `timeout_seconds? = 600` (max 1800) | `{agent, msg_id, session_id, reply, state, detail, timed_out, ended, origin, hop, sent_at_ms, started, woke, woke_note?, waited_ms, note?, unattributed_output?}`. Starts the agent if it has no live session (`woke: true` when it was asleep: it restarted into its conversation first), sends `[muster msg <id> from <sender> origin=<o> hop=<n>]` plus the text through the injection queue (`from = "session:<caller>"`), then waits for **this message's** turn: until the agent reports a final message attributed to it (Stop hook, Codex notify), or, after the message was typed in, stops on a prompt, question or error (`reply: null` and a `note`), or exits. If the agent goes idle after it with no attributed final message (3 s grace), `reply` is null and `unattributed_output` holds its last 60 terminal lines, with a `note` that they may belong to another prompt. The agent's `reply` to this message while the ask waits ends it with that text as `reply`. On timeout a `note` says a later answer comes as a new message (or, sent with wake=false, at the start of the next turn). See "Agents" below. |
 | `tell_agent` | `agent`, `text`, `wake` (required) | A message nobody waits for an answer to. `wake: true`: delivered now as `ask_agent`'s message is (the agent starts or wakes if needed), without waiting for the turn: `{agent, msg_id, wake, status: "delivered"\|"queued", session_id, woke, started, origin, hop, sent_at_ms, note}`. `wake: false`: kept for the agent's next turn (`{agent, msg_id, wake, status: "waiting", waiting, origin, hop, sent_at_ms, note}`); see "Quiet messages" below. Same checks as `ask_agent` either way. |
-| `reply` | `msg_id`, `text`, `wake? = true` | `{msg_id, status, delivered, note, delivered_as, session_id, origin, hop}`. Answers a message delivered to the caller's agent after the turn that received it; see "Late replies" below. With `wake: false`, an asker that is no longer waiting gets it at the start of its next turn instead of a new turn. Errors (nothing stored, no rate-limit slot used): the caller isn't a named agent, the message wasn't delivered to it (unknown, another agent's, refused, still queued), it already has a reply, empty or over 100 000 chars, or starts with `!` (unless shell commands are allowed). |
+| `reply` | `msg_id`, `text`, `wake? = true` | `{msg_id, status, delivered, note, delivered_as, session_id, origin, hop}`. Answers a message delivered to the caller's agent after the turn that received it; see "Late replies" below. With `wake: false`, an asker that is no longer waiting gets it at the start of its next turn instead of a new turn. Errors (nothing stored, no rate-limit slot used): the caller isn't a named agent, the message wasn't delivered to it (unknown, another agent's, refused, still queued), it already has a reply, empty or over 100 000 chars, starts with `!` (unless shell commands are allowed), or, with `wake: false`, over 6,000 characters (UTF-16 code units, an emoji counts two) or 150 lines. |
 | `start_fresh` | `file` (absolute, or relative to the caller's working directory; at most 4096 bytes) | `{status: "waiting", file, note}`. A named Claude agent the human promoted asks for its own fresh start; see "Self handoff" below. Only ever for the caller itself (no target argument). Refused (and recorded in its tab's timeline) when the caller isn't a named agent, isn't promoted (the error says how the human grants it), is a Codex agent (not supported yet), already has a request waiting, started fresh less than 30 minutes ago, or the file doesn't exist, isn't a regular file, or lies outside its home folder and working directory once symlinks are resolved. Counts toward the per-minute post rate limit. |
 
 `whoami` also returns `agent` (the caller's agent name, or null) and `origin: {origin, hop}`.
@@ -832,7 +832,13 @@ long job finishes: it says so in that turn's reply, then calls `reply {msg_id, t
   `Late reply to your message <id>` text, an agent message with `quiet` set; note "waits for
   <name>'s next turn as message <n>"), and another Claude session gets it at the start of its
   next turn (a Codex session is not delivered to: `undelivered`). An ask still waiting takes it
-  either way, and the human's and a schedule's rows are unchanged. Same checks as the waking way.
+  either way, and the human's and a schedule's rows are unchanged. Same checks as the waking way:
+  for an asking agent, its accepted origins for the reply's origin and every origin it is rooted
+  in, and the hop limit, before anything is kept. The answer's text must meet the quiet size rule
+  (6,000 characters, 150 lines), checked before it is stored and before the rate limit's slot is
+  taken; the generated `Late reply to your message` line gets room of its own. A quiet late reply
+  to a plain session is linked to the message it answers (one per session), so a restart that
+  cut its delivery off finds it kept (`delivered`) or keeps it once.
 
   A reply to an asker is a reply to that asker's own question, so two rules for starting work
   don't apply: the workspace rule (an agent may answer a project session that asked it) and
@@ -852,7 +858,7 @@ way. Code: `src/quiet.rs`.
   oldest first:
 
   ```
-  Messages that arrived for you while you were idle. Other agents or sessions sent them without waking you; the human did not type them. Answer one later with reply(msg_id) if it needs an answer.
+  Messages that waited for this turn. Other agents or sessions sent them without waking you; the human did not type them. To answer one, call reply with its msg_id and your text.
   [muster msg 812 from alpha origin=human hop=2] sent 6 min ago
     PR 31 is open, head abc1234. The report is in reports/auth.md.
   [muster msg 815 from beta origin=human hop=1] sent 2 min ago
@@ -860,54 +866,81 @@ way. Code: `src/quiet.rs`.
     deploy is green.
   ```
 
-  An agent message keeps its envelope, so `reply(msg_id)` answers it (a shown quiet message
-  counts as delivered). A message to a plain session has `[muster quiet message from <sender>
-  origin=<o> hop=<n>]` instead. Every line of a message's text is indented, so no line of it
-  can pass for a header. A turn takes at most 7,500 characters and 180 lines of them (Claude
+  An agent message keeps its envelope, so `reply` with its `msg_id` answers it (a shown quiet
+  message counts as delivered; the last sentence of the first line is for named agents only). A
+  message to a plain session has `[muster quiet message from <sender> origin=<o> hop=<n>]`
+  instead. Every line of a message's text is indented, and every line break a reader could take
+  for one (`\r`, U+0085, U+2028, U+2029) is made a plain line break first, so no line of it can
+  pass for a header. A turn takes at most 7,500 characters and 180 lines of them (Claude
   Code's limit for hook context is 8,000 characters and 200 lines, counted in UTF-16 code
   units as it counts them); the rest wait, under a last line "3 more messages are waiting; they
   come with your next turn." A prompt starting with `/` (a slash command such as `/clear`)
   takes none.
 - *How:* Muster's `UserPromptSubmit` hook (`muster hook claude UserPromptSubmit`) asks the
   backend for the session's waiting messages (`POST /quiet/take` with the session's own token,
-  at most 1 s) and prints them as the hook's JSON output; that marks them offered. The payload
-  the hook saves for the backend names them (`muster_quiet: {agent: [ids], session: [ids]}`),
-  and replaying it marks them shown, in the same transaction as the turn's attribution, and
-  raises the turn's provenance (above). With the backend down (a reload) the hook prints nothing
-  and they keep waiting; one offered but never confirmed is offered again after 2 minutes, so a
-  lost callback can show one twice, never lose it.
+  at most 1 s) and prints them as the hook's JSON output. `take` picks them, marks them offered
+  to the session's current run, and raises the session's provenance to their routes (the higher
+  hop, their origin), all in one transaction: the turn never acts on them under its old route,
+  and two overlapping takes never offer one message twice. The payload the hook saves for the
+  backend names them (`muster_quiet: {agent: [ids], session: [ids]}`); replaying it keeps them
+  pending for that run (and raises the provenance again, in case the prompt was the human's). The
+  run's next hook (`PreToolUse`, `PostToolUse` or `Stop`: the turn ran) marks them shown. A new
+  prompt with no such hook in between means the earlier one never ran (another
+  `UserPromptSubmit` hook blocked it, and Claude Code discarded its context): its messages stay
+  offered. Only a hook of the run they were offered to can confirm them. With the backend down
+  (a reload) the hook prints nothing and they keep waiting; one offered but never confirmed is
+  offered again after 2 minutes (at once to a new run), so a lost callback or a blocked prompt
+  can show one twice, never lose it.
+- *Which a turn takes:* messages of the human's origin, and messages of the turn's own origin
+  (the session's provenance when the turn starts: a delivered message's for a turn it started).
+  One turn never mixes a schedule's and a webhook's work, and a human-rooted ask's answer (which
+  goes straight back to the asker) never carries scheduled or triggered material: a
+  schedule- or webhook-rooted note waits for a turn of its own kind, or until it expires. A named
+  agent takes only origins it still accepts (an origin taken away after a note was sent keeps it
+  waiting), and an agent on OpenRouter takes unattended ones only while the spend caps allow
+  (read fresh, as the waking path does); the turn itself goes ahead either way.
 - *Who takes them:* Claude sessions only, through that hook. A Codex receiver is refused with
   "<name> is a codex session, which can't take a message that waits for its next turn (only
   Claude sessions can). Send it with wake=true". `send_message` with `wake: false` and
   `interrupt: true` together is refused.
 - *Guards:* the waking path's, every one, before anything is stored. `tell_agent` runs
   `ask_agent`'s checks (permission width, the agent's accepted origins, the hop limit, the daily
-  and unattended caps in the insert's transaction, the OpenRouter spend caps, the rate limit,
-  text cleaning); `send_message` keeps its own (reach, the Claude origin rule, permission width);
-  `reply` keeps its route and per-asker checks. Only the last step changes: stored instead of
-  typed in. Refusals are logged like any refused message.
-- *Limits:* at most 6,000 characters and 150 lines per message (a late reply's quoted first line
-  is extra), and 20 waiting per receiver: the 21st is refused ("beta has 20 messages waiting for its
-  next turn already; send with wake=true, or use ask_agent if it must act now"). A message never shown within 7
-  days is marked expired (kept in the log, never shown).
+  and unattended caps in the insert's transaction, the OpenRouter spend caps with a fresh
+  reading, the rate limit, text cleaning); every quiet message to a named agent checks the
+  agent's accepted origins and the hop limit again where it is stored (`agents::quiet`);
+  `send_message` keeps its own (reach, the Claude origin rule, permission width); `reply` keeps
+  its route and per-asker checks. Only the last step changes: stored instead of typed in.
+  Refusals are logged like any refused message. A message refused for its size takes no rate
+  limit slot.
+- *Limits:* at most 6,000 characters and 150 lines per message (a late reply's generated first
+  line is extra), and 20 waiting per receiver: the 21st is refused ("beta has 20 messages waiting for its
+  next turn already; send with wake=true, or use ask_agent if it must act now"). A message never
+  shown within 7 days is marked expired (kept in the log, never shown): checked at daemon start,
+  every hour and at each turn's start, and the tabs' counts follow.
 - *Where they wait:* in the database, so a backend reload or restart keeps them. An agent's
   are kept by agent, not by session: they come with its next turn after a restart, a wake or a
-  fresh start (`start_fresh`, `agent start --fresh`). A plain session's are dropped when it ends.
+  fresh start (`start_fresh`, `agent start --fresh`). A plain session's are dropped when its
+  process ends (or its tab is removed), and a session that has exited takes none.
   They are not prompts in the injection queue: they don't keep an agent awake (it may still go
   to sleep), and they never start a turn, so two agents can't keep each other busy with them.
 - *Seen in:* the receiver's tab (an envelope badge with the count, `quiet_waiting` on the
-  session), the agents panel's message log ("waits for next turn", "shown", "expired";
-  `agent.messages` fields `quiet`, `shown_at`, `expired_at`), `list_sessions`. Every agent's
-  generated `CLAUDE.md` says to use `tell_agent` for reports and `reply` with `wake: false` after
-  a long job.
+  session; an asleep agent's tab shows it too, and messages sent before an agent's first start
+  count once its tab opens), the agents panel's message log for named agents' messages ("waits
+  for next turn", "shown", "expired"; `agent.messages` fields `quiet`, `shown_at`,
+  `expired_at`; the overlay of a message whose late reply went quietly shows where the carrying
+  message stands), `list_sessions`. Every Claude agent's generated `CLAUDE.md` says to use
+  `tell_agent` for reports and `reply` with `wake: false` after a long job, and to leave wake on
+  for Codex receivers (a Codex agent's `AGENTS.md` doesn't mention quiet messages).
 
 **Message tools up front.** Claude Code defers MCP tools: a session sees only their names until
 it looks one up with its tool search, which costs a step each time. An agent with "Load message
 tools up front" (`tools_up_front`, off by default; Edit agent > More options, or `muster agent
 edit NAME --tools-up-front on`) gets seven tools in its prompt from the start: `ask_agent`,
 `tell_agent`, `reply`, `send_message`, `whoami`, `note_read`, `note_append`. Muster marks them
-with `_meta["anthropic/alwaysLoad"]` in that agent's sessions' `tools/list` (Claude Code
-2.1.325 honours it per tool). Measured on Claude Code 2.1.325 against Muster's server: about
+with `_meta["anthropic/alwaysLoad"]` in that agent's Claude sessions' `tools/list` (Claude Code
+2.1.325 honours it per tool); a Codex agent can't have it (refused) and never gets the mark.
+Like a self handoff grant, only the human turns it on (a click in Muster's window, or the CLI in
+a terminal outside Muster; refused from inside any Muster session); `off` works anywhere. Measured on Claude Code 2.1.325 against Muster's server: about
 2,200 more prompt tokens on every model call, mostly cache reads; all of Muster's tools would be
 about 14,500. Applies from the agent's next start (Claude Code reads the list when it connects).
 

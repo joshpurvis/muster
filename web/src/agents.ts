@@ -23,7 +23,7 @@ export interface AgentStatus {
   state: AgentState | null;
   /** Its session is running (clicking it only pulls the tab). */
   live: boolean;
-  /** Asleep: stopped while idle, the next message wakes it (src/sleep.rs). */
+  /** Asleep: stopped while idle, the next message sent with wake on wakes it (src/sleep.rs). */
   asleep: boolean;
   label: string;
   /** Unix ms the state began (null: never started). */
@@ -58,13 +58,14 @@ export function parseSleepAfter(v: string): number | null {
   return n >= SLEEP_AFTER_MIN && n <= SLEEP_AFTER_MAX ? n : null;
 }
 
-/** The asleep bar's sentence: how long it has slept, that the next message wakes it, and when
- * its prompt cache has likely expired, what that wake costs (`cold`). */
+/** The asleep bar's sentence: how long it has slept, that the next message sent with wake on (a
+ * quiet one waits instead) or typing wakes it, and when its prompt cache has likely expired, what
+ * that wake costs (`cold`). */
 export function asleepText(name: string, asleepAt: number | null | undefined, cold: boolean, now: number): string {
   const lead = asleepAt != null && now - asleepAt >= 60_000
     ? `${name} has been asleep for ${idleText(now - asleepAt)}`
     : `${name} is asleep`;
-  return `${lead}. The next message, or typing here, wakes it` +
+  return `${lead}. The next message sent with wake on, or typing here, wakes it` +
     (cold
       ? `: it re-reads the whole conversation at full cost, since its prompt cache has likely expired.`
       : " into the same conversation.");
@@ -73,7 +74,7 @@ export function asleepText(name: string, asleepAt: number | null | undefined, co
 /** The asleep bar's line after a wake that failed (`wake_error`): still asleep, how to try again,
  * and what a wake costs once its prompt cache has likely expired (`cold`). */
 export function wakeFailedText(name: string, error: string, cold: boolean): string {
-  return `Waking ${name} failed: ${error.replace(/\.$/, "")}. It is still asleep: the next message, or typing here, tries again` +
+  return `Waking ${name} failed: ${error.replace(/\.$/, "")}. It is still asleep: the next message sent with wake on, or typing here, tries again` +
     (cold ? ", and re-reads the whole conversation at full cost." : ".");
 }
 
@@ -400,17 +401,34 @@ export function quietStatus(
     return { state: "shown", chip: "shown", text: `Shown to ${m.to} at the start of a turn, ${time(m.shown_at)}.` };
   }
   if (m.expired_at != null) {
-    return {
-      state: "expired",
-      chip: "expired",
-      text: `Expired: ${m.to} didn't take a turn within 7 days of it being sent, so it was never shown.`,
-    };
+    return { state: "expired", chip: "expired", text: `Expired after 7 days without being shown to ${m.to}.` };
   }
   return {
     state: "waiting",
     chip: "waits for next turn",
     text: `Waits for ${m.to}'s next turn and arrives as context when it starts. Sending it didn't wake ${m.to}.`,
   };
+}
+
+/** How a late reply sent quietly (`answer.quiet`, carried by message `answer.msg`) stands: where
+ * the carrying message is now (waiting, shown at HH:MM, expired), not only the note stored when it
+ * was kept. Null when it didn't go quietly to an agent, or the carrying message isn't loaded. */
+export function quietAnswerText(
+  a: LateAnswer,
+  carrier: AgentMessage | undefined,
+  time: (ms: number) => string = hhmm,
+): string | null {
+  if (!a.quiet || a.status !== "delivered" || a.msg == null || !carrier || carrier.id !== a.msg) return null;
+  const q = quietStatus(carrier, time);
+  if (!q) return null;
+  switch (q.state) {
+    case "waiting":
+      return `Waits for ${carrier.to}'s next turn as message ${carrier.id}; it arrives as context when that turn starts.`;
+    case "shown":
+      return `Shown to ${carrier.to} at the start of a turn, ${time(carrier.shown_at!)} (message ${carrier.id}).`;
+    case "expired":
+      return `Expired after 7 days without being shown to ${carrier.to} (message ${carrier.id}).`;
+  }
 }
 
 /** The tab badge's tip: quiet messages waiting for the session's next turn. */

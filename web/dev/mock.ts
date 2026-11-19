@@ -1066,6 +1066,59 @@ const sched = scheduleMock({
       expired_at: null,
     },
   );
+  // A question whose late reply went quietly (`reply` with wake=false): its overlay says where the
+  // carrying message stands (src/agent_reply.rs, docs/UI.md "Message log").
+  const askId = seq++;
+  const carrierId = seq++;
+  agentMsgs.push(
+    {
+      id: askId,
+      from: orch.name,
+      from_session: null,
+      to: rev.name,
+      to_agent: rev.id,
+      to_session: null,
+      origin: "human",
+      hop: 1,
+      reply_to: null,
+      created_at: t0 + 26 * 60_000,
+      text: "Run the full benchmark suite on fix-auth and tell me if anything regressed.",
+      reply: "Started; it takes about 40 minutes. I'll reply with the numbers.",
+      replied_at: t0 + 27 * 60_000,
+      refused: null,
+      answer: {
+        text: "No regressions: all 48 benchmarks within 2% of master.",
+        at: t0 + 36 * 60_000,
+        from_session: 0,
+        origin: "human",
+        hop: 2,
+        status: "delivered",
+        note: `waits for ${orch.name}'s next turn as message ${carrierId}`,
+        msg: carrierId,
+        quiet: true,
+      },
+    },
+    {
+      id: carrierId,
+      from: rev.name,
+      from_session: null,
+      to: orch.name,
+      to_agent: orch.id,
+      to_session: null,
+      origin: "human",
+      hop: 2,
+      reply_to: askId,
+      created_at: t0 + 36 * 60_000,
+      text: `Late reply to your message ${askId} ("Run the full benchmark suite on fix-auth and tell me if…"):\n` +
+        "No regressions: all 48 benchmarks within 2% of master.",
+      reply: null,
+      replied_at: null,
+      refused: null,
+      quiet: true,
+      shown_at: null,
+      expired_at: null,
+    },
+  );
 }
 
 // ---------- notes (like src/notes.rs) ----------

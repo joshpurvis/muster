@@ -2580,10 +2580,13 @@ impl AgentOpts {
         }
         if let Some(on) = self.self_handoff {
             set("self_handoff", json!(on));
-            // Granting it inside a Muster session is refused: say whose call it is (`agent.update`).
-            if let Some(id) = env_session() {
-                set("from_session", json!(id));
-            }
+        }
+        // Granting self handoff or turning on tools up front inside a Muster session is refused:
+        // say whose call it is (`agent.update`).
+        if (self.self_handoff.is_some() || self.tools_up_front.is_some())
+            && let Some(id) = env_session()
+        {
+            set("from_session", json!(id));
         }
         if self.claude_mode.is_some() || self.codex_sandbox.is_some() {
             set(

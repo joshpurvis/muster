@@ -1742,7 +1742,7 @@ export function wakeAgent(a: Agent) {
 export function sleepAgent(a: Agent) {
   rpc.call<Agent>("agent.sleep", { name: a.name }).then((r) => {
     knowAgent(r);
-    toast("info", `${a.name} is asleep. The next message wakes it.`, 3000);
+    toast("info", `${a.name} is asleep. The next message sent with wake on wakes it.`, 3000);
   }).catch(fail("Couldn't put it to sleep")).catch(() => {});
 }
 

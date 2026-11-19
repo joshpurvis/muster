@@ -257,7 +257,7 @@ impl Backend for Arc<Mock> {
     fn agent_messages_since(&self, agent_id: i64, _since: i64) -> usize {
         self.d.lock().agent_counts.get(&agent_id).copied().unwrap_or(0)
     }
-    fn agent_quiet(&self, out: crate::agents::Outgoing) -> anyhow::Result<crate::agents::QuietSent> {
+    async fn agent_quiet(&self, out: crate::agents::Outgoing) -> anyhow::Result<crate::agents::QuietSent> {
         let mut d = self.d.lock();
         d.quiet.push(out);
         Ok(crate::agents::QuietSent { msg_id: 100 + d.quiet.len() as i64, session_id: Some(3), sent_at_ms: 0, waiting: d.quiet.len() })
@@ -1821,13 +1821,28 @@ async fn send_message_with_wake_false_keeps_it_for_the_next_turn() {
     // Session 2 is a Claude session in the caller's workspace.
     m.d.lock().sessions.get_mut(&2).unwrap().kind = SessionKind::Claude;
     let (t, err) = call(&st, "send_message", json!({"session_id": 2, "text": "fyi", "wake": false, "interrupt": true})).await;
-    assert!(err && t.contains("don't go together"), "{t}");
+    assert!(err && t.contains("can't be used together") && t.contains("Use wake=true with interrupt=true"), "{t}");
+    assert!(!t.contains("nothing"), "{t}");
     let (t, err) = call(&st, "send_message", json!({"session_id": 2, "text": "fyi", "wake": false})).await;
     assert!(!err, "{t}");
     assert_eq!(parse(&t)["status"], "waiting");
     let d = m.d.lock();
     assert!(d.sends.is_empty());
     assert_eq!((d.quiet_sessions[0].0, d.quiet_sessions[0].3.as_str()), (2, "fyi"));
+}
+
+#[tokio::test]
+async fn a_quiet_reply_too_long_to_keep_takes_no_rate_limit_slot() {
+    let (m, mut st) = state();
+    st.limits.send_per_window = 1;
+    for _ in 0..3 {
+        let (t, err) = call(&st, "reply", json!({"msg_id": 5, "text": "x".repeat(6001), "wake": false})).await;
+        assert!(err && t.contains("at most 6000 characters"), "{t}");
+    }
+    // The one slot is still free.
+    let (t, err) = call(&st, "send_message", json!({"session_id": 2, "text": "x"})).await;
+    assert!(!err, "{t}");
+    assert_eq!(m.d.lock().sends.len(), 1);
 }
 
 #[tokio::test]
@@ -1848,6 +1863,9 @@ async fn up_front_tools_are_marked_only_for_agents_that_load_them() {
     assert_eq!(names, want);
     // Other callers (cody, a plain session) keep everything deferred.
     assert!(marked(4).is_empty() && marked(1).is_empty());
+    // A Codex agent never gets Claude Code's mark, even with the setting on (an older record).
+    m.d.lock().agents.iter_mut().find(|a| a.name == "cody").unwrap().tools_up_front = true;
+    assert!(marked(4).is_empty());
     // The rest of each definition is unchanged (the UI visibility meta stays).
     let defs = crate::mcp::tools::tool_list(&st, 3);
     let ask = defs.iter().find(|d| d["name"] == "ask_agent").unwrap();
@@ -1866,7 +1884,7 @@ async fn ask_agent_guards() {
     assert!(err && t.contains("`!`"), "{t}");
     // Agents take messages through ask_agent only.
     let (t, err) = call_as(&st, "tok4", "send_message", json!({"session_id": 3, "text": "x"})).await;
-    assert!(err && t.contains("use ask_agent(agent=\"ada\")"), "{t}");
+    assert!(err && t.contains("use ask_agent(agent=\"ada\")") && t.contains("tell_agent(agent=\"ada\")"), "{t}");
     // The envelope sender is the agent's name.
     let (t, err) = call_as(&st, "tok4", "ask_agent", json!({"agent": "ada", "text": "x"})).await;
     assert!(!err, "{t}");

@@ -290,6 +290,11 @@ pub async fn reply(hub: &Arc<Hub>, caller: SessionId, msg_id: i64, text: String,
     if text.trim().is_empty() {
         anyhow::bail!("text must not be empty");
     }
+    // A reply kept for the asker's next turn has the quiet size rule, checked before it is
+    // stored: once stored, the message has had its one reply (the tool checks it first too).
+    if !wake {
+        crate::quiet::check_text(&text).map_err(|e| anyhow::anyhow!(e))?;
+    }
     let now = hub.agents().prov(caller);
     let route = answer_route(&m, now);
     let answer = Answer {
@@ -394,7 +399,9 @@ async fn deliver(hub: &Arc<Hub>, m: &AgentMessage, mut a: Answer) -> Answer {
             }
             let sender = hub.agents().by_id(m.to_agent).and_then(|r| r.session_id).unwrap_or(a.from_session);
             if a.quiet {
-                // Kept for the asker's next turn (src/quiet.rs), with the reply's own route.
+                // Kept for the asker's next turn (src/quiet.rs), with the reply's own route:
+                // `agents::quiet` checks it against the asker's accepted origins and the hop
+                // limit, as `send_checked` does below.
                 let out = agents::Outgoing {
                     agent: to.name.clone(),
                     agent_id: Some(to.id),
@@ -403,7 +410,7 @@ async fn deliver(hub: &Arc<Hub>, m: &AgentMessage, mut a: Answer) -> Answer {
                     from_session: Some(sender),
                     route: Route { origin: a.origin, hop: a.hop, reply_to: Some(m.id) },
                 };
-                match agents::quiet(hub, out) {
+                match agents::quiet(hub, out).await {
                     Ok(q) => {
                         a.msg = Some(q.msg_id);
                         a.session = q.session_id;
@@ -442,6 +449,8 @@ async fn deliver(hub: &Arc<Hub>, m: &AgentMessage, mut a: Answer) -> Answer {
                 return a;
             }
             if a.quiet {
+                // Kept once per answered message (`quiet_messages.reply_to`): a resumed delivery
+                // finds the row a previous backend stored.
                 let route = Route { origin: a.origin, hop: a.hop, reply_to: Some(m.id) };
                 match crate::quiet::send_session(hub, &s, from.clone(), Some(a.from_session), route, delivered_text(m, &a)) {
                     Ok(_) => {
@@ -530,12 +539,15 @@ async fn resume_one(hub: &Arc<Hub>, id: i64) -> anyhow::Result<()> {
                     },
                 }
             }
+            // Kept for its next turn: the row is linked to this message, so it is there or not, and
+            // keeping it again (`finish`) can't keep it twice.
+            Asker::Session(s) if a.quiet => hub.store().quiet_session_reply(s.id, m.id)?.map(|_| {
+                (AnswerStatus::Delivered, None, format!("waits for session {}'s next turn", s.id))
+            }),
             // Its queue may have it: typing it again could show it twice.
-            Asker::Session(s) => Some((AnswerStatus::Undelivered, None, if a.quiet {
-                format!("a backend restart interrupted keeping it for session {}'s next turn; it may not have arrived", s.id)
-            } else {
-                format!("a backend restart interrupted typing it into session {}; it may not have arrived", s.id)
-            })),
+            Asker::Session(s) => Some((AnswerStatus::Undelivered, None, format!(
+                "a backend restart interrupted typing it into session {}; it may not have arrived", s.id
+            ))),
             _ => None,
         };
         let changed = hub.store().update_agent_answer(id, &[AnswerStatus::Delivering], |x| match outcome {

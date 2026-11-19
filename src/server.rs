@@ -599,12 +599,13 @@ async fn hook(State(hub): State<Arc<Hub>>, Path(event): Path<String>, headers: H
 }
 
 /// `POST /quiet/take` with the run's session token: the quiet messages waiting for the turn its
-/// `UserPromptSubmit` hook is starting, marked offered (src/quiet.rs). Only that session's own.
+/// `UserPromptSubmit` hook is starting, marked offered to that run with the session's provenance
+/// raised to theirs (src/quiet.rs). Only that session's own.
 async fn quiet_take(State(hub): State<Arc<Hub>>, headers: HeaderMap) -> Response {
     let Some(id) = bearer(&headers).and_then(|token| hub.session_by_token(token)) else {
         return unauthorized();
     };
-    match crate::quiet::take(&hub, id) {
+    match crate::quiet::take(&hub, id).await {
         Ok(v) => axum::Json(v).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,

@@ -1872,6 +1872,12 @@ impl Hub {
         }
     }
 
+    /// The run (terminal generation) session `id` is on now: quiet messages are offered to, and
+    /// confirmed by, one run (src/quiet.rs).
+    pub(crate) fn session_run(&self, id: SessionId) -> Option<u64> {
+        self.inner.lock().sessions.get(&id).map(|e| e.generation)
+    }
+
     /// Update the count of quiet messages waiting for the session's next turn (src/quiet.rs).
     pub fn set_quiet_waiting(&self, id: SessionId, n: u32) {
         let mut g = self.inner.lock();
@@ -2039,6 +2045,9 @@ impl Hub {
                 return;
             }
         }
+        // Quiet messages waiting for an ordinary session's next turn end with its process
+        // (src/quiet.rs); a named agent's wait for the agent, whatever run takes them.
+        crate::quiet::session_ended(self, id);
         self.log_event(
             Some(channel_id),
             Some(id),
@@ -3282,6 +3291,9 @@ impl Hub {
             }
         }
         let generation = self.store.next_terminal_generation(self.generation_floor)?;
+        // A new run: quiet messages kept for an ordinary session's previous run are dropped with
+        // it (src/quiet.rs), even when its exit is never reported (a restart replacing it).
+        crate::quiet::session_ended(self, id);
         let (info, extra_args, port_base, permissions, resume) = {
             let mut g = self.inner.lock();
             let cwd = PathBuf::from(
@@ -3942,8 +3954,6 @@ impl Hub {
 
     /// Kill (if alive) and forget a session, including its scrollback.
     pub fn remove_session(&self, id: SessionId) -> anyhow::Result<()> {
-        // Quiet messages waiting for its next turn go with the tab (src/quiet.rs).
-        crate::quiet::session_ended(self, id);
         let entry = {
             let mut g = self.inner.lock();
             anyhow::ensure!(g.sessions.contains_key(&id), "no such session: {id}");
@@ -3972,6 +3982,8 @@ impl Hub {
         let _ = std::fs::remove_dir_all(paths::session_dir(id));
         self.replay_cache.lock().remove(&id);
         self.save_conversation_turn(&entry.info);
+        // Quiet messages waiting for its next turn go with the tab, once it is gone (src/quiet.rs).
+        crate::quiet::session_ended(self, id);
         self.agents.forget_session(id);
         self.emit(ServerEvent::SessionRemoved { id });
         let cid = entry.info.channel_id;

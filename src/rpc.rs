@@ -1185,12 +1185,14 @@ async fn dispatch_inner(hub: &Arc<Hub>, who: &Principal, method: &str, params: V
         }
         "agent.update" => {
             require_local(who, method)?;
-            // `muster agent edit --self-handoff` inside a session names it (never a request field).
+            // `muster agent edit --self-handoff` or `--tools-up-front` inside a session names it
+            // (never a request field).
             let mut params = params;
             let from_session = params.as_object_mut().and_then(|o| o.remove("from_session")).filter(|v| !v.is_null());
             let mut p: crate::agents::AgentUpdate = parse(params)?;
-            // Only the human grants self handoff: a click in the window, or the CLI from a terminal
-            // outside every session (`owner_terminal`, checked by `http_call`).
+            // Only the human grants self handoff or turns on tools up front: a click in the window,
+            // or the CLI from a terminal outside every session (`owner_terminal`, checked by
+            // `http_call`).
             p.by_owner = from_session.is_none()
                 && (via == Via::Window || OWNER_TERMINAL.try_with(|ok| *ok).unwrap_or(false));
             // Letting an agent take scheduled or triggered work, or moving one that does to or

@@ -195,7 +195,8 @@ pub struct Agent {
     /// When it last cleared its own conversation that way (Unix ms): the rate limit.
     pub self_handoff_at: Option<i64>,
     /// Its sessions load Muster's message tools up front instead of through tool search
-    /// (`mcp::tools::UP_FRONT`). Off by default; applies from its next start.
+    /// (`mcp::tools::UP_FRONT`). Claude agents only, off by default, turned on only by the human;
+    /// applies from its next start.
     pub tools_up_front: bool,
 }
 
@@ -338,7 +339,7 @@ pub fn persona_text(name: &str, kind: SessionKind, persona: &str) -> String {
          your final message for that turn goes back to the sender. If the answer needs longer (a long \
          job), say so in that reply, and once you have it answer with the muster MCP tool `reply` \
          (`msg_id` from the header): one reply per message, delivered to the sender. To ask other \
-         agents, use the muster MCP tools `list_agents` and `ask_agent`. {quiet}\n\n\
+         agents, use the muster MCP tools `list_agents` and `ask_agent`.{quiet}\n\n\
          ## Schedules\n\n\
          To follow something up later yourself (\"check CI again in 20 minutes\"), use `set_reminder`: a \
          one-off for you, up to 24 hours ahead, no approval needed. For anything recurring or later, use \
@@ -347,7 +348,8 @@ pub fn persona_text(name: &str, kind: SessionKind, persona: &str) -> String {
         kind = kind.as_str(),
         resume = " resumes your conversation when you restart",
         links = crate::links::INSTRUCTION,
-        quiet = QUIET_INSTRUCTION,
+        // Only Claude sessions take messages that wait for the next turn (src/quiet.rs).
+        quiet = if kind == SessionKind::Claude { format!(" {QUIET_INSTRUCTION}") } else { String::new() },
         persona = if persona.is_empty() { "(none given)" } else { persona },
     )
 }
@@ -537,26 +539,36 @@ pub fn rename_old_tools(text: &str) -> Option<String> {
     (out != text).then_some(out)
 }
 
-/// The persona's sentence on messages that wait for the next turn (src/quiet.rs).
+/// The persona's sentence on messages that wait for the next turn (src/quiet.rs), in a Claude
+/// agent's "## Messages" section only: Codex sessions can't take them.
 pub const QUIET_INSTRUCTION: &str = "To report or pass something on without waiting for an answer, use `tell_agent`; \
 with wake=false it waits for the agent's next turn instead of starting one. Messages that arrived that way come at the \
 start of a turn, after the prompt, under a line saying the human did not type them. After a long job, `reply` with \
-wake=false unless the asker must act now.";
+wake=false unless the asker must act now. Only Claude agents and sessions take wake=false: for a Codex one, leave wake on.";
 
 /// The sentence that ends the generated "## Messages" section before `QUIET_INSTRUCTION`.
 const MESSAGES_END: &str = "To ask other agents, use the muster MCP tools `list_agents` and `ask_agent`.";
 
-/// An agent made before quiet messages has a persona file whose "## Messages" section doesn't
-/// mention them. At its next start Muster adds `QUIET_INSTRUCTION` once after that section's last
-/// sentence, in a file it generated (`add_links_section`'s rule); a file changed there by hand is
-/// left alone. Best effort.
+/// A Claude agent made before quiet messages has a persona file whose "## Messages" section
+/// doesn't mention them. At its next start Muster adds `QUIET_INSTRUCTION` once after that
+/// section's last sentence, in a file it generated (`add_links_section`'s rule); a file changed
+/// there by hand is left alone, and only that section is read (a quote of its sentence elsewhere
+/// in the file is no match). Best effort.
 fn add_quiet_sentence(path: &Path) {
     let Ok(text) = std::fs::read_to_string(path) else { return };
-    if text.contains("`tell_agent`") || !text.contains("a persistent muster agent") {
+    if !text.contains("a persistent muster agent") {
         return;
     }
-    let Some(i) = text.find(MESSAGES_END) else { return };
-    let at = i + MESSAGES_END.len();
+    // The generated section, from its heading to the next one: the last "## Messages" heading
+    // (the persona, written by the human, comes before it).
+    let Some(start) = text.rfind("\n## Messages\n").map(|i| i + 1) else { return };
+    let end = text[start + 1..].find("\n## ").map_or(text.len(), |i| start + 1 + i);
+    let section = &text[start..end];
+    if section.contains("`tell_agent`") {
+        return;
+    }
+    let Some(i) = section.find(MESSAGES_END) else { return };
+    let at = start + i + MESSAGES_END.len();
     let next = format!("{} {QUIET_INSTRUCTION}{}", &text[..at], &text[at..]);
     if let Err(e) = refuse_symlink(path).and_then(|()| Ok(paths::write_private(path, next.as_bytes())?)) {
         tracing::warn!("adding the quiet message sentence to {}: {e:#}", path.display());
@@ -929,6 +941,21 @@ struct Attributions {
     /// `fresh_verdict`): an agent the human worked with in the last day keeps its conversation.
     #[serde(default)]
     human_prompt_at: HashMap<i64, i64>,
+    /// Quiet messages a session's `UserPromptSubmit` callback named (src/quiet.rs), waiting for
+    /// a later hook of the same run to show the turn ran (`quiet::TURN_RAN`), which marks them
+    /// shown. A newer prompt replaces them: the earlier one never ran, and they stay offered.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    quiet_pending: HashMap<SessionId, QuietPending>,
+}
+
+/// `Attributions::quiet_pending`: the run whose prompt named them, and their ids.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct QuietPending {
+    run: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    agent: Vec<i64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    session: Vec<i64>,
 }
 
 /// A named agent's conversation size, as its status line last reported it (src/statusline.rs).
@@ -1385,12 +1412,48 @@ impl Registry {
         MsgStatus { delivered_at, active, reply }
     }
 
+    /// Offer the quiet messages waiting for a turn of session `id` on run `run` (src/quiet.rs
+    /// `take`): `pick` gets the session's provenance now, its named agent and the waiting rows
+    /// (`Store::take_quiet`), and chooses. The chosen are marked offered to `run` and the
+    /// session's provenance raised to their routes, in one transaction under this registry's
+    /// lock, so hooks replayed meanwhile see both or neither.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn offer_quiet<R>(
+        &self,
+        store: &Store,
+        id: SessionId,
+        run: u64,
+        after: i64,
+        offered_before: i64,
+        now: i64,
+        pick: impl FnOnce(Option<Prov>, Option<&Agent>, &[AgentMessage], &[crate::quiet::SessionQuiet]) -> Option<(crate::quiet::Shown, R)>,
+    ) -> anyhow::Result<Option<(crate::quiet::Shown, R)>> {
+        let mut g = self.inner.lock();
+        let named = g.agents.values().find(|a| a.session_id == Some(id)).cloned();
+        let cur = g.runtime.prov.get(&id).copied();
+        let mut next = g.runtime.clone();
+        let out = store.take_quiet(named.as_ref().map(|a| a.id), id, after, offered_before, run, now, |a, s| {
+            let (shown, r) = pick(cur, named.as_ref(), a, s)?;
+            if let Some(p) = shown.raise(cur) {
+                next.prov.insert(id, p);
+            }
+            let save = (next != g.runtime).then(|| serde_json::to_string(&next).ok()).flatten();
+            Some((shown, r, save))
+        })?;
+        if out.is_some() && next != g.runtime {
+            self.mark(&next);
+            g.runtime = next;
+        }
+        Ok(out)
+    }
+
     pub fn forget_session(&self, id: SessionId) {
         if let Err(error) = self.edit_runtime(|state| {
             state.prov.remove(&id);
             state.active.remove(&id);
             state.human_seen.remove(&id);
             state.delivered.retain(|_, (session, _)| *session != id);
+            state.quiet_pending.remove(&id);
         }) {
             tracing::warn!(session = id, "forgetting attribution: {error:#}");
         }
@@ -1424,6 +1487,8 @@ impl Registry {
         let mut next = g.runtime.clone();
         let mut stamp = g.human_stamps.get(&info.id).copied();
         let named = g.agents.values().find(|a| a.session_id == Some(info.id)).map(|a| a.id);
+        // The run the hook came from (quiet messages are offered to, and confirmed by, one run).
+        let run = session.map_or(0, |(_, runtime)| runtime.generation);
         let mut fx = HookEffects::default();
         if event == "UserPromptSubmit" {
             let prompt = payload.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
@@ -1462,17 +1527,31 @@ impl Registry {
                 _ => {},
             }
             // Quiet messages the hook put in front of this turn (src/quiet.rs): only those
-            // offered to this session, never shown before. The turn takes on their route.
+            // offered to this run, never shown before. `take` raised the provenance to their
+            // routes already; a human's prompt above may have lowered it again, so raise it here
+            // too. They count as shown once a later hook of the run shows the turn ran. A pending
+            // set from an earlier prompt is dropped: that prompt never ran (another hook blocked
+            // it), and its messages stay offered, to be offered again.
+            next.quiet_pending.remove(&info.id);
             let named_ids = crate::quiet::Shown::from_payload(payload);
             if !named_ids.is_empty() {
-                let shown = store.quiet_offered(named, info.id, &named_ids)?;
-                if !shown.is_empty() {
-                    let cur = next.prov.get(&info.id).copied();
-                    if let Some(p) = shown.raise(cur) {
+                let offered = store.quiet_offered(named, info.id, &named_ids, run)?;
+                if !offered.is_empty() {
+                    if let Some(p) = offered.raise(next.prov.get(&info.id).copied()) {
                         next.prov.insert(info.id, p);
                     }
-                    fx.quiet = Some(shown);
+                    next.quiet_pending.insert(info.id, QuietPending { run, agent: offered.agent, session: offered.session });
                 }
+            }
+        } else if crate::quiet::TURN_RAN.contains(&event)
+            && let Some(pending) = next.quiet_pending.remove(&info.id)
+            && pending.run == run
+        {
+            // The turn ran: what its prompt was offered is shown (`commit_hook` marks it).
+            let ids = crate::quiet::Shown { agent: pending.agent, session: pending.session, routes: Vec::new() };
+            let shown = store.quiet_offered(named, info.id, &ids, run)?;
+            if !shown.is_empty() {
+                fx.quiet = Some(shown);
             }
         }
         // A Codex sub-agent's turn ending is not the agent's reply (`HookSession::child`).
@@ -1728,7 +1807,8 @@ pub struct AgentUpdate {
     /// Turning it on needs `by_owner`; turning it off works from anywhere.
     #[serde(default)]
     pub self_handoff: Option<bool>,
-    /// Load Muster's message tools up front in its sessions (`Agent::tools_up_front`).
+    /// Load Muster's message tools up front in its sessions (`Agent::tools_up_front`). Claude
+    /// agents only; turning it on needs `by_owner`, turning it off works from anywhere.
     #[serde(default)]
     pub tools_up_front: Option<bool>,
     /// The call is the human's own: a click in Muster's window, or the CLI from a terminal
@@ -1755,6 +1835,27 @@ pub struct Switch {
 #[cfg(test)]
 pub fn update(hub: &Hub, req: AgentUpdate, outside: bool) -> anyhow::Result<Agent> {
     update_switch(hub, req, outside).map(|(a, _)| a)
+}
+
+/// May this `agent.update` turn "Load message tools up front" on for `a`? Only for a Claude agent
+/// (the tools' `_meta` is Claude Code's), and, like a self handoff grant, only by the human
+/// (`by_owner`: a click in Muster's window, or the CLI from a terminal outside every session): it
+/// adds about 2,200 tokens to every request the agent makes. Turning it off works from anywhere.
+fn check_tools_up_front(a: &Agent, by_owner: bool) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        a.kind == SessionKind::Claude,
+        "loading message tools up front is for Claude agents only: {} is a Codex agent, whose tools load as they always do",
+        a.name
+    );
+    anyhow::ensure!(
+        by_owner,
+        "only the human can turn on loading message tools up front for {name}: in Edit agent (More options, \"Load \
+         message tools up front\") in Muster's window, or with `muster agent edit {name} --tools-up-front on` in a terminal \
+         outside Muster. This call came from inside a Muster session (an agent, or a shell tab), from a script, or from a \
+         program Muster can't identify, so it may be an agent's",
+        name = a.name
+    );
+    Ok(())
 }
 
 /// `agent.update`. Model, effort and permissions apply from the agent's next start; the persona
@@ -1839,6 +1940,9 @@ pub fn update_switch(hub: &Hub, req: AgentUpdate, outside: bool) -> anyhow::Resu
         next.self_handoff = on;
     }
     if let Some(on) = req.tools_up_front {
+        if on && !cur.tools_up_front {
+            check_tools_up_front(&cur, req.by_owner)?;
+        }
         next.tools_up_front = on;
     }
     if outside && let Some(why) = widens_unattended(hub, &cur, &next) {
@@ -2104,7 +2208,9 @@ async fn start_once(hub: &Arc<Hub>, name: &str, fresh: bool, window: Option<Wind
         Ok(Some(_)) => {
             refuse_symlink(&persona)?;
             add_links_section(&persona);
-            add_quiet_sentence(&persona);
+            if agent.kind == SessionKind::Claude {
+                add_quiet_sentence(&persona);
+            }
         }
         Err(e) => anyhow::bail!("can't read {}: {e}", persona.display()),
     }
@@ -2128,6 +2234,11 @@ async fn start_once(hub: &Arc<Hub>, name: &str, fresh: bool, window: Option<Wind
             Ok(_) => crate::sleep::launched(hub, id),
             Err(e) => crate::sleep::start_failed(hub, id, at, e),
         }
+    }
+    // Its tab counts the messages waiting for its next turn, those sent before this start too
+    // (src/quiet.rs).
+    if let Ok(s) = &r {
+        crate::quiet::refresh(hub, s.session.id);
     }
     r
 }
@@ -2886,11 +2997,12 @@ pub struct QuietSent {
     pub waiting: usize,
 }
 
-/// The stored half of `deliver` for a message sent with wake=false (src/quiet.rs): the spend
-/// caps, the agent's kind, both daily caps and the waiting cap, then the message is kept for the
-/// agent's next turn. Never starts, wakes or types into the agent. The caller checked the route
-/// (`route` / `precheck`) and the permission width, as for `deliver`. A cap refusal is `Refused`.
-pub fn quiet(hub: &Hub, out: Outgoing) -> anyhow::Result<QuietSent> {
+/// The stored half of `deliver` for a message sent with wake=false (src/quiet.rs): the agent's
+/// kind, the route (its accepted origins and the hop limit, so every quiet path gets them), the
+/// spend caps (with a fresh reading, as `deliver`), both daily caps and the waiting cap, then the
+/// message is kept for the agent's next turn. Never starts, wakes or types into the agent. The
+/// caller checked the permission width, as for `deliver`. A policy refusal is `Refused`.
+pub async fn quiet(hub: &Hub, out: Outgoing) -> anyhow::Result<QuietSent> {
     let text = crate::mcp::tools::clean_text(&out.text);
     let a = hub.agents().get(&out.agent).ok_or_else(|| no_agent(hub, &out.agent))?;
     if out.agent_id.is_some_and(|id| id != a.id) {
@@ -2903,13 +3015,17 @@ pub fn quiet(hub: &Hub, out: Outgoing) -> anyhow::Result<QuietSent> {
     if let Err(why) = crate::quiet::check_receiver(a.kind, &a.name) {
         return Err(refuse(why));
     }
-    // A late reply carries its "Late reply to your message" line too (src/agent_reply.rs).
-    let room = if out.route.reply_to.is_some() { crate::quiet::REPLY_ROOM } else { 0 };
-    crate::quiet::check_size(&text, room).map_err(|e| anyhow::anyhow!(e))?;
-    if crate::spend::applies(hub, &a, out.route.origin)
-        && let Err(why) = hub.spend.check(hub, &a, &hub.schedules.settings())
-    {
+    // A late reply starts with its "Late reply to your message" line (src/agent_reply.rs).
+    crate::quiet::check_message(&text, out.route.reply_to.is_some()).map_err(|e| anyhow::anyhow!(e))?;
+    // The origin rule and hop limit of the waking path (`route`); the daily cap is counted below.
+    if let Err(why) = guard::check_agent_delivery(&a.name, &a.accepts_origins, out.route.origin, out.route.hop, 0) {
         return Err(refuse(why));
+    }
+    if crate::spend::applies(hub, &a, out.route.origin) {
+        hub.spend.ensure_fresh(hub).await;
+        if let Err(why) = hub.spend.check(hub, &a, &hub.schedules.settings()) {
+            return Err(refuse(why));
+        }
     }
     let mut msg = message_record(&a, &out.from, out.from_session, out.route, &text);
     msg.quiet = true;
@@ -2940,10 +3056,8 @@ pub fn quiet(hub: &Hub, out: Outgoing) -> anyhow::Result<QuietSent> {
     };
     publish_message(hub, id);
     crate::quiet::refresh_agent(hub, a.id);
-    let waiting = a.session_id
-        .map(|s| hub.store().quiet_count(Some(a.id), s, waiting_after))
-        .transpose()?
-        .unwrap_or(1);
+    // Counted by agent: those sent before its first start count too.
+    let waiting = hub.store().quiet_count_agent(a.id, waiting_after)?;
     Ok(QuietSent { msg_id: id, session_id: a.session_id, sent_at_ms: now, waiting })
 }
 
@@ -4327,6 +4441,45 @@ mod tests {
         std::fs::write(&p, "# Mine\n\nMy own rules.\n").unwrap();
         add_links_section(&p);
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "# Mine\n\nMy own rules.\n");
+    }
+
+    #[test]
+    fn only_a_claude_agents_messages_section_tells_of_quiet_messages() {
+        let claude = persona_text("ada", SessionKind::Claude, "Reviews diffs.");
+        let section = &claude[claude.find("## Messages").unwrap()..claude.find("## Schedules").unwrap()];
+        assert!(section.contains(&format!("`ask_agent`. {QUIET_INSTRUCTION}\n\n")), "{section}");
+        let codex = persona_text("cody", SessionKind::Codex, "Builds.");
+        assert!(!codex.contains("tell_agent") && !codex.contains("wake=false"), "{codex}");
+        assert!(codex.contains(&format!("{MESSAGES_END}\n\n## Schedules")), "{codex}");
+    }
+
+    #[test]
+    fn an_older_claude_persona_gets_the_quiet_sentence_once_in_its_messages_section() {
+        let dir = scratch("quiet-sentence");
+        let p = dir.join("CLAUDE.md");
+        let now = persona_text("ada", SessionKind::Claude, "Reviews diffs.");
+        let old = now.replace(&format!(" {QUIET_INSTRUCTION}"), "");
+        assert!(!old.contains("tell_agent"));
+        std::fs::write(&p, &old).unwrap();
+        add_quiet_sentence(&p);
+        let once = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(once, now, "back to what Muster writes now");
+        add_quiet_sentence(&p);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), once, "only once");
+        // A persona that quotes the section's last sentence earlier: only the section changes.
+        let quoted = old.replace("## Persona\n\nReviews diffs.", &format!("## Persona\n\nReviews diffs. Never say \"{MESSAGES_END}\""));
+        std::fs::write(&p, &quoted).unwrap();
+        add_quiet_sentence(&p);
+        let got = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(got.matches(QUIET_INSTRUCTION).count(), 1, "{got}");
+        let messages = got.find("## Messages").unwrap();
+        assert!(got.find(QUIET_INSTRUCTION).unwrap() > messages, "{got}");
+        assert!(got.contains(&format!("Never say \"{MESSAGES_END}\"\n")), "{got}");
+        // The section changed by hand (its sentence gone): left alone.
+        let hand = old.replace(MESSAGES_END, "Ask me first.");
+        std::fs::write(&p, &hand).unwrap();
+        add_quiet_sentence(&p);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), hand);
     }
 
     /// A fresh scratch dir for one test (under the system temp dir).

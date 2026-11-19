@@ -806,6 +806,7 @@ function GroupTab(
     c ? tildify(c.cwd, home) : null,
     c?.branch ? `⎇ ${c.branch}` : null,
     s.state_detail || STATE_LABEL[s.state],
+    s.quiet_waiting ? quietWaitingText(s.quiet_waiting) : null,
   ].filter(Boolean).join(" · ");
   const edit = isRenaming ? r!.fields : null;
   return (
@@ -823,6 +824,8 @@ function GroupTab(
       aria-selected={active}
       aria-label={cold ? `${tabText(label)}, prompt cache likely expired`
         : dot ? `${tabText(label)}, ${CACHE_DOT_LABEL[dot]}` : tabText(label)}
+      // Its badge's count, for keyboard and screen reader users too (the badge itself isn't focusable).
+      aria-description={s.quiet_waiting ? quietWaitingText(s.quiet_waiting) : undefined}
       tabIndex={active ? 0 : -1}
       data-tab-sid={s.id}
       data-tip={tip}
@@ -874,7 +877,7 @@ function GroupTab(
       {onOpenRouter && <span class="tab-or" aria-label={OPENROUTER_BADGE}>OpenRouter</span>}
       {cold && <span class="tab-cold" aria-label="Prompt cache likely expired">cold</span>}
       {asleep && (
-        <span class="tab-asleep" data-tip="Asleep: the next message, or typing here, wakes it">asleep</span>
+        <span class="tab-asleep" data-tip="Asleep: a message sent with wake on, or typing here, wakes it">asleep</span>
       )}
       {c && <PermBadge c={c} />}
       {s.queued > 0 && <span class="tab-queued" data-tip={`${s.queued} queued`}>{s.queued}</span>}

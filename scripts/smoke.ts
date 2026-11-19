@@ -1516,7 +1516,8 @@ async function coldAnswer(c: Client, d: Daemon, mcp: (token: string, name: strin
 }
 
 /** Quiet messages (docs/MCP.md "Quiet messages"): a note to a fake Claude agent waits for its next
- * turn without being typed in; the turn's hook takes it and its callback marks it shown. */
+ * turn without being typed in; the turn's hook takes it, its callback keeps it pending, and the
+ * turn's next hook (the turn ran) marks it shown. */
 async function quietMessages(c: Client, mcp: (token: string, name: string, args?: Json) => Promise<any>) {
   const until = async (what: string, cond: () => Promise<boolean>, ms = 20000) => {
     const deadline = Date.now() + ms;
@@ -1560,17 +1561,24 @@ async function quietMessages(c: Client, mcp: (token: string, name: string, args?
     t1.context.includes(`[muster msg ${sent.msg_id} from quieta`) && t1.quiet.agent[0] === sent.msg_id,
     `the turn's hook gets it as context (${JSON.stringify(t1)})`);
   ok((await take(bT)).context === null, "an offered note isn't offered again at once");
-  // The turn's saved callback names it: shown, and the tab's count goes.
-  const r = await fetch(`http://127.0.0.1:${PORT}/hook/UserPromptSubmit`, {
-    method: "POST", headers: { Authorization: `Bearer ${bT}` },
-    body: JSON.stringify({ session_id: "conv-quiet", prompt: "hello", muster_quiet: t1.quiet }),
-  });
-  await r.body?.cancel();
-  ok(r.ok, "the turn's callback is taken");
+  // The turn's saved callback names it: pending until the turn shows it ran.
+  const hook = async (event: string, body: Json) => {
+    const r = await fetch(`http://127.0.0.1:${PORT}/hook/${event}`, {
+      method: "POST", headers: { Authorization: `Bearer ${bT}` }, body: JSON.stringify(body),
+    });
+    await r.body?.cancel();
+    return r.ok;
+  };
+  ok(await hook("UserPromptSubmit", { session_id: "conv-quiet", prompt: "hello", muster_quiet: t1.quiet }), "the turn's callback is taken");
+  const shownAt = async () =>
+    (await c.call("agent.messages", { agent: "quietb" })).messages.find((m: Json) => m.id === sent.msg_id)?.shown_at;
+  ok((await shownAt()) == null, "a prompt's callback alone doesn't mark it shown (another hook may block the prompt)");
+  // The turn's next hook: it ran, so the note was shown, and the tab's count goes.
+  ok(await hook("PreToolUse", { session_id: "conv-quiet", tool_name: "Read", tool_input: {} }), "the turn's tool hook is taken");
   await until("the note marked shown", async () =>
     (await c.call("agent.messages", { agent: "quietb" })).messages.find((m: Json) => m.id === sent.msg_id)?.shown_at != null);
   await until("quietb's tab count cleared", async () => (await info()).quiet_waiting === 0);
-  ok(true, "the callback marks the quiet note shown and clears the tab's count");
+  ok(true, "the turn's next hook marks the quiet note shown and clears the tab's count");
   await c.call("agent.remove", { name: "quietb" });
   await c.call("agent.remove", { name: "quieta" });
 }

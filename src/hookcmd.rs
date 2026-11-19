@@ -19,8 +19,9 @@
 //! Always exits 0. Prints nothing on stdout (Claude/Codex treat hook stdout as context or
 //! decisions), except Claude's `UserPromptSubmit`: it first asks the backend for the quiet
 //! messages waiting for this turn (`POST /quiet/take`, src/quiet.rs) and prints them as the
-//! turn's `additionalContext`, then names them in the payload it saves (`quiet::PAYLOAD_KEY`), so
-//! the backend marks them shown when it replays the callback. No backend (a reload) means no
+//! turn's `additionalContext`, then names them in the payload it saves (`quiet::PAYLOAD_KEY`):
+//! the backend keeps them pending for the run, and marks them shown once a later hook of the run
+//! (`PreToolUse`, `PostToolUse`, `Stop`) shows the turn ran. No backend (a reload) means no
 //! context: they wait for the next turn. No-ops silently when MUSTER_URL / MUSTER_TOKEN are
 //! unset (and no token file stands in for MUSTER_TOKEN, see [`TOKEN_FILE`]).
 
@@ -506,11 +507,26 @@ mod tests {
     }
 
     #[test]
+    fn a_chunked_answer_is_decoded() {
+        // Two chunks whose declared sizes match their bytes: the context reaches the output.
+        let (port, h) = answer_once(
+            b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n15\r\n{\"context\":\"Chunked\",\r\n2c\r\n\"quiet\":{\"agent\":[4],\"session\":[]},\"left\":0}\r\n0\r\n\r\n",
+        );
+        let mut out = Vec::new();
+        let body = quiet_messages(&format!("http://127.0.0.1:{port}"), "t", "claude", br#"{"prompt":"hi"}"#.to_vec(), &mut out);
+        h.join().unwrap();
+        let printed: serde_json::Value = serde_json::from_slice(&out).expect("the chunked answer decoded");
+        assert_eq!(printed["hookSpecificOutput"]["additionalContext"], "Chunked");
+        let saved: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(saved[crate::quiet::PAYLOAD_KEY], serde_json::json!({"agent": [4], "session": []}));
+    }
+
+    #[test]
     fn quiet_messages_wait_when_there_is_nothing_to_show_or_no_backend() {
         let payload = br#"{"prompt":"hi"}"#.to_vec();
-        // None waiting (a chunked answer, decoded).
+        // None waiting.
         let (port, h) = answer_once(
-            b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n1a\r\n{\"context\":null,\"left\":0}\r\n0\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\ncontent-length: 25\r\n\r\n{\"context\":null,\"left\":0}",
         );
         let mut out = Vec::new();
         assert_eq!(quiet_messages(&format!("http://127.0.0.1:{port}"), "t", "claude", payload.clone(), &mut out), payload);

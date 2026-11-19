@@ -619,8 +619,10 @@ enum AgentCmd {
         self_handoff: Option<String>,
         /// Load Muster's message tools (ask_agent, tell_agent, reply, send_message, whoami,
         /// note_read, note_append) up front in this Claude agent's sessions instead of through
-        /// tool search: about 2,000 more tokens per model call, one model call less each time
-        /// one of them would be searched for. Off by default; applies from its next start.
+        /// tool search: about 2,200 more tokens on every request, mostly cached, one model call
+        /// less each time one of them would be searched for. Off by default; applies from its
+        /// next start. Only the human turns it on (refused inside a Muster tab); anyone may turn
+        /// it off. Claude agents only.
         #[arg(long, value_name = "on|off", value_parser = ["on", "off"])]
         tools_up_front: Option<String>,
         #[command(flatten)]
@@ -1978,7 +1980,9 @@ async fn daemon_main(openrouter_key: Option<openrouter::ApiKey>, launch: Option<
             // first message; the other answers come after late replies (src/questions.rs).
             questions::resume(&hub, answers_first).await;
             agent_reply::resume(&hub, unfinished).await;
-            // The tabs' counts of messages waiting for the next turn (src/quiet.rs).
+            // Messages that waited a week unshown expire, and the tabs count what still waits
+            // for the next turn (src/quiet.rs); `expire` runs hourly below too.
+            quiet::expire(&hub, model::now_ms());
             quiet::refresh_all(&hub);
             questions::resume(&hub, answers).await;
             prs::resume(&hub, cards).await;
@@ -1998,7 +2002,11 @@ async fn daemon_main(openrouter_key: Option<openrouter::ApiKey>, launch: Option<
             loop {
                 t.tick().await;
                 let h = hub.clone();
-                let _ = tokio::task::spawn_blocking(move || h.prune_events()).await;
+                let _ = tokio::task::spawn_blocking(move || {
+                    h.prune_events();
+                    // Quiet messages unshown for a week (src/quiet.rs), even with no turn to take them.
+                    quiet::expire(&h, model::now_ms());
+                }).await;
             }
         });
     }

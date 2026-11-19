@@ -45,7 +45,14 @@ import {
 } from "../cache.ts";
 import type { Channel, Panel, SessionInfo, SessionKind } from "../types.ts";
 import { profileName } from "../account_profiles.ts";
-import { asleepText, isAsleep, OPENROUTER_BADGE, sessionOnOpenRouter, wakeFailedText } from "../agents.ts";
+import {
+  asleepText,
+  isAsleep,
+  OPENROUTER_BADGE,
+  quietWaitingText,
+  sessionOnOpenRouter,
+  wakeFailedText,
+} from "../agents.ts";
 import { STATE_LABEL } from "../types.ts";
 import { connStatus } from "../rpc.ts";
 import * as A from "../actions.ts";
@@ -60,6 +67,7 @@ import {
   IconCheck,
   IconChevronDown,
   IconCodex,
+  IconMail,
   IconMaximize,
   IconMinimize,
   IconNote,
@@ -870,6 +878,12 @@ function GroupTab(
       )}
       {c && <PermBadge c={c} />}
       {s.queued > 0 && <span class="tab-queued" data-tip={`${s.queued} queued`}>{s.queued}</span>}
+      {!!s.quiet_waiting && (
+        <span class="tab-quiet" data-tip={quietWaitingText(s.quiet_waiting)} aria-label={quietWaitingText(s.quiet_waiting)}>
+          <IconMail size={11} />
+          {s.quiet_waiting}
+        </span>
+      )}
       <button
         type="button"
         class="tab-close"

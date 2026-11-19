@@ -166,6 +166,8 @@ interface Session {
   rows: number;
   size_owner: string | null;
   queued: number;
+  /** Quiet messages waiting for its next turn (src/quiet.rs). */
+  quiet_waiting?: number;
   created_at: number;
   /** The window this session is a tab in (docs/PROTOCOL.md "Groups layout (v2)"). */
   window_id: number | null;
@@ -602,6 +604,8 @@ interface MockAgent {
   reset_on_next_start?: boolean;
   self_handoff: boolean;
   self_handoff_at: number | null;
+  /** Muster's message tools load up front in its sessions (src/mcp/tools.rs `UP_FRONT`). */
+  tools_up_front: boolean;
 }
 
 const DEFAULT_PERMS = { codex_sandbox: "workspace_write", claude_mode: "default" };
@@ -744,6 +748,7 @@ function newAgent(p: any): MockAgent {
     handoff: null,
     self_handoff: false,
     self_handoff_at: null,
+    tools_up_front: false,
   };
   agentList.push(a);
   memory.set(a.name, new Map());
@@ -963,7 +968,7 @@ const sched = scheduleMock({
 {
   const orch = newAgent({ ...AGENT_TEMPLATES[1], accepts: ["human"] });
   const rev = newAgent({ ...AGENT_TEMPLATES[3] });
-  orch.created_at = rev.created_at = now() - 3 * 3600_000;
+  orch.created_at = rev.created_at = now() - 9 * 24 * 3600_000;
   memory.get(orch.name)!.set(
     "notes.md",
     "# Notes\n\n- reviewer is good at Rust diffs\n- release notes due Friday\n",
@@ -971,6 +976,26 @@ const sched = scheduleMock({
   memory.get(orch.name)!.set("people/owner.md", "Prefers short summaries.\n");
   const t0 = now() - 40 * 60_000;
   agentMsgs.push(
+    // A quiet message (tell_agent wake=false, src/quiet.rs) that waited 7 days and expired.
+    {
+      id: seq++,
+      from: rev.name,
+      from_session: null,
+      to: orch.name,
+      to_agent: orch.id,
+      to_session: null,
+      origin: "human",
+      hop: 1,
+      reply_to: null,
+      created_at: now() - 8 * 24 * 3600_000,
+      text: "Report: last week's dependency updates are in reports/deps.md.",
+      reply: null,
+      replied_at: null,
+      refused: null,
+      quiet: true,
+      shown_at: null,
+      expired_at: now() - 24 * 3600_000,
+    },
     {
       id: seq++,
       from: "human",
@@ -1019,6 +1044,26 @@ const sched = scheduleMock({
       replied_at: null,
       refused:
         "orchestrator accepts only human-started messages, and this one started from a schedule (origin=schedule)",
+    },
+    // A quiet message shown at the start of the agent's next turn.
+    {
+      id: seq++,
+      from: rev.name,
+      from_session: null,
+      to: orch.name,
+      to_agent: orch.id,
+      to_session: null,
+      origin: "human",
+      hop: 2,
+      reply_to: null,
+      created_at: t0 + 24 * 60_000,
+      text: "FYI: the auth fix is on branch fix-auth, head 4e1c2a9. Tests pass.",
+      reply: null,
+      replied_at: null,
+      refused: null,
+      quiet: true,
+      shown_at: t0 + 31 * 60_000,
+      expired_at: null,
     },
   );
 }
@@ -1195,6 +1240,7 @@ async function agentMethod(method: string, p: any): Promise<unknown> {
         if (p.self_handoff && a.kind !== "claude") throw new Error("self handoff isn't supported for Codex agents yet");
         a.self_handoff = !!p.self_handoff;
       }
+      if ("tools_up_front" in p) a.tools_up_front = !!p.tools_up_front;
       if ("permissions" in p) a.permissions = p.permissions;
       if ("accepts" in p) {
         if (!Array.isArray(p.accepts) || !p.accepts.length || p.accepts.some((o: string) => !["human", "schedule", "webhook"].includes(o))) {
@@ -1350,6 +1396,28 @@ async function agentMethod(method: string, p: any): Promise<unknown> {
         text: p.text ?? "",
         refused: p.refused ?? null,
       });
+    }
+    // Dev only: a quiet message (tell_agent wake=false) waiting for the agent's next turn; its tab
+    // shows how many wait (src/quiet.rs).
+    case "mock.quiet": {
+      const a = agentNamed(p.to);
+      const m = pushAgentMessage({
+        from: p.from ?? "human",
+        to: a.name,
+        to_agent: a.id,
+        origin: p.origin ?? "human",
+        hop: p.hop ?? 1,
+        text: p.text ?? "",
+        quiet: true,
+        shown_at: null,
+        expired_at: null,
+      });
+      const s = a.session_id !== null ? sessions.get(a.session_id) : undefined;
+      if (s) {
+        s.quiet_waiting = (s.quiet_waiting ?? 0) + 1;
+        upsert(s);
+      }
+      return m;
     }
   }
   throw new Error(`unknown method ${method}`);

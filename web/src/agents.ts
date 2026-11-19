@@ -383,6 +383,41 @@ export function lateText(a: LateAnswer): string {
   }
 }
 
+/** "14:05": the local time of `ms`. */
+export function hhmm(ms: number): string {
+  const d = new Date(ms);
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+}
+
+/** Where a quiet message stands (sent with wake=false, src/quiet.rs): a short chip and a sentence.
+ * Null for an ordinary or refused message. */
+export function quietStatus(
+  m: AgentMessage,
+  time: (ms: number) => string = hhmm,
+): { state: "waiting" | "shown" | "expired"; chip: string; text: string } | null {
+  if (!m.quiet || m.refused) return null;
+  if (m.shown_at != null) {
+    return { state: "shown", chip: "shown", text: `Shown to ${m.to} at the start of a turn, ${time(m.shown_at)}.` };
+  }
+  if (m.expired_at != null) {
+    return {
+      state: "expired",
+      chip: "expired",
+      text: `Expired: ${m.to} didn't take a turn within 7 days of it being sent, so it was never shown.`,
+    };
+  }
+  return {
+    state: "waiting",
+    chip: "waits for next turn",
+    text: `Waits for ${m.to}'s next turn and arrives as context when it starts. Sending it didn't wake ${m.to}.`,
+  };
+}
+
+/** The tab badge's tip: quiet messages waiting for the session's next turn. */
+export function quietWaitingText(n: number): string {
+  return `${n} message${n === 1 ? "" : "s"} waiting for the next turn (sent without waking it)`;
+}
+
 // ---------------- moving to another account (docs/ACCOUNT_PROFILES.md) ----------------
 
 /** Busy as the backend counts it for Save notes and Now (src/agents.rs `session_busy`). */

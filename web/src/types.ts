@@ -173,6 +173,9 @@ export interface SessionInfo {
   /** Changes with every state/detail change and answered prompt (stale-approval guard). */
   state_seq?: number;
   queued: number;
+  /** Quiet messages (`tell_agent` with wake=false, src/quiet.rs) waiting for its next turn. Missing
+   * from older daemons. */
+  quiet_waiting?: number;
   /** Built-in subagents the agent is running right now (runtime only). */
   subagents?: number;
   /** Sub-agents and commands it started in the background that haven't reported back; a named
@@ -284,6 +287,9 @@ export interface Agent {
   self_handoff?: boolean;
   /** When it last did (Unix ms). */
   self_handoff_at?: number | null;
+  /** Its sessions get Muster's message tools in the prompt from the start, instead of through
+   * Claude Code's tool search (src/mcp/tools.rs `UP_FRONT`). Older daemons: absent. */
+  tools_up_front?: boolean;
   /** Why its last wake failed, while it is still asleep (it stays asleep; the next message or
    * typing tries again). */
   wake_error?: string;
@@ -315,6 +321,13 @@ export interface AgentMessage {
   /** The agent's later answer (MCP `reply`), and how it reached the asker. Missing: an older
    * daemon. */
   answer?: LateAnswer | null;
+  /** Sent without waking the agent (`tell_agent` or `reply` with wake=false, src/quiet.rs): it
+   * waits for the agent's next turn and arrives as context then. Missing: an older daemon. */
+  quiet?: boolean;
+  /** When a turn's start showed it (quiet messages only). */
+  shown_at?: number | null;
+  /** When it expired unshown (after 7 days). */
+  expired_at?: number | null;
 }
 
 /** How a late reply stands: `pending`/`delivering` until it reaches the asker. */
@@ -338,8 +351,10 @@ export interface LateAnswer {
   note?: string | null;
   /** The message that carried it to an asking agent. */
   msg?: number | null;
-  /** The session it was typed into. */
+  /** The session it was typed into (or, sent quietly, the one it waits for). */
   session?: SessionId | null;
+  /** Sent with wake=false: an asker no longer waiting gets it at the start of its next turn. */
+  quiet?: boolean;
 }
 
 /** A New agent template (`agent.templates`). */

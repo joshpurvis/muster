@@ -28,6 +28,8 @@ import {
   providerPendingNote,
   sessionOnOpenRouter,
   priceLabel,
+  quietStatus,
+  quietWaitingText,
   readMemoryFile,
   unattendedWarning,
   upsertMessage,
@@ -387,6 +389,28 @@ Deno.test("a message that carried a late reply is told by its own text", () => {
   check(carriesLateReply(msg(9, 1, { reply_to: 4, text: 'Late reply to your message 4 ("x"):\nok' })), "carrier");
   check(!carriesLateReply(msg(9, 1, { reply_to: 4, text: "while handling 4" })), "ordinary chained message");
   check(!carriesLateReply(msg(9, 1, { reply_to: 5, text: "Late reply to your message 4:\nok" })), "another message's");
+});
+
+Deno.test("a quiet message says whether it waits, was shown or expired", () => {
+  const t = (ms: number) => `t${ms}`;
+  assertEquals(quietStatus(msg(9)), null);
+  assertEquals(quietStatus(msg(9, 1, { quiet: true, refused: "agent ada has 20 messages waiting" })), null);
+  const waiting = quietStatus(msg(9, 1, { quiet: true, shown_at: null, expired_at: null }), t)!;
+  assertEquals(waiting.state, "waiting");
+  assertEquals(waiting.chip, "waits for next turn");
+  assertEquals(waiting.text, "Waits for ada's next turn and arrives as context when it starts. Sending it didn't wake ada.");
+  const shown = quietStatus(msg(9, 1, { quiet: true, shown_at: 5000 }), t)!;
+  assertEquals([shown.state, shown.chip, shown.text], ["shown", "shown", "Shown to ada at the start of a turn, t5000."]);
+  const expired = quietStatus(msg(9, 1, { quiet: true, expired_at: 7000 }), t)!;
+  assertEquals(expired.state, "expired");
+  check(expired.text.includes("within 7 days"), expired.text);
+  // An older daemon (no fields) reads as an ordinary message.
+  assertEquals(quietStatus(msg(9, 1, { quiet: undefined })), null);
+});
+
+Deno.test("the tab badge counts quiet messages waiting", () => {
+  assertEquals(quietWaitingText(1), "1 message waiting for the next turn (sent without waking it)");
+  assertEquals(quietWaitingText(3), "3 messages waiting for the next turn (sent without waking it)");
 });
 
 Deno.test("Save notes first is offered only to a running, idle agent with room", () => {

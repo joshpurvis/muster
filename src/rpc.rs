@@ -1267,7 +1267,7 @@ async fn dispatch_inner(hub: &Arc<Hub>, who: &Principal, method: &str, params: V
                 "session": bs.session,
                 "started": bs.started,
                 "woke": bs.woke.is_some(),
-                // A new conversation (Start fresh, a pending move or self-handoff): nothing re-read.
+                // A new conversation (Start fresh, a pending account move, a first start): no re-read.
                 "new_conversation": bs.new_conversation,
             }))
         }

@@ -2767,8 +2767,9 @@ pub fn agent_rm(d: &Discovery, name: &str) -> anyhow::Result<()> {
 /// woke the agent into its conversation (a re-read) or into a new one (`--fresh`: none).
 fn agent_start_line(r: &Value, fresh: bool) -> String {
     let id = r["session"]["id"].as_u64().unwrap_or(0);
-    // An older daemon doesn't send `new_conversation`: `--fresh` always starts a new one.
-    let new_conversation = r["new_conversation"].as_bool().unwrap_or(fresh);
+    // An older daemon doesn't send `new_conversation`: `--fresh` always starts a new one, and an
+    // agent left without a saved conversation (a pending account move cleared it) does too.
+    let new_conversation = r["new_conversation"].as_bool().unwrap_or(fresh || r["agent"]["resumable"] == false);
     if r["woke"] == true && new_conversation {
         format!("{id} (woke it into a new conversation: its old one is not re-read)")
     } else if r["woke"] == true {
@@ -2965,6 +2966,8 @@ mod tests {
         let old = json!({"session": {"id": 7}, "started": true, "woke": true});
         assert_eq!(agent_start_line(&old, true), "7 (woke it into a new conversation: its old one is not re-read)");
         assert_eq!(r(old), "7 (woke it: it re-reads its conversation)");
+        let moved = json!({"session": {"id": 7}, "started": true, "woke": true, "agent": {"resumable": false}});
+        assert_eq!(r(moved), "7 (woke it into a new conversation: its old one is not re-read)");
         assert_eq!(agent_start_line(&json!({"session": {"id": 7}, "started": true, "woke": false}), true), "7");
         assert_eq!(r(json!({"session": {"id": 7}, "started": false, "woke": false})), "7 (already running)");
     }

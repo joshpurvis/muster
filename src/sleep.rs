@@ -1275,7 +1275,7 @@ pub fn wake_cost(info: &SessionInfo, now: i64) -> Option<i64> {
 /// Say in the agent's timeline that `cause` woke it (asleep since `asleep_at`); `say_cost`: and,
 /// when its cache had likely expired, what the wake costs (a message Muster types in gets the
 /// cold-start note of its own instead). A wake into a new conversation (`new_conversation`:
-/// Start fresh, a pending account move or self-handoff) re-reads none of the old one: it says so instead.
+/// Start fresh, a pending account move) re-reads none of the old one: it says so instead.
 pub(crate) fn note_woke(hub: &Hub, s: &crate::agents::AgentSession, asleep_at: i64, cause: &str, say_cost: bool) {
     let (agent, session) = (&s.agent, &s.session);
     let now = now_ms();

@@ -96,7 +96,7 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "list_sessions",
             "List sessions",
-            "List terminal sessions (agents and shells), including exited ones. Each has id, channel_id, kind (claude|codex|shell), name, state, detail (e.g. the pending approval or question), queued (messages waiting to be delivered) and, when some wait, queue_waits (why they are not typed yet, e.g. unsent text in its input box), parent_id (the session that spawned it via MCP) and is_me.",
+            "List terminal sessions (agents and shells), including exited ones. Each has id, channel_id, kind (claude|codex|shell), name, state, detail (e.g. the pending approval or question), queued (messages waiting to be delivered) and, when some wait, queue_waits (why they are not typed yet, e.g. unsent text in its input box; null when the next is about to be typed), parent_id (the session that spawned it via MCP) and is_me.",
             json!({
                 "type": "object",
                 "properties": {

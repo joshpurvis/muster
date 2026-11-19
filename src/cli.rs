@@ -2786,11 +2786,12 @@ pub fn agent_start(d: &Discovery, name: &str, fresh: bool) -> anyhow::Result<()>
     Ok(())
 }
 
-/// After `muster agent start --fresh`: the prompts that were waiting are kept, not dropped.
+/// After `muster agent start --fresh`: the prompts waiting for it (those kept from before the
+/// start among them) go into the new conversation.
 fn kept_prompts_line(r: &Value, fresh: bool) -> Option<String> {
     let n = r["queued_prompts"].as_u64().filter(|n| fresh && *n > 0)?;
-    let what = if n == 1 { "1 prompt that was waiting".to_string() } else { format!("{n} prompts that were waiting") };
-    Some(format!("kept {what}: typed into the new conversation once it is ready (`muster queue {}` lists them)",
+    let what = if n == 1 { "1 prompt waits".to_string() } else { format!("{n} prompts wait") };
+    Some(format!("{what}: typed into the new conversation once it is ready (`muster queue {}` lists them)",
         r["session"]["id"].as_u64().unwrap_or(0)))
 }
 
@@ -2926,9 +2927,9 @@ mod tests {
     fn queued_prompts_are_named_with_why_they_wait() {
         let r = |n: u64| json!({"session": {"id": 41}, "queued_prompts": n});
         assert_eq!(kept_prompts_line(&r(2), true).as_deref(),
-            Some("kept 2 prompts that were waiting: typed into the new conversation once it is ready (`muster queue 41` lists them)"));
+            Some("2 prompts wait: typed into the new conversation once it is ready (`muster queue 41` lists them)"));
         assert_eq!(kept_prompts_line(&r(1), true).as_deref(),
-            Some("kept 1 prompt that was waiting: typed into the new conversation once it is ready (`muster queue 41` lists them)"));
+            Some("1 prompt waits: typed into the new conversation once it is ready (`muster queue 41` lists them)"));
         assert_eq!(kept_prompts_line(&r(0), true), None);
         assert_eq!(kept_prompts_line(&r(2), false), None, "a plain start keeps its queue anyway");
         assert_eq!(kept_prompts_line(&json!({"session": {"id": 41}}), true), None, "an older daemon");

@@ -1070,24 +1070,41 @@ pub fn keys(hub: &Arc<Hub>, id: SessionId, bytes: &[u8]) -> Keys {
     Keys::Held
 }
 
-/// `bytes` hold only the terminal's own focus and mouse reports (`ESC [ I`, `ESC [ O`, X10 and
-/// SGR mouse reports), nothing the human typed. Claude Code turns focus reporting on, so the
-/// terminal sends a report whenever its tab gains or loses focus; read as typing, a report made
-/// the dim suggestion in an idle agent's input box look like the human's draft, and queued
-/// prompts waited behind it for hours (`inject::composer`, issue #24).
+/// `bytes` hold only what the terminal sends by itself, nothing the human typed: focus reports
+/// (`ESC [ I`, `ESC [ O`), mouse reports (X10, SGR), and answers to the program's queries that
+/// the client terminal gives live (OSC colour replies, DECRQM `CSI ? … $ y`, DECRQSS `DCS … ST`,
+/// cursor and size reports `CSI … R` / `CSI … t`, `CSI ? …` and `CSI > …` replies). Claude Code
+/// turns focus reporting on, so a tab gaining or losing focus sends a report; read as typing, it
+/// made the dim suggestion in an idle agent's input box look like the human's draft, and queued
+/// prompts waited behind it for hours (`inject::composer`, issue #24). No key sends these: keys
+/// are printable bytes, control bytes, `ESC O x` and `CSI` sequences ending in `A`-`D`, `F`, `H`,
+/// `P`-`S` without a prefix, `Z` or `~`.
 pub fn reports_only(bytes: &[u8]) -> bool {
     let mut i = 0;
     while i < bytes.len() {
         let rest = &bytes[i..];
-        if rest.starts_with(b"\x1b[I") || rest.starts_with(b"\x1b[O") {
-            i += 3;
-        } else if rest.starts_with(b"\x1b[M") && rest.len() >= 6 {
+        if rest.starts_with(b"\x1b[M") {
+            // X10 mouse report: three bytes follow.
+            if rest.len() < 6 { return false }
             i += 6;
-        } else if let Some(body) = rest.strip_prefix(b"\x1b[<") {
-            match body.iter().position(|b| !(b.is_ascii_digit() || *b == b';')) {
-                Some(n) if matches!(body[n], b'M' | b'm') => i += 3 + n + 1,
-                _ => return false,
-            }
+        } else if let Some(body) = rest.strip_prefix(b"\x1b[") {
+            // CSI: parameter bytes, intermediate bytes, one final byte.
+            let params = body.iter().take_while(|b| (0x30..=0x3f).contains(*b)).count();
+            let inter = body[params..].iter().take_while(|b| (0x20..=0x2f).contains(*b)).count();
+            let Some(&last) = body.get(params + inter) else { return false };
+            let (p, im) = (&body[..params], &body[params..params + inter]);
+            let report = matches!(p.first(), Some(b'?' | b'>' | b'<'))
+                || (p.is_empty() && im.is_empty() && matches!(last, b'I' | b'O'))
+                || (!p.is_empty() && matches!(last, b'R' | b't'))
+                || (im == b"$" && last == b'y');
+            if !report { return false }
+            i += 2 + params + inter + 1;
+        } else if rest.starts_with(b"\x1b]") || rest.starts_with(b"\x1bP") {
+            // OSC or DCS reply, up to BEL or ST.
+            let end = rest.windows(2).position(|w| w == b"\x1b\\").map(|n| n + 2)
+                .or_else(|| (rest[0..2] == *b"\x1b]").then(|| rest.iter().position(|b| *b == 0x07).map(|n| n + 1)).flatten());
+            let Some(end) = end else { return false };
+            i += end;
         } else {
             return false;
         }
@@ -1505,10 +1522,14 @@ mod tests {
     /// Focus and mouse reports are the terminal's, not the human's typing; anything else is.
     #[test]
     fn focus_and_mouse_reports_are_not_typing() {
-        for report in [&b"\x1b[I"[..], b"\x1b[O", b"\x1b[O\x1b[I", b"\x1b[<0;10;5M\x1b[<0;10;5m", b"\x1b[M #!", b""] {
+        for report in [&b"\x1b[I"[..], b"\x1b[O", b"\x1b[O\x1b[I", b"\x1b[<0;10;5M\x1b[<0;10;5m", b"\x1b[M #!", b"",
+            // Live answers to the program's queries (xterm.js: colour, mode, cursor, size, DA).
+            b"\x1b]11;rgb:1e1e/1e1e/1e1e\x1b\\", b"\x1b]10;rgb:ffff/ffff/ffff\x07", b"\x1b[?1004;1$y", b"\x1b[?2026;2$y",
+            b"\x1bP1$r0m\x1b\\", b"\x1b[12;40R", b"\x1b[4;600;800t", b"\x1b[?62;22c", b"\x1b[>0;276;0c", b"\x1b[I\x1b]11;rgb:0/0/0\x07"] {
             assert!(reports_only(report), "{report:?}");
         }
-        for typing in [&b"a"[..], b"\x1b[Ia", b"\r", b"\x7f", b"\x1b[D", b"\x03", b"\x1b[<0;10", b"\x1b[M #"] {
+        for typing in [&b"a"[..], b"\x1b[Ia", b"\r", b"\x7f", b"\x1b[D", b"\x03", b"\x1b[<0;10", b"\x1b[M #",
+            b"\x1b[1;5D", b"\x1b[3~", b"\x1b[Z", b"\x1bOP", b"\x1b[H", b"\x1b[200~hi\x1b[201~", b"\x1b]11;rgb:0/0/0", b"\x1b"] {
             assert!(!reports_only(typing), "{typing:?}");
         }
     }

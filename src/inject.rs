@@ -208,14 +208,35 @@ struct SessQ {
     /// prompts never typed, and the next run types them (`rebase`).
     #[serde(default)]
     carry: bool,
+    /// The run whose exit parked carried prompts (`drop_queue`): a send still addressed to it
+    /// joins them instead of taking them back to the stopped run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parked_from: Option<u64>,
+}
+
+/// Carried prompts parked by their run's exit, waiting for the next run (`adopt`).
+fn parked(q: &SessQ) -> bool { q.carry && q.generation.is_none() }
+
+/// A new live run (`generation`) takes parked prompts: kept in order, now for this run. Never the
+/// run that parked them (a worker or a send that read it before it stopped).
+fn adopt(q: &mut SessQ, generation: Option<u64>) {
+    if parked(q) && generation.is_some() && generation != q.parked_from { rebase(q, generation); }
+}
+
+/// A send that reached a queue parked by a fresh start (its run stopped meanwhile) joins the
+/// carried prompts when the human sent it, and is refused otherwise (as `keeps_across_fresh_start`).
+fn join_parked(hub: &Hub, q: &SessQ, item: &Item) -> anyhow::Result<()> {
+    anyhow::ensure!(!parked(q) || keeps_across_fresh_start(hub, item), "the agent is being started fresh; send it again once it runs");
+    Ok(())
 }
 
 /// Point queue `q` at run `generation`. A queue for another run is dropped, unless it carries
 /// prompts across a restart (`carry_over`): those stay, now for this run.
 fn rebase(q: &mut SessQ, generation: Option<u64>) {
     // Still the same run: a prompt queued while a restart is under way stays carried with the
-    // rest (only `after_restart` settles the carry).
-    if q.generation == generation { return }
+    // rest (only `after_restart` settles the carry). A send addressed to the run that parked the
+    // carried prompts joins them (`send`).
+    if q.generation == generation || (parked(q) && generation == q.parked_from) { return }
     let mut items = if q.carry { std::mem::take(&mut q.items) } else { VecDeque::new() };
     for item in &mut items { item.generation = generation; }
     *q = SessQ { items, generation, ..SessQ::default() };
@@ -347,7 +368,7 @@ pub fn restore(hub: &Hub) -> anyhow::Result<()> {
             // Prompts kept for a fresh start's next run: the run that started meanwhile takes
             // them; else they wait for the agent's next start.
             let generation = hub.pty_generation(id);
-            if is_live(hub, id) { hub.injection.edit(id, |q| rebase(q, generation))?; }
+            if is_live(hub, id) { hub.injection.edit(id, |q| adopt(q, generation))?; }
         } else if !is_live(hub, id) || queue.generation != hub.pty_generation(id) {
             note_lost_panel_batch(hub, id, &queue);
             hub.injection.remove(id)?;
@@ -574,6 +595,8 @@ pub struct Wait {
     /// Only the human can end the wait (review a delivery, send or clear a draft, answer a
     /// dialog, switch the view back); otherwise it ends by itself.
     pub needs_human: bool,
+    /// The human was already told of this gate (the draft and subagent-view notices).
+    pub told: bool,
 }
 
 /// What `wait_reason` reads from the queue, the session and its screen.
@@ -593,11 +616,14 @@ struct WaitFacts {
     ready: bool,
     screen: Option<Unsafe>,
     draft: bool,
+    /// The human was told of the draft (`Item::draft_noticed`) / the subagent view (`view_noticed`).
+    draft_told: bool,
+    view_told: bool,
 }
 
 fn wait_from(id: SessionId, f: &WaitFacts) -> Option<Wait> {
-    let human = |text: String| Some(Wait { text, needs_human: true });
-    let by_itself = |text: &str| Some(Wait { text: text.into(), needs_human: false });
+    let human = |text: String| Some(Wait { text, needs_human: true, told: false });
+    let by_itself = |text: &str| Some(Wait { text: text.into(), needs_human: false, told: false });
     if !f.pending { return None }
     if f.blocked {
         return human(format!(
@@ -613,7 +639,8 @@ fn wait_from(id: SessionId, f: &WaitFacts) -> Option<Wait> {
     if f.head_held { return by_itself("a fresh start the agent asked for goes first") }
     // A subagent's view holds the queue whatever the agent does (`kick` checks it first).
     if let Some(Unsafe::OtherView(name)) = &f.screen {
-        return human(format!("the terminal shows subagent {name}: switch back to the main conversation"));
+        return Some(Wait { text: format!("the terminal shows subagent {name}: switch back to the main conversation"),
+            needs_human: true, told: f.view_told });
     }
     match f.state {
         Some(AgentState::NeedsApproval) => return human("a permission prompt is open in the terminal".into()),
@@ -621,7 +648,7 @@ fn wait_from(id: SessionId, f: &WaitFacts) -> Option<Wait> {
         Some(AgentState::Error) => return human("the agent shows an error: check its terminal".into()),
         Some(AgentState::Stuck) => return human("the agent looks stuck: check its terminal".into()),
         Some(state) if !f.ready => return Some(Wait {
-            text: format!("it is typed once the agent is idle (now {})", state.as_str()), needs_human: false }),
+            text: format!("it is typed once the agent is idle (now {})", state.as_str()), needs_human: false, told: false }),
         _ => {}
     }
     match &f.screen {
@@ -629,7 +656,9 @@ fn wait_from(id: SessionId, f: &WaitFacts) -> Option<Wait> {
         Some(Unsafe::Gone(why)) => return by_itself(why),
         _ => {}
     }
-    if f.draft { return human("unsent text is in the input box: send it or clear it".into()) }
+    if f.draft {
+        return Some(Wait { text: "unsent text is in the input box: send it or clear it".into(), needs_human: true, told: f.draft_told });
+    }
     None
 }
 
@@ -637,7 +666,7 @@ fn wait_from(id: SessionId, f: &WaitFacts) -> Option<Wait> {
 /// list, a refused sleep, the stall notice). None: nothing waits, or the next is about to be typed.
 pub fn wait_reason(hub: &Hub, id: SessionId) -> Option<Wait> {
     let generation = hub.pty_generation(id);
-    let (mut f, clear_first) = {
+    let (mut f, clear_first, draft_told) = {
         let guard = hub.injection.inner.lock();
         let q = guard.get(&id)?;
         (WaitFacts {
@@ -648,8 +677,10 @@ pub fn wait_reason(hub: &Hub, id: SessionId) -> Option<Wait> {
             same_run: q.generation == generation,
             head_held: q.items.front().is_some_and(held),
             ..WaitFacts::default()
-        }, q.items.front().is_some_and(|i| i.clear_first))
+        }, q.items.front().is_some_and(|i| i.clear_first), q.items.front().is_some_and(|i| i.draft_noticed))
     };
+    f.draft_told = draft_told;
+    f.view_told = hub.injection.view_noticed.lock().contains(&id);
     if !f.pending || f.blocked || f.carry || f.delivering { return wait_from(id, &f) }
     f.live = is_live(hub, id);
     if f.live && f.same_run {
@@ -683,13 +714,17 @@ pub(crate) fn carry_over(hub: &Hub, id: SessionId) -> anyhow::Result<()> {
 }
 
 /// A prompt a fresh start keeps for the new conversation: the human's own (a message, a
-/// question card's answer). A message from another agent or a schedule was allowed for the run
+/// question card's answer, by its message record's sender). A message from another agent or a schedule was allowed for the run
 /// it was sent to; the restart may change the agent's permissions, so it goes back to its
 /// sender instead (`return_unsent`).
-fn keeps_across_fresh_start(item: &Item) -> bool {
+fn keeps_across_fresh_start(hub: &Hub, item: &Item) -> bool {
     item.panel.is_none() && item.handoff.is_none() && match item.source {
         crate::agents::Source::Human => true,
-        crate::agents::Source::Chain(p) => p.origin == crate::agents::Origin::Human && p.hop == 0,
+        // Who sent it, from its message record: an agent without a chain of its own also sends
+        // at human origin, hop 0.
+        crate::agents::Source::Chain(crate::agents::Prov { msg_id: Some(m), .. }) => hub.store().agent_message(m).ok().flatten()
+            .is_some_and(|m| m.from == "human" && m.from_session.is_none()),
+        crate::agents::Source::Chain(_) => false,
     }
 }
 
@@ -721,7 +756,7 @@ pub(crate) fn after_restart(hub: &Arc<Hub>, id: SessionId) -> usize {
             // The old run never stopped: its queue simply goes on.
             q.carry = false;
         } else if live {
-            rebase(q, generation);
+            adopt(q, generation);
         }
         // Not running (the launch failed or is unconfirmed): kept for its next run.
         Some((live, q.items.len()))
@@ -764,8 +799,11 @@ fn watch_stalls(hub: &Arc<Hub>) {
         let wait = wait_reason(hub, id);
         let n = queue_len(hub, id);
         match &wait {
-            // One notice per reason: told once, it isn't repeated while that reason holds.
-            Some(w) if w.needs_human && noticed.as_deref() == Some(w.text.as_str()) => {}
+            // One notice per reason: told once (here, or by the draft or subagent notice), it isn't
+            // repeated while that reason holds.
+            Some(w) if w.needs_human && (w.told || noticed.as_deref() == Some(w.text.as_str())) => {
+                hub.injection.stalls.lock().insert(id, (since, Some(w.text.clone())));
+            }
             Some(w) if w.needs_human => {
                 let prompts = if n == 1 { "1 queued prompt has".to_string() } else { format!("{n} queued prompts have") };
                 hub.notice("warn", format!("Session {id}: {prompts} waited over {} minutes: {}.", STALL_AFTER.as_secs() / 60, w.text));
@@ -849,6 +887,7 @@ pub async fn send(
         let n = hub.injection.edit(id, |q| {
             anyhow::ensure!(current == generation, "the terminal run changed");
             rebase(q, generation);
+            join_parked(hub, q, &item)?;
             // Never ahead of a held self-handoff prompt: the new conversation reads it first.
             let at = q.items.iter().take_while(|i| held(i)).count();
             q.items.insert(at, item);
@@ -869,7 +908,8 @@ pub async fn send(
     let deliver_now = hub.injection.edit(id, |q| {
         anyhow::ensure!(current == generation, "the terminal run changed");
         rebase(q, generation);
-        if q.items.is_empty() && !q.busy && !q.blocked && adapter.is_ready(info.state) {
+        join_parked(hub, q, &item)?;
+        if q.items.is_empty() && !q.busy && !q.blocked && !parked(q) && adapter.is_ready(info.state) {
             q.busy = true;
             q.active = Some(Active { item: item.clone(), stage: Stage::Selected });
             Ok(true)
@@ -1146,12 +1186,15 @@ fn kick(hub: Arc<Hub>, id: SessionId) {
     if !ready(&hub, id) || hub.injection.backing_off(id) { return }
     let generation = hub.pty_generation(id);
     let should_start = hub.injection.edit(id, |q| {
+        // A run started without `after_restart` (a retried start after a failed launch, a launch
+        // adopted later) takes the prompts parked for it.
+        adopt(q, generation);
         if q.generation != generation || q.busy || q.blocked || q.items.is_empty() { return false }
         q.busy = true;
         true
     });
     match should_start {
-        Ok(true) => {},
+        Ok(true) => sync_queued(&hub, id),
         Ok(false) => return,
         Err(error) => { hub.notice("error", format!("Could not save prompt queue: {error:#}")); return; }
     }
@@ -1281,17 +1324,19 @@ fn drop_queue_of_run(hub: &Hub, id: SessionId, run: Option<Option<u64>>) {
         // prompt being typed may have arrived, and isn't resent; panel events go back to their
         // panels and a self handoff's prompts are dropped, as on any exit.
         let kept = hub.injection.edit(id, |q| {
-            if !ours(q) { return Vec::new() }
+            if !ours(q) || parked(q) { return None }
             if let Some(active) = q.active.take() && active.stage == Stage::Selected { q.items.push_front(active.item); }
-            let (keep, others): (VecDeque<Item>, VecDeque<Item>) = std::mem::take(&mut q.items).into_iter().partition(keeps_across_fresh_start);
-            *q = SessQ { items: keep, carry: true, ..SessQ::default() };
-            others.into_iter().filter(|i| i.panel.is_none() && i.handoff.is_none()).collect::<Vec<_>>()
+            let (keep, others): (VecDeque<Item>, VecDeque<Item>) = std::mem::take(&mut q.items).into_iter()
+                .partition(|i| keeps_across_fresh_start(hub, i));
+            *q = SessQ { items: keep, carry: true, parked_from: q.generation, ..SessQ::default() };
+            Some(others.into_iter().filter(|i| i.panel.is_none() && i.handoff.is_none()).collect::<Vec<_>>())
         });
         match kept {
-            Ok(others) => {
+            Ok(Some(others)) => {
                 hub.injection.returns.lock().extend(others);
                 hub.set_queued(id, 0);
             }
+            Ok(None) => {}
             Err(error) => hub.notice("error", format!("Could not keep the prompt queue across the restart: {error:#}")),
         }
         return;
@@ -1978,18 +2023,30 @@ mod tests {
         drop_queue(&hub, 1);
         let q = hub.injection.inner.lock().get(&1).cloned().unwrap();
         assert!(q.carry && q.generation.is_none() && q.active.is_none() && !q.busy);
-        assert_eq!(q.items.iter().map(|i| i.text.as_str()).collect::<Vec<_>>(), ["msg 11", "answer Q3: a", "msg 12", "msg 13"]);
-        // Another agent's message goes back to its sender: the restart may change permissions.
+        assert_eq!(q.items.iter().map(|i| i.text.as_str()).collect::<Vec<_>>(), ["msg 11", "answer Q3: a", "msg 13"]);
+        assert_eq!(q.parked_from, Some(5));
+        // Another agent's message goes back to its sender (the restart may change permissions),
+        // also one sent at human origin, hop 0, with no message record from the human.
         let returned: Vec<String> = hub.injection.returns.lock().iter().map(|i| i.text.clone()).collect();
-        assert_eq!(returned, ["from builder-2"]);
+        assert_eq!(returned, ["msg 12", "from builder-2"]);
+        // A send that still addressed the stopped run (5): the human's joins the parked prompts,
+        // an agent's is refused; neither takes them back to run 5.
+        let late = |item: Item| hub.injection.edit(1, |q| { rebase(q, Some(5)); join_parked(&hub, q, &item)?; q.items.push_back(item); anyhow::Ok(()) });
+        assert!(late(plain(5, "msg 14")).unwrap().is_ok());
+        assert!(late(Item { source: agent(1), ..plain(5, "late from builder-2") }).unwrap().is_err());
+        // A worker that read run 5 before it stopped doesn't adopt them for it.
+        hub.injection.edit(1, |q| adopt(q, Some(5))).unwrap();
+        let q = hub.injection.inner.lock().get(&1).cloned().unwrap();
+        assert!(parked(&q));
+        assert_eq!(q.items.iter().map(|i| i.text.as_str()).collect::<Vec<_>>(), ["msg 11", "answer Q3: a", "msg 13", "msg 14"]);
         // Kept across a backend restart too (saved with the queue).
         let reloaded = Queues::load(hub.store()).unwrap();
-        assert!(reloaded.inner.lock().get(&1).is_some_and(|q| q.carry && q.items.len() == 4));
+        assert!(reloaded.inner.lock().get(&1).is_some_and(|q| q.carry && q.items.len() == 4 && q.parked_from == Some(5)));
         // The new run (6) starts with a prompt of its own: it goes first.
         prepare_initial(&hub, 1, 6, "read memory/ first".into(), crate::agents::Source::Human).unwrap();
         let q = hub.injection.inner.lock().get(&1).cloned().unwrap();
         assert!(!q.carry && q.generation == Some(6));
-        assert_eq!(q.items.iter().map(|i| i.text.as_str()).collect::<Vec<_>>(), ["read memory/ first", "msg 11", "answer Q3: a", "msg 12", "msg 13"]);
+        assert_eq!(q.items.iter().map(|i| i.text.as_str()).collect::<Vec<_>>(), ["read memory/ first", "msg 11", "answer Q3: a", "msg 13", "msg 14"]);
         assert!(q.items.iter().all(|i| i.generation == Some(6)));
     }
 
@@ -2016,8 +2073,10 @@ mod tests {
         // A backend restart keeps them (the session is still down).
         restore(&hub).unwrap();
         assert!(hub.injection.inner.lock().get(&1).is_some_and(|q| q.carry && q.items.len() == 1));
+        // A retried start (run 6) with no prompt of its own: its first kick adopts them.
+        hub.injection.edit(1, |q| adopt(q, Some(6))).unwrap();
+        assert!(hub.injection.inner.lock().get(&1).is_some_and(|q| !q.carry && q.generation == Some(6) && q.items[0].generation == Some(6)));
         // A worker that saw the old run (5) gone must not drop the queue run 6 took over.
-        hub.injection.edit(1, |q| rebase(q, Some(6))).unwrap();
         drop_queue_of_run(&hub, 1, Some(Some(5)));
         assert!(hub.injection.inner.lock().get(&1).is_some_and(|q| q.generation == Some(6) && q.items.len() == 1));
     }

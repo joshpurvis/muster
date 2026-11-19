@@ -353,6 +353,15 @@ pub fn send_session(hub: &Hub, to: &SessionInfo, from: String, from_session: Opt
     }))
 }
 
+/// A turn of session `id` showed `shown` (its callback was saved): the log's entries and the
+/// tab's count change.
+pub fn shown(hub: &Hub, id: SessionId, shown: &Shown) {
+    for m in &shown.agent {
+        crate::agents::publish_message(hub, *m);
+    }
+    refresh(hub, id);
+}
+
 /// Session `id` ended: what waited for it is dropped.
 pub fn session_ended(hub: &Hub, id: SessionId) {
     if let Err(e) = hub.store().drop_quiet_session(id, "the session ended before its next turn") {
@@ -528,7 +537,12 @@ mod tests {
         assert!(take(&hub, 3).unwrap()["context"].is_null());
         // The turn's callback marks it shown and the turn takes on its route (the human typed).
         let fx = prompt(&hub, 2, json!({"prompt": "hello", PAYLOAD_KEY: t["quiet"]}));
-        assert_eq!(fx.quiet.unwrap().agent, vec![q.msg_id]);
+        let seen = fx.quiet.unwrap();
+        assert_eq!(seen.agent, vec![q.msg_id]);
+        // The hub then recounts the tab (src/hub.rs `handle_hook_checkpoint`).
+        assert_eq!(hub.session(2).unwrap().quiet_waiting, 1);
+        shown(&hub, 2, &seen);
+        assert_eq!(hub.session(2).unwrap().quiet_waiting, 0);
         let m = hub.store().agent_message(q.msg_id).unwrap().unwrap();
         assert!(m.shown_at.is_some() && hub.store().agent_message_delivered_at(q.msg_id).unwrap().is_some());
         assert_eq!(hub.agents().prov(2), Some(Prov { origin: Origin::Human, hop: 2, msg_id: None }));

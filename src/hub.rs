@@ -4460,6 +4460,8 @@ impl Hub {
             crate::schedules::on_reply(self, m);
         }
         if let Some(a) = fx.agent.and_then(|a| self.agents.by_id(a)) { crate::agents::publish(self, &a); }
+        // Quiet messages this turn showed: their log entries and the tab's count (src/quiet.rs).
+        if let Some(shown) = &fx.quiet { crate::quiet::shown(self, id, shown); }
         self.log_event(Some(info.channel_id), Some(id), EventKind::Hook,
             serde_json::json!({"session_id": id, "event": event, "summary": hook_summary(&payload)}));
         if from != info.state {

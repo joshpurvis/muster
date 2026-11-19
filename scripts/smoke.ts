@@ -1540,7 +1540,12 @@ async function quietMessages(c: Client, mcp: (token: string, name: string, args?
     if (!r.ok) throw new Error(`/quiet/take: ${r.status}`);
     return await r.json();
   };
-  await until("quietb running", async () => ["idle", "working"].includes((await info())?.state));
+  // The fake reports its conversation as Claude's SessionStart hook would.
+  const ss = await fetch(`http://127.0.0.1:${PORT}/hook/SessionStart`, {
+    method: "POST", headers: { Authorization: `Bearer ${bT}` }, body: JSON.stringify({ session_id: "conv-quiet", source: "startup" }),
+  });
+  await ss.body?.cancel();
+  await until("quietb's session", async () => !!(await info()) && (await info()).state !== "exited");
 
   const sent = await mcp(aT, "tell_agent", { agent: "quietb", text: "QUIET-NOTE-1 the build is green", wake: false });
   ok(sent.status === "waiting" && sent.wake === false && sent.msg_id > 0, `tell_agent wake=false keeps it waiting (${JSON.stringify(sent)})`);

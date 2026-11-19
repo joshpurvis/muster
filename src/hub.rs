@@ -1434,6 +1434,15 @@ impl Hub {
         self.human_input.note(id);
     }
 
+    /// `bytes` from a client into session `id`: the human's input, unless they are only the
+    /// terminal's focus or mouse reports (`sleep::reports_only`), which a tab sends when it
+    /// gains or loses focus.
+    pub fn note_human_keys(&self, id: SessionId, bytes: &[u8]) {
+        if !crate::sleep::reports_only(bytes) {
+            self.note_human_input(id);
+        }
+    }
+
     /// Commit every pending human-input marker now (tests, the attribution worker, shutdown).
     pub(crate) fn flush_human_input(&self) -> anyhow::Result<()> {
         if self.human_input.is_empty() {

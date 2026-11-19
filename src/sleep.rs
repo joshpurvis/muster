@@ -235,7 +235,7 @@ impl State {
             g.keys.remove(&sid).filter(|k| !k.is_empty()).map(|k| (k, g.admit(sid)))
         };
         if let Some((keys, admitted)) = held {
-            hub.note_human_input(sid);
+            hub.note_human_keys(sid, &keys);
             if let Err(e) = hub.send_keys_admitted(sid, &keys, admitted) {
                 tracing::warn!(session = sid, "typing the keys held while it was going to sleep: {e:#}");
             }
@@ -538,6 +538,8 @@ pub struct Facts {
     pub waking: bool,
     /// When the agent message it is running was typed in (`Registry::active_delivered_at`).
     pub active_at: Option<i64>,
+    /// Why its queued prompts wait, when they do (`inject::wait_reason`).
+    pub queue_wait: Option<String>,
 }
 
 /// Why `agent` can't sleep now, in words for the human (None: it can).
@@ -571,7 +573,10 @@ pub fn blocker(agent: &Agent, info: Option<&SessionInfo>, f: &Facts) -> Option<S
         });
     }
     if !f.queue_idle || info.queued > 0 {
-        return Some("it has prompts waiting to be typed".into());
+        return Some(match &f.queue_wait {
+            Some(why) => format!("it has prompts waiting to be typed: {why}"),
+            None => "it has prompts waiting to be typed".into(),
+        });
     }
     if f.deliveries > 0 {
         return Some("a message to it is on its way".into());
@@ -618,6 +623,7 @@ fn facts(hub: &Hub, a: &Agent) -> (Option<SessionInfo>, Facts) {
         deliveries: hub.agents().sleep.deliveries(a.id),
         waking: hub.agents().sleep.waking(a.id),
         active_at: hub.agents().active_delivered_at(sid),
+        queue_wait: crate::inject::wait_reason(hub, sid).map(|w| w.text),
     };
     (info, f)
 }
@@ -924,7 +930,7 @@ fn flush(hub: &Hub, agent: i64, tab: SessionId, to: SessionId) -> bool {
         let keys = g.keys.remove(&tab).unwrap_or_default();
         let admitted = g.admit(to);
         // The human typed them: the turn they start is the human's (whatever woke it).
-        hub.note_human_input(to);
+        hub.note_human_keys(to, &keys);
         if let Err(e) = hub.send_keys_admitted(to, &keys, admitted) {
             tracing::warn!(session = to, "typing the keys held while it woke: {e:#}");
         }
@@ -1062,6 +1068,31 @@ pub fn keys(hub: &Arc<Hub>, id: SessionId, bytes: &[u8]) -> Keys {
         wake_soon(hub, agent, Some(id), Cause::Typing);
     }
     Keys::Held
+}
+
+/// `bytes` hold only the terminal's own focus and mouse reports (`ESC [ I`, `ESC [ O`, X10 and
+/// SGR mouse reports), nothing the human typed. Claude Code turns focus reporting on, so the
+/// terminal sends a report whenever its tab gains or loses focus; read as typing, a report made
+/// the dim suggestion in an idle agent's input box look like the human's draft, and queued
+/// prompts waited behind it for hours (`inject::composer`, issue #24).
+pub fn reports_only(bytes: &[u8]) -> bool {
+    let mut i = 0;
+    while i < bytes.len() {
+        let rest = &bytes[i..];
+        if rest.starts_with(b"\x1b[I") || rest.starts_with(b"\x1b[O") {
+            i += 3;
+        } else if rest.starts_with(b"\x1b[M") && rest.len() >= 6 {
+            i += 6;
+        } else if let Some(body) = rest.strip_prefix(b"\x1b[<") {
+            match body.iter().position(|b| !(b.is_ascii_digit() || *b == b';')) {
+                Some(n) if matches!(body[n], b'M' | b'm') => i += 3 + n + 1,
+                _ => return false,
+            }
+        } else {
+            return false;
+        }
+    }
+    true
 }
 
 /// The human's typing in `bytes`: the bytes worth typing into a new run (the terminal's own
@@ -1428,6 +1459,9 @@ mod tests {
         queued.queued = 1;
         assert!(why(&a, queued, ready()).contains("waiting"));
         assert!(why(&a, info(AgentState::Idle), Facts { queue_idle: false, ..ready() }).contains("waiting"));
+        let draft = Facts { queue_idle: false, queue_wait: Some("unsent text is in the input box: send it or clear it".into()), ..ready() };
+        assert_eq!(why(&a, info(AgentState::Idle), draft).as_str(),
+            "it has prompts waiting to be typed: unsent text is in the input box: send it or clear it");
         let mut sub = info(AgentState::Idle);
         sub.subagents = 2;
         assert!(why(&a, sub, ready()).contains("sub-agents"));
@@ -1466,6 +1500,17 @@ mod tests {
         let p = crate::cli::parse_sleep_after;
         assert_eq!((p("off").unwrap(), p("45").unwrap(), p("90m").unwrap(), p("2h").unwrap()), (0, 45, 90, 120));
         assert!(p("1").is_err() && p("soon").is_err() && p("9999h").is_err());
+    }
+
+    /// Focus and mouse reports are the terminal's, not the human's typing; anything else is.
+    #[test]
+    fn focus_and_mouse_reports_are_not_typing() {
+        for report in [&b"\x1b[I"[..], b"\x1b[O", b"\x1b[O\x1b[I", b"\x1b[<0;10;5M\x1b[<0;10;5m", b"\x1b[M #!", b""] {
+            assert!(reports_only(report), "{report:?}");
+        }
+        for typing in [&b"a"[..], b"\x1b[Ia", b"\r", b"\x7f", b"\x1b[D", b"\x03", b"\x1b[<0;10", b"\x1b[M #"] {
+            assert!(!reports_only(typing), "{typing:?}");
+        }
     }
 
     /// A hub over an in-memory store: task 1 with session 1 (Claude, no process), the agent

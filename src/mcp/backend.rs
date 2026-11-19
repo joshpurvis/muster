@@ -35,6 +35,8 @@ pub trait Backend: Send + Sync + 'static {
     fn session_by_token(&self, token: &str) -> Option<SessionId>;
     fn session(&self, id: SessionId) -> Option<SessionInfo>;
     fn sessions(&self) -> Vec<SessionInfo>;
+    /// Why session `id`'s queued prompts wait, when they do (src/inject.rs `wait_reason`).
+    fn queue_waits(&self, _id: SessionId) -> Option<String> { None }
     fn live_session_ids(&self) -> Vec<SessionId>;
     fn channel(&self, id: ChannelId) -> Option<Channel>;
     fn channels(&self) -> Vec<Channel>;
@@ -136,6 +138,9 @@ impl Backend for HubBackend {
     }
     fn sessions(&self) -> Vec<SessionInfo> {
         self.0.sessions()
+    }
+    fn queue_waits(&self, id: SessionId) -> Option<String> {
+        crate::inject::wait_reason(&self.0, id).map(|w| w.text)
     }
     fn live_session_ids(&self) -> Vec<SessionId> {
         self.0.live_session_ids()

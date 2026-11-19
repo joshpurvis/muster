@@ -611,8 +611,10 @@ async fn quiet_take(State(hub): State<Arc<Hub>>, headers: HeaderMap, body: Bytes
     // Anything but a positive message id is a prompt Muster didn't type in: the human's turn.
     let body = serde_json::from_slice::<serde_json::Value>(&body).unwrap_or_default();
     let msg = body.get("msg").and_then(serde_json::Value::as_i64).filter(|m| *m > 0);
-    // A missing or unknown mode counts as the widest (`quiet::mode_width`).
-    let width = crate::quiet::mode_width(body.get("permission_mode").and_then(serde_json::Value::as_str));
+    // A missing mode, or one Muster doesn't set (the user's own default), counts as the tab's
+    // (`quiet::mode_width`).
+    let tab = hub.session(id).map_or(crate::quiet::width(crate::model::ClaudeMode::Bypass), |s| crate::quiet::session_width(&hub, &s));
+    let width = crate::quiet::mode_width(body.get("permission_mode").and_then(serde_json::Value::as_str), tab);
     match crate::quiet::take_run(&hub, id, run, msg, width).await {
         Ok(v) => axum::Json(v).into_response(),
         Err(e) => (

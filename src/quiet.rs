@@ -125,15 +125,17 @@ pub fn session_width(hub: &Hub, s: &SessionInfo) -> i64 {
 
 /// The width of the permission mode a turn's process runs in, as Claude Code's
 /// `UserPromptSubmit` payload names it (`permission_mode`, sent on to `/quiet/take`). A mode
-/// Muster doesn't set (`auto`, `dontAsk`), or none, counts as the widest: that turn takes only
-/// notes checked for the widest mode.
-pub fn mode_width(mode: Option<&str>) -> i64 {
-    width(match mode {
-        Some("plan") => ClaudeMode::Plan,
-        Some("default") => ClaudeMode::Default,
-        Some("acceptEdits") => ClaudeMode::AcceptEdits,
-        _ => ClaudeMode::Bypass,
-    })
+/// Muster doesn't set (`auto`, `dontAsk`: the user's own default mode, which Muster's default
+/// profile leaves in place), or none, counts as `tab`, the width of the mode its tab sets
+/// (`session_width`): what the waking path checks a send against too.
+pub fn mode_width(mode: Option<&str>, tab: i64) -> i64 {
+    match mode {
+        Some("plan") => width(ClaudeMode::Plan),
+        Some("default") => width(ClaudeMode::Default),
+        Some("acceptEdits") => width(ClaudeMode::AcceptEdits),
+        Some("bypassPermissions") => width(ClaudeMode::Bypass),
+        _ => tab,
+    }
 }
 
 /// Is this hook payload from one of Claude Code's subagents (a non-empty `agent_id`)? Its
@@ -1097,17 +1099,20 @@ mod tests {
     }
 
     /// The mode the process runs in decides, not the tab's setting: a Bypass run doesn't take a
-    /// note checked for Default while the tab says Default, and a turn naming no mode (or one
-    /// Muster doesn't set) takes only notes checked for the widest.
+    /// note checked for Default while the tab says Default. A turn naming no mode, or one Muster
+    /// doesn't set (the user's own default, such as `auto`), counts as its tab's mode.
     #[tokio::test]
     async fn the_running_mode_decides_which_notes_a_turn_takes() {
         let (hub, _, beta, _) = hub();
         let q = agents::quiet(&hub, out(&beta, "for a Default run", 0)).await.unwrap().msg_id;
         let run = hub.session_run(2).unwrap();
+        let bypass_tab = width(ClaudeMode::Bypass);
         for mode in [Some("bypassPermissions"), None, Some("auto"), Some("dontAsk")] {
-            assert!(take_run(&hub, 2, run, None, mode_width(mode)).await.unwrap()["context"].is_null(), "{mode:?}");
+            assert!(take_run(&hub, 2, run, None, mode_width(mode, bypass_tab)).await.unwrap()["context"].is_null(), "{mode:?}");
         }
-        assert_eq!(take_run(&hub, 2, run, None, mode_width(Some("plan"))).await.unwrap()["quiet"]["agent"], json!([q]));
+        let default_tab = width(ClaudeMode::Default);
+        assert!(take_run(&hub, 2, run, None, mode_width(Some("bypassPermissions"), default_tab)).await.unwrap()["context"].is_null());
+        assert_eq!(take_run(&hub, 2, run, None, mode_width(Some("auto"), default_tab)).await.unwrap()["quiet"]["agent"], json!([q]));
     }
 
     /// A note keeps the width the sender's permission check ran against, even when the agent's
@@ -1120,8 +1125,8 @@ mod tests {
         let checked = Some(width(ClaudeMode::Default));
         let q = agents::quiet_checked(&hub, out(&beta, "checked for Default", 0), checked).await.unwrap().msg_id;
         let run = hub.session_run(2).unwrap();
-        assert!(take_run(&hub, 2, run, None, mode_width(Some("bypassPermissions"))).await.unwrap()["context"].is_null());
-        assert_eq!(take_run(&hub, 2, run, None, mode_width(Some("default"))).await.unwrap()["quiet"]["agent"], json!([q]));
+        assert!(take_run(&hub, 2, run, None, mode_width(Some("bypassPermissions"), width(ClaudeMode::Default))).await.unwrap()["context"].is_null());
+        assert_eq!(take_run(&hub, 2, run, None, mode_width(Some("default"), width(ClaudeMode::Default))).await.unwrap()["quiet"]["agent"], json!([q]));
     }
 
     #[tokio::test]

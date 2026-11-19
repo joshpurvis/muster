@@ -921,7 +921,8 @@ for what can wait. Code: `src/quiet.rs`.
   keeps it waiting). A message is held while the receiving process runs in a wider permission
   mode than the one its send was checked against (the tab restarted in Bypass, say), as the
   turn's own `UserPromptSubmit` payload reports it (`permission_mode`), not the tab's setting; a
-  turn that reports none, or a mode Muster doesn't set, takes only messages checked for Bypass. An agent on OpenRouter takes
+  turn that reports none, or a mode Muster doesn't set (such as the user's own default `auto`, which
+  Muster's default profile leaves in place), counts as the mode its tab sets. An agent on OpenRouter takes
   unattended ones only while the spend caps allow, read fresh only when the turn would take one,
   and waited for at most 400 ms: a slow reading leaves them waiting and never holds back the
   human's. The rest wait for a turn that can take them, or until they expire; the turn itself

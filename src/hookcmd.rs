@@ -527,7 +527,7 @@ mod tests {
         let prompt = br#"{"prompt":"[muster msg 12 from alpha origin=human hop=1]\nrun the tests"}"#.to_vec();
         quiet_messages(&format!("http://127.0.0.1:{port}"), "tok", "claude", prompt, &mut out);
         let req = h.join().unwrap();
-        // No mode in the payload: null (the backend counts it as the widest).
+        // No mode in the payload: null (the backend counts it as the tab's mode).
         assert!(req.ends_with("\r\n\r\n{\"msg\":12,\"permission_mode\":null}"), "{req}");
     }
 

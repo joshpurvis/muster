@@ -402,7 +402,7 @@ human"); the **Questions** tab is where the human sees and answers them (`web/sr
 
 Agents that want a pull request merged post a card for it (docs/MCP.md "Pull requests to merge");
 the **PRs to merge** tab is where the human looks at it and merges it with a click
-(`web/src/components/PrsView.tsx`, `web/src/prs.ts`, `web/src/prs_model.ts`). Muster's own code
+(`web/src/components/PrsView.tsx`, `web/src/prs.ts`, `web/src/prs_model.ts`, `web/src/prs_merges.ts`). Muster's own code
 merges, never a model.
 
 - **The tab**: one per window, in whichever channel is shown, placed, moved, remembered per channel
@@ -428,17 +428,25 @@ merges, never a model.
   changes**, **Not now** and **Merge <owner/repo> #<n>** (the target always on the button). Merge is
   off, with why, unless the last read passes every rule and no refusal stands. In a pane under 620px
   tall the dock ends the card instead of staying at the bottom.
-- **Merge**: a click (a real pointer click) or Ctrl+Enter on the focused button starts a 5 second
-  countdown: the dock keeps its layout, says **Merging in N s**, the target and the commit, and
-  **Cancel** takes Merge's exact place (a double click lands on Cancel). Cancel, Esc anywhere in the
-  tab, opening a picture or the list, leaving the card, hiding the tab or the window cancels; nothing is sent
-  until the countdown ends, and nothing at all if the window has lost its connection then. Then
-  `pr.merge`: "Asking GitHub to merge", and the card ends merged ("<repo> #<n> is in master as commit
-  abc1234", whether its poster was told, with **Next waiting** at the dock's other end), refused (a
-  red banner with why and GitHub's first line; Merge off until a read passes), or "Not known yet"
-  when Muster asked GitHub but couldn't confirm the result (Check again settles it). Plain Enter and
-  Space on Merge do nothing; Merge ignores clicks for 0.6 s after its card appears or changes, a
-  Cancel, a reorder, or the large view or list closing. There is no other shortcut for it.
+- **Merge**: a click (a real pointer click) or Ctrl+Enter on the focused button starts that card's 5
+  second countdown: the dock keeps its layout, says **Merging in N s**, the target and the commit,
+  and **Cancel** takes Merge's exact place (a double click lands on Cancel). The countdown runs in
+  the background (`web/src/prs_merges.ts`): moving to another card, clicking its Merge, opening a
+  picture or the list, going to another tab or hiding the window never stops it, so several cards
+  can count down and merge at once. Only that card's Cancel (or Esc in the tab while the card is
+  shown) stops it, or the card changing under it (posted again, no longer mergeable: a toast says
+  why); its pill and its row in the list show … ("merging soon") until it ends. Nothing is sent
+  until the countdown ends, nothing at all if the window has lost its connection then, and
+  closing or reloading the window ends every countdown unsent. Then `pr.merge`: "Asking GitHub to
+  merge", and the card ends merged ("<repo> #<n> is in master as commit abc1234", whether its poster
+  was told, with **Next waiting** at the dock's other end), refused (a red banner with why and
+  GitHub's first line; Merge off until a read passes), or "Not known yet" when Muster asked GitHub
+  but couldn't confirm the result (Check again settles it). A result never takes focus, changes
+  the card shown or switches to **Merged**: wherever the human is typing stays focused, and a card
+  merged from here keeps its place in the Waiting strip (marked ✓) until the tab is shown again or
+  the filter changes. Plain Enter and Space on Merge do nothing; Merge ignores clicks for 0.6 s
+  after its card appears or changes, a Cancel, a reorder, or the large view or list closing, and
+  says so under the button when it ignores one. There is no other shortcut for it.
 - **Stale**: when GitHub's newest commit isn't the one posted, the card says **Changed since it was
   posted: new commits**, its pictures are marked "older version", Merge is off, and the poster is
   told to post it again.

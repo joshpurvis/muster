@@ -1,22 +1,28 @@
 // The PRs to merge tab (docs/UI.md "PRs to merge"): one pull request an agent wants merged fills
 // the tab, pictures first; a strip of pills switches between them. The dock at the bottom shows
-// what Muster itself read from GitHub (the four rules) and Merge. A click on Merge starts a 5
-// second countdown with Cancel in Merge's exact place; only then does the tab send `pr.merge`, and
-// Muster's own code (never a model) reads the pull request again and merges that exact commit.
+// what Muster itself read from GitHub (the four rules) and Merge. A click on Merge starts that
+// card's 5 second countdown with Cancel in Merge's exact place; only then does the window send
+// `pr.merge`, and Muster's own code (never a model) reads the pull request again and merges that
+// exact commit. The countdown runs in the background (prs_merges.ts): moving to another card,
+// clicking its Merge, opening a picture or the list, or leaving the tab never stops it; only that
+// card's Cancel (or Esc while it is shown) does, or the card changing. Several cards can count
+// down and merge at once. A merge's result never moves focus, the card shown or the list: the
+// card just says how it went, and a card merged from here keeps its place in the Waiting strip.
 //
 // Why a stray key or click can't merge: no shortcut for Merge anywhere; plain Enter and Space on
 // it do nothing (Ctrl+Enter does); clicks are ignored for 600 ms after the card changes, a Cancel,
-// a reorder or the large view or list closing; the countdown keeps the dock's layout, so a double
-// click lands its second click on Cancel; opening a picture or the list cancels a countdown; Merge
+// a reorder or the large view or list closing (the dock says so when it ignores one); the
+// countdown keeps the dock's layout, so a double click lands its second click on Cancel; Merge
 // and "Next waiting" are at opposite ends of the dock.
 import { signal } from "@preact/signals";
 import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
 import {
   askChanges, banner, baseName, canMerge, cardState, CLICK_GUARD_MS, COUNTDOWN_S, GROUPS, groupOf, loadPrPicture,
-  mergeCommand, mergedPrs, mergePr, nb, nextReady, offReason, otherSide, pairs, pairText, pictureKey, pillMark, prPictures,
-  prs, prsFilter, refreshPrs, REFRESH_EVERY_MS, repoName, type Rule, rules, type Seen, selectedPr, setLater, shortSha, sizeOf,
-  stepPicture, tagText, target, titleOf, toldText, waitingPrs,
+  mergeCommand, mergedPrs, nb, nextReady, offReason, otherSide, pairs, pairText, pictureKey, pillMark, prPictures,
+  prs, prsFilter, refreshPrs, REFRESH_EVERY_MS, repoName, type Rule, rules, selectedPr, setLater, shortSha, sizeOf,
+  sortWaiting, stepPicture, tagText, target, titleOf, toldText, waitingPrs,
 } from "../prs.ts";
+import { cancelMerge, mergedHere, queuedMerges, startMerge } from "../prs_merges.ts";
 import { ageText, clockText } from "../questions_model.ts";
 import type { Pr } from "../types.ts";
 import { agents, sessions, toast } from "../state.ts";
@@ -30,8 +36,6 @@ const SHORT_PX = 620;
 
 const errText = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
-/** The countdown running in this window (its Cancel), so opening a picture or the list stops it. */
-const countdown = signal<{ id: number; cancel: () => void } | null>(null);
 /** Bumped when the large view or the list closes: Merge ignores clicks for a moment after. */
 const guardBump = signal(0);
 
@@ -59,7 +63,7 @@ function posterSession(p: Pr) {
   return sid != null ? sessions.value.get(sid) : undefined;
 }
 
-/** Focus the shown card's title (after picking a card, a Cancel, a merge's result). */
+/** Focus the shown card's title (after picking a card or a Cancel; never on a merge's result). */
 function focusTitle() {
   requestAnimationFrame(() => document.querySelector<HTMLElement>(".prs-view .pb-stage .qv-q")?.focus({ preventScroll: true }));
 }
@@ -85,6 +89,9 @@ export function PrsView() {
     return () => ro.disconnect();
   }, []);
 
+  // A new visit to the tab starts the Waiting strip afresh (cards merged meanwhile leave it).
+  useEffect(() => { mergedHere.value = new Set(); }, []);
+
   // GitHub is read when the tab is shown and every 2 minutes while it is and the window is in
   // view (never in the background).
   useEffect(() => {
@@ -103,7 +110,9 @@ export function PrsView() {
   }, []);
 
   const filter = prsFilter.value;
-  const waiting = waitingPrs.value;
+  const kept = mergedHere.value;
+  // Cards merged from here keep their places in the strip, so it never shifts under the pointer.
+  const waiting = kept.size ? sortWaiting(prs.value.values(), kept) : waitingPrs.value;
   const merged = mergedPrs.value;
   const list = filter === "waiting" ? waiting : merged;
   const chosen = selectedPr.value === null ? undefined : prs.value.get(selectedPr.value);
@@ -121,11 +130,11 @@ export function PrsView() {
   };
   const showFilter = (f: "waiting" | "merged") => {
     prsFilter.value = f;
+    mergedHere.value = new Set();
     selectedPr.value = (f === "waiting" ? waiting : merged)[0]?.id ?? null;
     setMenu(false);
   };
   const openZoom = (p: Pr, index: number) => {
-    countdown.peek()?.cancel();
     setZoom({ id: p.id, post: p.post, index });
   };
   // The picture open large, while its card still shows that post and that picture.
@@ -138,8 +147,7 @@ export function PrsView() {
     }
   }, [zoom, zoomed]);
   const toggleMenu = () => {
-    if (!menu) countdown.peek()?.cancel();
-    else guardBump.value++;
+    if (menu) guardBump.value++;
     setMenu(!menu);
   };
   const closeMenu = (refocus: boolean) => {
@@ -157,7 +165,7 @@ export function PrsView() {
         <h1>PRs to merge</h1>
         <button type="button" class={cx("qv-chip", filter === "waiting" && "on")} aria-pressed={filter === "waiting"}
           onClick={() => showFilter("waiting")}>
-          Waiting <span class="qv-n">{waiting.length}</span>
+          Waiting <span class="qv-n">{waitingPrs.value.length}</span>
         </button>
         <button type="button" class={cx("qv-chip", filter === "merged" && "on")} aria-pressed={filter === "merged"}
           onClick={() => showFilter("merged")}>
@@ -217,7 +225,7 @@ function Strip({ list, current, onPick }: { list: Pr[]; current: Pr | undefined;
     <div class="pb-strip" role="tablist" aria-label="Pull requests" ref={ref} onKeyDown={onKey}>
       {list.map((p) => {
         const on = p.id === current?.id;
-        const mark = pillMark(p);
+        const mark = queuedMark(p) ?? pillMark(p);
         return (
           <button key={p.id} id={`prs-pill-${p.id}`} type="button" role="tab" aria-selected={on} aria-controls="prs-stage"
             tabIndex={on || (!current && p === list[0]) ? 0 : -1}
@@ -232,6 +240,13 @@ function Strip({ list, current, onPick }: { list: Pr[]; current: Pr | undefined;
       })}
     </div>
   );
+}
+
+/** A card counting down or being sent from this window: its pill and list row say so. */
+function queuedMark(p: Pr): { glyph: string; cls: "run"; status: string } | null {
+  const q = queuedMerges.value.get(p.id);
+  if (!q || p.status !== "waiting") return null;
+  return { glyph: "…", cls: "run", status: q.phase === "count" ? "merging in a moment (Cancel is on its card)" : "merging" };
 }
 
 function AllMenu({ list, filter, current, now, onPick, onClose }: {
@@ -269,7 +284,8 @@ function AllMenu({ list, filter, current, now, onPick, onClose }: {
           <div key={title} role="group" aria-label={title || undefined}>
             {title && <div class="qv-grp">{title}</div>}
             {ps.map((p) => {
-              const tag = tagText(p);
+              const q = queuedMark(p);
+              const tag = q ? { text: q.status.startsWith("merging in") ? "merging soon" : "merging", tone: "" } : tagText(p);
               return (
                 <div key={p.id} role="listitem">
                   <button type="button" class={cx("qv-row", "pm-row", p.id === current?.id && "sel", p.status === "merged" && "done")}
@@ -411,11 +427,7 @@ function Ticks({ list }: { list: Rule[] }) {
   );
 }
 
-type Phase =
-  | { kind: "idle" }
-  | { kind: "count"; left: number; seen: Seen }
-  | { kind: "send"; seen: Seen; answered: boolean }
-  | { kind: "ask" };
+type Phase = { kind: "idle" } | { kind: "ask" };
 
 function Dock({ p, now, order, onPick }: { p: Pr; now: number; order: string; onPick: (p: Pr) => void }) {
   const [phase, setPhase] = useState<Phase>({ kind: "idle" });
@@ -430,85 +442,45 @@ function Dock({ p, now, order, onPick }: { p: Pr; now: number; order: string; on
   const can = canMerge(p);
   const who = p.poster.label;
   const bump = guardBump.value;
+  // This card's countdown or send, if it has one (prs_merges.ts: it runs whether or not this
+  // dock is shown).
+  const queued = queuedMerges.value.get(p.id);
+  const counting = queued?.phase === "count" && p.status === "waiting";
+  // Re-renders the seconds left while it counts down.
+  useNow(counting ? 200 : 60_000);
 
   // Merge ignores clicks for a moment after its card appears or changes, the list reorders, or
   // the large view or list closes. Before paint, so no click lands in between.
   useLayoutEffect(() => { guard.current = performance.now(); }, [p.updated_at, p.head_sha, p.post, order, bump]);
 
-  // The countdown: one step a second; at 0, `pr.merge` for what the human saw.
+  // Esc anywhere in the tab cancels the countdown of the card shown.
   useEffect(() => {
-    if (phase.kind !== "count") return;
-    if (phase.left <= 0) {
-      // Only while the human can see it: a window hidden or left meanwhile sends nothing.
-      if (document.visibilityState !== "visible" || !ref.current?.isConnected) {
-        cancel();
-        return;
-      }
-      const seen = phase.seen;
-      setPhase({ kind: "send", seen, answered: false });
-      mergePr(seen).then(() => setPhase({ kind: "send", seen, answered: true })).catch((e) => {
-        // Not sent (disconnected, refused at the click), or Muster didn't answer: the card says
-        // what Muster knows, and Check again reads GitHub.
-        setPhase({ kind: "idle" });
-        guard.current = performance.now();
-        toast("error", `${target(p)}: ${errText(e)}`, 8000);
-        focusTitle();
-      });
-      return;
-    }
-    const t = setTimeout(() => setPhase({ ...phase, left: phase.left - 1 }), 1000);
-    return () => clearTimeout(t);
-  }, [phase]);
-
-  // The merge has ended (merged, or not and why, on the card itself): the dock goes back.
-  useEffect(() => {
-    if (phase.kind !== "send" || !phase.answered || p.status === "merging") return;
-    setPhase({ kind: "idle" });
-    guard.current = performance.now();
-    if (p.status === "merged" && selectedPr.peek() === p.id) prsFilter.value = "merged";
-    focusTitle();
-  }, [phase, p.status]);
-
-  // The card stops being mergeable, or is posted again: the countdown ends.
-  useEffect(() => {
-    if (phase.kind === "count" && (!can || p.head_sha !== phase.seen.sha || p.post !== phase.seen.post
-      || p.github?.base !== phase.seen.base)) cancel();
-  }, [can, p.head_sha, p.post, p.github?.base]);
-
-  // Esc anywhere in the tab cancels; so does opening a picture or the list (`countdown`), and
-  // leaving the card or hiding the tab (this dock goes away).
-  useEffect(() => {
-    if (phase.kind !== "count") return;
-    countdown.value = { id: p.id, cancel };
+    if (!counting) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Escape" || !(e.target as HTMLElement)?.closest?.(".prs-view")) return;
       e.preventDefault();
       e.stopPropagation();
       cancel();
     };
-    // Hiding the window (another browser tab, minimised) or leaving the page cancels too.
-    const hidden = () => { if (document.visibilityState !== "visible") cancel(); };
     addEventListener("keydown", onKey, true);
-    document.addEventListener("visibilitychange", hidden);
-    addEventListener("pagehide", cancel);
-    return () => {
-      removeEventListener("keydown", onKey, true);
-      document.removeEventListener("visibilitychange", hidden);
-      removeEventListener("pagehide", cancel);
-      if (countdown.peek()?.id === p.id) countdown.value = null;
-    };
-  }, [phase.kind]);
+    return () => removeEventListener("keydown", onKey, true);
+  }, [counting]);
 
   const start = () => {
-    if (!can || phase.kind !== "idle" || performance.now() - guard.current < CLICK_GUARD_MS || !p.github) return;
+    if (!can || queued || !p.github) return;
+    if (performance.now() - guard.current < CLICK_GUARD_MS) {
+      setHint("That click came right after the card changed, so Merge ignored it: click again.");
+      setTimeout(() => setHint(""), 3000);
+      return;
+    }
     setMergeWidth(ref.current?.querySelector<HTMLElement>(".pm-merge")?.offsetWidth ?? 0);
     // The card stays shown through its result, even when it leaves the Waiting list.
     selectedPr.value = p.id;
-    setPhase({ kind: "count", left: COUNTDOWN_S, seen: { id: p.id, sha: p.head_sha, base: p.github.base, post: p.post } });
+    startMerge({ id: p.id, sha: p.head_sha, base: p.github.base, post: p.post });
     requestAnimationFrame(() => ref.current?.querySelector<HTMLElement>(".pm-cancel")?.focus());
   };
   function cancel() {
-    setPhase((ph) => (ph.kind === "count" ? { kind: "idle" } : ph));
+    if (!cancelMerge(p.id)) return;
     guard.current = performance.now();
     focusTitle();
   }
@@ -629,11 +601,11 @@ function Dock({ p, now, order, onPick }: { p: Pr; now: number; order: string; on
 
   // Idle, counting down, or asking GitHub: one layout, so Cancel sits exactly where Merge was
   // (Ask for changes and Not now keep their places, hidden).
-  const counting = phase.kind === "count";
-  const sending = phase.kind === "send" || s === "merging";
+  const sending = (queued != null && !counting) || s === "merging";
   const going = counting || sending;
-  const seenSha = phase.kind === "count" || phase.kind === "send" ? phase.seen.sha : p.head_sha;
-  const left = phase.kind === "count" ? phase.left : 0;
+  const seenSha = queued?.seen.sha ?? p.merge?.sha ?? p.head_sha;
+  const leftMs = counting && queued ? Math.max(0, Math.min(COUNTDOWN_S * 1000, queued.endsAt - Date.now())) : 0;
+  const left = Math.ceil(leftMs / 1000);
   const list = rules(p);
   const size = sizeOf(p);
   const off = offReason(p);
@@ -641,7 +613,7 @@ function Dock({ p, now, order, onPick }: { p: Pr; now: number; order: string; on
   const spoken = going ? `${status}: ${target(p)}, commit ${shortSha(seenSha)}, into ${baseName(p)}` : "";
   return (
     <div class={cx("pb-dock", going && "counting")} ref={ref}>
-      {going && <div class="pm-drain" aria-hidden="true"><i style={{ width: `${(left / COUNTDOWN_S) * 100}%` }} /></div>}
+      {going && <div class="pm-drain" aria-hidden="true"><i style={{ width: `${(leftMs / (COUNTDOWN_S * 1000)) * 100}%` }} /></div>}
       <span class="sr-only" role="status" aria-live="polite">{spoken}</span>
       <div class="pb-dock-in">
         {/* While it counts down, the idle words keep their places (hidden), so every row, and Cancel
@@ -696,7 +668,7 @@ function Dock({ p, now, order, onPick }: { p: Pr; now: number; order: string; on
             )
             : (
               <button type="button" class="qv-btn primary pm-merge" disabled={!can}
-                data-tip={can ? `Starts a ${COUNTDOWN_S} second countdown; Cancel takes this button's place` : undefined}
+                data-tip={can ? `Starts a ${COUNTDOWN_S} second countdown that keeps going when you move on; Cancel takes this button's place` : undefined}
                 data-keys={can ? "Ctrl+Enter" : undefined}
                 onClick={(e) => { if (e.detail >= 1 && e.button === 0) start(); }}
                 onKeyDown={(e) => {
@@ -715,14 +687,14 @@ function Dock({ p, now, order, onPick }: { p: Pr; now: number; order: string; on
         <div class="pb-fine">
           {going && (
             <span class="pm-over" aria-hidden="true">
-              Into {baseName(p)} as a merge commit. {counting ? "Cancel or Esc stops it; nothing is sent until then." : ""}
+              Into {baseName(p)} as a merge commit. {counting ? "Cancel or Esc stops it. You can move on: it merges on its own." : "You can move on meanwhile."}
             </span>
           )}
           <span class={cx("pm-idle", going && "pm-held")}>
             {hint
               ? <span class="off" role="status">{hint}</span>
               : can
-              ? <span class="pm-fine-text">A merge commit into {baseName(p)}; Muster leaves the branch alone. You get {COUNTDOWN_S} seconds to cancel.</span>
+              ? <span class="pm-fine-text">A merge commit into {baseName(p)}; Muster leaves the branch alone. You get {COUNTDOWN_S} seconds to cancel, and can move on meanwhile.</span>
               : off && <span class="off">Merge is off: {off}.</span>}
             {links}
           </span>

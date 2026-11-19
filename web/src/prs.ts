@@ -2,8 +2,8 @@
 // "Pull requests to merge"). `pr.list` after each hello, then `pr_upserted` events; `pr.refresh`
 // reads GitHub again (when the tab is shown, every 2 minutes while it is, and with Check again).
 // Merging, asking for changes and Not now go through `pr.merge`, `pr.ask_changes` and `pr.later`,
-// which the daemon accepts only from a click in this window; `pr.merge` is sent only once the
-// tab's 5 second countdown has run out.
+// which the daemon accepts only from a click in this window; `pr.merge` is sent only once that
+// card's 5 second countdown has run out (prs_merges.ts: each card's own, in the background).
 //
 // The pure part (states, order, the rules and the words) is prs_model.ts, re-exported here.
 
@@ -11,6 +11,7 @@ import { computed, signal } from "@preact/signals";
 import { rpc } from "./rpc.ts";
 import type { Pr } from "./types.ts";
 import { sortMerged, sortWaiting } from "./prs_model.ts";
+import type { Seen } from "./prs_merge_queue.ts";
 
 export * from "./prs_model.ts";
 
@@ -78,13 +79,7 @@ export async function refreshPrs(id?: number): Promise<void> {
   }
 }
 
-/** What the human saw when the countdown started: the merge goes ahead only for that. */
-export interface Seen {
-  id: number;
-  sha: string;
-  base: string;
-  post: number;
-}
+export type { Seen } from "./prs_merge_queue.ts";
 
 /** Merge what the human saw (`seen`), once the countdown has run out. Returns the card, merging:
  * the result comes as `pr_upserted`. Refused at once when this window isn't connected (a queued

@@ -600,6 +600,8 @@ async fn whoami_and_lists() {
     assert_eq!(v.as_array().unwrap().len(), 2);
     assert_eq!(v[0]["is_me"], true);
     assert_eq!(v[1]["link"], format!("muster://tab/{}", v[1]["id"]));
+    // How many quiet messages wait for each session's next turn.
+    assert_eq!(v[0]["quiet_waiting"], 0);
     let v = parse(
         &call(&st, "list_sessions", json!({"channel_id": 999}))
             .await

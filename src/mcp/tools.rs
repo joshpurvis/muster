@@ -542,6 +542,7 @@ fn session_json(s: &SessionInfo, caller: SessionId) -> Value {
         "detail": s.state_detail,
         "state_since_ms": s.state_since,
         "queued": s.queued,
+        "quiet_waiting": s.quiet_waiting,
         "parent_id": s.parent_id,
         "title": s.title,
         "exit_code": s.exit_code,

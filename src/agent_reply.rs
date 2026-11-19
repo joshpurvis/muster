@@ -91,7 +91,7 @@ pub const WAITER_MAX: Duration = Duration::from_secs(30);
 const QUOTE_MAX: usize = 80;
 
 /// What a timed-out ask says about late replies.
-pub const TIMED_OUT_NOTE: &str = "no reply yet; the message stays delivered. If the agent answers later with its reply tool, the answer comes to you as a new message (\"Late reply to your message <msg_id>\"), or, if the human asked, in the agents panel's message log";
+pub const TIMED_OUT_NOTE: &str = "no reply yet; the message stays delivered. If the agent answers later with its reply tool, the answer comes to you as a new message (\"Late reply to your message <msg_id>\"; if it sends it with wake=false, at the start of your next turn instead), or, if the human asked, in the agents panel's message log";
 
 /// The asks in progress (in memory: no ask survives a restart): those waiting for a message's
 /// turn, and those still delivering theirs (the message id isn't theirs to know yet).

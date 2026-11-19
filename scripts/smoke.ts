@@ -1296,6 +1296,7 @@ done
   await questionsForHuman(c, d, mcp);
   await selfHandoff(c, mcp);
   await coldAnswer(c, d, mcp);
+  await quietMessages(c, mcp);
   ({ c, d } = await sleepAndWake(c, d, { mcp }));
 
   ({ c, d } = await schedules(c, d));
@@ -1512,6 +1513,61 @@ async function coldAnswer(c: Client, d: Daemon, mcp: (token: string, name: strin
   await Deno.remove(`${BASE}/claude-draws-box`);
   await c.call("prefs.set", { cache_ttl: { claude: 60 } });
   await c.call("agent.remove", { name: "coldy" });
+}
+
+/** Quiet messages (docs/MCP.md "Quiet messages"): a note to a fake Claude agent waits for its next
+ * turn without being typed in; the turn's hook takes it and its callback marks it shown. */
+async function quietMessages(c: Client, mcp: (token: string, name: string, args?: Json) => Promise<any>) {
+  const until = async (what: string, cond: () => Promise<boolean>, ms = 20000) => {
+    const deadline = Date.now() + ms;
+    while (!(await cond())) {
+      if (Date.now() > deadline) throw new Error(`timeout waiting for ${what}`);
+      await sleep(200);
+    }
+  };
+  await c.call("agent.create", { name: "quietb", kind: "claude" });
+  await c.call("agent.create", { name: "quieta", kind: "codex" });
+  const sid: number = (await c.call("agent.start", { name: "quietb" })).session.id;
+  const aid: number = (await c.call("agent.start", { name: "quieta" })).session.id;
+  let bT = "";
+  let aT = "";
+  await until("quietb's token", async () => (bT = await Deno.readTextFile(`${BASE}/claude-token-${sid}`).catch(() => "")).length > 10);
+  await until("quieta's token", async () => (aT = await Deno.readTextFile(`${BASE}/fake-token-${aid}`).catch(() => "")).length > 10);
+  const info = async () => (await c.call("hello")).sessions.find((x: Json) => x.id === sid);
+  const input = () => Deno.readTextFile(`${BASE}/claude-input-${sid}`).catch(() => "");
+  const take = async (t: string) => {
+    const r = await fetch(`http://127.0.0.1:${PORT}/quiet/take`, { method: "POST", headers: { Authorization: `Bearer ${t}` }, body: "{}" });
+    if (!r.ok) throw new Error(`/quiet/take: ${r.status}`);
+    return await r.json();
+  };
+  await until("quietb running", async () => ["idle", "working"].includes((await info())?.state));
+
+  const sent = await mcp(aT, "tell_agent", { agent: "quietb", text: "QUIET-NOTE-1 the build is green", wake: false });
+  ok(sent.status === "waiting" && sent.wake === false && sent.msg_id > 0, `tell_agent wake=false keeps it waiting (${JSON.stringify(sent)})`);
+  await until("quietb's tab counts it", async () => (await info()).quiet_waiting === 1);
+  await sleep(1000);
+  ok(!(await input()).includes("QUIET-NOTE-1"), "a quiet note is never typed into the agent's input");
+  const codex = await mcp(bT, "tell_agent", { agent: "quieta", text: "x", wake: false }).then(() => "", (e) => String(e));
+  ok(codex.includes("only Claude sessions can"), `a Codex agent can't take a quiet note (${codex})`);
+
+  const t1 = await take(bT);
+  ok(typeof t1.context === "string" && t1.context.includes("QUIET-NOTE-1") &&
+    t1.context.includes(`[muster msg ${sent.msg_id} from quieta`) && t1.quiet.agent[0] === sent.msg_id,
+    `the turn's hook gets it as context (${JSON.stringify(t1)})`);
+  ok((await take(bT)).context === null, "an offered note isn't offered again at once");
+  // The turn's saved callback names it: shown, and the tab's count goes.
+  const r = await fetch(`http://127.0.0.1:${PORT}/hook/UserPromptSubmit`, {
+    method: "POST", headers: { Authorization: `Bearer ${bT}` },
+    body: JSON.stringify({ session_id: "conv-quiet", prompt: "hello", muster_quiet: t1.quiet }),
+  });
+  await r.body?.cancel();
+  ok(r.ok, "the turn's callback is taken");
+  await until("the note marked shown", async () =>
+    (await c.call("agent.messages", { agent: "quietb" })).messages.find((m: Json) => m.id === sent.msg_id)?.shown_at != null);
+  await until("quietb's tab count cleared", async () => (await info()).quiet_waiting === 0);
+  ok(true, "the callback marks the quiet note shown and clears the tab's count");
+  await c.call("agent.remove", { name: "quietb" });
+  await c.call("agent.remove", { name: "quieta" });
 }
 
 /** Late replies (docs/MCP.md "Late replies"): two fake Codex agents stand in for an asker and a

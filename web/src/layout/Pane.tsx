@@ -800,7 +800,7 @@ function GroupTab(
     tabText(label),
     c?.name,
     onOpenRouter ? `${OPENROUTER_BADGE}: billed per token to your OpenRouter key` : null,
-    cold ? `Cold: idle ${idleText(idleFor(s, cacheNow()) ?? 0)}, a message sent with wake on re-reads the conversation`
+    cold ? `Cold: idle ${idleText(idleFor(s, cacheNow()) ?? 0)}, the next turn re-reads the whole conversation at full cost`
       : dot ? `Idle, ${CACHE_DOT_LABEL[dot]}` : null,
     s.kind === "claude" ? `Claude profile: ${profileName(accountProfiles.value, s.account_profile_id)}` : null,
     c ? tildify(c.cwd, home) : null,
@@ -983,7 +983,7 @@ function InputPausedBar({ s }: { s: SessionInfo }) {
 /** Idle periods (`coldKey`) whose cold bar has been announced in this page. */
 const announcedCold = new Set<string>();
 const COLD_ANNOUNCEMENT =
-  "the prompt cache has likely expired, so the next message re-reads the whole conversation at full cost.";
+  "the prompt cache has likely expired, so the next turn re-reads the whole conversation at full cost.";
 
 /** The agent idled past its prompt cache's lifetime (src/cache.ts). Never takes the keyboard:
  * its buttons don't take focus on press, and the terminal keeps it. Dismissed for this idle

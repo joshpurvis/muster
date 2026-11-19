@@ -421,6 +421,28 @@ export function quietAnswerText(
   carrier: AgentMessage | undefined,
   time: (ms: number) => string = hhmm,
 ): string | null {
+  return quietAnswer(a, carrier, time)?.text ?? null;
+}
+
+/** A late reply's status as the log's chip, its tip and the message's overlay all show it: where
+ * its carrier stands for one sent quietly (`quietAnswerText`), else the note stored with it
+ * (`lateText`). `failed`: it never reached the asker (refused, undelivered, or a quiet carrier
+ * that expired or was dropped). */
+export function lateStatus(
+  a: LateAnswer,
+  carrier: AgentMessage | undefined,
+  time: (ms: number) => string = hhmm,
+): { failed: boolean; text: string } {
+  const q = quietAnswer(a, carrier, time);
+  if (q) return { failed: q.state === "expired" || q.state === "dropped", text: q.text };
+  return { failed: a.status === "refused" || a.status === "undelivered", text: lateText(a) };
+}
+
+function quietAnswer(
+  a: LateAnswer,
+  carrier: AgentMessage | undefined,
+  time: (ms: number) => string,
+): { state: QuietState["state"]; text: string } | null {
   if (!a.quiet || a.status !== "delivered") return null;
   let q: QuietState | null = a.quiet_state ?? null;
   if (!q && a.msg != null && carrier?.id === a.msg) {
@@ -431,16 +453,19 @@ export function quietAnswerText(
   if (!q) return null;
   const who = q.session != null ? `session ${q.session}` : q.to ?? "the asker";
   const msg = q.msg != null ? ` (message ${q.msg})` : "";
-  switch (q.state) {
-    case "waiting":
-      return `Waits for ${who}'s next turn that can take it${msg}; it arrives as context when that turn starts.`;
-    case "shown":
-      return `Shown to ${who} at the start of a turn${q.at != null ? `, ${time(q.at)}` : ""}${msg}.`;
-    case "expired":
-      return `Expired after 7 days without being shown to ${who}${msg}.`;
-    case "dropped":
-      return `Not delivered: ${q.reason ?? `${who} ended before a turn took it`}${msg}.`;
-  }
+  const text = (() => {
+    switch (q.state) {
+      case "waiting":
+        return `Waits for ${who}'s next turn that can take it${msg}; it arrives as context when that turn starts.`;
+      case "shown":
+        return `Shown to ${who} at the start of a turn${q.at != null ? `, ${time(q.at)}` : ""}${msg}.`;
+      case "expired":
+        return `Expired after 7 days without being shown to ${who}${msg}.`;
+      case "dropped":
+        return `Not delivered: ${q.reason ?? `${who} ended before a turn took it`}${msg}.`;
+    }
+  })();
+  return { state: q.state, text };
 }
 
 /** The tab badge's tip: quiet messages waiting for a later turn of the session. */

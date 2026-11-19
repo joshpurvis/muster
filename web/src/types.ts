@@ -353,8 +353,8 @@ export interface LateAnswer {
   msg?: number | null;
   /** The session it was typed into (or, sent quietly, the one it waits for). */
   session?: SessionId | null;
-  /** Sent with wake=false: an asker no longer waiting gets it at the start of its next turn
-   * that can take it. */
+  /** Sent with wake=false: unless a waiting ask takes it, the asker gets it at the start of its
+   * next turn that can take it. */
   quiet?: boolean;
   /** Sent quietly and kept for the asker: where the carrying message stands now (src/agents.rs
    * `quiet_state`), whatever page of the log holds it. Missing from an older daemon. */

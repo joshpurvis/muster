@@ -18,9 +18,9 @@
 //! Legacy runs retain blocking HTTP/1.1 forwarding. Both paths have an absolute deadline.
 //! Always exits 0. Prints nothing on stdout (Claude/Codex treat hook stdout as context or
 //! decisions), except Claude's `UserPromptSubmit`: it first asks the backend for the quiet
-//! messages waiting for this turn (`POST /quiet/take` with the prompt's envelope message id,
-//! src/quiet.rs) and prints them as the turn's `additionalContext`, then names them in the
-//! payload it saves (`quiet::PAYLOAD_KEY`): the backend keeps them pending for the run, and marks
+//! messages waiting for this turn (`POST /quiet/take` with the prompt's envelope message id and
+//! the payload's `permission_mode`, src/quiet.rs; never for a subagent's prompt) and prints them
+//! as the turn's `additionalContext`, then names them in the payload it saves (`quiet::PAYLOAD_KEY`): the backend keeps them pending for the run, and marks
 //! them shown once a later hook of the run's main agent (`PreToolUse`, `PostToolUse`, `Stop`)
 //! shows the turn ran. No backend (a reload) means no context: they wait for a later turn. No-ops silently when MUSTER_URL / MUSTER_TOKEN are
 //! unset (and no token file stands in for MUSTER_TOKEN, see [`TOKEN_FILE`]).
@@ -121,10 +121,17 @@ fn quiet_messages(url: &str, token: &str, agent: &str, body: Vec<u8>, out: &mut 
     if payload.get("prompt").and_then(|p| p.as_str()).is_some_and(|p| p.trim_start().starts_with('/')) {
         return body;
     }
+    // A subagent's prompt (the human typing while viewing one) never takes the main agent's notes.
+    if crate::quiet::subagent_hook(&payload) {
+        return body;
+    }
     // The prompt's own message, when Muster typed it in (its envelope's id): the backend judges
     // the turn by it (src/quiet.rs `take_run`); any other prompt is the human's turn.
     let msg = payload.get("prompt").and_then(|p| p.as_str()).and_then(crate::agents::parse_envelope);
-    let request = serde_json::json!({"msg": msg}).to_string().into_bytes();
+    // The permission mode the process runs in now (it may differ from the tab's setting): notes
+    // checked for a narrower mode wait (`quiet::mode_width`).
+    let mode = payload.get("permission_mode").and_then(|m| m.as_str());
+    let request = serde_json::json!({"msg": msg, "permission_mode": mode}).to_string().into_bytes();
     let (tx, rx) = std::sync::mpsc::channel();
     let (url, token, agent) = (url.to_string(), token.to_string(), agent.to_string());
     std::thread::spawn(move || {
@@ -499,11 +506,12 @@ mod tests {
             b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 74\r\n\r\n{\"context\":\"Messages for you\",\"quiet\":{\"agent\":[7],\"session\":[]},\"left\":0}",
         );
         let mut out = Vec::new();
-        let body = quiet_messages(&format!("http://127.0.0.1:{port}"), "tok", "claude", br#"{"prompt":"hi"}"#.to_vec(), &mut out);
+        let body = quiet_messages(&format!("http://127.0.0.1:{port}"), "tok", "claude", br#"{"prompt":"hi","permission_mode":"default"}"#.to_vec(), &mut out);
         let req = h.join().unwrap();
         assert!(req.starts_with("POST /quiet/take HTTP/1.1\r\n") && req.contains("Authorization: Bearer tok\r\n"), "{req}");
-        // A typed prompt names no message: the backend takes it as the human's turn.
-        assert!(req.ends_with("\r\n\r\n{\"msg\":null}"), "{req}");
+        // A typed prompt names no message: the backend takes it as the human's turn. The mode the
+        // process runs in goes along.
+        assert!(req.ends_with("\r\n\r\n{\"msg\":null,\"permission_mode\":\"default\"}"), "{req}");
         // Claude Code's hook output: one JSON object on stdout.
         let printed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(printed, serde_json::json!({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": "Messages for you"}}));
@@ -519,7 +527,8 @@ mod tests {
         let prompt = br#"{"prompt":"[muster msg 12 from alpha origin=human hop=1]\nrun the tests"}"#.to_vec();
         quiet_messages(&format!("http://127.0.0.1:{port}"), "tok", "claude", prompt, &mut out);
         let req = h.join().unwrap();
-        assert!(req.ends_with("\r\n\r\n{\"msg\":12}"), "{req}");
+        // No mode in the payload: null (the backend counts it as the widest).
+        assert!(req.ends_with("\r\n\r\n{\"msg\":12,\"permission_mode\":null}"), "{req}");
     }
 
     #[test]
@@ -561,6 +570,10 @@ mod tests {
         // A slash command never asks: nothing listens on this port, and nothing is tried.
         let slash = br#"{"prompt":"  /clear"}"#.to_vec();
         assert_eq!(quiet_messages(&format!("http://127.0.0.1:{closed}"), "t", "claude", slash.clone(), &mut out), slash);
+        assert!(out.is_empty());
+        // Nor does a subagent's prompt: the main agent's notes wait for the main agent.
+        let sub = br#"{"prompt":"hi","agent_id":"a1"}"#.to_vec();
+        assert_eq!(quiet_messages(&format!("http://127.0.0.1:{closed}"), "t", "claude", sub.clone(), &mut out), sub);
         assert!(out.is_empty());
         assert_eq!(unchunk(b"3\r\nabc\r\n0\r\n\r\n").unwrap(), b"abc");
         assert!(unchunk(b"zz\r\n").is_none());

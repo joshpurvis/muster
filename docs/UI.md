@@ -584,7 +584,7 @@ whole conversation at full cost with its next message. When the active tab is su
 right under its terminal, by the CLI's input box, in the exited bar's family (a hollow blue dot,
 a light blue tint):
 
-> Idle 1 h 20 m. The prompt cache has likely expired, so your next message re-reads the whole
+> Idle 1 h 20 m. The prompt cache has likely expired, so the next turn re-reads the whole
 > conversation at full cost. · **Start fresh** · ×
 
 - The idle time is since the agent's last turn (its start or end), counted by this page's clock
@@ -595,7 +595,7 @@ a light blue tint):
   reloads): once a later turn ends and goes cold too, it comes back.
 - It never takes the keyboard: its buttons don't take focus when pressed and the terminal keeps
   it. A polite live region inside it says once per idle period (not on each tab switch, and
-  without the ticking time) "<agent>: the prompt cache has likely expired, so the next message
+  without the ticking time) "<agent>: the prompt cache has likely expired, so the next turn
   re-reads the whole conversation at full cost." It sits above the terminal's canvases, which can
   overhang it until xterm refits.
 - The tab gets a small **cold** marker (after the OpenRouter badge), a tooltip line and ", prompt

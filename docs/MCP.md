@@ -98,7 +98,7 @@ and targets in them are refused.
 | `list_agents` | — | `{agents: [{id, name, kind, model, effort, persona, permissions, accepts_origins, autostart, home_dir, channel_id, session_id, state, detail, resumable, created_at, sleep_after_min, asleep, asleep_at, self_handoff, self_handoff_at, tools_up_front, is_me}], your_origin: {origin, hop}}`. All agents, whatever the caller's workspace. `asleep`: its process was stopped while idle (state `exited`, detail `asleep`); asking it wakes it, which re-reads its whole conversation (docs/PROTOCOL.md "Sleep and wake"). Listing never wakes anyone. |
 | `ask_agent` | `agent` (name, case-insensitive), `text`, `timeout_seconds? = 600` (max 1800) | `{agent, msg_id, session_id, reply, state, detail, timed_out, ended, origin, hop, sent_at_ms, started, woke, woke_note?, waited_ms, note?, unattributed_output?}`. Starts the agent if it has no live session (`woke: true` when it was asleep: it restarted into its conversation first), sends `[muster msg <id> from <sender> origin=<o> hop=<n>]` plus the text through the injection queue (`from = "session:<caller>"`), then waits for **this message's** turn: until the agent reports a final message attributed to it (Stop hook, Codex notify), or, after the message was typed in, stops on a prompt, question or error (`reply: null` and a `note`), or exits. If the agent goes idle after it with no attributed final message (3 s grace), `reply` is null and `unattributed_output` holds its last 60 terminal lines, with a `note` that they may belong to another prompt. The agent's `reply` to this message while the ask waits ends it with that text as `reply`. On timeout a `note` says a later answer comes as a new message (or, sent with wake=false, at the start of the next turn). See "Agents" below. |
 | `tell_agent` | `agent`, `text`, `wake` (required) | A message nobody waits for an answer to. `wake: true`: delivered now as `ask_agent`'s message is (the agent starts or wakes if needed), without waiting for the turn: `{agent, msg_id, wake, status: "delivered"\|"queued", session_id, woke, started, origin, hop, sent_at_ms, note}`. `wake: false`: kept for the agent's next turn that can take it (`{agent, msg_id, wake, status: "waiting", waiting, origin, hop, sent_at_ms, note}`); see "Quiet messages" below. Same checks as `ask_agent` either way. |
-| `reply` | `msg_id`, `text`, `wake? = true` | `{msg_id, status, delivered, note, delivered_as, session_id, origin, hop}`. Answers a message delivered to the caller's agent after the turn that received it; see "Late replies" below. With `wake: false`, an asker that is no longer waiting gets it at the start of its next turn that can take it instead of a new turn (refused, nothing stored, when the reply is rooted in two kinds of unattended work). Errors (nothing stored, no rate-limit slot used): the caller isn't a named agent, the message wasn't delivered to it (unknown, another agent's, refused, still queued), it already has a reply, empty or over 100 000 chars, starts with `!` (unless shell commands are allowed), or, with `wake: false`, over 6,000 characters (an emoji counts as two) or 150 lines. |
+| `reply` | `msg_id`, `text`, `wake? = true` | `{msg_id, status, delivered, note, delivered_as, session_id, origin, hop}`. Answers a message delivered to the caller's agent after the turn that received it; see "Late replies" below. A waiting ask returns it only when it brings no origin the question's chain didn't have and is at most one hop past the question; otherwise it goes as a new message. With `wake: false`, unless a waiting ask takes it, the asker gets it at the start of its next turn that can take it instead of a new turn (refused, nothing stored, when the reply is rooted in two kinds of unattended work). Errors (nothing stored, no rate-limit slot used): the caller isn't a named agent, the message wasn't delivered to it (unknown, another agent's, refused, still queued), it already has a reply, empty or over 100 000 chars, starts with `!` (unless shell commands are allowed), or, with `wake: false`, over 6,000 characters (an emoji such as 😀 counts as two) or 150 lines. |
 | `start_fresh` | `file` (absolute, or relative to the caller's working directory; at most 4096 bytes) | `{status: "waiting", file, note}`. A named Claude agent the human promoted asks for its own fresh start; see "Self handoff" below. Only ever for the caller itself (no target argument). Refused (and recorded in its tab's timeline) when the caller isn't a named agent, isn't promoted (the error says how the human grants it), is a Codex agent (not supported yet), already has a request waiting, started fresh less than 30 minutes ago, or the file doesn't exist, isn't a regular file, or lies outside its home folder and working directory once symlinks are resolved. Counts toward the per-minute post rate limit. |
 
 `whoami` also returns `agent` (the caller's agent name, or null) and `origin: {origin, hop}`.
@@ -821,7 +821,7 @@ long job finishes: it says so in that turn's reply, then calls `reply {msg_id, t
 
   | Asker | What happens | Status |
   |---|---|---|
-  | An ask still waiting for that message (`ask_agent`, `muster ask`, `agent.ask`) | It returns the text as its `reply` (it re-checks every second; after 3 s untaken, e.g. the ask was cancelled, the next row applies). Only a reply that brings no origin the question's chain didn't have, and is no deeper in the chain than an answer in the question's own turn (one hop past it); any other goes as the next row says. | `returned` |
+  | An ask still waiting for that message (`ask_agent`, `muster ask`, `agent.ask`) | It returns the text as its `reply` (it re-checks every second; after 30 s untaken, e.g. the ask was cancelled, the next row applies: `WAITER_MAX`). Only a reply that brings no origin the question's chain didn't have, and is no deeper in the chain than an answer in the question's own turn (one hop past it); any other goes as the next row says. | `returned` |
   | A named agent | A new agent message: `[muster msg <new id> from <replier> origin=<o> hop=<n>]`, then `Late reply to your message <id> ("<first line of the question>"):` and the text, with `reply_to` = the message answered. Through `agents::send_checked`: the asker's accepted origins, the hop limit, the daily and unattended caps, the OpenRouter spend caps, the injection queue; a stopped agent is started as for any message. A refusal is logged like any refused message. | `delivered` (`delivered_as`), else `refused` |
   | Another Claude or Codex session (live) | Typed in through its injection queue after `[muster reply to msg <id> from <replier> origin=<o> hop=<n>]` (no message row of its own, so not an envelope the agents' attribution acts on); the session takes the reply's origin and hop. A Claude session takes only `human`-origin replies (`send_message`'s rule). | `delivered` (`session_id`), else `refused` |
   | The human (a client, `muster ask` outside a session or in a shell tab), or a schedule | Shown in the agents panel's message log (the message's entry gets a `late reply` chip; its overlay shows the text and how it was delivered); a desktop notification when the human asked. | `shown` |
@@ -832,13 +832,14 @@ long job finishes: it says so in that turn's reply, then calls `reply {msg_id, t
   `Late reply to your message <id>` text, an agent message with `quiet` set; note "waits for
   <name>'s next turn that can take it, as message <n>"), and another Claude session gets it at
   the start of its next turn that can take it (a Codex session is not delivered to:
-  `undelivered`). An ask still waiting takes it either way, and the human's and a schedule's rows
+  `undelivered`). An ask still waiting takes it either way, under the first row's rule (no new
+  origin, at most one hop past the question; `agent_reply::returnable`), and the human's and a schedule's rows
   are unchanged. Same checks as the waking way: for an asking agent, its accepted origins for the
   reply's origin and every origin it is rooted in, and the hop limit; for a plain session, the
   hop limit and the plain Claude rule on the reply's route; all before anything is kept. A reply
   rooted in two kinds of unattended work is refused with `wake: false` before it is stored (send
   it with `wake: true`, checked against both). The answer's text must meet the quiet size rule
-  (6,000 characters, an emoji counting as two, and 150 lines), checked before it is stored and
+  (6,000 characters, an emoji such as 😀 counting as two, and 150 lines), checked before it is stored and
   before the rate limit's slot is taken; the generated `Late reply to your message` line (always
   one line) gets room of its own. A quiet late reply to a plain session is linked to the message
   it answers (`late_reply_to`, one per session; an ordinary quiet note sent while handling that
@@ -917,8 +918,10 @@ for what can wait. Code: `src/quiet.rs`.
   route, so it never carries scheduled or triggered material into a human-rooted answer, or a
   deeper note into a shallower chain. One turn never mixes a schedule's and a webhook's work. A
   named agent takes only origins it still accepts (an origin taken away after a note was sent
-  keeps it waiting). A message is held while the receiving run is wider than the permission mode
-  its send was checked against (the tab restarted in Bypass, say). An agent on OpenRouter takes
+  keeps it waiting). A message is held while the receiving process runs in a wider permission
+  mode than the one its send was checked against (the tab restarted in Bypass, say), as the
+  turn's own `UserPromptSubmit` payload reports it (`permission_mode`), not the tab's setting; a
+  turn that reports none, or a mode Muster doesn't set, takes only messages checked for Bypass. An agent on OpenRouter takes
   unattended ones only while the spend caps allow, read fresh only when the turn would take one,
   and waited for at most 400 ms: a slow reading leaves them waiting and never holds back the
   human's. The rest wait for a turn that can take them, or until they expire; the turn itself
@@ -932,7 +935,8 @@ for what can wait. Code: `src/quiet.rs`.
   and unattended caps in the insert's transaction, the OpenRouter spend caps with a fresh
   reading, the rate limit, text cleaning); every quiet message to a named agent checks the
   agent's accepted origins and the hop limit again where it is stored (`agents::quiet`), and
-  keeps the permission mode the agent's tabs had then. `send_message` keeps its own (reach, the
+  keeps the permission mode `tell_agent`'s permission check ran against (a late reply: the one
+  the agent's tabs have then). `send_message` keeps its own (reach, the
   Claude origin rule, permission width) and binds the message to the run and permission mode it
   checked; every quiet message to a plain session checks the hop limit and the plain Claude rule
   (the human's work only) on its final route where it is stored (`quiet::send_session`), a late
@@ -941,11 +945,15 @@ for what can wait. Code: `src/quiet.rs`.
   stored ("send it with wake=true"), since the waiting message carries one origin. Only the last
   step changes: stored instead of typed in. Refusals are logged like any refused message. A
   message refused for its size takes no rate limit slot.
-- *Limits:* at most 6,000 characters (an emoji counts as two) and 150 lines per message (a late
+- *Limits:* at most 6,000 characters (an emoji such as 😀 counts as two) and 150 lines per message (a late
   reply's generated first line is extra), and 20 waiting per receiver: the 21st is refused
   ("beta has 20 messages waiting already; send with wake=true, or use ask_agent if it must act
-  now"). A message never shown within 7 days is marked expired (kept in the log, never shown):
-  checked at daemon start, every hour and at each turn's start, and the tabs' counts follow. A
+  now"). Characters are counted as Claude Code counts a hook's context, in UTF-16 code units:
+  most letters count one, a character outside the Basic Multilingual Plane (😀) two, ☕ one, and
+  an emoji built of several characters (👩‍💻) the sum of its parts (five). Lines are counted
+  once every line break a reader could see (`\r\n`, `\r`, U+0085, U+2028, U+2029) is one. A
+  message never shown within 7 days is marked expired (kept in the log, never shown): checked at
+  daemon start, every hour and at each turn's start, and the tabs' counts follow. A
   message a turn has in hand (offered in the last 2 minutes) doesn't expire under it, and one
   that expired is never then marked shown.
 - *Where they wait:* in the database, so a backend reload or restart keeps them. An agent's

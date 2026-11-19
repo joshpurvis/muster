@@ -25,7 +25,8 @@
 //! Every guard of the waking path applies before a message is stored (the caller checks them:
 //! src/mcp/tools.rs, src/agents.rs `quiet`, src/agent_reply.rs, `send_session`), and again when it
 //! is offered: an agent's accepted origins, the OpenRouter spend caps, and the receiver's
-//! permission mode (a run wider than the one the send was checked against doesn't take it). The
+//! permission mode (a process running wider than the mode the send was checked against, as its
+//! prompt's `permission_mode` says, doesn't take it; `mode_width`). The
 //! rest keep waiting for a turn that can take them, or until they expire. Only Claude sessions
 //! take quiet messages: their hook is the way in. Agent messages live in `agent_messages`
 //! (`quiet` = 1, so the daily caps, the agents panel's log and `reply` all see them); an ordinary
@@ -44,12 +45,12 @@ use crate::model::*;
 
 /// The longest quiet message, in characters and lines: one always fits Claude Code's limit for
 /// a hook's context (8,000 UTF-16 code units and 200 lines in 2.1.325) with its header.
-/// Characters are counted as Claude Code counts them, in UTF-16 code units (`units`): an emoji
-/// counts as two.
+/// Characters are counted as Claude Code counts them, in UTF-16 code units (`units`): 😀 counts
+/// as two, ☕ as one, 👩‍💻 as five.
 pub const TEXT_MAX: usize = 6000;
 pub const LINES_MAX: usize = 150;
 /// The size rule in words, as the tool descriptions and docs give it (`TEXT_MAX`, `LINES_MAX`).
-pub const SIZE_RULE: &str = "at most 6,000 characters (an emoji counts as two) and 150 lines";
+pub const SIZE_RULE: &str = "at most 6,000 characters (an emoji such as 😀 counts as two) and 150 lines";
 /// At most this many wait for one receiver.
 pub const WAITING_MAX: usize = 20;
 /// Never shown after this long: marked expired (kept in the log).
@@ -116,13 +117,28 @@ pub fn width(mode: ClaudeMode) -> i64 {
     mode as i64
 }
 
-/// The permission mode session `s` runs with now: its tab's (a missing tab counts as the widest).
+/// The permission mode session `s`'s tab sets now (a missing tab counts as the widest): what a
+/// send is checked against. A running process may differ (`mode_width`).
 pub fn session_width(hub: &Hub, s: &SessionInfo) -> i64 {
     width(hub.channel(s.channel_id).map_or(ClaudeMode::Bypass, |c| c.permissions.claude_mode))
 }
 
-/// Is this hook payload from one of Claude Code's subagents (a non-empty `agent_id`)? Its tool
-/// calls say nothing about the main agent's turn.
+/// The width of the permission mode a turn's process runs in, as Claude Code's
+/// `UserPromptSubmit` payload names it (`permission_mode`, sent on to `/quiet/take`). A mode
+/// Muster doesn't set (`auto`, `dontAsk`), or none, counts as the widest: that turn takes only
+/// notes checked for the widest mode.
+pub fn mode_width(mode: Option<&str>) -> i64 {
+    width(match mode {
+        Some("plan") => ClaudeMode::Plan,
+        Some("default") => ClaudeMode::Default,
+        Some("acceptEdits") => ClaudeMode::AcceptEdits,
+        _ => ClaudeMode::Bypass,
+    })
+}
+
+/// Is this hook payload from one of Claude Code's subagents (a non-empty `agent_id`)? Its
+/// prompts and tool calls say nothing about the main agent's turn: they take, offer and confirm
+/// no quiet messages.
 pub fn subagent_hook(payload: &Value) -> bool {
     payload.get("agent_id").and_then(Value::as_str).is_some_and(|a| !a.is_empty())
 }
@@ -225,7 +241,7 @@ fn check_size(text: &str, room: usize, more_lines: usize) -> Result<(), String> 
     Ok(())
 }
 
-/// Length as Claude Code measures hook context: UTF-16 code units (an emoji counts two).
+/// Length as Claude Code measures hook context: UTF-16 code units (😀 counts two).
 pub fn units(s: &str) -> usize {
     s.encode_utf16().count()
 }
@@ -350,12 +366,12 @@ pub fn context(agent: &[AgentMessage], session: &[SessionQuiet], named: bool, no
     (Some(out), shown, left)
 }
 
-/// `take` for session `id`'s current run (tests and callers that hold no token).
+/// `take` for session `id`'s current run, running in the mode its tab sets (tests).
 #[cfg(test)]
 pub async fn take(hub: &Hub, id: SessionId, msg: Option<i64>) -> anyhow::Result<Value> {
-    match hub.session_run(id) {
-        Some(run) => take_run(hub, id, run, msg).await,
-        None => Ok(nothing()),
+    match (hub.session_run(id), hub.session(id)) {
+        (Some(run), Some(info)) => take_run(hub, id, run, msg, session_width(hub, &info)).await,
+        _ => Ok(nothing()),
     }
 }
 
@@ -364,7 +380,8 @@ fn nothing() -> Value {
 }
 
 /// `POST /quiet/take`: the waiting messages for the turn run `run` of session `id` is starting
-/// (`msg`: the message id in the prompt's envelope, if it has one), marked offered to that run,
+/// (`msg`: the message id in the prompt's envelope, if it has one; `width`: the permission mode
+/// the process runs in, `mode_width` of the prompt's `permission_mode`), marked offered to that run,
 /// with the session's provenance raised to theirs in the same transaction.
 /// `{context, quiet: {agent, session}, left}`; `context` is null when none wait for this turn.
 ///
@@ -373,9 +390,9 @@ fn nothing() -> Value {
 /// messages of the human's origin, or of a message's turn's own origin and no deeper in the chain
 /// (hop no higher); for a named agent only origins it still accepts, on OpenRouter unattended
 /// ones only while the spend caps allow (a fresh reading, waited for at most `SPEND_WAIT`), and
-/// only those kept for a receiver at least as wide as this run. Nothing, when the run is no
+/// only those checked for a mode at least as wide as the process's. Nothing, when the run is no
 /// longer the session's current one. The rest keep waiting; the turn itself goes ahead.
-pub async fn take_run(hub: &Hub, id: SessionId, run: u64, msg: Option<i64>) -> anyhow::Result<Value> {
+pub async fn take_run(hub: &Hub, id: SessionId, run: u64, msg: Option<i64>, width: i64) -> anyhow::Result<Value> {
     let Some(info) = hub.session(id) else { return Ok(nothing()) };
     if info.kind != SessionKind::Claude {
         return Ok(nothing());
@@ -383,7 +400,6 @@ pub async fn take_run(hub: &Hub, id: SessionId, run: u64, msg: Option<i64>) -> a
     let now = now_ms();
     expire(hub, now);
     let agent = hub.agents().by_session(id);
-    let width = session_width(hub, &info);
     // The spend gate of the waking path (`spend::submit_gate_fresh`), before any lock, and only
     // when the turn would take unattended messages: the human's never wait on it.
     let turn = hub.agents().turn_of(hub.store(), id, msg);
@@ -701,7 +717,7 @@ mod tests {
         let lines = "a\n".repeat(LINES_MAX);
         assert!(check_text(&lines).is_ok());
         assert!(context(&[agent_msg(1, 0, &lines, Origin::Human, 0)], &[], true, 0).0.is_some());
-        assert!(check_text(&"x".repeat(TEXT_MAX + 1)).unwrap_err().contains("at most 6,000 characters (an emoji counts as two)"));
+        assert!(check_text(&"x".repeat(TEXT_MAX + 1)).unwrap_err().contains("at most 6,000 characters (an emoji such as 😀 counts as two)"));
         assert!(check_text(&"a\n".repeat(LINES_MAX + 1)).unwrap_err().contains("and 150 lines (this one has"));
     }
 
@@ -914,7 +930,7 @@ mod tests {
         assert!(hub.store().quiet_offered(Some(beta.id), 2, &ids, 5).unwrap().is_empty());
         // A take from the replaced run (its hook was slow) gets nothing and leaves the claim.
         hub.store().offer_quiet(&[q.msg_id], &[], now_ms() - REOFFER_MS - 1, 7).unwrap();
-        assert!(take_run(&hub, 2, 5, None).await.unwrap()["context"].is_null());
+        assert!(take_run(&hub, 2, 5, None, width(ClaudeMode::Default)).await.unwrap()["context"].is_null());
         assert_eq!(hub.store().quiet_offered(Some(beta.id), 2, &ids, 7).unwrap().agent, vec![q.msg_id]);
         // Nor does an older run ever take a newer run's fresh claim.
         hub.store().offer_quiet(&[q.msg_id], &[], now_ms(), 9).unwrap();
@@ -1080,6 +1096,34 @@ mod tests {
         assert_eq!(take(&hub, 2, None).await.unwrap()["quiet"]["agent"], json!([q]));
     }
 
+    /// The mode the process runs in decides, not the tab's setting: a Bypass run doesn't take a
+    /// note checked for Default while the tab says Default, and a turn naming no mode (or one
+    /// Muster doesn't set) takes only notes checked for the widest.
+    #[tokio::test]
+    async fn the_running_mode_decides_which_notes_a_turn_takes() {
+        let (hub, _, beta, _) = hub();
+        let q = agents::quiet(&hub, out(&beta, "for a Default run", 0)).await.unwrap().msg_id;
+        let run = hub.session_run(2).unwrap();
+        for mode in [Some("bypassPermissions"), None, Some("auto"), Some("dontAsk")] {
+            assert!(take_run(&hub, 2, run, None, mode_width(mode)).await.unwrap()["context"].is_null(), "{mode:?}");
+        }
+        assert_eq!(take_run(&hub, 2, run, None, mode_width(Some("plan"))).await.unwrap()["quiet"]["agent"], json!([q]));
+    }
+
+    /// A note keeps the width the sender's permission check ran against, even when the agent's
+    /// tab became wider before it was stored.
+    #[tokio::test]
+    async fn a_note_keeps_the_width_its_check_saw() {
+        let (hub, _, beta, _) = hub();
+        let ch = hub.session(2).unwrap().channel_id;
+        hub.set_permissions(ch, Permissions { claude_mode: ClaudeMode::Bypass, ..Permissions::default() }).unwrap();
+        let checked = Some(width(ClaudeMode::Default));
+        let q = agents::quiet_checked(&hub, out(&beta, "checked for Default", 0), checked).await.unwrap().msg_id;
+        let run = hub.session_run(2).unwrap();
+        assert!(take_run(&hub, 2, run, None, mode_width(Some("bypassPermissions"))).await.unwrap()["context"].is_null());
+        assert_eq!(take_run(&hub, 2, run, None, mode_width(Some("default"))).await.unwrap()["quiet"]["agent"], json!([q]));
+    }
+
     #[tokio::test]
     async fn caps_kinds_routes_and_sizes_are_enforced_and_refusals_logged() {
         let (hub, _, beta, gamma) = hub();
@@ -1164,7 +1208,9 @@ mod tests {
         assert!(context.contains("check the deploy") && context.contains("and the docs"), "{context}");
         prompt(&hub, 3, json!({"prompt": "x", PAYLOAD_KEY: t["quiet"]}));
         assert_eq!(hub.agents().prov(3).map(|p| (p.origin, p.hop)), Some((Origin::Human, 1)));
-        // A subagent's tool call confirms nothing; the main agent's does.
+        // A subagent's prompt (the human typing while viewing it) leaves the main agent's
+        // pending set alone, and its tool call confirms nothing; the main agent's does.
+        prompt(&hub, 3, json!({"prompt": "y", "agent_id": "a8c3f0"}));
         assert!(hook(&hub, 3, "PostToolUse", json!({"agent_id": "a8c3f0"})).quiet.is_none());
         assert_eq!(hook(&hub, 3, "PostToolUse", json!({})).quiet.unwrap().session.len(), 2);
         // Waiting ones are dropped when its process ends (src/hub.rs `pty_exited`), and an
@@ -1281,7 +1327,7 @@ mod tests {
         let asked = hub.store().insert_agent_message(&m).unwrap();
         hub.store().set_agent_message_delivered(asked, now_ms() - 60_000).unwrap();
         let e = crate::agent_reply::reply(&hub, 2, asked, "x".repeat(TEXT_MAX + 1), false).await.unwrap_err();
-        assert!(e.to_string().contains("at most 6,000 characters (an emoji counts as two)"), "{e}");
+        assert!(e.to_string().contains("at most 6,000 characters (an emoji such as 😀 counts as two)"), "{e}");
         // Nothing stored: the one reply is still there to give.
         assert!(hub.store().agent_message(asked).unwrap().unwrap().answer.is_none());
     }

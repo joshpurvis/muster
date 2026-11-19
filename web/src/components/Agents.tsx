@@ -40,10 +40,9 @@ import {
   feedFor,
   firstLine,
   carriesLateReply,
-  quietAnswerText,
   quietStatus,
   keepForKind,
-  lateText,
+  lateStatus,
   listedModels,
   memoryPathError,
   nameError,
@@ -393,11 +392,13 @@ export function ColdChip({ ms }: { ms: number }) {
   );
 }
 
-/** The agent answered this message later (`reply`): green once it reached the asker. */
+/** The agent answered this message later (`reply`): green unless it never reached the asker,
+ * judged as the message's overlay judges it (a quiet carrier's own status, `lateStatus`). */
 function LateChip({ a }: { a: LateAnswer }) {
-  const failed = a.status === "refused" || a.status === "undelivered";
+  const carrier = a.msg != null ? agentMessages.value.find((x) => x.id === a.msg) : undefined;
+  const { failed, text } = lateStatus(a, carrier);
   return (
-    <span class={cx("ap-chip", failed ? "ap-chip-warn" : "ap-chip-ok")} data-tip={lateText(a)}>
+    <span class={cx("ap-chip", failed ? "ap-chip-warn" : "ap-chip-ok")} data-tip={text}>
       {failed ? "late reply not delivered" : "late reply"}
     </span>
   );
@@ -2076,6 +2077,7 @@ export function MessageDialog({ id, Modal, close }: { id: number; Modal: ModalT;
   const quiet = quietStatus(m);
   // The message that carried its later reply, when that went quietly: where it stands now.
   const carrier = m.answer?.msg != null ? agentMessages.value.find((x) => x.id === m.answer!.msg) : undefined;
+  const late = m.answer ? lateStatus(m.answer, carrier) : null;
   return (
     <Modal class="dialog dialog-scroll dlg-calm msg-dlg" label={`Message ${m.id}`}>
       <div class="dlg-head">
@@ -2128,12 +2130,9 @@ export function MessageDialog({ id, Modal, close }: { id: number; Modal: ModalT;
             <span
               role="status"
               aria-live="polite"
-              class={cx(
-                "msg-late-status",
-                m.answer.status === "refused" || m.answer.status === "undelivered" ? "form-error" : "muted",
-              )}
+              class={cx("msg-late-status", late?.failed ? "form-error" : "muted")}
             >
-              {quietAnswerText(m.answer, carrier) ?? lateText(m.answer)}
+              {late?.text}
             </span>
           </div>
         )}

@@ -453,8 +453,8 @@ With --no-wake an asker that stopped waiting gets it at the start of its next tu
         msg_id: i64,
         /// Words, joined by spaces. None or `-`: read stdin.
         text: Vec<String>,
-        /// Don't start a turn for it: an asker no longer waiting gets it at the start of its
-        /// next turn that can take it (docs/MCP.md, "Quiet messages").
+        /// Don't start a turn for it: unless a waiting ask takes it, the asker gets it at the
+        /// start of its next turn that can take it (docs/MCP.md, "Quiet messages").
         #[arg(long)]
         no_wake: bool,
         /// Print the result as JSON.
@@ -1978,14 +1978,16 @@ async fn daemon_main(openrouter_key: Option<openrouter::ApiKey>, launch: Option<
             // What waited for a plain session's run that ended while no backend ran is dropped
             // before any new run or late reply (src/quiet.rs).
             quiet::reconcile(&hub);
+            // Messages that waited a week unshown expire (src/quiet.rs; hourly below too), before
+            // late replies are recovered: recovery then sees an overdue carrier as expired, as
+            // the overlay does, instead of recording it delivered.
+            quiet::expire(&hub, model::now_ms());
             agents::autostart(&hub).await;
             // An answer that had started its agent in a new conversation is that conversation's
             // first message; the other answers come after late replies (src/questions.rs).
             questions::resume(&hub, answers_first).await;
             agent_reply::resume(&hub, unfinished).await;
-            // Messages that waited a week unshown expire, and the tabs count what still waits
-            // for the next turn (src/quiet.rs); `expire` runs hourly below too.
-            quiet::expire(&hub, model::now_ms());
+            // The tabs count what still waits for a later turn.
             quiet::refresh_all(&hub);
             questions::resume(&hub, answers).await;
             prs::resume(&hub, cards).await;

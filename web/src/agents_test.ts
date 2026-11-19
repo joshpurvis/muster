@@ -16,6 +16,7 @@ import {
   effortsFor,
   feedFor,
   firstLine,
+  lateStatus,
   lateText,
   keepForKind,
   listedModels,
@@ -465,6 +466,31 @@ Deno.test("a quiet late reply's status comes from the daemon whatever page holds
     "Not delivered: the session ended before its next turn.",
   );
   assertEquals(quietAnswerText(answer({ state: "shown", at: 4000, session: 5 }), undefined, t), "Shown to session 5 at the start of a turn, t4000.");
+});
+
+Deno.test("the log's late reply chip and the overlay show one status for a quiet late reply", () => {
+  const t = (ms: number) => `t${ms}`;
+  const answer = (over: Partial<LateAnswer> = {}): LateAnswer => ({
+    text: "done", at: 0, from_session: 3, origin: "human", hop: 2, status: "delivered",
+    note: "waits for session 5's next turn that can take it", session: 5, quiet: true, ...over,
+  });
+  // The carrier was dropped (the asking session ended): not delivered, whatever the stored note said.
+  assertEquals(
+    lateStatus(answer({ quiet_state: { state: "dropped", reason: "the session ended before its next turn", session: 5 } }), undefined, t),
+    { failed: true, text: "Not delivered: the session ended before its next turn." },
+  );
+  assertEquals(
+    lateStatus(answer({ quiet_state: { state: "expired", session: 5 } }), undefined, t).failed,
+    true,
+  );
+  assertEquals(
+    lateStatus(answer({ quiet_state: { state: "shown", at: 4000, session: 5 } }), undefined, t),
+    { failed: false, text: "Shown to session 5 at the start of a turn, t4000." },
+  );
+  // Not quiet: the stored status and note.
+  assertEquals(lateStatus(answer({ quiet: false, note: "delivered to ada as message 9" }), undefined, t),
+    { failed: false, text: "Delivered to ada as message 9." });
+  assertEquals(lateStatus(answer({ quiet: false, status: "undelivered", note: null }), undefined, t).failed, true);
 });
 
 Deno.test("the tab badge counts quiet messages waiting", () => {

@@ -1550,24 +1550,28 @@ impl Registry {
                 }
                 _ => {},
             }
-            // Quiet messages (src/quiet.rs). `take` raised the provenance to their routes
+            // Quiet messages (src/quiet.rs), for the main agent's prompts only: a subagent's
+            // (the human typing while viewing one) took none, so it leaves the provenance and
+            // the pending set alone. `take` raised the provenance to their routes
             // already; the prompt above may have set it again (a human's lowers it), and this
             // callback may arrive in any order with the offers, so every prompt of the run is
             // raised to everything offered to the run and not shown yet, whichever prompt had it.
-            let offered_run = store.quiet_offered_run(named, info.id, run)?;
-            if let Some(p) = offered_run.raise(next.prov.get(&info.id).copied()) {
-                next.prov.insert(info.id, p);
-            }
-            // Those the hook put in front of this turn (only those offered to this run, never
-            // shown before) count as shown once a later hook of the run shows the turn ran. A
-            // pending set from an earlier prompt is dropped: that prompt never ran (another hook
-            // blocked it), and its messages stay offered, to be offered again.
-            next.quiet_pending.remove(&info.id);
-            let named_ids = crate::quiet::Shown::from_payload(payload);
-            if !named_ids.is_empty() {
-                let offered = store.quiet_offered(named, info.id, &named_ids, run)?;
-                if !offered.is_empty() {
-                    next.quiet_pending.insert(info.id, QuietPending { run, agent: offered.agent, session: offered.session });
+            if !crate::quiet::subagent_hook(payload) {
+                let offered_run = store.quiet_offered_run(named, info.id, run)?;
+                if let Some(p) = offered_run.raise(next.prov.get(&info.id).copied()) {
+                    next.prov.insert(info.id, p);
+                }
+                // Those the hook put in front of this turn (only those offered to this run, never
+                // shown before) count as shown once a later hook of the run shows the turn ran. A
+                // pending set from an earlier prompt is dropped: that prompt never ran (another
+                // hook blocked it), and its messages stay offered, to be offered again.
+                next.quiet_pending.remove(&info.id);
+                let named_ids = crate::quiet::Shown::from_payload(payload);
+                if !named_ids.is_empty() {
+                    let offered = store.quiet_offered(named, info.id, &named_ids, run)?;
+                    if !offered.is_empty() {
+                        next.quiet_pending.insert(info.id, QuietPending { run, agent: offered.agent, session: offered.session });
+                    }
                 }
             }
         } else if crate::quiet::TURN_RAN.contains(&event)
@@ -3032,9 +3036,17 @@ pub struct QuietSent {
 /// spend caps (with a fresh reading, as `deliver`), both daily caps and the waiting cap, then the
 /// message is kept for a later turn of the agent that can take it. Never starts, wakes or types
 /// into the agent. The caller checked the permission width, as for `deliver`; the message keeps
-/// the width it reaches now (`reach_profile`), and a run wider than that won't take it. A policy
+/// the width it reaches now (`reach_profile`; `quiet_checked`: the one the check saw), and a
+/// process running wider than that won't take it. A policy
 /// refusal is `Refused`.
 pub async fn quiet(hub: &Hub, out: Outgoing) -> anyhow::Result<QuietSent> {
+    quiet_checked(hub, out, None).await
+}
+
+/// `quiet`, keeping `width` (`quiet::width`) when given: the permission mode the caller's
+/// permission check ran against (`agent_send`), so the row never records a width that check
+/// didn't see (the agent's tab changed meanwhile). None: the width it reaches now.
+pub async fn quiet_checked(hub: &Hub, out: Outgoing, width: Option<i64>) -> anyhow::Result<QuietSent> {
     let text = crate::mcp::tools::clean_text(&out.text);
     let a = hub.agents().get(&out.agent).ok_or_else(|| no_agent(hub, &out.agent))?;
     if out.agent_id.is_some_and(|id| id != a.id) {
@@ -3066,10 +3078,12 @@ pub async fn quiet(hub: &Hub, out: Outgoing) -> anyhow::Result<QuietSent> {
     let now = msg.created_at;
     let ucap = unattended_cap(hub, out.route);
     let waiting_after = crate::quiet::after(now);
-    let session_ch = a.session_id.and_then(|s| hub.session(s)).and_then(|s| hub.channel(s.channel_id));
-    let own_ch = a.channel_id.and_then(|c| hub.channel(c));
-    let (_, reach) = reach_profile(&a, session_ch.as_ref(), own_ch.as_ref());
-    let keep = crate::quiet::Keep { after: waiting_after, max: crate::quiet::WAITING_MAX, width: crate::quiet::width(reach.claude_mode) };
+    let width = width.unwrap_or_else(|| {
+        let session_ch = a.session_id.and_then(|s| hub.session(s)).and_then(|s| hub.channel(s.channel_id));
+        let own_ch = a.channel_id.and_then(|c| hub.channel(c));
+        crate::quiet::width(reach_profile(&a, session_ch.as_ref(), own_ch.as_ref()).1.claude_mode)
+    });
+    let keep = crate::quiet::Keep { after: waiting_after, max: crate::quiet::WAITING_MAX, width };
     let id = match hub.store().insert_agent_message_capped_waiting(
         &msg,
         now - guard::AGENT_CAP_WINDOW_MS,

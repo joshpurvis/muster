@@ -46,6 +46,8 @@ struct Data {
     deliveries: Vec<crate::agents::Outgoing>,
     /// Messages kept for an agent's or session's next turn (src/quiet.rs).
     quiet: Vec<crate::agents::Outgoing>,
+    /// The permission mode each of `quiet` was checked against.
+    quiet_widths: Vec<i64>,
     quiet_sessions: Vec<(SessionId, String, crate::agents::Route, String)>,
     /// Agent session -> the reply its turns report.
     replies: HashMap<SessionId, String>,
@@ -257,8 +259,9 @@ impl Backend for Arc<Mock> {
     fn agent_messages_since(&self, agent_id: i64, _since: i64) -> usize {
         self.d.lock().agent_counts.get(&agent_id).copied().unwrap_or(0)
     }
-    async fn agent_quiet(&self, out: crate::agents::Outgoing) -> anyhow::Result<crate::agents::QuietSent> {
+    async fn agent_quiet(&self, out: crate::agents::Outgoing, width: i64) -> anyhow::Result<crate::agents::QuietSent> {
         let mut d = self.d.lock();
+        d.quiet_widths.push(width);
         d.quiet.push(out);
         Ok(crate::agents::QuietSent { msg_id: 100 + d.quiet.len() as i64, session_id: Some(3), sent_at_ms: 0, waiting: d.quiet.len() })
     }
@@ -1787,6 +1790,8 @@ async fn tell_agent_wakes_or_waits_as_the_sender_says_with_ask_agents_guards() {
         let d = m.d.lock();
         assert!(d.deliveries.is_empty() && d.sends.is_empty());
         assert_eq!((d.quiet[0].agent.as_str(), d.quiet[0].text.as_str()), ("ada", "PR open"));
+        // Kept with the permission mode the check ran against.
+        assert_eq!(d.quiet_widths, vec![crate::quiet::width(crate::model::ClaudeMode::Default)]);
     }
     // wake=true: delivered now, nobody waits.
     let (t, err) = call(&st, "tell_agent", json!({"agent": "ada", "text": "act now", "wake": true})).await;
@@ -1798,7 +1803,7 @@ async fn tell_agent_wakes_or_waits_as_the_sender_says_with_ask_agents_guards() {
     assert!(err && t.contains("cody is a codex session") && t.contains("wake=true"), "{t}");
     // Too long to wait for a turn.
     let (t, err) = call(&st, "tell_agent", json!({"agent": "ada", "text": "x".repeat(6001), "wake": false})).await;
-    assert!(err && t.contains("at most 6,000 characters (an emoji counts as two) and 150 lines"), "{t}");
+    assert!(err && t.contains("at most 6,000 characters (an emoji such as 😀 counts as two) and 150 lines"), "{t}");
     // The origin rule, hop limit and cap apply as for ask_agent, with refusals logged.
     inbound(&m, 2, Origin::Schedule, 1);
     let (t, err) = call_as(&st, "tok2", "tell_agent", json!({"agent": "ada", "text": "x", "wake": false})).await;
@@ -1837,7 +1842,7 @@ async fn a_quiet_reply_too_long_to_keep_takes_no_rate_limit_slot() {
     st.limits.send_per_window = 1;
     for _ in 0..3 {
         let (t, err) = call(&st, "reply", json!({"msg_id": 5, "text": "x".repeat(6001), "wake": false})).await;
-        assert!(err && t.contains("at most 6,000 characters (an emoji counts as two) and 150 lines"), "{t}");
+        assert!(err && t.contains("at most 6,000 characters (an emoji such as 😀 counts as two) and 150 lines"), "{t}");
     }
     // The one slot is still free.
     let (t, err) = call(&st, "send_message", json!({"session_id": 2, "text": "x"})).await;

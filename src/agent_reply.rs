@@ -76,8 +76,8 @@ pub struct Answer {
     /// The session it was typed into.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<SessionId>,
-    /// Sent with wake=false (src/quiet.rs): an asker no longer waiting gets it at the start of
-    /// its next turn, as a quiet message, instead of a new turn.
+    /// Sent with wake=false (src/quiet.rs): unless a waiting ask takes it (`returnable`), the
+    /// asker gets it at the start of its next turn, as a quiet message, instead of a new turn.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub quiet: bool,
 }
@@ -824,6 +824,34 @@ mod tests {
         let a = answer_of(&hub, m);
         assert_eq!((a.status, a.msg), (AnswerStatus::Delivered, Some(carried)));
         assert_eq!(hub.store().agent_messages(Some(ada.id), None, 10).unwrap().len(), 1);
+    }
+
+    /// At daemon start expiry runs before recovery (src/main.rs): a quiet carrier whose week
+    /// ran out while no backend ran is recovered as not delivered, as the overlay shows it.
+    #[tokio::test]
+    async fn an_overdue_quiet_carrier_is_recovered_as_expired() {
+        let hub = fixture();
+        let scout = agent(&hub, "scout", SessionKind::Codex, 3);
+        let beta = agent(&hub, "beta", SessionKind::Claude, 2);
+        let m = msg(&hub, &scout, "beta", Some(2), Origin::Human, 1, false);
+        let a = Answer {
+            text: "late".into(), at: now_ms(), from_session: 3, origin: Origin::Human, hop: 2,
+            origins: vec![], status: AnswerStatus::Delivering, note: None, msg: None, session: None, quiet: true,
+        };
+        hub.store().set_agent_answer(m, &a).unwrap();
+        // Its carrier got in before the crash, more than a week ago.
+        let orig = hub.store().agent_message(m).unwrap().unwrap();
+        let mut d = agents::message_record(&beta, "scout", Some(3), Route { origin: Origin::Human, hop: 2, reply_to: Some(m) },
+            &delivered_text(&orig, &a));
+        d.quiet = true;
+        d.created_at = now_ms() - crate::quiet::EXPIRE_MS - 60_000;
+        let carrier = hub.store().insert_agent_message(&d).unwrap();
+        let ids = unfinished(&hub);
+        crate::quiet::expire(&hub, now_ms());
+        resume(&hub, ids).await;
+        let a = answer_of(&hub, m);
+        assert_eq!((a.status, a.msg), (AnswerStatus::Undelivered, Some(carrier)));
+        assert!(a.note.unwrap().contains("expired"));
     }
 
     #[tokio::test]

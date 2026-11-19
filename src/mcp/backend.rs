@@ -102,8 +102,9 @@ pub trait Backend: Send + Sync + 'static {
     fn agent_reply(&self, _caller: SessionId, _msg_id: i64, _text: String, _wake: bool) -> impl Future<Output = anyhow::Result<serde_json::Value>> + Send {
         async { anyhow::bail!("replies unavailable in this backend") }
     }
-    /// Keep a message for the agent's next turn (`agents::quiet`, src/quiet.rs).
-    fn agent_quiet(&self, _out: Outgoing) -> impl Future<Output = anyhow::Result<crate::agents::QuietSent>> + Send {
+    /// Keep a message for the agent's next turn (`agents::quiet_checked`, src/quiet.rs), with
+    /// the permission mode the caller checked it against (`width`).
+    fn agent_quiet(&self, _out: Outgoing, _width: i64) -> impl Future<Output = anyhow::Result<crate::agents::QuietSent>> + Send {
         async { anyhow::bail!("quiet messages unavailable in this backend") }
     }
     /// Keep a message for a later turn of an ordinary session (`quiet::send_session`), for the
@@ -236,8 +237,8 @@ impl Backend for HubBackend {
     async fn agent_reply(&self, caller: SessionId, msg_id: i64, text: String, wake: bool) -> anyhow::Result<serde_json::Value> {
         crate::agent_reply::reply(&self.0, caller, msg_id, text, wake).await
     }
-    async fn agent_quiet(&self, out: Outgoing) -> anyhow::Result<crate::agents::QuietSent> {
-        crate::agents::quiet(&self.0, out).await
+    async fn agent_quiet(&self, out: Outgoing, width: i64) -> anyhow::Result<crate::agents::QuietSent> {
+        crate::agents::quiet_checked(&self.0, out, Some(width)).await
     }
     fn session_quiet(&self, to: &SessionInfo, from: String, from_session: Option<SessionId>, route: crate::agents::Route,
         text: String, bind: Option<crate::quiet::Bind>) -> anyhow::Result<serde_json::Value> {

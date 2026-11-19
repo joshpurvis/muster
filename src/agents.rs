@@ -1979,7 +1979,7 @@ fn fake_fresh_start(hub: &Arc<Hub>, name: &str, ok: &(dyn Fn(&SessionInfo) -> bo
     }
     hub.fence_conversation(sid);
     let agent = hub.agents().reset_for_start(hub.store(), agent.id, &agent.working_location)?;
-    Ok(AgentSession { agent, session, started: true, woke: None })
+    Ok(AgentSession { agent, session, started: true, woke: None, new_conversation: true })
 }
 
 async fn start_guarded(hub: &Arc<Hub>, name: &str, fresh: bool, window: Option<WindowId>,

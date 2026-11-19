@@ -885,7 +885,33 @@ struct Attributions {
     active: HashMap<SessionId, i64>,
     delivered: HashMap<i64, (SessionId, i64)>,
     human_seen: HashSet<SessionId>,
+    /// When the human last had a prompt of their own taken in by each named agent (agent id ->
+    /// Unix ms), whichever tab it ran in: typed at its input box, or sent from a terminal or the
+    /// window as the human's (`on_delivered` with `Source::Human`). Messages from agents,
+    /// schedules and answers are not. Read by the cold-answer rule (src/relay.rs
+    /// `fresh_verdict`): an agent the human worked with in the last day keeps its conversation.
+    #[serde(default)]
+    human_prompt_at: HashMap<i64, i64>,
 }
+
+/// A named agent's conversation size, as its status line last reported it (src/statusline.rs).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContextSize {
+    /// The conversation it was measured in (Claude's session id, what `resume_id` holds).
+    pub conversation: String,
+    /// The input tokens of its last model request: what resuming it re-reads.
+    pub tokens: u64,
+    /// The run that reported it, and that run's API time then (`cost.total_api_duration_ms`,
+    /// which only grows within a run): a report that arrives late, after a newer one about the
+    /// same conversation, is older than what is kept and is dropped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_ms: Option<f64>,
+}
+
+/// Runtime key of the agents' conversation sizes.
+const CONTEXT_KEY: &str = "agent-context-size";
 
 #[derive(Default)]
 struct RegInner {
@@ -926,6 +952,15 @@ pub struct Registry {
     unattended: Mutex<HashSet<SessionId>>,
     /// Fresh starts agents asked for that haven't happened yet (src/self_handoff.rs).
     pub(crate) self_handoff: crate::self_handoff::State,
+    /// Each named agent's conversation size by agent id (`note_context`), saved when it changes
+    /// so a backend restart keeps it for agents that sit idle. A leaf lock.
+    context: Mutex<HashMap<i64, ContextSize>>,
+    /// One answer at a time per agent through the cold-answer rule (src/relay.rs `rule_lock`).
+    pub(crate) answer_locks: Mutex<HashMap<i64, Arc<tokio::sync::Mutex<()>>>>,
+    /// Tests without a terminal host: `start_fresh_if_held` forgets the conversation as a start
+    /// does and reports the start done, without running anything.
+    #[cfg(test)]
+    pub(crate) fake_fresh_start: std::sync::atomic::AtomicBool,
 }
 
 /// The sessions `rt` says are doing unattended work.
@@ -979,7 +1014,59 @@ impl Registry {
             unattended,
             sleep,
             self_handoff: Default::default(),
+            // Only an estimate: one Muster can't read is dropped (sizes are unknown until the next
+            // report), never a reason not to start.
+            context: Mutex::new(store.load_runtime(CONTEXT_KEY).unwrap_or_else(|e| {
+                tracing::warn!("dropping the agents' conversation sizes: {e:#}");
+                None
+            }).unwrap_or_default()),
+            answer_locks: Default::default(),
+            #[cfg(test)]
+            fake_fresh_start: Default::default(),
         })
+    }
+
+    /// Agent `id`'s status line reported its conversation `conversation` at `tokens`, from run
+    /// `run` at API time `api_ms` (which orders reports within a run; a report without it can't
+    /// be ordered, so the caller drops it and the size stays as it was). Saved only when it
+    /// changed (a status line redraws often); a report older than the one kept for the same
+    /// conversation (it arrived late) is dropped.
+    pub(crate) fn note_context(&self, id: i64, conversation: &str, tokens: u64, run: u64, api_ms: f64)
+        -> anyhow::Result<()> {
+        // Agents removed since are dropped with the next save.
+        let known: HashSet<i64> = self.inner.lock().agents.keys().copied().collect();
+        let mut g = self.context.lock();
+        let next = ContextSize { conversation: conversation.to_string(), tokens, run: Some(run), api_ms: Some(api_ms) };
+        if let Some(kept) = g.get(&id).filter(|k| k.conversation == conversation) {
+            let older = match (kept.run, kept.api_ms) {
+                (Some(k), _) if k != run => run < k,
+                (_, Some(k)) => api_ms < k,
+                _ => false,
+            };
+            if older || *kept == next {
+                return Ok(());
+            }
+        }
+        let mut all = g.clone();
+        all.insert(id, next);
+        all.retain(|a, _| known.contains(a));
+        self.store.save_runtime(CONTEXT_KEY, &all)?;
+        *g = all;
+        Ok(())
+    }
+
+    /// The size of the conversation agent `a` would resume, when its status line reported one
+    /// for that conversation (None: unknown, a Codex agent, no conversation, or the last report
+    /// was about another one).
+    pub fn context_size(&self, a: &Agent) -> Option<u64> {
+        let resume = a.resume_id.as_deref()?;
+        self.context.lock().get(&a.id).filter(|c| c.conversation == resume).map(|c| c.tokens)
+    }
+
+    /// When the human last had a prompt of their own taken in by named agent `agent` (Unix ms),
+    /// as far as any backend saw.
+    pub fn human_prompt_at(&self, agent: i64) -> Option<i64> {
+        self.inner.lock().runtime.human_prompt_at.get(&agent).copied()
     }
 
     /// Persist before publishing attribution or allowing the corresponding input.
@@ -1046,6 +1133,20 @@ impl Registry {
         a.resume_id = None;
         a.reset_on_next_start = false;
         Ok(a.clone())
+    }
+
+    /// A fresh start of agent `id` stopped before a new run took over (src/relay.rs): it resumes
+    /// `conversation` again, unless something set another conversation meanwhile. The record, when
+    /// it is set back.
+    pub(crate) fn restore_conversation(&self, store: &Store, id: i64, conversation: &str) -> anyhow::Result<Option<Agent>> {
+        let mut g = self.inner.lock();
+        let a = g.agents.get_mut(&id).ok_or_else(|| anyhow::anyhow!("agent {id} was removed"))?;
+        if a.resume_id.is_some() {
+            return Ok(None);
+        }
+        store.update_agent_runtime(a.id, a.channel_id, a.session_id, Some(conversation))?;
+        a.resume_id = Some(conversation.to_string());
+        Ok(Some(a.clone()))
     }
 
     /// `agent.update`: the configuration fields of `next` (model, effort, persona, profile,
@@ -1153,10 +1254,17 @@ impl Registry {
 
     /// Persist attribution before the injector submits the prompt.
     pub fn on_delivered(&self, id: SessionId, source: Source, now: i64) -> anyhow::Result<()> {
+        let agent = self.by_session(id).map(|a| a.id);
         self.edit_runtime(|state| {
             state.human_seen.remove(&id);
             match source {
-                Source::Human => { state.prov.remove(&id); state.active.remove(&id); }
+                Source::Human => {
+                    state.prov.remove(&id);
+                    state.active.remove(&id);
+                    if let Some(a) = agent {
+                        state.human_prompt_at.insert(a, now);
+                    }
+                }
                 Source::Chain(prov) => {
                     state.prov.insert(id, prov);
                     match prov.msg_id {
@@ -1277,6 +1385,7 @@ impl Registry {
         }
         let mut next = g.runtime.clone();
         let mut stamp = g.human_stamps.get(&info.id).copied();
+        let named = g.agents.values().find(|a| a.session_id == Some(info.id)).map(|a| a.id);
         let mut fx = HookEffects::default();
         if event == "UserPromptSubmit" {
             let prompt = payload.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
@@ -1297,6 +1406,9 @@ impl Registry {
                         if first <= arrival {
                             // The human typed before this prompt: it is theirs.
                             next.prov.remove(&info.id);
+                            if let Some(a) = named {
+                                next.human_prompt_at.insert(a, now_ms());
+                            }
                             if last > arrival {
                                 // And again since: that input belongs to the next prompt.
                                 stamp = Some((last, last));
@@ -1832,6 +1944,39 @@ pub async fn start_fresh_if(hub: &Arc<Hub>, name: &str, ok: &(dyn Fn(&SessionInf
         publish(hub, &s.agent);
     }
     r
+}
+
+/// The start lock, held: `start_fresh_if_held` and `send_checked_held` then run without another
+/// start (a message waiting to start the agent, a wake) slipping in between them.
+pub(crate) type StartHeld<'a> = tokio::sync::MutexGuard<'a, ()>;
+
+/// `start_fresh_if` for a caller holding the start lock (`_held`).
+pub(crate) async fn start_fresh_if_held(hub: &Arc<Hub>, name: &str, ok: &(dyn Fn(&SessionInfo) -> bool + Sync),
+    _held: &StartHeld<'_>) -> anyhow::Result<AgentSession> {
+    #[cfg(test)]
+    if hub.agents().fake_fresh_start.load(std::sync::atomic::Ordering::Relaxed) {
+        return fake_fresh_start(hub, name, ok);
+    }
+    let r = start_locked(hub, name, true, None, Some(ok)).await;
+    if let Ok(s) = &r {
+        publish(hub, &s.agent);
+    }
+    r
+}
+
+/// `Registry::fake_fresh_start`: `start_once`'s checks and its forgetting of the conversation,
+/// then a start reported done (the agent's session as it is; nothing runs).
+#[cfg(test)]
+fn fake_fresh_start(hub: &Arc<Hub>, name: &str, ok: &(dyn Fn(&SessionInfo) -> bool + Sync)) -> anyhow::Result<AgentSession> {
+    let agent = hub.agents().get(name).ok_or_else(|| no_agent(hub, name))?;
+    let sid = agent.session_id.ok_or_else(|| anyhow::anyhow!("no session"))?;
+    let session = hub.session(sid).ok_or_else(|| anyhow::anyhow!("no session"))?;
+    if session.state != AgentState::Exited && hub.live_session_ids().contains(&sid) && !ok(&session) {
+        return Err(NotIdle.into());
+    }
+    hub.fence_conversation(sid);
+    let agent = hub.agents().reset_for_start(hub.store(), agent.id, &agent.working_location)?;
+    Ok(AgentSession { agent, session, started: true, woke: None })
 }
 
 async fn start_guarded(hub: &Arc<Hub>, name: &str, fresh: bool, window: Option<WindowId>,
@@ -2566,7 +2711,13 @@ fn unattended_cap(hub: &Hub, route: Route) -> Option<u32> {
 /// Start the agent if needed, record the message (checking the daily caps in the same
 /// transaction), and send it (envelope first) through the injection queue. A cap refusal is a
 /// `Refused` error.
-pub async fn deliver(hub: &Arc<Hub>, mut out: Outgoing) -> anyhow::Result<Delivery> {
+pub async fn deliver(hub: &Arc<Hub>, out: Outgoing) -> anyhow::Result<Delivery> {
+    deliver_inner(hub, out, None).await
+}
+
+/// `deliver` with the start lock held by the caller (`held`): the agent is started, if needed,
+/// under that hold.
+async fn deliver_inner(hub: &Arc<Hub>, mut out: Outgoing, held: Option<&StartHeld<'_>>) -> anyhow::Result<Delivery> {
     // Plain text only, whoever built it (a schedule's prompt quotes stored replies): no control
     // character, such as the end of a bracketed paste, reaches the agent's input.
     out.text = crate::mcp::tools::clean_text(&out.text);
@@ -2587,7 +2738,16 @@ pub async fn deliver(hub: &Arc<Hub>, mut out: Outgoing) -> anyhow::Result<Delive
     }
     // A sleep waits for this delivery to reach the queue (src/sleep.rs).
     let _delivering = hub.agents().get(&out.agent).map(|a| crate::sleep::delivering(hub, a.id));
-    let bs = start(hub, &out.agent, false, None).await?;
+    let bs = match held {
+        Some(_) => {
+            let r = start_locked(hub, &out.agent, false, None, None).await;
+            if let Ok(s) = &r {
+                publish(hub, &s.agent);
+            }
+            r?
+        }
+        None => start(hub, &out.agent, false, None).await?,
+    };
     if replaced(Some(bs.agent.id)) {
         return Err(Refused(format!("the agent {} this was for was removed, and the name now belongs to another agent", out.agent)).into());
     }
@@ -2666,6 +2826,26 @@ pub async fn send_checked(
     }
     let route = precheck(hub, agent, &text, &from, from_session, prov, forced)?;
     let d = deliver(hub, Outgoing { agent: agent.name.clone(), agent_id: Some(agent.id), text, from, from_session, route }).await?;
+    Ok((d, route))
+}
+
+/// `send_checked` for a caller holding the start lock (`held`): the message is in the agent's
+/// queue before any other start can put one there.
+pub(crate) async fn send_checked_held(
+    hub: &Arc<Hub>,
+    agent: &Agent,
+    text: String,
+    from: String,
+    from_session: Option<SessionId>,
+    prov: Option<Prov>,
+    held: &StartHeld<'_>,
+) -> anyhow::Result<(Delivery, Route)> {
+    if crate::spend::applies(hub, agent, proposed_route(prov, None).origin) {
+        hub.spend.ensure_fresh(hub).await;
+    }
+    let route = precheck(hub, agent, &text, &from, from_session, prov, None)?;
+    let out = Outgoing { agent: agent.name.clone(), agent_id: Some(agent.id), text, from, from_session, route };
+    let d = deliver_inner(hub, out, Some(held)).await?;
     Ok((d, route))
 }
 
@@ -3585,6 +3765,100 @@ mod tests {
         let reg = Registry::load(&store).unwrap();
         assert_eq!(reg.get("alpha").unwrap().accepts_origins, vec![Origin::Human]);
         assert!(reg.insert(&store, a).unwrap_err().to_string().contains("accepts allows only"));
+    }
+
+    #[test]
+    fn a_conversations_size_belongs_to_that_conversation_and_survives_a_restart() {
+        let store = Store::open_memory().unwrap();
+        let mut a = agent(SessionKind::Claude);
+        a.name = "alpha".into();
+        a.resume_id = Some("conv-1".into());
+        a.id = store.insert_agent(&a).unwrap();
+        let reg = Registry::load(&store).unwrap();
+        let a = reg.by_id(a.id).unwrap();
+        assert_eq!(reg.context_size(&a), None, "nothing reported yet");
+        reg.note_context(a.id, "conv-1", 216_003, 1, 1.0).unwrap();
+        assert_eq!(reg.context_size(&a), Some(216_003));
+        // Kept across a backend restart.
+        let reg = Registry::load(&store).unwrap();
+        assert_eq!(reg.context_size(&a), Some(216_003));
+        // Reported for another conversation (a /clear, a fresh start): not the one it resumes.
+        reg.note_context(a.id, "conv-2", 1_000, 1, 1.0).unwrap();
+        assert_eq!(reg.context_size(&a), None);
+        let mut fresh = a.clone();
+        fresh.resume_id = None;
+        assert_eq!(reg.context_size(&fresh), None, "no conversation, no size");
+        fresh.resume_id = Some("conv-2".into());
+        assert_eq!(reg.context_size(&fresh), Some(1_000));
+        // A removed agent's entry goes with the next save.
+        reg.remove(&store, a.id).unwrap();
+        reg.note_context(a.id + 1, "conv-9", 5, 1, 1.0).unwrap();
+        let saved: HashMap<i64, ContextSize> = store.load_runtime(CONTEXT_KEY).unwrap().unwrap();
+        assert!(saved.is_empty(), "{saved:?}");
+    }
+
+    #[test]
+    fn the_humans_own_prompts_are_dated_per_agent_and_kept_but_not_messages() {
+        let store = Store::open_memory().unwrap();
+        // Attribution saved by an older backend, before the field existed, still loads.
+        store.save_runtime("agent-attribution", &json!({"prov": {}, "active": {}, "delivered": {}, "human_seen": []})).unwrap();
+        let mut a = agent(SessionKind::Claude);
+        a.name = "alpha".into();
+        a.session_id = Some(5);
+        a.id = store.insert_agent(&a).unwrap();
+        store.update_agent_runtime(a.id, None, Some(5), None).unwrap();
+        let reg = Registry::load(&store).unwrap();
+        let mut info = test_session(5, None);
+        info.kind = SessionKind::Claude;
+        assert_eq!(reg.human_prompt_at(a.id), None);
+        // A message from an agent or the Questions tab is not the human's prompt.
+        let m = msg(&store, a.id, 5, Origin::Human, 0);
+        reg.on_delivered(5, Source::Chain(Prov { origin: Origin::Human, hop: 0, msg_id: Some(m) }), 100).unwrap();
+        reg.on_hook(&store, &info, "UserPromptSubmit", &json!({"prompt": envelope(m, "x", Origin::Human, 0)})).unwrap();
+        assert_eq!(reg.human_prompt_at(a.id), None);
+        // A prompt Muster types as the human's (`muster send`, the window): dated when typed.
+        reg.on_delivered(5, Source::Human, 200).unwrap();
+        assert_eq!(reg.human_prompt_at(a.id), Some(200));
+        // One the human typed at the input box: dated when its hook arrives.
+        let before = now_ms();
+        reg.note_human_input(5).unwrap();
+        reg.on_hook(&store, &info, "UserPromptSubmit", &json!({"prompt": "look at the logs"})).unwrap();
+        assert!(reg.human_prompt_at(a.id).is_some_and(|t| t >= before));
+        // Kept across a backend restart, and with the agent when its tab goes (the same
+        // conversation can be resumed in another one).
+        let typed = reg.human_prompt_at(a.id);
+        assert_eq!(Registry::load(&store).unwrap().human_prompt_at(a.id), typed);
+        reg.forget_session(5);
+        assert_eq!(reg.human_prompt_at(a.id), typed);
+        // A plain session (no named agent) records nothing.
+        reg.on_delivered(6, Source::Human, 300).unwrap();
+        assert_eq!(reg.human_prompt_at(a.id), typed);
+    }
+
+    #[test]
+    fn a_size_report_that_arrives_late_never_replaces_a_newer_one() {
+        let store = Store::open_memory().unwrap();
+        let mut a = agent(SessionKind::Claude);
+        a.name = "alpha".into();
+        a.resume_id = Some("conv-1".into());
+        a.id = store.insert_agent(&a).unwrap();
+        let reg = Registry::load(&store).unwrap();
+        let a = reg.by_id(a.id).unwrap();
+        // Compacted: 40k at API time 900 of run 3.
+        reg.note_context(a.id, "conv-1", 40_000, 3, 900.0).unwrap();
+        // The redraw from before the compaction (API time 500) lands after it: dropped.
+        reg.note_context(a.id, "conv-1", 216_000, 3, 500.0).unwrap();
+        assert_eq!(reg.context_size(&a), Some(40_000));
+        // An older run's report too.
+        reg.note_context(a.id, "conv-1", 216_000, 2, 9_000.0).unwrap();
+        assert_eq!(reg.context_size(&a), Some(40_000));
+        // A newer run of the same conversation starts its API time again: taken.
+        reg.note_context(a.id, "conv-1", 41_000, 4, 10.0).unwrap();
+        assert_eq!(reg.context_size(&a), Some(41_000));
+        // Unreadable sizes are dropped at load, never a failed start.
+        store.save_runtime(CONTEXT_KEY, &json!("not a map")).unwrap();
+        let reg = Registry::load(&store).unwrap();
+        assert_eq!(reg.context_size(&a), None);
     }
 
     #[test]

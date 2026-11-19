@@ -345,17 +345,23 @@ function QuestionPage({ q, now, narrow, onBack, onZoom }: {
     <div class="qv-card">
       <Head q={q} now={now} narrow={narrow} onBack={onBack} />
       <Pictures q={q} onZoom={onZoom} />
-      {q.status === "answered" ? <Answered q={q} now={now} /> : <Answering q={q} />}
+      {q.status === "answered" ? <Answered q={q} now={now} /> : <Answering q={q} now={now} />}
       <Details q={q} />
     </div>
   );
 }
 
-function Answering({ q }: { q: Question }) {
+function Answering({ q, now }: { q: Question; now: number }) {
   const d = draftFor(q, drafts.value);
   const [busy, setBusy] = useState(false);
   const { agent, gone, session } = askerSession(q);
-  const after = afterAnswer(q, session, isAsleep(agent, session), session ? wakeCold(session, Date.now()) : false, gone);
+  const asleep = isAsleep(agent, session);
+  const cold = session ? wakeCold(session, now) : false;
+  // Whether an answer now starts a new conversation is the backend's call (`asker_now`): read it
+  // again when the asker rests, wakes, works or goes cold, and every half minute (typing into it,
+  // a queued message or a new size report change it too), so the line below stays true.
+  useEffect(() => refreshQuestion(q.id), [q.id, session?.state, asleep, cold, now]);
+  const after = afterAnswer(q, session, asleep, cold, gone);
   const ready = readyToSend(q, d);
   const many = q.kind === "pick_several";
   const update = (next: Draft) => setDraft(q.id, next);
@@ -429,7 +435,7 @@ function Answering({ q }: { q: Question }) {
       <div class="qv-fate">
         <div><span>If you don't answer</span><span>{q.if_no_answer}</span></div>
         {q.holding_up && <div><span>Holding up</span><span>{q.holding_up}</span></div>}
-        <div><span>After you answer</span><span class={cx("qv-dot", after.tone)}>{after.text}</span></div>
+        <div><span>After you answer</span><span class={cx("qv-dot", after.tone)} aria-live="polite">{after.text}</span></div>
       </div>
       <div class="qv-acts">
         <button type="button" class="qv-btn primary" disabled={!ready || busy} onClick={() => void send()}
@@ -483,7 +489,7 @@ function Answered({ q, now }: { q: Question; now: number }) {
       )}
       <div class="qv-fate">
         <div><span>How</span><span>{howText(q, now)}</span></div>
-        <div><span>What happened</span><span class={cx(happened.warn && "qv-warn")}>{happened.text}</span></div>
+        <div><span>What happened</span><span class={cx(happened.warn && "qv-warn")} aria-live="polite">{happened.text}</span></div>
       </div>
       <div class="qv-acts">
         {q.can_undo && (

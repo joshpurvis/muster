@@ -182,7 +182,7 @@ impl State {
         self.inner.lock().failed.get(&id).cloned()
     }
 
-    fn deliveries(&self, agent: i64) -> u32 {
+    pub(crate) fn deliveries(&self, agent: i64) -> u32 {
         self.inner.lock().deliveries.get(&agent).copied().unwrap_or(0)
     }
 
@@ -608,7 +608,7 @@ fn human_at(hub: &Hub, id: SessionId, now: i64) -> Option<i64> {
     hub.human_input_of(id).map(|(_, at)| now - at.elapsed().as_millis() as i64)
 }
 
-fn facts(hub: &Hub, a: &Agent) -> (Option<SessionInfo>, Facts) {
+pub(crate) fn facts(hub: &Hub, a: &Agent) -> (Option<SessionInfo>, Facts) {
     let Some(sid) = a.session_id else { return (None, Facts::default()) };
     let info = hub.session(sid);
     let f = Facts {

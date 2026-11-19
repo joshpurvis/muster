@@ -233,9 +233,18 @@ exec tee '${BASE}/fake-input-'"$MUSTER_SESSION_ID" > '${BASE}/fake-input'
   // Stand-in Claude: records how it was launched and each line typed into it, then idles (never
   // starts a real agent). A line SMOKE-START-FRESH <file> runs `muster start-fresh <file>` as
   // a program of its own session would (the self handoff test), its output in start-fresh-<id>.
+  // While the file claude-draws-box exists, a run starts by drawing Claude's empty input box (a
+  // "❯" row between two rules, the cursor after it), so Muster sees it ready for a prompt; like
+  // Claude, typed text doesn't stay in the box and one Ctrl-C (Muster clearing it) doesn't end it.
   await Deno.writeTextFile(`${BASE}/bin/claude`, `#!/bin/bash
 ${LAUNCH_DUMP("claude")}
 printf '%s' "$MUSTER_TOKEN" > '${BASE}/claude-token-'"$MUSTER_SESSION_ID"
+if [ -e '${BASE}/claude-draws-box' ]; then
+  stty -echo
+  trap '' INT
+  rule='────────────────────────────────────────'
+  printf '\\033[2J\\033[H%s\\r\\n❯ \\r\\n%s\\033[2;3H' "$rule" "$rule"
+fi
 while IFS= read -r line; do
   printf '%s\\n' "$line" >> '${BASE}/claude-input-'"$MUSTER_SESSION_ID"
   case "$line" in
@@ -493,7 +502,7 @@ done
   await mcp(shellToken, "panel_close", { panel_id: preview.panel_id });
   const page = await fetch(`http://127.0.0.1:${PORT}/`);
   await page.body?.cancel();
-  ok(page.headers.get("x-frame-options") === "DENY" && page.headers.get("content-security-policy") === "frame-ancestors 'none'", "Muster's own page refuses to be framed");
+  ok(page.headers.get("x-frame-options") === "DENY" && String(page.headers.get("content-security-policy")).startsWith("frame-ancestors 'none';"), "Muster's own page refuses to be framed");
   await c.call("panel.context", { panel_id: pid, context: { structuredContent: { selection: 2 } } });
   const waiting = mcp(shellToken, "wait_for_panel_event", { panel_id: pid, timeout_seconds: 5 });
   await sleep(150);
@@ -1286,6 +1295,7 @@ done
   await lateReplies(c, mcp);
   await questionsForHuman(c, d, mcp);
   await selfHandoff(c, mcp);
+  await coldAnswer(c, d, mcp);
   ({ c, d } = await sleepAndWake(c, d, { mcp }));
 
   ({ c, d } = await schedules(c, d));
@@ -1424,6 +1434,84 @@ async function selfHandoff(c: Client, mcp: (token: string, name: string, args?: 
   await refusedHere(file, "isn't allowed", "self handoff: taken back, refused again");
   ok(!(await Deno.readTextFile(`${home}/CLAUDE.md`)).includes("## Starting fresh"), "self handoff: its CLAUDE.md drops the section");
   await c.call("agent.remove", { name: "otto" });
+}
+
+/** The cold-answer rule (src/relay.rs `fresh_verdict`): the human's answer to a question from a
+ * Claude agent whose conversation is cold (here a 1-minute cache lifetime) and large (its status
+ * line's report) starts it in a new conversation, with a first line saying why; a second answer
+ * goes into that new conversation. A fake Claude stands in: the test plays its hooks. */
+async function coldAnswer(c: Client, d: Daemon, mcp: (token: string, name: string, args?: Json) => Promise<any>) {
+  const until = async (what: string, cond: () => Promise<boolean>, ms = 20000) => {
+    const deadline = Date.now() + ms;
+    while (!(await cond())) {
+      if (Date.now() > deadline) throw new Error(`timeout waiting for ${what}`);
+      await sleep(200);
+    }
+  };
+  await c.call("agent.create", { name: "coldy", kind: "claude" });
+  const sid: number = (await c.call("agent.start", { name: "coldy" })).session.id;
+  const tokenFile = `${BASE}/claude-token-${sid}`;
+  let token = "";
+  await until("coldy's token", async () => (token = await Deno.readTextFile(tokenFile).catch(() => "")).length > 10);
+  const input = () => Deno.readTextFile(`${BASE}/claude-input-${sid}`).catch(() => "");
+  const post = async (path: string, t: string, body: Json) => {
+    const r = await fetch(`http://127.0.0.1:${PORT}${path}`, { method: "POST", headers: { Authorization: `Bearer ${t}` }, body: JSON.stringify(body) });
+    await r.body?.cancel();
+    if (!r.ok) throw new Error(`${path}: ${r.status}`);
+  };
+  const info = async () => (await c.call("hello")).sessions.find((x: Json) => x.id === sid);
+  const ask = (question: string, note: string) => ({
+    question, context: "The smoke test's demo-app has two footers and shows one on every page.",
+    example: "Someone on the pricing page sees one footer or the other under the plans.",
+    options: [{ text: "The short footer", why: "Fewer links to keep up to date." }, { text: "The long footer" }],
+    pick: "a", if_no_answer: "The build waits; nothing on the site changes.", note_to_self: note,
+  });
+  // One turn in conversation "conv-cold", which its status line says holds 216k tokens.
+  await post("/hook/SessionStart", token, { session_id: "conv-cold", source: "startup" });
+  await post("/hook/UserPromptSubmit", token, { session_id: "conv-cold", prompt: "[muster msg 0 from smoke origin=human hop=0]\ngo" });
+  await post("/hook/Stop", token, { session_id: "conv-cold", last_assistant_message: "done" });
+  await post("/usage/claude", token, { rate_limits: {}, api_duration_ms: 10, context: { conversation: "conv-cold", tokens: 216003 } });
+  await until("coldy idle with its conversation", async () => (await info()).state === "idle" &&
+    (await c.call("agent.list")).find((a: Json) => a.name === "coldy").resumable === true);
+  const q1 = await mcp(token, "post_question", ask("Which footer goes on demo-app?", "cold-note-one: on a edit footer.html"));
+  const q2 = await mcp(token, "post_question", ask("Which footer goes on the docs?", "cold-note-two: on a edit docs/footer.html"));
+  await c.call("prefs.set", { cache_ttl: { claude: 1 } });
+  await until("coldy's cache to go cold", async () => (await info()).cache_cold_at <= Date.now(), 75000);
+  const w = await ownerWindow(d);
+  await Deno.remove(tokenFile);
+  await Deno.writeTextFile(`${BASE}/claude-draws-box`, "");
+  await w.call("question.answer", { id: q1.number, pick: ["a"] });
+  // Started fresh (no --resume), then its answer, first line saying why, once Claude is up.
+  await until("coldy's new run", async () => (token = await Deno.readTextFile(tokenFile).catch(() => "")).length > 10, 30000);
+  const relaunched = (await launchOf("claude", sid)).args;
+  ok(!relaunched.includes("--resume"), `cold answer: the new run starts a new conversation (${relaunched})`);
+  await post("/hook/SessionStart", token, { session_id: "conv-new", source: "startup" });
+  await until("the answer typed in", async () => (await input()).includes(`Answer to your question Q${q1.number}: a) The short footer.`), 30000);
+  const typed = await input();
+  const line = typed.indexOf("Muster started you in a new conversation for this message, because the old one was cold and large, about 216k tokens and idle");
+  ok(line >= 0 && line < typed.indexOf(`Answer to your question Q${q1.number}`) && typed.includes("cold-note-one"),
+    `cold answer: its first line says why, then the whole question and its note (${typed.slice(-600)})`);
+  let got = await w.call("question.get", { id: q1.number });
+  for (let n = 0; n < 50 && ["pending", "delivering"].includes(got.answer.delivery.status); n++) {
+    await sleep(100);
+    got = await w.call("question.get", { id: q1.number });
+  }
+  ok(got.answer.delivery.status === "delivered" && String(got.answer.delivery.note).startsWith("started coldy in a new conversation, because the old one was cold and large") &&
+    got.answer.delivery.fresh?.replaces === "conv-cold", `cold answer: the Questions tab's line says so (${JSON.stringify(got.answer.delivery)})`);
+  // The new conversation takes the answer as a turn; the second answer goes into it, no restart.
+  await post("/hook/UserPromptSubmit", token, { session_id: "conv-new", prompt: typed.slice(line) });
+  await post("/hook/Stop", token, { session_id: "conv-new", last_assistant_message: "noted" });
+  await until("coldy idle again", async () => (await info()).state === "idle");
+  const before = (await launchOf("claude", sid)).args;
+  await w.call("question.answer", { id: q2.number, pick: ["a"] });
+  await until("the second answer", async () => (await input()).includes(`Answer to your question Q${q2.number}: a) The short footer.`), 30000);
+  ok((await Deno.readTextFile(tokenFile)) === token && (await launchOf("claude", sid)).args === before,
+    "cold answer: the second answer goes into the new conversation, no second restart");
+  ok((await input()).split("Muster started you in a new conversation").length === 2, "cold answer: one new-conversation line in all");
+  w.close();
+  await Deno.remove(`${BASE}/claude-draws-box`);
+  await c.call("prefs.set", { cache_ttl: { claude: 60 } });
+  await c.call("agent.remove", { name: "coldy" });
 }
 
 /** Late replies (docs/MCP.md "Late replies"): two fake Codex agents stand in for an asker and a

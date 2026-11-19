@@ -741,6 +741,9 @@ export interface QuestionAnswer {
     msg_id?: number;
     session_id?: SessionId;
     at?: number;
+    /** Muster started the asker in a new conversation for it: its old one was cold and large
+     * (`why`, a few words), or the human asked for one. `replaces`: the old conversation's id. */
+    fresh?: { why: string; replaces?: string };
   };
 }
 
@@ -779,6 +782,10 @@ export interface Question {
     asleep: boolean;
     cold: boolean;
     idle_ms?: number | null;
+    /** An answer now would start its recipient in a new conversation (its old one is cold and
+     * large): why, the old one's size in thousands of tokens, whether it is asleep, and `to`, the
+     * lead's name when the answer goes to the lead of an asker that ended. Null otherwise. */
+    new_conversation?: { why: string; size_k?: number | null; asleep?: boolean; to?: string | null } | null;
   };
   /** Answered ones: the human may still take it back (an answer given in the tab, not yet read). */
   can_undo?: boolean;

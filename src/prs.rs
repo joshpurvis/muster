@@ -1376,6 +1376,8 @@ fn letter<T>(pr: &Pr, index: usize, run: impl FnOnce(&crate::relay::Letter<'_>) 
     run(&crate::relay::Letter {
         poster: note_to(pr, n), recorder: None, from: n.from.clone(), from_session: None, prov: note_prov(pr, n),
         text: &text, envelope: &envelope, prefix: note_prefix(pr.id, index),
+        // The cold-answer rule covers answers to questions only (src/relay.rs).
+        fresh: None,
     })
 }
 
@@ -1402,7 +1404,7 @@ pub async fn send_notes(hub: &Arc<Hub>, id: i64) {
             let envelope = |from: &str, origin: Origin, hop: u32| note_envelope(id, index, from, origin, hop);
             let l = crate::relay::Letter {
                 poster: note_to(&pr, n), recorder: None, from: n.from.clone(), from_session: None, prov: note_prov(&pr, n),
-                text: &text, envelope: &envelope, prefix: note_prefix(id, index),
+                text: &text, envelope: &envelope, prefix: note_prefix(id, index), fresh: None,
             };
             // A stale notice goes to the poster itself or nowhere: it carries the poster's own words,
             // and no click of the human's sent it, so it is never passed on to a lead.

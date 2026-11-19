@@ -1954,11 +1954,14 @@ async fn daemon_main(openrouter_key: Option<openrouter::ApiKey>, launch: Option<
         // now, before the server takes requests: this backend's own deliveries are never among them.
         let unfinished = agent_reply::unfinished(&hub);
         // Answers to questions for the human likewise (src/questions.rs).
-        let answers = questions::unfinished(&hub);
+        let (answers_first, answers) = questions::started_first(&hub, questions::unfinished(&hub));
         // Pull request cards likewise: a merge a restart cut off, results on their way (src/prs.rs).
         let cards = prs::unfinished(&hub);
         tokio::spawn(async move {
             agents::autostart(&hub).await;
+            // An answer that had started its agent in a new conversation is that conversation's
+            // first message; the other answers come after late replies (src/questions.rs).
+            questions::resume(&hub, answers_first).await;
             agent_reply::resume(&hub, unfinished).await;
             questions::resume(&hub, answers).await;
             prs::resume(&hub, cards).await;

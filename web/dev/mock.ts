@@ -166,7 +166,7 @@ interface Session {
   rows: number;
   size_owner: string | null;
   queued: number;
-  /** Quiet messages waiting for its next turn (src/quiet.rs). */
+  /** Quiet messages waiting for a later turn (src/quiet.rs). */
   quiet_waiting?: number;
   created_at: number;
   /** The window this session is a tab in (docs/PROTOCOL.md "Groups layout (v2)"). */
@@ -1093,9 +1093,11 @@ const sched = scheduleMock({
         origin: "human",
         hop: 2,
         status: "delivered",
-        note: `waits for ${orch.name}'s next turn as message ${carrierId}`,
+        note: `waits for ${orch.name}'s next turn that can take it, as message ${carrierId}`,
         msg: carrierId,
         quiet: true,
+        // Where the carrier stands, as the daemon adds it to the answer (src/agents.rs `quiet_state`).
+        quiet_state: { state: "waiting", msg: carrierId, to: orch.name },
       },
     },
     {

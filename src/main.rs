@@ -447,14 +447,14 @@ carries that session's origin (docs/MCP.md, \"Agents\").")]
     #[command(after_help = "Examples:\n  muster reply 42 the benchmarks finished: all green\n  cat report.md | muster reply 42 -\n\n\
 Runs the session's MCP `reply` tool: once per message, only for messages Muster delivered to this\n\
 agent. The asker gets it as a new message, or the human in the agents panel (docs/MCP.md, \"Late replies\").\n\
-With --no-wake an asker that stopped waiting gets it at the start of its next turn instead.")]
+With --no-wake an asker that stopped waiting gets it at the start of its next turn that can take it instead.")]
     Reply {
         /// The message's id, from its `[muster msg <id> ...]` line.
         msg_id: i64,
         /// Words, joined by spaces. None or `-`: read stdin.
         text: Vec<String>,
         /// Don't start a turn for it: an asker no longer waiting gets it at the start of its
-        /// next turn (docs/MCP.md, "Quiet messages").
+        /// next turn that can take it (docs/MCP.md, "Quiet messages").
         #[arg(long)]
         no_wake: bool,
         /// Print the result as JSON.
@@ -561,7 +561,7 @@ enum AgentCmd {
         /// Start it whenever the daemon starts.
         #[arg(long)]
         autostart: bool,
-        /// Stop its process after this long idle (minutes, 90m, 2h); the next message wakes it
+        /// Stop its process after this long idle (minutes, 90m, 2h); a message sent with wake on wakes it
         /// into the same conversation. Default: never.
         #[arg(long, value_name = "TIME")]
         sleep_after: Option<String>,
@@ -1975,6 +1975,9 @@ async fn daemon_main(openrouter_key: Option<openrouter::ApiKey>, launch: Option<
         // Pull request cards likewise: a merge a restart cut off, results on their way (src/prs.rs).
         let cards = prs::unfinished(&hub);
         tokio::spawn(async move {
+            // What waited for a plain session's run that ended while no backend ran is dropped
+            // before any new run or late reply (src/quiet.rs).
+            quiet::reconcile(&hub);
             agents::autostart(&hub).await;
             // An answer that had started its agent in a new conversation is that conversation's
             // first message; the other answers come after late replies (src/questions.rs).

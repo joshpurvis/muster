@@ -980,7 +980,7 @@ pub fn run_json(hub: &Hub, r: &Run) -> Value {
         "late_reply": late,
         "reason": r.reason,
         "msg_id": r.msg_id,
-        "message": msg.as_ref().map(crate::agents::message_json),
+        "message": msg.as_ref().map(|m| crate::agents::message_json(hub.store(), m)),
         "parent_run": r.parent,
         "step": r.step,
         "agent": r.agent_id.and_then(|a| hub.agents().by_id(a)).map(|a| a.name),

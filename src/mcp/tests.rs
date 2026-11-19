@@ -263,7 +263,7 @@ impl Backend for Arc<Mock> {
         Ok(crate::agents::QuietSent { msg_id: 100 + d.quiet.len() as i64, session_id: Some(3), sent_at_ms: 0, waiting: d.quiet.len() })
     }
     fn session_quiet(&self, to: &SessionInfo, from: String, _from_session: Option<SessionId>, route: crate::agents::Route,
-        text: String) -> anyhow::Result<Value> {
+        text: String, _bind: Option<crate::quiet::Bind>) -> anyhow::Result<Value> {
         crate::quiet::check_receiver(to.kind, &format!("session {}", to.id)).map_err(|e| anyhow::anyhow!(e))?;
         self.d.lock().quiet_sessions.push((to.id, from, route, text));
         Ok(json!({"session_id": to.id, "status": "waiting"}))
@@ -1798,7 +1798,7 @@ async fn tell_agent_wakes_or_waits_as_the_sender_says_with_ask_agents_guards() {
     assert!(err && t.contains("cody is a codex session") && t.contains("wake=true"), "{t}");
     // Too long to wait for a turn.
     let (t, err) = call(&st, "tell_agent", json!({"agent": "ada", "text": "x".repeat(6001), "wake": false})).await;
-    assert!(err && t.contains("at most 6000 characters"), "{t}");
+    assert!(err && t.contains("at most 6,000 characters (an emoji counts as two) and 150 lines"), "{t}");
     // The origin rule, hop limit and cap apply as for ask_agent, with refusals logged.
     inbound(&m, 2, Origin::Schedule, 1);
     let (t, err) = call_as(&st, "tok2", "tell_agent", json!({"agent": "ada", "text": "x", "wake": false})).await;
@@ -1837,7 +1837,7 @@ async fn a_quiet_reply_too_long_to_keep_takes_no_rate_limit_slot() {
     st.limits.send_per_window = 1;
     for _ in 0..3 {
         let (t, err) = call(&st, "reply", json!({"msg_id": 5, "text": "x".repeat(6001), "wake": false})).await;
-        assert!(err && t.contains("at most 6000 characters"), "{t}");
+        assert!(err && t.contains("at most 6,000 characters (an emoji counts as two) and 150 lines"), "{t}");
     }
     // The one slot is still free.
     let (t, err) = call(&st, "send_message", json!({"session_id": 2, "text": "x"})).await;

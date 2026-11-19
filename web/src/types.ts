@@ -353,8 +353,24 @@ export interface LateAnswer {
   msg?: number | null;
   /** The session it was typed into (or, sent quietly, the one it waits for). */
   session?: SessionId | null;
-  /** Sent with wake=false: an asker no longer waiting gets it at the start of its next turn. */
+  /** Sent with wake=false: an asker no longer waiting gets it at the start of its next turn
+   * that can take it. */
   quiet?: boolean;
+  /** Sent quietly and kept for the asker: where the carrying message stands now (src/agents.rs
+   * `quiet_state`), whatever page of the log holds it. Missing from an older daemon. */
+  quiet_state?: QuietState | null;
+}
+
+/** Where the message carrying a quiet late reply stands: an agent's (`msg`, `to`) or a plain
+ * session's (`session`). `at`: when it was shown (or an agent's expired); `reason`: why it was
+ * dropped. */
+export interface QuietState {
+  state: "waiting" | "shown" | "expired" | "dropped";
+  at?: number | null;
+  reason?: string | null;
+  msg?: number | null;
+  to?: string | null;
+  session?: SessionId | null;
 }
 
 /** A New agent template (`agent.templates`). */

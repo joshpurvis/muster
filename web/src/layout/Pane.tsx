@@ -800,7 +800,7 @@ function GroupTab(
     tabText(label),
     c?.name,
     onOpenRouter ? `${OPENROUTER_BADGE}: billed per token to your OpenRouter key` : null,
-    cold ? `Cold: idle ${idleText(idleFor(s, cacheNow()) ?? 0)}, the next message re-reads the conversation`
+    cold ? `Cold: idle ${idleText(idleFor(s, cacheNow()) ?? 0)}, a message sent with wake on re-reads the conversation`
       : dot ? `Idle, ${CACHE_DOT_LABEL[dot]}` : null,
     s.kind === "claude" ? `Claude profile: ${profileName(accountProfiles.value, s.account_profile_id)}` : null,
     c ? tildify(c.cwd, home) : null,
@@ -829,6 +829,8 @@ function GroupTab(
       tabIndex={active ? 0 : -1}
       data-tab-sid={s.id}
       data-tip={tip}
+      // The tip (with its waiting count) also shows when the keyboard reaches the tab.
+      data-tip-focus={s.quiet_waiting ? "" : undefined}
       onPointerDown={(e) => {
         if (isRenaming || (e.target as HTMLElement).closest("button")) return;
         startTabDrag(e, s, tabText(label), () => A.revealSession(s.id));

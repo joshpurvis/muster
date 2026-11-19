@@ -23,7 +23,7 @@ mode 0600: `{"pid": 123, "port": 7433, "panel_port": 51234, "token": "<client to
 | `POST /api/device/logout` | device cookie | Revokes the calling device, clears the cookie. |
 | `GET /m/…` | none | The phone UI (`web/dist/m`), with a strict CSP. `/m` redirects to `/m/`. |
 | `POST /hook/<event>` | `Authorization: Bearer <session token>` | Agent hook callbacks (body: JSON payload). |
-| `POST /quiet/take` | `Authorization: Bearer <session token>` | The quiet messages waiting for the turn this session's `UserPromptSubmit` hook is starting (docs/MCP.md "Quiet messages"), marked offered: `{context: string \| null, quiet: {agent: number[], session: number[]}, left: number}`. Only that session's own; `context` is null when none wait or the session isn't Claude. Not reachable through a funnel or proxy. |
+| `POST /quiet/take` | `Authorization: Bearer <session token>` | Body `{"msg": <id> \| null}`: the message id of the envelope the prompt starts with (null: a prompt Muster didn't type in, the human's turn). The quiet messages waiting for the turn this session's `UserPromptSubmit` hook is starting (docs/MCP.md "Quiet messages"), marked offered: `{context: string \| null, quiet: {agent: number[], session: number[]}, left: number}`. Only that session's own, and only while the token's run is its current one; `context` is null when none wait for this turn or the session isn't Claude. Not reachable through a funnel or proxy. |
 | `POST /usage/claude` | `Authorization: Bearer <session token>` | A Claude session's status-line usage report (`muster statusline`): `{rate_limits: {five_hour?, seven_day?: {used_percentage, resets_at}}, api_duration_ms?, context?: {conversation, tokens}}` (`api_duration_ms`: the run's `cost.total_api_duration_ms`; more than the run's previous report is the evidence that the numbers are newly fetched; a report may carry it alone, as the baseline before the run's first response; `context`: the conversation's id, Claude Code's `session_id`, and its size, `context_window.current_usage`'s input, cache-write and cache-read tokens, kept per named agent with that conversation for the cold-answer rule (only from a report that carries `api_duration_ms`, which orders them), docs/MCP.md "Questions for the human"; other fields are ignored), at most 16 KiB. Attributed by the token to its session and run, and filed under the configuration folder recorded at that run's launch; a run without one is ignored. See "Claude account profiles". |
 | `POST /mcp` | `Authorization: Bearer <session token>` | MCP (streamable HTTP, JSON responses). |
 | `GET /api/health` | none | `{"ok":true,"version":"..."}` |
@@ -325,7 +325,7 @@ it; its key buttons stay off until it is awake.
 A wake that fails (its account profile is disabled, the CLI can't start, or the woken CLI stops
 before it is ready) leaves it asleep, not stopped: its record has `wake_error` (why) until it
 wakes or sleeps again, the asleep bar says so, keys held for it are dropped (with a notice), and
-the next message, Wake, or typing into its tab tries again at once (a panel click at most once a
+a message sent with wake on, Wake, or typing into its tab tries again at once (a panel click at most once a
 minute). A launch whose answer from the terminal host was lost is not a failure (the CLI may be
 running): the agent stays awake, keys stay held, and the wake goes on until recovery adopts the
 launch (it is ready: the keys are typed) or retires it (a failed wake, as above).
@@ -1227,22 +1227,30 @@ notify `last-assistant-message`), which is stored as the reply in `agent_message
 cuts payload strings at 4000 bytes, those final-message fields at 64 KiB.
 
 `muster hook` prints nothing, with one exception: Claude's `UserPromptSubmit` with quiet
-messages waiting. It fetches them (`POST /quiet/take`, at most 1 s; skipped for a prompt that
+messages waiting. It fetches them (`POST /quiet/take` with `{"msg": <id>}` when the prompt
+starts with a Muster envelope, else `{"msg": null}`; at most 1 s; skipped for a prompt that
 starts with `/`), prints `{"hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
 "additionalContext": <context>}}` on stdout, and adds `muster_quiet: {agent: [ids], session:
 [ids]}` to the payload it saves. `/quiet/take` marks the messages it returns offered to the
-session's current run and raises the session's provenance to theirs in one transaction; it
-returns only messages of the human's origin or of the turn's own (docs/MCP.md "Quiet
-messages"). Replaying the saved payload keeps those ids pending for that run (the backend checks
-they were offered to it), and the run's next `PreToolUse`, `PostToolUse` or `Stop` hook marks
-them shown (and the agent messages delivered), in the transaction that records that hook. A new
-`UserPromptSubmit` first drops the pending ones: that prompt never ran, and they stay offered.
-`SessionInfo.quiet_waiting` counts what waits for a session's next turn (its agent's included,
+session's current run and raises the session's provenance to theirs in one transaction, while
+that run is the session's current one; it judges the turn by the `msg` it is given (a message
+delivered to this session and not answered yet: that message's route; anything else: the
+human's) and returns only messages that turn may take (docs/MCP.md "Quiet messages"). Every
+`UserPromptSubmit` callback of the run raises the provenance again to what was offered to the
+run and not shown yet. Replaying the saved payload keeps those ids pending for that run (the
+backend checks they were offered to it), and the run's next `PreToolUse`, `PostToolUse` or
+`Stop` hook from its main agent (one with no `agent_id`: a subagent's never counts) marks them
+shown (and the agent messages delivered), in the transaction that records that hook; a message
+that expired meanwhile stays expired. A new `UserPromptSubmit` first drops the pending ones:
+that prompt never ran, and they stay offered.
+`SessionInfo.quiet_waiting` counts what waits for a later turn of the session (its agent's included, a plain session's for its current run,
 on an exited tab too; runtime, recounted at start, at an agent's start and after expiry; a
 change emits `session_upserted`). Store migration v32 adds `agent_messages.quiet`, `offered_at`,
-`offered_run`, `shown_at`, `expired_at`, the `quiet_messages` table (a plain session's, dropped
-when its process ends; `reply_to` links a quiet late reply to the message it answers, once per
-session) and `agents.tools_up_front`.
+`offered_run`, `shown_at`, `expired_at`, `width` (the receiver's Claude permission mode the send
+was checked against, 0-3: a wider run doesn't take it), the `quiet_messages` table (a plain
+session's, for run `to_run` with `width`, dropped when that run's process ends; `reply_to` is the
+message the sender was handling, `late_reply_to` links a quiet late reply to the message it
+answers, once per session) and `agents.tools_up_front`.
 
 ## Claude account profiles
 

@@ -609,8 +609,12 @@ const MIGRATIONS: &[&str] = &[
     // inbox callback), or expired unseen at `expired_at`. `quiet_messages` holds the same for
     // ordinary sessions (send_message), dropped (`dropped` says why) when the session's process
     // ends. `offered_run`: the run (terminal generation) a turn's hook offered it to; only a later
-    // hook of that run confirms it shown. `reply_to` on `quiet_messages`: the message a quiet late
-    // reply answers (one per answered message and session, so a restart can't keep it twice).
+    // hook of that run confirms it shown. `width`: the receiver's Claude permission mode the send
+    // was checked against (`ClaudeMode` as 0-3); a run wider than that doesn't take it. On
+    // `quiet_messages`, `to_run`: the run the send was checked against (only that run takes it),
+    // `reply_to`: the message the sender was handling, and `late_reply_to`: the message a quiet
+    // late reply answers (one per answered message and session, so a restart can't keep it twice;
+    // ordinary sends never set it).
     // `tools_up_front`: the agent's sessions load Muster's message tools without tool search.
     // An older backend ignores all of it (it would show a waiting quiet message as delivered).
     r#"
@@ -619,6 +623,7 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE agent_messages ADD COLUMN offered_run INTEGER;
     ALTER TABLE agent_messages ADD COLUMN shown_at INTEGER;
     ALTER TABLE agent_messages ADD COLUMN expired_at INTEGER;
+    ALTER TABLE agent_messages ADD COLUMN width INTEGER;
     CREATE INDEX agent_messages_waiting ON agent_messages(to_agent, id)
         WHERE quiet = 1 AND shown_at IS NULL AND expired_at IS NULL AND refused IS NULL;
     CREATE TABLE quiet_messages (
@@ -634,10 +639,13 @@ const MIGRATIONS: &[&str] = &[
         offered_run INTEGER,
         shown_at INTEGER,
         dropped TEXT,
-        reply_to INTEGER
+        to_run INTEGER NOT NULL,
+        width INTEGER NOT NULL,
+        reply_to INTEGER,
+        late_reply_to INTEGER
     );
     CREATE INDEX quiet_messages_waiting ON quiet_messages(to_session, id) WHERE shown_at IS NULL AND dropped IS NULL;
-    CREATE UNIQUE INDEX quiet_messages_reply ON quiet_messages(to_session, reply_to) WHERE reply_to IS NOT NULL;
+    CREATE UNIQUE INDEX quiet_messages_late_reply ON quiet_messages(to_session, late_reply_to) WHERE late_reply_to IS NOT NULL;
     ALTER TABLE agents ADD COLUMN tools_up_front INTEGER NOT NULL DEFAULT 0;
     "#,
 ];
@@ -693,6 +701,15 @@ const AGENT_MESSAGE_SELECT: &str = "SELECT m.id, m.from_label, m.from_session, m
     m.hop, m.reply_to, m.created_at, m.reply, m.replied_at, m.text, m.refused, a.name, m.cold_idle_ms,
     m.answer, m.quiet, m.shown_at, m.expired_at
     FROM agent_messages m LEFT JOIN agents a ON a.id = m.to_agent";
+
+/// `row_session_quiet`'s columns.
+const SESSION_QUIET_SELECT: &str = "SELECT id, to_session, from_label, from_session, origin, hop, text, created_at,
+    shown_at, dropped, reply_to, to_run, width, late_reply_to FROM quiet_messages";
+
+/// A quiet message's stored origin and hop as its route (an unreadable origin as the strictest).
+fn quiet_route(origin: String, hop: i64) -> (crate::agents::Origin, u32) {
+    (crate::agents::Origin::parse(&origin).unwrap_or(crate::agents::Origin::Webhook), hop.clamp(0, u32::MAX as i64) as u32)
+}
 
 fn perms_json(p: &Permissions) -> String {
     serde_json::to_string(p).unwrap_or_else(|_| "{}".into())
@@ -1764,21 +1781,21 @@ impl Store {
     }
 
     /// `insert_agent_message_capped` for a quiet message (`m.quiet`): also refused while
-    /// `waiting.1` quiet messages created at or after `waiting.0` still wait for the agent's
-    /// next turn, counted in the same transaction.
+    /// `keep.max` quiet messages created at or after `keep.after` still wait for the agent's next
+    /// turn, counted in the same transaction. Kept with the receiver's width `keep.width`.
     pub fn insert_agent_message_capped_waiting(
         &self,
         m: &crate::agents::AgentMessage,
         since: i64,
         cap: usize,
         unattended_cap: Option<usize>,
-        waiting: Option<(i64, usize)>,
+        keep: Option<&crate::quiet::Keep>,
     ) -> anyhow::Result<Result<i64, CapHit>> {
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
-        if let Some((after, max)) = waiting {
-            let w = Self::count_quiet_agent_on(&tx, m.to_agent, after)?;
-            if w >= max {
+        if let Some(k) = keep {
+            let w = Self::count_quiet_agent_on(&tx, m.to_agent, k.after)?;
+            if w >= k.max {
                 return Ok(Err(CapHit::Waiting(w)));
             }
         }
@@ -1799,6 +1816,9 @@ impl Store {
         }
         Self::insert_agent_message_on(&tx, m, None)?;
         let id = tx.last_insert_rowid();
+        if let Some(k) = keep {
+            tx.execute("UPDATE agent_messages SET width = ?2 WHERE id = ?1", params![id, k.width])?;
+        }
         tx.commit()?;
         Ok(Ok(id))
     }
@@ -1815,19 +1835,22 @@ impl Store {
         Ok(n.max(0) as usize)
     }
 
-    fn count_quiet_session_on(conn: &Connection, session: SessionId, after: i64) -> rusqlite::Result<usize> {
+    /// A session's quiet messages for its run `run` (those for an earlier run never count).
+    fn count_quiet_session_on(conn: &Connection, session: SessionId, after: i64, run: u64) -> rusqlite::Result<usize> {
         let n: i64 = conn.query_row(
             "SELECT COUNT(*) FROM quiet_messages WHERE to_session = ?1 AND shown_at IS NULL AND dropped IS NULL
-             AND created_at >= ?2",
-            params![session, after],
+             AND created_at >= ?2 AND to_run = ?3",
+            params![session, after, run as i64],
             |r| r.get(0),
         )?;
         Ok(n.max(0) as usize)
     }
 
-    /// Quiet messages waiting for a turn of `session` (and of its agent `agent`): created at or
-    /// after `after`, never shown, and not offered to run `run` at or after `offered_before` (an
-    /// offer to another run is never confirmed, so it is offered again at once).
+    /// Quiet messages waiting for a turn of `session` (and of its agent `agent`) on run `run`:
+    /// created at or after `after`, never shown, kept for a receiver at least as wide as `width`
+    /// (a wider run doesn't take them), and not offered at or after `offered_before` unless to an
+    /// older run (an offer to an older run is never confirmed, so a newer run takes it at once;
+    /// a newer run's offer is never taken by an older one). A session's only for run `run`.
     fn quiet_waiting_on(
         conn: &Connection,
         agent: Option<i64>,
@@ -1835,24 +1858,25 @@ impl Store {
         after: i64,
         offered_before: i64,
         run: u64,
+        width: i64,
     ) -> rusqlite::Result<(Vec<crate::agents::AgentMessage>, Vec<crate::quiet::SessionQuiet>)> {
         let run = run as i64;
         let mut agent_rows = Vec::new();
         if let Some(agent) = agent {
             let mut st = conn.prepare(&format!(
                 "{AGENT_MESSAGE_SELECT} WHERE m.to_agent = ?1 AND m.quiet = 1 AND m.shown_at IS NULL
-                 AND m.expired_at IS NULL AND m.refused IS NULL AND m.created_at >= ?2
-                 AND (m.offered_at IS NULL OR m.offered_at < ?3 OR m.offered_run IS NOT ?4) ORDER BY m.id"
+                 AND m.expired_at IS NULL AND m.refused IS NULL AND m.created_at >= ?2 AND m.width >= ?5
+                 AND (m.offered_at IS NULL OR m.offered_at < ?3 OR IFNULL(m.offered_run, -1) < ?4) ORDER BY m.id"
             ))?;
-            let rows = st.query_map(params![agent, after, offered_before, run], Self::row_agent_message)?;
+            let rows = st.query_map(params![agent, after, offered_before, run, width], Self::row_agent_message)?;
             agent_rows = rows.collect::<Result<_, _>>()?;
         }
-        let mut st = conn.prepare(
-            "SELECT id, to_session, from_label, from_session, origin, hop, text, created_at, shown_at, dropped, reply_to
-             FROM quiet_messages WHERE to_session = ?1 AND shown_at IS NULL AND dropped IS NULL
-             AND created_at >= ?2 AND (offered_at IS NULL OR offered_at < ?3 OR offered_run IS NOT ?4) ORDER BY id",
-        )?;
-        let rows = st.query_map(params![session, after, offered_before, run], Self::row_session_quiet)?;
+        let mut st = conn.prepare(&format!(
+            "{SESSION_QUIET_SELECT} WHERE to_session = ?1 AND shown_at IS NULL AND dropped IS NULL
+             AND created_at >= ?2 AND to_run = ?4 AND width >= ?5
+             AND (offered_at IS NULL OR offered_at < ?3 OR IFNULL(offered_run, -1) < ?4) ORDER BY id",
+        ))?;
+        let rows = st.query_map(params![session, after, offered_before, run, width], Self::row_session_quiet)?;
         Ok((agent_rows, rows.collect::<Result<_, _>>()?))
     }
 
@@ -1870,17 +1894,25 @@ impl Store {
             shown_at: r.get(8)?,
             dropped: r.get(9)?,
             reply_to: r.get(10)?,
+            to_run: r.get::<_, i64>(11)?.max(0) as u64,
+            width: r.get(12)?,
+            late_reply_to: r.get(13)?,
         })
     }
 
-    /// How many quiet messages wait for `session`'s next turn (its agent `agent`'s included).
-    pub fn quiet_count(&self, agent: Option<i64>, session: SessionId, after: i64) -> anyhow::Result<usize> {
+    /// How many quiet messages wait for `session`'s next turn on run `run` (its agent `agent`'s
+    /// included, whatever run takes them; a session's only for that run).
+    pub fn quiet_count(&self, agent: Option<i64>, session: SessionId, run: Option<u64>, after: i64) -> anyhow::Result<usize> {
         let conn = self.conn.lock();
         let a = match agent {
             Some(agent) => Self::count_quiet_agent_on(&conn, agent, after)?,
             None => 0,
         };
-        Ok(a + Self::count_quiet_session_on(&conn, session, after)?)
+        let s = match run {
+            Some(run) => Self::count_quiet_session_on(&conn, session, after, run)?,
+            None => 0,
+        };
+        Ok(a + s)
     }
 
     /// How many quiet messages wait for agent `agent`'s next turn, whatever its session.
@@ -1888,21 +1920,22 @@ impl Store {
         Ok(Self::count_quiet_agent_on(&self.conn.lock(), agent, after)?)
     }
 
-    /// Does a quiet message on unattended work (any origin but the human's) wait for `agent`?
-    pub fn quiet_has_unattended(&self, agent: i64, after: i64) -> anyhow::Result<bool> {
+    /// Does a quiet message of origin `origin` wait for `agent`?
+    pub fn quiet_has_origin(&self, agent: i64, origin: crate::agents::Origin, after: i64) -> anyhow::Result<bool> {
         Ok(self.conn.lock().query_row(
             "SELECT EXISTS(SELECT 1 FROM agent_messages WHERE to_agent = ?1 AND quiet = 1 AND shown_at IS NULL
-             AND expired_at IS NULL AND refused IS NULL AND created_at >= ?2 AND origin != 'human')",
-            params![agent, after],
+             AND expired_at IS NULL AND refused IS NULL AND created_at >= ?2 AND origin = ?3)",
+            params![agent, after, origin.as_str()],
             |r| r.get(0),
         )?)
     }
 
     /// `POST /quiet/take` in one transaction: the messages waiting for a turn of `session` run
-    /// `run` (`quiet_waiting_on`), of which `choose` picks some (`Shown`) and says what else to
-    /// save: the attribution record, JSON (`Some`: the turn's provenance changed). The picked are
-    /// marked offered to `run` at `now` and the attribution saved with them, so two takes can't
-    /// offer one message twice and a turn never has the messages without their provenance.
+    /// `run` of width `width` (`quiet_waiting_on`), of which `choose` picks some (`Shown`) and
+    /// says what else to save: the attribution record, JSON (`Some`: the turn's provenance
+    /// changed). The picked are marked offered to `run` at `now` and the attribution saved with
+    /// them, so two takes can't offer one message twice and a turn never has the messages
+    /// without their provenance.
     #[allow(clippy::too_many_arguments)]
     pub fn take_quiet<R>(
         &self,
@@ -1911,12 +1944,13 @@ impl Store {
         after: i64,
         offered_before: i64,
         run: u64,
+        width: i64,
         now: i64,
         choose: impl FnOnce(&[crate::agents::AgentMessage], &[crate::quiet::SessionQuiet]) -> Option<(crate::quiet::Shown, R, Option<String>)>,
     ) -> anyhow::Result<Option<(crate::quiet::Shown, R)>> {
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
-        let (agent_rows, session_rows) = Self::quiet_waiting_on(&tx, agent, session, after, offered_before, run)?;
+        let (agent_rows, session_rows) = Self::quiet_waiting_on(&tx, agent, session, after, offered_before, run, width)?;
         if agent_rows.is_empty() && session_rows.is_empty() {
             return Ok(None);
         }
@@ -1952,23 +1986,22 @@ impl Store {
     }
 
     /// Of `ids`, the quiet messages that were offered to run `run` of `session` (agent messages:
-    /// to its agent `agent`) and aren't marked shown yet: what a later hook of that run may confirm.
+    /// to its agent `agent`) and aren't shown, expired or dropped: what a later hook of that run
+    /// may confirm.
     pub fn quiet_offered(&self, agent: Option<i64>, session: SessionId, ids: &crate::quiet::Shown, run: u64)
         -> anyhow::Result<crate::quiet::Shown> {
         let conn = self.conn.lock();
         let run = run as i64;
         let mut out = crate::quiet::Shown::default();
-        let route = |o: String, h: i64| (crate::agents::Origin::parse(&o).unwrap_or(crate::agents::Origin::Webhook),
-            h.clamp(0, u32::MAX as i64) as u32);
         if let Some(agent) = agent {
             for id in &ids.agent {
                 let row: Option<(String, i64)> = conn.query_row(
                     "SELECT origin, hop FROM agent_messages WHERE id = ?1 AND to_agent = ?2 AND quiet = 1
-                     AND offered_run = ?3 AND shown_at IS NULL AND refused IS NULL",
+                     AND offered_run = ?3 AND shown_at IS NULL AND expired_at IS NULL AND refused IS NULL",
                     params![id, agent, run], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
                 if let Some((o, h)) = row {
                     out.agent.push(*id);
-                    out.routes.push(route(o, h));
+                    out.routes.push(quiet_route(o, h));
                 }
             }
         }
@@ -1979,88 +2012,140 @@ impl Store {
                 params![id, session, run], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
             if let Some((o, h)) = row {
                 out.session.push(*id);
-                out.routes.push(route(o, h));
+                out.routes.push(quiet_route(o, h));
             }
         }
         Ok(out)
     }
 
+    /// Every quiet message offered to run `run` of `session` (agent messages: to its agent
+    /// `agent`) that no hook has confirmed shown yet, and that hasn't expired or been dropped:
+    /// what any prompt of that run may have in front of it.
+    pub fn quiet_offered_run(&self, agent: Option<i64>, session: SessionId, run: u64) -> anyhow::Result<crate::quiet::Shown> {
+        let conn = self.conn.lock();
+        let run = run as i64;
+        let mut out = crate::quiet::Shown::default();
+        if let Some(agent) = agent {
+            let mut st = conn.prepare("SELECT id, origin, hop FROM agent_messages WHERE to_agent = ?1 AND quiet = 1
+                AND offered_run = ?2 AND shown_at IS NULL AND expired_at IS NULL AND refused IS NULL ORDER BY id")?;
+            let rows = st.query_map(params![agent, run], |r| Ok((r.get::<_, i64>(0)?, r.get(1)?, r.get(2)?)))?;
+            for row in rows {
+                let (id, o, h) = row?;
+                out.agent.push(id);
+                out.routes.push(quiet_route(o, h));
+            }
+        }
+        let mut st = conn.prepare("SELECT id, origin, hop FROM quiet_messages WHERE to_session = ?1
+            AND offered_run = ?2 AND shown_at IS NULL AND dropped IS NULL ORDER BY id")?;
+        let rows = st.query_map(params![session, run], |r| Ok((r.get::<_, i64>(0)?, r.get(1)?, r.get(2)?)))?;
+        for row in rows {
+            let (id, o, h) = row?;
+            out.session.push(id);
+            out.routes.push(quiet_route(o, h));
+        }
+        Ok(out)
+    }
+
+    /// Confirmation: never for a row that expired or was dropped meanwhile (`expire_quiet` skips
+    /// rows a turn has in hand, so only an offer older than that loses).
     fn mark_quiet_shown_on(tx: &rusqlite::Transaction, shown: &crate::quiet::Shown, at: i64) -> rusqlite::Result<()> {
         for id in &shown.agent {
             // Shown is when it reached the agent: `reply` may answer it from then on.
             tx.execute("UPDATE agent_messages SET shown_at = ?2, delivered_at = COALESCE(delivered_at, ?2)
-                WHERE id = ?1 AND quiet = 1 AND shown_at IS NULL", params![id, at])?;
+                WHERE id = ?1 AND quiet = 1 AND shown_at IS NULL AND expired_at IS NULL", params![id, at])?;
         }
         for id in &shown.session {
-            tx.execute("UPDATE quiet_messages SET shown_at = ?2 WHERE id = ?1 AND shown_at IS NULL", params![id, at])?;
+            tx.execute("UPDATE quiet_messages SET shown_at = ?2 WHERE id = ?1 AND shown_at IS NULL AND dropped IS NULL",
+                params![id, at])?;
         }
         Ok(())
     }
 
-    /// Keep a quiet message for an ordinary session, unless `cap` already wait for it (counted
-    /// from `after`): then `Err(count)`. A late reply (`q.reply_to`) is kept once per session: if
-    /// it is there already, that row's id.
+    /// Keep a quiet message for an ordinary session's run `q.to_run`, unless `cap` already wait
+    /// for that run (counted from `after`): then `Err(count)`. A late reply (`q.late_reply_to`)
+    /// is kept once per session: if it is there already, that row's id. Ordinary sends never
+    /// match an earlier row.
     pub fn insert_quiet_session_capped(&self, q: &crate::quiet::SessionQuiet, after: i64, cap: usize) -> anyhow::Result<Result<i64, usize>> {
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
-        if let Some(reply_to) = q.reply_to
-            && let Some(id) = Self::quiet_session_reply_on(&tx, q.to_session, reply_to)?
+        if let Some(late) = q.late_reply_to
+            && let Some(c) = Self::quiet_session_carrier_on(&tx, q.to_session, late)?
         {
-            return Ok(Ok(id));
+            return Ok(Ok(c.id));
         }
-        let n = Self::count_quiet_session_on(&tx, q.to_session, after)?;
+        let n = Self::count_quiet_session_on(&tx, q.to_session, after, q.to_run)?;
         if n >= cap {
             return Ok(Err(n));
         }
         tx.execute(
-            "INSERT INTO quiet_messages (to_session, from_label, from_session, origin, hop, text, created_at, reply_to)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![q.to_session, q.from, q.from_session, q.origin.as_str(), q.hop, q.text, q.created_at, q.reply_to],
+            "INSERT INTO quiet_messages (to_session, from_label, from_session, origin, hop, text, created_at, to_run,
+                width, reply_to, late_reply_to)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![q.to_session, q.from, q.from_session, q.origin.as_str(), q.hop, q.text, q.created_at,
+                q.to_run as i64, q.width, q.reply_to, q.late_reply_to],
         )?;
         let id = tx.last_insert_rowid();
         tx.commit()?;
         Ok(Ok(id))
     }
 
-    fn quiet_session_reply_on(conn: &Connection, session: SessionId, reply_to: i64) -> rusqlite::Result<Option<i64>> {
-        conn.query_row("SELECT id FROM quiet_messages WHERE to_session = ?1 AND reply_to = ?2",
-            params![session, reply_to], |r| r.get(0)).optional()
+    fn quiet_session_carrier_on(conn: &Connection, session: SessionId, late_reply_to: i64)
+        -> rusqlite::Result<Option<crate::quiet::SessionQuiet>> {
+        conn.query_row(&format!("{SESSION_QUIET_SELECT} WHERE to_session = ?1 AND late_reply_to = ?2"),
+            params![session, late_reply_to], Self::row_session_quiet).optional()
     }
 
-    /// The quiet message that carries message `reply_to`'s late reply to session `session`, if
-    /// one was kept (src/agent_reply.rs recovery).
-    pub fn quiet_session_reply(&self, session: SessionId, reply_to: i64) -> anyhow::Result<Option<i64>> {
-        Ok(Self::quiet_session_reply_on(&self.conn.lock(), session, reply_to)?)
+    /// The quiet message that carries message `late_reply_to`'s late reply to session `session`,
+    /// if one was kept, whatever became of it (src/agent_reply.rs recovery, the log's status).
+    pub fn quiet_session_carrier(&self, session: SessionId, late_reply_to: i64) -> anyhow::Result<Option<crate::quiet::SessionQuiet>> {
+        Ok(Self::quiet_session_carrier_on(&self.conn.lock(), session, late_reply_to)?)
     }
 
-    /// Quiet messages created before `before` and never shown are expired at `at` (agent
-    /// messages keep their row, marked; a session's are marked dropped). Returns the agent
-    /// messages expired, to publish, and whether any session's were.
-    pub fn expire_quiet(&self, before: i64, at: i64) -> anyhow::Result<(Vec<i64>, bool)> {
+    /// The message whose late reply quiet session message `id` carries, if it carries one.
+    pub fn quiet_session_late_reply(&self, id: i64) -> anyhow::Result<Option<i64>> {
+        Ok(self.conn.lock().query_row("SELECT late_reply_to FROM quiet_messages WHERE id = ?1", [id], |r| r.get(0))
+            .optional()?.flatten())
+    }
+
+    /// Quiet messages created before `before` and never shown are expired at `at`, except those
+    /// offered at or after `offered_before` (a turn has them in hand: its hook confirms them).
+    /// Agent messages keep their row, marked; a session's are marked dropped. Returns the agent
+    /// messages expired, and the messages whose late replies the session rows expired carried
+    /// (`None` for an ordinary one), to publish.
+    pub fn expire_quiet(&self, before: i64, offered_before: i64, at: i64) -> anyhow::Result<(Vec<i64>, Vec<Option<i64>>)> {
         let mut conn = self.conn.lock();
         let tx = conn.transaction()?;
         let ids: Vec<i64> = {
             let mut st = tx.prepare("SELECT id FROM agent_messages WHERE quiet = 1 AND shown_at IS NULL
-                AND expired_at IS NULL AND refused IS NULL AND created_at < ?1")?;
-            let rows = st.query_map([before], |r| r.get(0))?;
+                AND expired_at IS NULL AND refused IS NULL AND created_at < ?1
+                AND (offered_at IS NULL OR offered_at < ?2)")?;
+            let rows = st.query_map(params![before, offered_before], |r| r.get(0))?;
             rows.collect::<Result<_, _>>()?
         };
         for id in &ids {
             tx.execute("UPDATE agent_messages SET expired_at = ?2 WHERE id = ?1", params![id, at])?;
         }
-        let sessions = tx.execute("UPDATE quiet_messages SET dropped = 'expired' WHERE shown_at IS NULL AND dropped IS NULL
-            AND created_at < ?1", [before])?;
+        let sessions: Vec<Option<i64>> = {
+            let mut st = tx.prepare("UPDATE quiet_messages SET dropped = 'expired' WHERE shown_at IS NULL AND dropped IS NULL
+                AND created_at < ?1 AND (offered_at IS NULL OR offered_at < ?2) RETURNING late_reply_to")?;
+            let rows = st.query_map(params![before, offered_before], |r| r.get(0))?;
+            rows.collect::<Result<_, _>>()?
+        };
         tx.commit()?;
-        Ok((ids, sessions > 0))
+        Ok((ids, sessions))
     }
 
-    /// A session's process ended (or its tab was removed): its waiting quiet messages are
-    /// dropped with reason `why`. Returns how many.
-    pub fn drop_quiet_session(&self, session: SessionId, why: &str) -> anyhow::Result<usize> {
-        Ok(self.conn.lock().execute(
-            "UPDATE quiet_messages SET dropped = ?2 WHERE to_session = ?1 AND shown_at IS NULL AND dropped IS NULL",
-            params![session, why],
-        )?)
+    /// Session `session`'s waiting quiet messages are dropped with reason `why`: all of them, or
+    /// with `keep` those of every run but that one. Returns the messages whose late replies the
+    /// dropped rows carried (`None` for an ordinary one).
+    pub fn drop_quiet_session(&self, session: SessionId, keep: Option<u64>, why: &str) -> anyhow::Result<Vec<Option<i64>>> {
+        let conn = self.conn.lock();
+        let mut st = conn.prepare(
+            "UPDATE quiet_messages SET dropped = ?2 WHERE to_session = ?1 AND shown_at IS NULL AND dropped IS NULL
+             AND to_run IS NOT ?3 RETURNING late_reply_to",
+        )?;
+        let rows = st.query_map(params![session, why, keep.map(|r| r as i64)], |r| r.get(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
     }
 
     /// Retention for refused messages: drop those created before `before`, and all but the

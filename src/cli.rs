@@ -2621,7 +2621,7 @@ fn print_agent(verb: &str, b: &Value, name: &str) {
         );
     }
     if let Some(m) = b["sleep_after_min"].as_u64() {
-        println!("  sleeps after {} idle; the next message wakes it", crate::cache::idle_text(m as i64 * 60_000));
+        println!("  sleeps after {} idle; a message sent with wake on wakes it", crate::cache::idle_text(m as i64 * 60_000));
     }
 }
 
@@ -2740,10 +2740,10 @@ pub fn agent_ls(d: &Discovery, as_json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `muster agent sleep`: stop an idle agent's process now; its next message wakes it.
+/// `muster agent sleep`: stop an idle agent's process now; a message sent with wake on wakes it.
 pub fn agent_sleep(d: &Discovery, name: &str) -> anyhow::Result<()> {
     let a = client::rpc_with_timeout(d, "agent.sleep", json!({ "name": name }), Duration::from_secs(30))?;
-    println!("{} is asleep; the next message wakes it", a["name"].as_str().unwrap_or(name));
+    println!("{} is asleep; a message sent with wake on wakes it", a["name"].as_str().unwrap_or(name));
     Ok(())
 }
 

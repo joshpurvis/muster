@@ -187,7 +187,7 @@ pub struct Agent {
     /// Put to sleep after this many idle minutes (src/sleep.rs). None: never (the default).
     pub sleep_after_min: Option<u32>,
     /// Asleep since (Unix ms): its process was stopped while idle, its tab and conversation
-    /// kept; the next message wakes it. None: awake (running or stopped).
+    /// kept; a message sent with wake on wakes it. None: awake (running or stopped).
     pub asleep_at: Option<i64>,
     /// The human lets it ask for its own fresh start from a handoff file (src/self_handoff.rs).
     /// Off by default; only the human turns it on (`AgentUpdate::by_owner`).
@@ -1032,6 +1032,14 @@ fn unattended_of(rt: &Attributions) -> HashSet<SessionId> {
     rt.prov.iter().filter(|(_, p)| p.origin != Origin::Human).map(|(id, _)| *id).collect()
 }
 
+/// The route of a turn of session `id` answering message `delivered` (one Muster delivered to
+/// it): that message's, unless it is gone, for another session, or already answered.
+fn turn_route(store: &Store, id: SessionId, delivered: Option<i64>) -> Option<Prov> {
+    let m = store.agent_message(delivered?).ok().flatten()?;
+    (m.to_session == Some(id) && m.reply.is_none() && m.refused.is_none())
+        .then_some(Prov { origin: m.origin, hop: m.hop, msg_id: Some(m.id) })
+}
+
 impl Registry {
     /// Is session `id` doing unattended work now (its provenance a schedule's or a trigger's)?
     /// A leaf lock: safe from anywhere.
@@ -1412,17 +1420,31 @@ impl Registry {
         MsgStatus { delivered_at, active, reply }
     }
 
-    /// Offer the quiet messages waiting for a turn of session `id` on run `run` (src/quiet.rs
-    /// `take`): `pick` gets the session's provenance now, its named agent and the waiting rows
-    /// (`Store::take_quiet`), and chooses. The chosen are marked offered to `run` and the
-    /// session's provenance raised to their routes, in one transaction under this registry's
-    /// lock, so hooks replayed meanwhile see both or neither.
+    /// The turn a prompt with envelope message `msg` starts in session `id` (src/quiet.rs
+    /// `take`): that message's route when it was delivered to this session and isn't answered
+    /// yet, else None (the human's turn).
+    pub(crate) fn turn_of(&self, store: &Store, id: SessionId, msg: Option<i64>) -> Option<Prov> {
+        let delivered = {
+            let g = self.inner.lock();
+            msg.filter(|m| g.runtime.delivered.get(m).is_some_and(|(s, _)| *s == id))
+        };
+        turn_route(store, id, delivered)
+    }
+
+    /// Offer the quiet messages waiting for a turn of session `id` on run `run` of permission
+    /// mode `width` (src/quiet.rs `take_run`): `pick` gets the turn (`turn_of` for envelope
+    /// message `msg`, judged here under this registry's lock, in step with the prompt callbacks),
+    /// its named agent and the waiting rows (`Store::take_quiet`), and chooses. The chosen are
+    /// marked offered to `run` and the session's provenance raised to their routes, in one
+    /// transaction under this registry's lock, so hooks replayed meanwhile see both or neither.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn offer_quiet<R>(
         &self,
         store: &Store,
         id: SessionId,
         run: u64,
+        msg: Option<i64>,
+        width: i64,
         after: i64,
         offered_before: i64,
         now: i64,
@@ -1431,9 +1453,11 @@ impl Registry {
         let mut g = self.inner.lock();
         let named = g.agents.values().find(|a| a.session_id == Some(id)).cloned();
         let cur = g.runtime.prov.get(&id).copied();
+        let delivered = msg.filter(|m| g.runtime.delivered.get(m).is_some_and(|(s, _)| *s == id));
+        let turn = turn_route(store, id, delivered);
         let mut next = g.runtime.clone();
-        let out = store.take_quiet(named.as_ref().map(|a| a.id), id, after, offered_before, run, now, |a, s| {
-            let (shown, r) = pick(cur, named.as_ref(), a, s)?;
+        let out = store.take_quiet(named.as_ref().map(|a| a.id), id, after, offered_before, run, width, now, |a, s| {
+            let (shown, r) = pick(turn, named.as_ref(), a, s)?;
             if let Some(p) = shown.raise(cur) {
                 next.prov.insert(id, p);
             }
@@ -1526,24 +1550,30 @@ impl Registry {
                 }
                 _ => {},
             }
-            // Quiet messages the hook put in front of this turn (src/quiet.rs): only those
-            // offered to this run, never shown before. `take` raised the provenance to their
-            // routes already; a human's prompt above may have lowered it again, so raise it here
-            // too. They count as shown once a later hook of the run shows the turn ran. A pending
-            // set from an earlier prompt is dropped: that prompt never ran (another hook blocked
-            // it), and its messages stay offered, to be offered again.
+            // Quiet messages (src/quiet.rs). `take` raised the provenance to their routes
+            // already; the prompt above may have set it again (a human's lowers it), and this
+            // callback may arrive in any order with the offers, so every prompt of the run is
+            // raised to everything offered to the run and not shown yet, whichever prompt had it.
+            let offered_run = store.quiet_offered_run(named, info.id, run)?;
+            if let Some(p) = offered_run.raise(next.prov.get(&info.id).copied()) {
+                next.prov.insert(info.id, p);
+            }
+            // Those the hook put in front of this turn (only those offered to this run, never
+            // shown before) count as shown once a later hook of the run shows the turn ran. A
+            // pending set from an earlier prompt is dropped: that prompt never ran (another hook
+            // blocked it), and its messages stay offered, to be offered again.
             next.quiet_pending.remove(&info.id);
             let named_ids = crate::quiet::Shown::from_payload(payload);
             if !named_ids.is_empty() {
                 let offered = store.quiet_offered(named, info.id, &named_ids, run)?;
                 if !offered.is_empty() {
-                    if let Some(p) = offered.raise(next.prov.get(&info.id).copied()) {
-                        next.prov.insert(info.id, p);
-                    }
                     next.quiet_pending.insert(info.id, QuietPending { run, agent: offered.agent, session: offered.session });
                 }
             }
         } else if crate::quiet::TURN_RAN.contains(&event)
+            // A subagent's tool call says nothing about the main agent's turn: the pending set
+            // stays for the main agent's own next hook.
+            && !crate::quiet::subagent_hook(payload)
             && let Some(pending) = next.quiet_pending.remove(&info.id)
             && pending.run == run
         {
@@ -1620,7 +1650,7 @@ pub fn agent_view(hub: &Hub, a: &Agent) -> Value {
 /// Tell clients about a message to an agent: new, refused, or just replied to (`agent_message`).
 pub fn publish_message(hub: &Hub, id: i64) {
     match hub.store().agent_message(id) {
-        Ok(Some(m)) => hub.emit(ServerEvent::AgentMessage(message_json(&m))),
+        Ok(Some(m)) => hub.emit(ServerEvent::AgentMessage(message_json(hub.store(), &m))),
         Ok(None) => {}
         Err(e) => tracing::warn!("reading agent message {id}: {e}"),
     }
@@ -2757,7 +2787,7 @@ async fn ask_until(hub: &Arc<Hub>, name: &str, text: String, deadline: tokio::ti
 pub async fn autostart(hub: &Arc<Hub>) {
     for a in hub.agents().list().into_iter().filter(|a| a.autostart && a.asleep_at.is_none()) {
         // Checked again under the start lock: a sleep since the list was read (the idle sweep
-        // runs from daemon start too) keeps it asleep; its next message wakes it (src/sleep.rs).
+        // runs from daemon start too) keeps it asleep; a message sent with wake on wakes it (src/sleep.rs).
         let r = {
             let _one = hub.agents().start_lock.lock().await;
             match hub.agents().by_id(a.id).filter(|b| b.autostart && b.asleep_at.is_none()) {
@@ -3000,8 +3030,10 @@ pub struct QuietSent {
 /// The stored half of `deliver` for a message sent with wake=false (src/quiet.rs): the agent's
 /// kind, the route (its accepted origins and the hop limit, so every quiet path gets them), the
 /// spend caps (with a fresh reading, as `deliver`), both daily caps and the waiting cap, then the
-/// message is kept for the agent's next turn. Never starts, wakes or types into the agent. The
-/// caller checked the permission width, as for `deliver`. A policy refusal is `Refused`.
+/// message is kept for a later turn of the agent that can take it. Never starts, wakes or types
+/// into the agent. The caller checked the permission width, as for `deliver`; the message keeps
+/// the width it reaches now (`reach_profile`), and a run wider than that won't take it. A policy
+/// refusal is `Refused`.
 pub async fn quiet(hub: &Hub, out: Outgoing) -> anyhow::Result<QuietSent> {
     let text = crate::mcp::tools::clean_text(&out.text);
     let a = hub.agents().get(&out.agent).ok_or_else(|| no_agent(hub, &out.agent))?;
@@ -3015,8 +3047,10 @@ pub async fn quiet(hub: &Hub, out: Outgoing) -> anyhow::Result<QuietSent> {
     if let Err(why) = crate::quiet::check_receiver(a.kind, &a.name) {
         return Err(refuse(why));
     }
-    // A late reply starts with its "Late reply to your message" line (src/agent_reply.rs).
-    crate::quiet::check_message(&text, out.route.reply_to.is_some()).map_err(|e| anyhow::anyhow!(e))?;
+    // A late reply starts with its one-line "Late reply to your message" header
+    // (src/agent_reply.rs), which gets room of its own; any other message has the plain rule.
+    let late = out.route.reply_to.is_some() && text.starts_with("Late reply to your message ");
+    crate::quiet::check_message(&text, late).map_err(|e| anyhow::anyhow!(e))?;
     // The origin rule and hop limit of the waking path (`route`); the daily cap is counted below.
     if let Err(why) = guard::check_agent_delivery(&a.name, &a.accepts_origins, out.route.origin, out.route.hop, 0) {
         return Err(refuse(why));
@@ -3032,12 +3066,16 @@ pub async fn quiet(hub: &Hub, out: Outgoing) -> anyhow::Result<QuietSent> {
     let now = msg.created_at;
     let ucap = unattended_cap(hub, out.route);
     let waiting_after = crate::quiet::after(now);
+    let session_ch = a.session_id.and_then(|s| hub.session(s)).and_then(|s| hub.channel(s.channel_id));
+    let own_ch = a.channel_id.and_then(|c| hub.channel(c));
+    let (_, reach) = reach_profile(&a, session_ch.as_ref(), own_ch.as_ref());
+    let keep = crate::quiet::Keep { after: waiting_after, max: crate::quiet::WAITING_MAX, width: crate::quiet::width(reach.claude_mode) };
     let id = match hub.store().insert_agent_message_capped_waiting(
         &msg,
         now - guard::AGENT_CAP_WINDOW_MS,
         guard::AGENT_DAILY_PROMPT_CAP,
         ucap.map(|c| c as usize),
-        Some((waiting_after, crate::quiet::WAITING_MAX)),
+        Some(&keep),
     )? {
         Ok(id) => id,
         Err(hit) => {
@@ -3047,7 +3085,7 @@ pub async fn quiet(hub: &Hub, out: Outgoing) -> anyhow::Result<QuietSent> {
                     .unwrap_or_else(|| "daily cap reached".into()),
                 crate::store::CapHit::Unattended(n) => guard::unattended_cap_refusal(&a.name, n, ucap.unwrap_or(0)),
                 crate::store::CapHit::Waiting(n) => format!(
-                    "{} has {n} messages waiting for its next turn already; send with wake=true, or use ask_agent if it must act now",
+                    "{} has {n} messages waiting already; send with wake=true, or use ask_agent if it must act now",
                     a.name
                 ),
             };
@@ -3291,8 +3329,40 @@ pub fn agent_json(b: &Agent, session: Option<&SessionInfo>) -> Value {
     })
 }
 
+/// Where the message carrying a quiet late reply to `m` stands now (`answer.quiet_state`), for
+/// the question's overlay whatever log page holds the carrier: `waiting`, `shown` (`at`),
+/// `expired` (`at` for an agent's) or `dropped` (`reason`), with the carrier (`msg` and the
+/// asker's name `to`, or `session`). None: not a quiet reply kept for an asker, or its carrier
+/// is gone.
+fn quiet_state(store: &Store, m: &AgentMessage) -> Option<Value> {
+    let a = m.answer.as_ref().filter(|a| a.quiet && a.status == crate::agent_reply::AnswerStatus::Delivered)?;
+    if let Some(c) = a.msg {
+        let c = store.agent_message(c).ok().flatten()?;
+        return Some(match (c.shown_at, c.expired_at) {
+            (Some(at), _) => json!({"state": "shown", "at": at, "msg": c.id, "to": c.to_name}),
+            (None, Some(at)) => json!({"state": "expired", "at": at, "msg": c.id, "to": c.to_name}),
+            _ => json!({"state": "waiting", "msg": c.id, "to": c.to_name}),
+        });
+    }
+    let c = store.quiet_session_carrier(a.session?, m.id).ok().flatten()?;
+    Some(match (c.shown_at, c.dropped.as_deref()) {
+        (Some(at), _) => json!({"state": "shown", "at": at, "session": c.to_session}),
+        (None, Some("expired")) => json!({"state": "expired", "session": c.to_session}),
+        (None, Some(why)) => json!({"state": "dropped", "reason": why, "session": c.to_session}),
+        _ => json!({"state": "waiting", "session": c.to_session}),
+    })
+}
+
 /// A message as `agent.messages` and `agent_message` carry it.
-pub fn message_json(m: &AgentMessage) -> Value {
+pub fn message_json(store: &Store, m: &AgentMessage) -> Value {
+    let mut v = message_fields(m);
+    if let Some(state) = quiet_state(store, m) {
+        v["answer"]["quiet_state"] = state;
+    }
+    v
+}
+
+fn message_fields(m: &AgentMessage) -> Value {
     json!({
         "id": m.id,
         "from": m.from,
@@ -3329,7 +3399,7 @@ pub fn messages(hub: &Hub, agent: Option<&str>, before: Option<i64>, limit: Opti
     let mut ms = hub.store().agent_messages(to, before, limit + 1)?;
     let more = ms.len() > limit;
     ms.truncate(limit);
-    Ok(json!({ "messages": ms.iter().map(message_json).collect::<Vec<_>>(), "more": more }))
+    Ok(json!({ "messages": ms.iter().map(|m| message_json(hub.store(), m)).collect::<Vec<_>>(), "more": more }))
 }
 
 // ----- models and efforts -----

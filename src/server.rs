@@ -598,14 +598,18 @@ async fn hook(State(hub): State<Arc<Hub>>, Path(event): Path<String>, headers: H
     }
 }
 
-/// `POST /quiet/take` with the run's session token: the quiet messages waiting for the turn its
-/// `UserPromptSubmit` hook is starting, marked offered to that run with the session's provenance
-/// raised to theirs (src/quiet.rs). Only that session's own.
-async fn quiet_take(State(hub): State<Arc<Hub>>, headers: HeaderMap) -> Response {
-    let Some(id) = bearer(&headers).and_then(|token| hub.session_by_token(token)) else {
+/// `POST /quiet/take` with the run's session token, body `{"msg": <id> | null}` (the message id
+/// of the prompt's envelope): the quiet messages waiting for the turn its `UserPromptSubmit` hook
+/// is starting, marked offered to that run with the session's provenance raised to theirs
+/// (src/quiet.rs). Only that session's own, and only while the token's run is its current one.
+async fn quiet_take(State(hub): State<Arc<Hub>>, headers: HeaderMap, body: Bytes) -> Response {
+    let Some((id, run)) = bearer(&headers).and_then(|token| hub.session_run_by_token(token)) else {
         return unauthorized();
     };
-    match crate::quiet::take(&hub, id).await {
+    // Anything but a positive message id is a prompt Muster didn't type in: the human's turn.
+    let msg = serde_json::from_slice::<serde_json::Value>(&body).ok()
+        .and_then(|v| v.get("msg").and_then(serde_json::Value::as_i64)).filter(|m| *m > 0);
+    match crate::quiet::take_run(&hub, id, run, msg).await {
         Ok(v) => axum::Json(v).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,

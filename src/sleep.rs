@@ -30,7 +30,7 @@
 //! uncached, which costs the owner real usage. The tab says so before a wake, the wake is noted
 //! in the timeline, and a message typed in after the wake gets the cold-start mark as any
 //! message to a cold agent does. A wake that fails leaves the agent asleep, says why (its
-//! asleep bar, a notice), and the next message or typing tries again.
+//! asleep bar, a notice), and a message sent with wake on, or typing, tries again.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -703,9 +703,9 @@ pub async fn sleep(hub: &Arc<Hub>, name: &str, why: Why) -> anyhow::Result<Agent
     crate::agents::publish(hub, &a);
     let idle = now - idle_since(&info, human_at(hub, info.id, now));
     let text = match why {
-        Why::Manual => format!("{} is asleep. The next message wakes it.", a.name),
+        Why::Manual => format!("{} is asleep. A message sent with wake on wakes it.", a.name),
         Why::Idle => format!(
-            "{} fell asleep after {} idle. The next message wakes it.",
+            "{} fell asleep after {} idle. A message sent with wake on wakes it.",
             a.name,
             crate::cache::idle_text(idle)
         ),
@@ -788,7 +788,7 @@ pub(crate) fn unconfirmed(e: &anyhow::Error) -> bool {
 }
 
 /// The start that was waking agent `agent` (asleep since `asleep_at`) failed with `e`. With no
-/// run going, it is asleep again (not "stopped"): its next message, or typing into its tab,
+/// run going, it is asleep again (not "stopped"): a message sent with wake on, or typing into its tab,
 /// tries again. The keys held for it are dropped (said), and its asleep bar says why. A launch
 /// that is only unconfirmed (`unconfirmed`) hasn't failed: the wake goes on, and `settle`
 /// waits for the launch to be adopted (it is ready) or retired (the wake failed after all).
@@ -958,7 +958,7 @@ async fn ended_early(hub: &Arc<Hub>, agent: i64, tab: SessionId, asleep_at: i64)
     let name = hub.agents().by_id(agent).map(|a| a.name).unwrap_or_else(|| "The agent".into());
     tracing::warn!(agent = name, "waking: {e:#}");
     let lost = if wake_lost(hub, agent, asleep_at, &e, false) { " What you typed into its tab meanwhile wasn't sent." } else { "" };
-    hub.notice("warn", format!("{name} couldn't be woken: {e:#}. It is asleep again; the next message, or typing into its tab, tries again.{lost}"));
+    hub.notice("warn", format!("{name} couldn't be woken: {e:#}. It is asleep again; a message sent with wake on, or typing into its tab, tries again.{lost}"));
     true
 }
 

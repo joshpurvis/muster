@@ -1878,6 +1878,30 @@ impl Hub {
         self.inner.lock().sessions.get(&id).map(|e| e.generation)
     }
 
+    /// The session and run a session token belongs to, read together (src/quiet.rs).
+    pub(crate) fn session_run_by_token(&self, token: &str) -> Option<(SessionId, u64)> {
+        if token.is_empty() {
+            return None;
+        }
+        let g = self.inner.lock();
+        let id = *g.tokens.get(token)?;
+        Some((id, g.sessions.get(&id)?.generation))
+    }
+
+    /// Run `f` while session `id` is on run `run`: the sessions' lock is held throughout, so no
+    /// new run replaces it meanwhile (src/quiet.rs `take_run`). `f` may take the agent
+    /// registry's and the store's locks (the order hooks take them in), never the hub's. None:
+    /// the session is on another run, or gone.
+    pub(crate) fn with_run<R>(&self, id: SessionId, run: u64, f: impl FnOnce() -> R) -> Option<R> {
+        let g = self.inner.lock();
+        if g.sessions.get(&id).map(|e| e.generation) != Some(run) {
+            return None;
+        }
+        let r = f();
+        drop(g);
+        Some(r)
+    }
+
     /// Update the count of quiet messages waiting for the session's next turn (src/quiet.rs).
     pub fn set_quiet_waiting(&self, id: SessionId, n: u32) {
         let mut g = self.inner.lock();
@@ -1886,6 +1910,12 @@ impl Hub {
             e.info.quiet_waiting = n;
             self.publish_session(&e.info);
         }
+    }
+
+    /// Tests: put a session on run `generation` (a new run, without a terminal).
+    #[cfg(test)]
+    pub(crate) fn set_generation_for_test(&self, id: SessionId, generation: u64) {
+        if let Some(e) = self.inner.lock().sessions.get_mut(&id) { e.generation = generation; }
     }
 
     /// Tests: put a restored (exited) session in another state without a terminal.
@@ -2029,7 +2059,7 @@ impl Hub {
             // Said in the tab: the CLI printed why (e.g. "No conversation found") above.
             failed_resume_detail(code)
         } else if self.agents.sleep.is_asleep(id) {
-            // Stopped to sleep (src/sleep.rs): the next message wakes it.
+            // Stopped to sleep (src/sleep.rs): a message sent with wake on wakes it.
             crate::sleep::ASLEEP_DETAIL.to_string()
         } else {
             format!("exit code {code}")

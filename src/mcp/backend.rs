@@ -106,11 +106,14 @@ pub trait Backend: Send + Sync + 'static {
     fn agent_quiet(&self, _out: Outgoing) -> impl Future<Output = anyhow::Result<crate::agents::QuietSent>> + Send {
         async { anyhow::bail!("quiet messages unavailable in this backend") }
     }
-    /// Keep a message for an ordinary session's next turn (`quiet::send_session`).
+    /// Keep a message for a later turn of an ordinary session (`quiet::send_session`), for the
+    /// run and permission mode the caller checked (`bind`).
     fn session_quiet(&self, _to: &SessionInfo, _from: String, _from_session: Option<SessionId>, _route: crate::agents::Route,
-        _text: String) -> anyhow::Result<serde_json::Value> {
+        _text: String, _bind: Option<crate::quiet::Bind>) -> anyhow::Result<serde_json::Value> {
         anyhow::bail!("quiet messages unavailable in this backend")
     }
+    /// The run (terminal generation) session `id` is on now.
+    fn session_run(&self, _id: SessionId) -> Option<u64> { None }
     /// The caller (a promoted named agent) asks for its own fresh start (src/self_handoff.rs).
     fn agent_start_fresh(&self, _caller: SessionId, _file: &str) -> anyhow::Result<serde_json::Value> {
         anyhow::bail!("fresh starts unavailable in this backend")
@@ -237,8 +240,11 @@ impl Backend for HubBackend {
         crate::agents::quiet(&self.0, out).await
     }
     fn session_quiet(&self, to: &SessionInfo, from: String, from_session: Option<SessionId>, route: crate::agents::Route,
-        text: String) -> anyhow::Result<serde_json::Value> {
-        crate::quiet::send_session(&self.0, to, from, from_session, route, text)
+        text: String, bind: Option<crate::quiet::Bind>) -> anyhow::Result<serde_json::Value> {
+        crate::quiet::send_session(&self.0, to, from, from_session, route, text, bind, None)
+    }
+    fn session_run(&self, id: SessionId) -> Option<u64> {
+        self.0.session_run(id)
     }
     fn agent_start_fresh(&self, caller: SessionId, file: &str) -> anyhow::Result<serde_json::Value> {
         crate::self_handoff::request(&self.0, caller, file)

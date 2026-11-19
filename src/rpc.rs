@@ -2107,13 +2107,17 @@ pub fn url_origin(url: &str) -> Option<String> {
 
 tokio::task_local! {
     /// This `/api/rpc` call passed `owner_terminal`: the CLI run by the human from a terminal
-    /// outside every Muster session. Read only by `agent.update` (granting self handoff).
+    /// outside every Muster session. Read only by `agent.update` (granting self handoff, turning
+    /// on tools up front).
     static OWNER_TERMINAL: bool;
 }
 
-/// Does this call turn on an agent's self handoff (src/self_handoff.rs)?
-fn grants_self_handoff(method: &str, params: &Value) -> bool {
-    method == "agent.update" && params.get("self_handoff") == Some(&Value::Bool(true))
+/// Does this call turn on something only the human may (`owner_terminal`): an agent's self
+/// handoff (src/self_handoff.rs) or its message tools up front (src/mcp/tools.rs), either alone
+/// or both?
+fn grants_owner_switch(method: &str, params: &Value) -> bool {
+    method == "agent.update"
+        && ["self_handoff", "tools_up_front"].iter().any(|k| params.get(*k) == Some(&Value::Bool(true)))
 }
 
 /// Is the `/api/rpc` call on connection `peer` the human's own: the client token, on no session's
@@ -2151,10 +2155,10 @@ pub async fn http_call(hub: &Arc<Hub>, who: &Principal, body: &[u8], peer: Optio
     match serde_json::from_slice::<Request>(body) {
         Ok(req) => {
             let r = match authorize(hub, who, &req.method, &req.params) {
-                Ok(()) if grants_self_handoff(&req.method, &req.params) => {
+                Ok(()) if grants_owner_switch(&req.method, &req.params) => {
                     let owner = owner_terminal(hub, who, peer, &req.params).await;
                     if let Err(why) = &owner {
-                        tracing::info!("agent.update: self handoff not granted from here: {why}");
+                        tracing::info!("agent.update: an owner-only switch is not granted from here: {why}");
                     }
                     OWNER_TERMINAL.scope(owner.is_ok(), dispatch(hub, who, &req.method, req.params)).await
                 }
@@ -3606,6 +3610,31 @@ mod tests {
         let e = dispatch_via(&hub, &Principal::Local, "agent.update", json!({"name": "rpc-cody", "self_handoff": true}), Via::Window)
             .await.map_err(|e| e.0).unwrap_err();
         assert!(e.contains("Codex"), "{e}");
+    }
+
+    /// Tools up front: `http_call` runs the owner check for it alone too (the CLI's
+    /// `muster agent edit NAME --tools-up-front on` from the owner's terminal turns it on), and a
+    /// session's CLI is refused.
+    #[tokio::test]
+    async fn the_owners_terminal_turns_on_tools_up_front_by_itself() {
+        let (hub, _st) = fixture();
+        agent(&hub, "rpc-otto");
+        let on = json!({"name": "rpc-otto", "tools_up_front": true});
+        assert!(grants_owner_switch("agent.update", &on));
+        assert!(grants_owner_switch("agent.update", &json!({"name": "rpc-otto", "self_handoff": true})));
+        assert!(!grants_owner_switch("agent.update", &json!({"name": "rpc-otto", "tools_up_front": false})));
+        // `muster agent edit` typed in a Muster tab: refused, whatever the terminal check said.
+        let mut from = on.clone();
+        from["from_session"] = json!(2);
+        let e = OWNER_TERMINAL.scope(true, call(&hub, "agent.update", from)).await.unwrap_err();
+        assert!(e.contains("only the human"), "{e}");
+        // A program Muster can't place: refused.
+        let body = serde_json::to_vec(&json!({"id": 1, "method": "agent.update", "params": on})).unwrap();
+        let r = http_call(&hub, &Principal::Local, &body, None).await;
+        assert!(r["error"]["message"].as_str().unwrap_or_default().contains("only the human"), "{r}");
+        // The owner's terminal, the edit on its own: on.
+        let r = OWNER_TERMINAL.scope(true, call(&hub, "agent.update", on)).await.unwrap();
+        assert_eq!(r["tools_up_front"], true);
     }
 
     /// `start_fresh` (MCP; `muster start-fresh` calls it): refused, and recorded, unless the agent

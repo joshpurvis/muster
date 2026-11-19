@@ -1537,7 +1537,7 @@ async function quietMessages(c: Client, mcp: (token: string, name: string, args?
   const info = async () => (await c.call("hello")).sessions.find((x: Json) => x.id === sid);
   const input = () => Deno.readTextFile(`${BASE}/claude-input-${sid}`).catch(() => "");
   const take = async (t: string) => {
-    const r = await fetch(`http://127.0.0.1:${PORT}/quiet/take`, { method: "POST", headers: { Authorization: `Bearer ${t}` }, body: "{}" });
+    const r = await fetch(`http://127.0.0.1:${PORT}/quiet/take`, { method: "POST", headers: { Authorization: `Bearer ${t}` }, body: JSON.stringify({ msg: null }) });
     if (!r.ok) throw new Error(`/quiet/take: ${r.status}`);
     return await r.json();
   };

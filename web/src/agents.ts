@@ -8,6 +8,7 @@ import type {
   AgentMessage,
   AgentState,
   LateAnswer,
+  QuietState,
   ModelCatalog,
   OpenRouterModel,
   Origin,
@@ -405,35 +406,46 @@ export function quietStatus(
   }
   return {
     state: "waiting",
-    chip: "waits for next turn",
-    text: `Waits for ${m.to}'s next turn and arrives as context when it starts. Sending it didn't wake ${m.to}.`,
+    chip: "waits for a turn",
+    text: `Waits for ${m.to}'s next turn that can take it and arrives as context when that turn starts. ` +
+      `Sending it didn't wake ${m.to}.`,
   };
 }
 
-/** How a late reply sent quietly (`answer.quiet`, carried by message `answer.msg`) stands: where
- * the carrying message is now (waiting, shown at HH:MM, expired), not only the note stored when it
- * was kept. Null when it didn't go quietly to an agent, or the carrying message isn't loaded. */
+/** How a late reply sent quietly (`answer.quiet`) stands: where the message carrying it is now
+ * (waiting, shown at HH:MM, expired, dropped), not only the note stored when it was kept. From
+ * the daemon's `answer.quiet_state`, else (an older daemon) from the carrying agent message when
+ * it is loaded. Null when it didn't go quietly, or neither says. */
 export function quietAnswerText(
   a: LateAnswer,
   carrier: AgentMessage | undefined,
   time: (ms: number) => string = hhmm,
 ): string | null {
-  if (!a.quiet || a.status !== "delivered" || a.msg == null || !carrier || carrier.id !== a.msg) return null;
-  const q = quietStatus(carrier, time);
+  if (!a.quiet || a.status !== "delivered") return null;
+  let q: QuietState | null = a.quiet_state ?? null;
+  if (!q && a.msg != null && carrier?.id === a.msg) {
+    const s = quietStatus(carrier, time);
+    if (!s) return null;
+    q = { state: s.state, at: carrier.shown_at ?? carrier.expired_at, msg: carrier.id, to: carrier.to };
+  }
   if (!q) return null;
+  const who = q.session != null ? `session ${q.session}` : q.to ?? "the asker";
+  const msg = q.msg != null ? ` (message ${q.msg})` : "";
   switch (q.state) {
     case "waiting":
-      return `Waits for ${carrier.to}'s next turn as message ${carrier.id}; it arrives as context when that turn starts.`;
+      return `Waits for ${who}'s next turn that can take it${msg}; it arrives as context when that turn starts.`;
     case "shown":
-      return `Shown to ${carrier.to} at the start of a turn, ${time(carrier.shown_at!)} (message ${carrier.id}).`;
+      return `Shown to ${who} at the start of a turn${q.at != null ? `, ${time(q.at)}` : ""}${msg}.`;
     case "expired":
-      return `Expired after 7 days without being shown to ${carrier.to} (message ${carrier.id}).`;
+      return `Expired after 7 days without being shown to ${who}${msg}.`;
+    case "dropped":
+      return `Not delivered: ${q.reason ?? `${who} ended before a turn took it`}${msg}.`;
   }
 }
 
-/** The tab badge's tip: quiet messages waiting for the session's next turn. */
+/** The tab badge's tip: quiet messages waiting for a later turn of the session. */
 export function quietWaitingText(n: number): string {
-  return `${n} message${n === 1 ? "" : "s"} waiting for the next turn (sent without waking it)`;
+  return `${n} message${n === 1 ? "" : "s"} waiting for a later turn (sent without waking it)`;
 }
 
 // ---------------- moving to another account (docs/ACCOUNT_PROFILES.md) ----------------

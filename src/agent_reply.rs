@@ -91,7 +91,7 @@ pub const WAITER_MAX: Duration = Duration::from_secs(30);
 const QUOTE_MAX: usize = 80;
 
 /// What a timed-out ask says about late replies.
-pub const TIMED_OUT_NOTE: &str = "no reply yet; the message stays delivered. If the agent answers later with its reply tool, the answer comes to you as a new message (\"Late reply to your message <msg_id>\"; if it sends it with wake=false, at the start of your next turn instead), or, if the human asked, in the agents panel's message log";
+pub const TIMED_OUT_NOTE: &str = "no reply yet; the message stays delivered. If the agent answers later with its reply tool, the answer comes to you as a new message (\"Late reply to your message <msg_id>\"; if it sends it with wake=false, at the start of your next turn that can take it instead), or, if the human asked, in the agents panel's message log";
 
 /// The asks in progress (in memory: no ask survives a restart): those waiting for a message's
 /// turn, and those still delivering theirs (the message id isn't theirs to know yet).
@@ -186,9 +186,10 @@ pub fn answer_origins(m: &AgentMessage, now: Option<Prov>) -> Vec<Origin> {
 }
 
 /// May a waiting ask for `m` take answer `a` as its reply? Only when the answer brings no origin
-/// the question's own chain didn't have: otherwise it goes the guarded way, as a new message.
+/// the question's own chain didn't have and is no deeper in the chain than an answer in the
+/// question's own turn (one hop on): otherwise it goes the guarded way, as a new message.
 fn returnable(m: &AgentMessage, a: &Answer) -> bool {
-    a.origins.iter().all(|o| *o == m.origin)
+    a.origins.iter().all(|o| *o == m.origin) && a.hop <= m.hop.saturating_add(1)
 }
 
 /// Did message `m` reach its agent? Never for a refused one.
@@ -239,12 +240,14 @@ fn replier_name(hub: &Hub, m: &AgentMessage) -> String {
         .unwrap_or_else(|| format!("agent:{}", m.to_agent))
 }
 
-/// The text a reply is delivered with: which message it answers, then the answer.
+/// The text a reply is delivered with: which message it answers (a header that is always one
+/// line: every line break in the quote is a space), then the answer.
 pub fn delivered_text(m: &AgentMessage, a: &Answer) -> String {
     let quote: String = m
         .text
         .as_deref()
         .and_then(|t| t.lines().map(str::trim).find(|l| !l.is_empty()))
+        .map(|l| l.replace(crate::quiet::LINE_BREAKS, " "))
         .map(|l| {
             let mut q: String = l.chars().take(QUOTE_MAX).collect();
             if l.chars().count() > QUOTE_MAX {
@@ -297,13 +300,23 @@ pub async fn reply(hub: &Arc<Hub>, caller: SessionId, msg_id: i64, text: String,
     }
     let now = hub.agents().prov(caller);
     let route = answer_route(&m, now);
+    let origins = answer_origins(&m, now);
+    // Kept for a later turn, it carries one origin to check when that turn takes it: a reply
+    // rooted in two kinds of unattended work goes the waking way, checked against both now.
+    if !wake && origins.len() > 1 {
+        let list: Vec<&str> = origins.iter().map(Origin::as_str).collect();
+        anyhow::bail!(
+            "this reply is rooted in two kinds of unattended work ({}), and only a reply sent now is checked against both: send it with wake=true",
+            list.join(" and ")
+        );
+    }
     let answer = Answer {
         text,
         at: now_ms(),
         from_session: caller,
         origin: route.origin,
         hop: route.hop,
-        origins: answer_origins(&m, now),
+        origins,
         status: AnswerStatus::Pending,
         note: None,
         msg: None,
@@ -414,7 +427,7 @@ async fn deliver(hub: &Arc<Hub>, m: &AgentMessage, mut a: Answer) -> Answer {
                     Ok(q) => {
                         a.msg = Some(q.msg_id);
                         a.session = q.session_id;
-                        set(&mut a, AnswerStatus::Delivered, format!("waits for {}'s next turn as message {}", to.name, q.msg_id));
+                        set(&mut a, AnswerStatus::Delivered, format!("waits for {}'s next turn that can take it, as message {}", to.name, q.msg_id));
                     }
                     Err(e) if e.downcast_ref::<agents::Refused>().is_some() => {
                         set(&mut a, AnswerStatus::Refused, format!("not delivered to {}: {e:#}", to.name));
@@ -449,13 +462,14 @@ async fn deliver(hub: &Arc<Hub>, m: &AgentMessage, mut a: Answer) -> Answer {
                 return a;
             }
             if a.quiet {
-                // Kept once per answered message (`quiet_messages.reply_to`): a resumed delivery
-                // finds the row a previous backend stored.
+                // Kept once per answered message (`quiet_messages.late_reply_to`): a resumed
+                // delivery finds the row a previous backend stored. `send_session` checks the
+                // final route (the hop limit, the plain Claude rule) and binds it to this run.
                 let route = Route { origin: a.origin, hop: a.hop, reply_to: Some(m.id) };
-                match crate::quiet::send_session(hub, &s, from.clone(), Some(a.from_session), route, delivered_text(m, &a)) {
+                match crate::quiet::send_session(hub, &s, from.clone(), Some(a.from_session), route, delivered_text(m, &a), None, Some(m.id)) {
                     Ok(_) => {
                         a.session = Some(s.id);
-                        set(&mut a, AnswerStatus::Delivered, format!("waits for session {}'s next turn", s.id));
+                        set(&mut a, AnswerStatus::Delivered, format!("waits for session {}'s next turn that can take it", s.id));
                     }
                     Err(e) => set(&mut a, AnswerStatus::Undelivered, format!("not delivered to session {}: {e:#}", s.id)),
                 }
@@ -510,50 +524,63 @@ async fn resume_one(hub: &Arc<Hub>, id: i64) -> anyhow::Result<()> {
     let Some(m) = hub.store().agent_message(id)? else { return Ok(()) };
     let Some(a) = m.answer.clone() else { return Ok(()) };
     if a.status == AnswerStatus::Delivering {
-        // The restart came while it was being delivered: what got through?
-        let outcome = match asker(hub, &m) {
-            Asker::Agent(to) => {
-                match hub.store().find_answer_delivery(to.id, m.id, &replier_name(hub, &m), &delivered_text(&m, &a))? {
-                    None => None,
-                    Some(n) => match hub.store().agent_message(n)? {
-                        // Kept for its next turn: stored is delivered.
-                        Some(c) if c.quiet && c.refused.is_none() => {
-                            Some((AnswerStatus::Delivered, Some(n), format!("waits for {}'s next turn as message {n}", to.name)))
-                        }
-                        Some(c) if c.refused.is_some() => Some((
-                            AnswerStatus::Refused, Some(n),
-                            format!("not delivered to {}: {}", to.name, c.refused.unwrap_or_default()),
-                        )),
-                        Some(c) if c.reply.is_some()
-                            || hub.store().agent_message_delivered_at(n)?.is_some()
-                            || crate::inject::holds_message(hub, n) =>
-                        {
-                            Some((AnswerStatus::Delivered, Some(n), format!("delivered to {} as message {n}", to.name)))
-                        }
-                        // Recorded, but the restart came before it was queued: nothing will type
-                        // it in. Drop that row (as a failed delivery does) and send it again.
-                        _ => {
-                            hub.store().delete_agent_message(n)?;
-                            None
-                        }
-                    },
-                }
-            }
-            // Kept for its next turn: the row is linked to this message, so it is there or not, and
-            // keeping it again (`finish`) can't keep it twice.
-            Asker::Session(s) if a.quiet => hub.store().quiet_session_reply(s.id, m.id)?.map(|_| {
-                (AnswerStatus::Delivered, None, format!("waits for session {}'s next turn", s.id))
-            }),
-            // Its queue may have it: typing it again could show it twice.
-            Asker::Session(s) => Some((AnswerStatus::Undelivered, None, format!(
-                "a backend restart interrupted typing it into session {}; it may not have arrived", s.id
-            ))),
+        // The restart came while it was being delivered: what got through? A quiet one kept for
+        // a session is found by its link to this message, even after that session ended.
+        let session_carrier = match (a.quiet, m.from_session) {
+            (true, Some(s)) => hub.store().quiet_session_carrier(s, m.id)?,
             _ => None,
+        };
+        let carrier_session = session_carrier.as_ref().map(|c| c.to_session);
+        let outcome = if let Some(c) = session_carrier {
+            Some(carried(c.shown_at, c.dropped.as_deref(), None, &format!("session {}", c.to_session)))
+        } else {
+            match asker(hub, &m) {
+                Asker::Agent(to) => {
+                    match hub.store().find_answer_delivery(to.id, m.id, &replier_name(hub, &m), &delivered_text(&m, &a))? {
+                        None => None,
+                        Some(n) => match hub.store().agent_message(n)? {
+                            Some(c) if c.refused.is_some() => Some((
+                                AnswerStatus::Refused, Some(n),
+                                format!("not delivered to {}: {}", to.name, c.refused.unwrap_or_default()),
+                            )),
+                            // Kept for a later turn: what became of it.
+                            Some(c) if c.quiet => {
+                                let expired = c.expired_at.map(|_| "expired");
+                                Some(carried(c.shown_at, expired, Some(n), &to.name))
+                            }
+                            Some(c) if c.reply.is_some()
+                                || hub.store().agent_message_delivered_at(n)?.is_some()
+                                || crate::inject::holds_message(hub, n) =>
+                            {
+                                Some((AnswerStatus::Delivered, Some(n), format!("delivered to {} as message {n}", to.name)))
+                            }
+                            // Recorded, but the restart came before it was queued: nothing will type
+                            // it in. Drop that row (as a failed delivery does) and send it again.
+                            _ => {
+                                hub.store().delete_agent_message(n)?;
+                                None
+                            }
+                        },
+                    }
+                }
+                // Not kept (looked up above): `finish` keeps it now.
+                Asker::Session(_) if a.quiet => None,
+                // Its queue may have it: typing it again could show it twice.
+                Asker::Session(s) => Some((AnswerStatus::Undelivered, None, format!(
+                    "a backend restart interrupted typing it into session {}; it may not have arrived", s.id
+                ))),
+                _ => None,
+            }
         };
         let changed = hub.store().update_agent_answer(id, &[AnswerStatus::Delivering], |x| match outcome {
             Some((status, msg, note)) => {
                 x.status = status;
-                x.msg = msg;
+                if msg.is_some() {
+                    x.msg = msg;
+                }
+                if carrier_session.is_some() {
+                    x.session = carrier_session;
+                }
                 x.note = Some(note);
             }
             None => x.status = AnswerStatus::Pending,
@@ -564,6 +591,18 @@ async fn resume_one(hub: &Arc<Hub>, id: i64) -> anyhow::Result<()> {
     }
     finish(hub, id).await?;
     Ok(())
+}
+
+/// The outcome of a quiet late reply from its carrier's state (`resume_one`): kept and waiting
+/// or shown is delivered; expired or dropped (`gone`: why) is not. `to`: who it was kept for.
+fn carried(shown_at: Option<i64>, gone: Option<&str>, msg: Option<i64>, to: &str) -> (AnswerStatus, Option<i64>, String) {
+    let as_msg = msg.map(|n| format!(" as message {n}")).unwrap_or_default();
+    match (shown_at, gone) {
+        (Some(_), _) => (AnswerStatus::Delivered, msg, format!("shown to {to} at the start of a turn{as_msg}")),
+        (None, Some("expired")) => (AnswerStatus::Undelivered, msg, format!("not delivered: it expired before a turn of {to} took it")),
+        (None, Some(why)) => (AnswerStatus::Undelivered, msg, format!("not delivered: {why}")),
+        (None, None) => (AnswerStatus::Delivered, msg, format!("waits for {to}'s next turn that can take it{as_msg}")),
+    }
 }
 
 #[cfg(test)]
@@ -884,4 +923,23 @@ mod tests {
         assert_eq!(e, format!("[muster reply to msg {id} from sc_out_ origin=human hop=2]"));
         assert_eq!(agents::parse_envelope(&e), None);
     }
+
+    /// A waiting ask takes an answer as its reply only when it is no deeper in the chain than an
+    /// answer in the question's own turn: a reply the replier raised (a deep note it read) goes
+    /// as a new message, through the hop limit.
+    #[test]
+    fn a_waiting_ask_takes_only_an_answer_no_deeper_than_its_own_turn() {
+        let hub = fixture();
+        let b = agent(&hub, "beta", SessionKind::Claude, 2);
+        let m = hub.store().agent_message(msg(&hub, &b, "human", None, Origin::Human, 1, false)).unwrap().unwrap();
+        let a = |now: Option<Prov>| {
+            let r = answer_route(&m, now);
+            Answer { text: "x".into(), at: 0, from_session: 2, origin: r.origin, hop: r.hop, origins: answer_origins(&m, now),
+                status: AnswerStatus::Pending, note: None, msg: None, session: None, quiet: false }
+        };
+        assert!(returnable(&m, &a(None)));
+        assert!(returnable(&m, &a(Some(Prov { origin: Origin::Human, hop: 1, msg_id: Some(m.id) }))));
+        assert!(!returnable(&m, &a(Some(Prov { origin: Origin::Human, hop: 4, msg_id: None }))));
+    }
+
 }

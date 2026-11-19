@@ -415,14 +415,16 @@ function QuietChip({ m }: { m: AgentMessage }) {
 }
 
 function FeedEntry({ m, now }: { m: AgentMessage; now: number }) {
-  // A quiet message's status sentence, on the focusable row itself: the chip's tooltip is
-  // pointer-only.
+  // A quiet message's status sentence, on the focusable row itself, as its description and as a
+  // tip that shows when the keyboard reaches the row (the chip's own tip is pointer-only).
   const quiet = quietStatus(m);
   return (
     <button
       type="button"
       class={cx("ap-msg", m.refused && "refused")}
       aria-description={quiet?.text}
+      data-tip={quiet?.text}
+      data-tip-focus={quiet ? "" : undefined}
       data-msg={m.id}
       onClick={() => (overlay.value = { kind: "agent_message", id: m.id })}
     >

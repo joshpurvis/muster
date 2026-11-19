@@ -18,11 +18,11 @@
 //! Legacy runs retain blocking HTTP/1.1 forwarding. Both paths have an absolute deadline.
 //! Always exits 0. Prints nothing on stdout (Claude/Codex treat hook stdout as context or
 //! decisions), except Claude's `UserPromptSubmit`: it first asks the backend for the quiet
-//! messages waiting for this turn (`POST /quiet/take`, src/quiet.rs) and prints them as the
-//! turn's `additionalContext`, then names them in the payload it saves (`quiet::PAYLOAD_KEY`):
-//! the backend keeps them pending for the run, and marks them shown once a later hook of the run
-//! (`PreToolUse`, `PostToolUse`, `Stop`) shows the turn ran. No backend (a reload) means no
-//! context: they wait for the next turn. No-ops silently when MUSTER_URL / MUSTER_TOKEN are
+//! messages waiting for this turn (`POST /quiet/take` with the prompt's envelope message id,
+//! src/quiet.rs) and prints them as the turn's `additionalContext`, then names them in the
+//! payload it saves (`quiet::PAYLOAD_KEY`): the backend keeps them pending for the run, and marks
+//! them shown once a later hook of the run's main agent (`PreToolUse`, `PostToolUse`, `Stop`)
+//! shows the turn ran. No backend (a reload) means no context: they wait for a later turn. No-ops silently when MUSTER_URL / MUSTER_TOKEN are
 //! unset (and no token file stands in for MUSTER_TOKEN, see [`TOKEN_FILE`]).
 
 use std::io::{Read, Write};
@@ -121,10 +121,14 @@ fn quiet_messages(url: &str, token: &str, agent: &str, body: Vec<u8>, out: &mut 
     if payload.get("prompt").and_then(|p| p.as_str()).is_some_and(|p| p.trim_start().starts_with('/')) {
         return body;
     }
+    // The prompt's own message, when Muster typed it in (its envelope's id): the backend judges
+    // the turn by it (src/quiet.rs `take_run`); any other prompt is the human's turn.
+    let msg = payload.get("prompt").and_then(|p| p.as_str()).and_then(crate::agents::parse_envelope);
+    let request = serde_json::json!({"msg": msg}).to_string().into_bytes();
     let (tx, rx) = std::sync::mpsc::channel();
     let (url, token, agent) = (url.to_string(), token.to_string(), agent.to_string());
     std::thread::spawn(move || {
-        let _ = tx.send(post_read(&url, "/quiet/take", &token, &agent, b"{}", QUIET_MAX_RESPONSE));
+        let _ = tx.send(post_read(&url, "/quiet/take", &token, &agent, &request, QUIET_MAX_RESPONSE));
     });
     let Ok(Ok((200, answer))) = rx.recv_timeout(QUIET_WAIT) else { return body };
     let Ok(answer) = serde_json::from_slice::<serde_json::Value>(&answer) else { return body };
@@ -481,7 +485,7 @@ mod tests {
             while let Ok(n) = c.read(&mut buf) {
                 if n == 0 { break }
                 req.extend_from_slice(&buf[..n]);
-                if req.ends_with(b"{}") { break }
+                if req.ends_with(b"}") { break }
             }
             c.write_all(response).unwrap();
             String::from_utf8(req).unwrap()
@@ -498,12 +502,24 @@ mod tests {
         let body = quiet_messages(&format!("http://127.0.0.1:{port}"), "tok", "claude", br#"{"prompt":"hi"}"#.to_vec(), &mut out);
         let req = h.join().unwrap();
         assert!(req.starts_with("POST /quiet/take HTTP/1.1\r\n") && req.contains("Authorization: Bearer tok\r\n"), "{req}");
+        // A typed prompt names no message: the backend takes it as the human's turn.
+        assert!(req.ends_with("\r\n\r\n{\"msg\":null}"), "{req}");
         // Claude Code's hook output: one JSON object on stdout.
         let printed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(printed, serde_json::json!({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": "Messages for you"}}));
         let saved: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(saved["prompt"], "hi");
         assert_eq!(saved[crate::quiet::PAYLOAD_KEY], serde_json::json!({"agent": [7], "session": []}));
+    }
+
+    #[test]
+    fn a_prompt_muster_typed_in_names_its_message() {
+        let (port, h) = answer_once(b"HTTP/1.1 200 OK\r\ncontent-length: 25\r\n\r\n{\"context\":null,\"left\":0}");
+        let mut out = Vec::new();
+        let prompt = br#"{"prompt":"[muster msg 12 from alpha origin=human hop=1]\nrun the tests"}"#.to_vec();
+        quiet_messages(&format!("http://127.0.0.1:{port}"), "tok", "claude", prompt, &mut out);
+        let req = h.join().unwrap();
+        assert!(req.ends_with("\r\n\r\n{\"msg\":12}"), "{req}");
     }
 
     #[test]

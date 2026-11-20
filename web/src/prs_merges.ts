@@ -17,18 +17,22 @@ export const queuedMerges = signal<ReadonlyMap<number, Queued>>(new Map());
 export const mergedHere = signal<ReadonlySet<number>>(new Set());
 /** Why a card's last send from here failed, for the post and commit tried (shown on that card
  * until Merge is clicked again). */
-export const failedMerges = signal<ReadonlyMap<number, { text: string; post: number; sha: string }>>(new Map());
+export const failedMerges = signal<ReadonlyMap<number, { text: string; post: number; sha: string; lost: boolean }>>(new Map());
+/** Cards whose merge went out but whose answer was lost, with the card's `updated_at` then: they
+ * keep their strip place until Muster's next word on the card settles it. */
+const unresolved = new Map<number, number>();
 /** Cards whose `pr.merge` went out on an open connection (until its failure is handled). */
 const sentOpen = new Set<number>();
-const LOST = "its answer was lost on the way, so Muster may be merging it: the card updates when Muster is reachable " +
-  "again, and Merge again can't merge it twice";
+const LOST = "Muster's answer was lost on the way, so it may be merging it: the card updates when Muster is " +
+  "reachable again, and Merge again can't merge it twice";
 
 /** Forget the cards whose merge has ended (the tab shown again, the filter changed); one still
  * counting down or merging keeps its place. */
 export function clearSettled() {
   const q = queuedMerges.peek();
   const cards = prs.peek();
-  mergedHere.value = new Set([...mergedHere.peek()].filter((id) => q.has(id) || cards.get(id)?.status === "merging"));
+  mergedHere.value = new Set([...mergedHere.peek()]
+    .filter((id) => q.has(id) || unresolved.has(id) || cards.get(id)?.status === "merging"));
 }
 
 const errText = (e: unknown) => (e instanceof Error ? e.message : String(e));
@@ -55,13 +59,14 @@ const queue = mergeQueue(COUNTDOWN_S * 1000, {
     // taken, so the card keeps its place and says the outcome is unknown.
     const lost = !(e instanceof RpcError && e.answered) && sentOpen.has(seen.id);
     sentOpen.delete(seen.id);
-    if (!lost && p?.status !== "merging" && p?.status !== "merged") {
+    if (lost) unresolved.set(seen.id, p?.updated_at ?? 0);
+    else if (!unresolved.has(seen.id) && p?.status !== "merging" && p?.status !== "merged") {
       const kept = new Set(mergedHere.peek());
       kept.delete(seen.id);
       mergedHere.value = kept;
     }
     const text = lost ? LOST : errText(e);
-    failedMerges.value = new Map(failedMerges.peek()).set(seen.id, { text, post: seen.post, sha: seen.sha });
+    failedMerges.value = new Map(failedMerges.peek()).set(seen.id, { text, post: seen.post, sha: seen.sha, lost });
     toast("error", `${nameOf(seen.id)}: ${text}`, 8000);
   },
   changed: (all) => { queuedMerges.value = all; },
@@ -83,6 +88,18 @@ export const cancelMerge = (id: number) => queue.stop(id);
 // and a toast says why (the merge would be refused anyway).
 effect(() => {
   const cards = prs.value;
+  // Muster's next word on a card whose answer was lost settles it: the unknown note goes.
+  for (const [id, at] of [...unresolved]) {
+    const p = cards.get(id);
+    if (p && p.updated_at <= at) continue;
+    unresolved.delete(id);
+    const f = failedMerges.peek().get(id);
+    if (f?.lost) {
+      const m = new Map(failedMerges.peek());
+      m.delete(id);
+      failedMerges.value = m;
+    }
+  }
   for (const [id, q] of queuedMerges.peek()) {
     if (q.phase !== "count") continue;
     const p = cards.get(id);

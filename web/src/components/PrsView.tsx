@@ -456,7 +456,7 @@ function Dock({ p, now, order, onPick }: { p: Pr; now: number; order: string; on
   const counting = queued?.phase === "count" && p.status === "waiting";
   // Why this card's last send from here failed (for this post and commit), until Merge is clicked again.
   const tried = failedMerges.value.get(p.id);
-  const failed = tried && tried.post === p.post && tried.sha === p.head_sha ? tried.text : undefined;
+  const failed = tried && tried.post === p.post && tried.sha === p.head_sha ? tried : undefined;
   // Re-renders the seconds left while it counts down.
   useNow(counting ? 200 : 60_000);
 
@@ -707,7 +707,7 @@ function Dock({ p, now, order, onPick }: { p: Pr; now: number; order: string; on
             {hint
               ? <span class="off" role="status">{hint}</span>
               : failed && can
-              ? <span class="off" role="status">Not merged: {failed}</span>
+              ? <span class="off" role="status">{failed.lost ? "Outcome unknown" : "Not merged"}: {failed.text}</span>
               : can
               ? <span class="pm-fine-text">A merge commit into {baseName(p)}; Muster leaves the branch alone. You get {COUNTDOWN_S} seconds to cancel, and can move on meanwhile.</span>
               : off && <span class="off">Merge is off: {off}.</span>}

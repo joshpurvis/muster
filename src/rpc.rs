@@ -1047,7 +1047,7 @@ async fn dispatch_inner(hub: &Arc<Hub>, who: &Principal, method: &str, params: V
                 // The human's keys (a paired phone, `muster keys` outside a session) take the
                 // same path as a client's: no session lookup under the hub lock, no SQLite.
                 None => {
-                    hub.note_human_input(p.id);
+                    hub.note_human_keys(p.id, p.data.as_bytes());
                     // An asleep agent's tab: held until it has woken (src/sleep.rs).
                     match crate::sleep::keys(hub, p.id, p.data.as_bytes()) {
                         crate::sleep::Keys::Held => return Ok(json!({})),
@@ -1214,7 +1214,16 @@ async fn dispatch_inner(hub: &Arc<Hub>, who: &Principal, method: &str, params: V
                 .agents()
                 .list()
                 .iter()
-                .map(|b| crate::agents::agent_view(hub, b))
+                .map(|b| {
+                    let mut v = crate::agents::agent_view(hub, b);
+                    // Prompts waiting to be typed into it, and why (`muster agent ls`). Here only,
+                    // not in every `agent_upserted`: it reads the screen.
+                    if let Some(s) = b.session_id.and_then(|s| hub.session(s)).filter(|s| s.queued > 0) {
+                        v["queued"] = json!(s.queued);
+                        v["queue_waits"] = json!(crate::inject::wait_reason(hub, s.id).map(|w| w.text));
+                    }
+                    v
+                })
                 .collect();
             Ok(Value::Array(out))
         }
@@ -1248,6 +1257,9 @@ async fn dispatch_inner(hub: &Arc<Hub>, who: &Principal, method: &str, params: V
             }
             Ok(json!({
                 "agent": crate::agents::agent_json(&bs.agent, Some(&bs.session)),
+                // Prompts waiting to be typed into it now; after a fresh start, the ones kept
+                // from before it (src/inject.rs `carry_over`).
+                "queued_prompts": hub.session(bs.session.id).map_or(0, |s| s.queued),
                 // The running process keeps the provider it started with: a change shows here
                 // until a restart (Start fresh, or Stop then Start) applies it.
                 "provider_pending": !bs.started && bs.session.provider != bs.agent.provider,
@@ -2351,7 +2363,7 @@ pub async fn ws_session(socket: WebSocket, hub: Arc<Hub>, who: Principal, link: 
                     // Keystrokes from a client window or a paired phone: the human's input.
                     // The marker is recorded in memory and committed off this path, so a
                     // keystroke never waits on SQLite or the callback lock (Hub::note_human_input).
-                    hub.note_human_input(id);
+                    hub.note_human_keys(id, &data[5..]);
                     // An asleep agent's tab: held until it has woken (src/sleep.rs). Admitted
                     // until the terminal host has them, so a sleep can't stop the run meanwhile.
                     let admitted = match crate::sleep::keys(&hub, id, &data[5..]) {

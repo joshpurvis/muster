@@ -1524,7 +1524,7 @@ struct AgentSend {
 /// The checks before any message to a named agent: the name, size and text rules, the
 /// permission width over the agent's tabs, the origin rule, hop limit and daily cap, then the
 /// rate limit. Policy refusals are kept for the agents panel's log.
-fn agent_send<B: Backend>(st: &McpState<B>, caller: SessionId, name: &str, text: &str) -> Result<AgentSend, String> {
+fn agent_send<B: Backend>(st: &McpState<B>, caller: SessionId, name: &str, text: &str, wake: bool) -> Result<AgentSend, String> {
     let agent = st
         .backend
         .agents()
@@ -1553,9 +1553,10 @@ fn agent_send<B: Backend>(st: &McpState<B>, caller: SessionId, name: &str, text:
     check_no_shell_escape(st, agent.kind, &text)?;
     let me = caller_session(st, caller)?;
     let from = crate::agents::sender_label(st.backend.agents().iter().find(|b| b.session_id == Some(caller)), caller);
+    let prov = caller_prov(st, caller);
     // Policy refusals (permissions, origin, hops, cap) are kept for the agents panel's log.
     let refused = |why: String| {
-        let proposed = crate::agents::proposed_route(caller_prov(st, caller), None);
+        let proposed = crate::agents::proposed_route(prov, None);
         st.backend
             .agent_refused(crate::agents::message_record(&agent, &from, Some(caller), proposed, &text), &why);
         why
@@ -1569,15 +1570,11 @@ fn agent_send<B: Backend>(st: &McpState<B>, caller: SessionId, name: &str, text:
     let recent = st
         .backend
         .agent_messages_since(agent.id, now_ms() - guard::AGENT_CAP_WINDOW_MS);
-    let route = crate::agents::route(&agent, caller_prov(st, caller), None, recent).map_err(refused)?;
-    if let Err(wait_s) = st.edit_guard(|g| g.sends.check_and_record(
-        caller, now_ms(), st.limits.send_per_window, st.limits.send_window_ms,
-    ))? {
-        return Err(format!(
-            "rate limit: at most {} messages per minute. Try again in {wait_s}s.",
-            st.limits.send_per_window
-        ));
+    let route = crate::agents::route(&agent, prov, None, recent).map_err(refused)?;
+    if !wake {
+        crate::quiet::check_quiet_origin(route.origin)?;
     }
+    reserve_send(st, caller)?;
     let out = crate::agents::Outgoing {
         agent: agent.name.clone(),
         agent_id: Some(agent.id),
@@ -1600,7 +1597,7 @@ async fn ask_agent<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_>
         .int("timeout_seconds")?
         .unwrap_or(AGENT_ASK_DEFAULT_S)
         .clamp(1, st.limits.wait_max_s as i64) as u64;
-    let AgentSend { agent, out, .. } = agent_send(st, caller, name, text)?;
+    let AgentSend { agent, out, .. } = agent_send(st, caller, name, text, true)?;
     let route = out.route;
     // A reply that comes before this ask starts waiting below still goes to it.
     let asking = st.backend.agent_asking(agent.id, caller);
@@ -1651,12 +1648,10 @@ async fn tell_agent<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_
             crate::quiet::check_receiver(agent.kind, &agent.name)?;
         }
         crate::quiet::check_text(&clean_text(text))?;
-        crate::quiet::check_quiet_origin(caller_route(st, caller).origin)?;
     }
-    let AgentSend { agent, out, width } = agent_send(st, caller, name, text)?;
+    let AgentSend { agent, out, width } = agent_send(st, caller, name, text, wake)?;
     let route = out.route;
     if !wake {
-        crate::quiet::check_quiet_origin(route.origin)?;
         return match st.backend.agent_quiet(out, width).await {
             Ok(q) => Ok(pretty(&json!({
                 "agent": agent.name,
@@ -1733,6 +1728,10 @@ async fn reply<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_>) ->
     if !wake {
         crate::quiet::check_text(&text)?;
     }
+    st.backend.agent_reply(caller, msg_id, text, wake).await.map(|v| pretty(&v)).map_err(|e| format!("{e:#}"))
+}
+
+pub(crate) fn reserve_send<B: Backend>(st: &McpState<B>, caller: SessionId) -> Result<(), String> {
     if let Err(wait_s) = st.edit_guard(|g| g.sends.check_and_record(
         caller, now_ms(), st.limits.send_per_window, st.limits.send_window_ms,
     ))? {
@@ -1741,14 +1740,7 @@ async fn reply<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_>) ->
             st.limits.send_per_window
         ));
     }
-    match st.backend.agent_reply(caller, msg_id, text, wake).await {
-        Ok(v) => Ok(pretty(&v)),
-        Err(e) => {
-            // Refused before anything was stored or sent: the slot isn't used.
-            if let Err(error) = st.edit_guard(|g| g.sends.refund(caller)) { tracing::warn!("{error}"); }
-            Err(format!("{e:#}"))
-        }
-    }
+    Ok(())
 }
 
 /// `start_fresh`: a promoted named agent asks for its own fresh start (src/self_handoff.rs). Only

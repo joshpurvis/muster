@@ -1780,7 +1780,7 @@ async fn ask_agent_origin_rule_hops_and_cap() {
 #[tokio::test]
 async fn a_lead_agents_scheduled_turn_counts_as_the_humans() {
     use crate::agents::{Origin, Prov, Source};
-    let (m, st) = state();
+    let (m, mut st) = state();
     with_agents(&m);
     // A second Claude agent to message: bea (session 6).
     {
@@ -1817,16 +1817,24 @@ async fn a_lead_agents_scheduled_turn_counts_as_the_humans() {
     assert_eq!((v["reply"].as_str(), v["origin"].as_str(), v["hop"].as_u64()), (Some("bea says hi"), Some("lead"), Some(2)));
     let out = m.d.lock().deliveries.last().unwrap().route;
     assert_eq!((out.origin, out.hop, out.reply_to), (Origin::Lead, 2, Some(77)));
-    let (t, err) = call_as(&st, "tok3", "tell_agent", json!({"agent": "bea", "text": "x", "wake": true})).await;
-    assert!(!err, "{t}");
-    // A note on lead work can't wait for a later turn (none would show it): refused, both ways.
-    let (t, err) = call_as(&st, "tok3", "tell_agent", json!({"agent": "bea", "text": "fyi", "wake": false})).await;
-    assert!(err && t.contains("origin=lead") && t.contains("wake=true"), "{t}");
-    let (t, err) = call_as(&st, "tok3", "send_message", json!({"session_id": 7, "text": "fyi", "wake": false})).await;
-    assert!(err && t.contains("origin=lead") && t.contains("wake=true"), "{t}");
+    let (t, err) = call_as(&st, "tok3", "tell_agent", json!({"agent": "unknown", "text": "fyi", "wake": false})).await;
+    assert!(err && t.contains("no agent named unknown"), "{t}");
+    // A note on lead work can't wait for a later turn. Each refusal leaves the only slot free.
+    let send_per_window = st.limits.send_per_window;
+    st.limits.send_per_window = 1;
+    for (tool, mut args) in [
+        ("tell_agent", json!({"agent": "bea", "text": "fyi", "wake": false})),
+        ("send_message", json!({"session_id": 7, "text": "fyi", "wake": false})),
+    ] {
+        st.edit_guard(|g| g.sends.forget(3)).unwrap();
+        let (t, err) = call_as(&st, "tok3", tool, args.clone()).await;
+        assert!(err && t.contains("origin=lead") && t.contains("wake=true"), "{t}");
+        args["wake"] = json!(true);
+        let (t, err) = call_as(&st, "tok3", tool, args).await;
+        assert!(!err, "{t}");
+    }
+    st.limits.send_per_window = send_per_window;
     assert!(m.d.lock().quiet.is_empty());
-    let (t, err) = call_as(&st, "tok3", "send_message", json!({"session_id": 7, "text": "x"})).await;
-    assert!(!err, "{t}");
     assert_eq!(*m.d.lock().sources.last().unwrap(), Source::Chain(Prov { origin: Origin::Lead, hop: 2, msg_id: None }));
     let (t, err) = call_as(&st, "tok3", "spawn_session", json!({"kind": "claude", "prompt": "build it"})).await;
     assert!(!err, "{t}");

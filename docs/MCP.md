@@ -799,9 +799,9 @@ lifted, and what isn't:
   outside triggers stay blocked from Claude agents even through a lead;
 - keys (`muster keys`) reach a Claude session only from the human's own chain: never from scheduled
   work, `lead` included (raw input carries no route into the turn it starts);
-- a message on `lead` work can't wait for a later turn (`tell_agent`, `send_message` or `reply`
-  with `wake: false` is refused before anything is kept or counted; send it with `wake: true`):
-  only a `lead` turn could show it;
+- a message on `lead` work can't wait for a later turn, since only a `lead` turn could show it.
+  `tell_agent`, `send_message` and any `reply` that needs to wait for a later turn are refused
+  with `wake: false` before anything is kept or counted. Use `wake: true` to start a turn.
 - what reaches a lead is unchanged: its accepted origins decide what it takes.
 
 Codex agents can't be leads (refused; a flag written into the database by hand is ignored), and no
@@ -856,7 +856,7 @@ long job finishes: it says so in that turn's reply, then calls `reply {msg_id, t
 
   | Asker | What happens | Status |
   |---|---|---|
-  | An ask still waiting for that message (`ask_agent`, `muster ask`, `agent.ask`) | It returns the text as its `reply` (it re-checks every second; after 30 s untaken, e.g. the ask was cancelled, the next row applies: `WAITER_MAX`). Only a reply that brings no origin the question's chain didn't have, and is no deeper in the chain than an answer in the question's own turn (one hop past it); any other goes as the next row says. | `returned` |
+  | An ask still waiting for that message (`ask_agent`, `muster ask`, `agent.ask`) | It checks for a reply every second. It takes the text as its `reply` if the answer brings no new origin and is at most one hop past the question. If the ask goes away or has yet to take the reply after 30 s (`WAITER_MAX`), the remaining rows and the `wake` rules apply. | `returned` |
   | A named agent | A new agent message: `[muster msg <new id> from <replier> origin=<o> hop=<n>]`, then `Late reply to your message <id> ("<first line of the question>"):` and the text, with `reply_to` = the message answered. Through `agents::send_checked`: the asker's accepted origins, the hop limit, the daily and unattended caps, the OpenRouter spend caps, the injection queue; a stopped agent is started as for any message. A refusal is logged like any refused message. | `delivered` (`delivered_as`), else `refused` |
   | Another Claude or Codex session (live) | Typed in through its injection queue after `[muster reply to msg <id> from <replier> origin=<o> hop=<n>]` (no message row of its own, so not an envelope the agents' attribution acts on); the session takes the reply's origin and hop. A Claude session takes only `human`-origin replies (`send_message`'s rule). | `delivered` (`session_id`), else `refused` |
   | The human (a client, `muster ask` outside a session or in a shell tab), or a schedule | Shown in the agents panel's message log (the message's entry gets a `late reply` chip; its overlay shows the text and how it was delivered); a desktop notification when the human asked. | `shown` |
@@ -868,10 +868,12 @@ long job finishes: it says so in that turn's reply, then calls `reply {msg_id, t
   <name>'s next turn that can take it, as message <n>"), and another Claude session gets it at
   the start of its next turn that can take it (a Codex session is not delivered to:
   `undelivered`). An ask still waiting takes it either way, under the first row's rule (no new
-  origin, at most one hop past the question; `agent_reply::returnable`), and the human's and a schedule's rows
-  are unchanged. Same checks as the waking way: for an asking agent, its accepted origins for the
-  reply's origin and every origin it is rooted in, and the hop limit; for a plain session, the
-  hop limit and the plain Claude rule on the reply's route; all before anything is kept. A reply
+  origin, at most one hop past the question; `agent_reply::returnable`), including on `lead` work.
+  Replies to the human or a schedule still reach the message log. A `lead` reply that can only
+  go to a waiting ask is kept and counted only when the ask takes it. If the ask goes away first,
+  the replier can retry with `wake: true`. The waking route checks also apply. An asking agent
+  must accept every origin the reply is rooted in, including its route's origin. A plain session
+  applies the plain Claude rule. Both apply the hop limit before a quiet message is kept. A reply
   rooted in two kinds of unattended work is refused with `wake: false` before it is stored (send
   it with `wake: true`, checked against both). The answer's text must meet the quiet size rule
   (6,000 characters, an emoji such as 😀 counting as two, and 150 lines), checked before it is stored and

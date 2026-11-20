@@ -3,8 +3,8 @@
 //! `muster reply` inside its session runs that tool).
 //!
 //! Only that agent may reply, once per message, and only to a message Muster actually typed into
-//! it. The answer is stored on the message's row (`agent_messages.answer`) before it reaches
-//! the asker:
+//! it. The answer is stored on the message's row (`agent_messages.answer`) before anything else,
+//! then reaches the asker:
 //! - an ask still waiting for that message (`ask_agent`, `agent.ask`) returns it as its reply;
 //! - a named agent gets it as a new agent message (`[muster msg <new id> …]`, `reply_to` = the
 //!   message answered) through `agents::send_checked`, so the origin rule, hop limit, both daily
@@ -95,17 +95,8 @@ pub const TIMED_OUT_NOTE: &str = "no reply yet; the message stays delivered. If 
 
 /// The asks in progress (in memory: no ask survives a restart): those waiting for a message's
 /// turn, and those still delivering theirs (the message id isn't theirs to know yet).
-#[derive(Default)]
-pub struct Waiters {
-    counts: Arc<Mutex<HashMap<WaitKey, u32>>>,
-    return_only: Mutex<HashMap<i64, ReturnOnly>>,
-}
-
-/// A lead reply that can only reach an active ask. Kept in memory until the ask takes it.
-struct ReturnOnly {
-    answer: Answer,
-    result: Option<anyhow::Result<()>>,
-}
+#[derive(Default, Clone)]
+pub struct Waiters(Arc<Mutex<HashMap<WaitKey, u32>>>);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum WaitKey {
@@ -116,8 +107,8 @@ enum WaitKey {
 
 impl Waiters {
     fn hold(&self, key: WaitKey) -> WaitGuard {
-        *self.counts.lock().entry(key).or_default() += 1;
-        WaitGuard { counts: self.counts.clone(), key }
+        *self.0.lock().entry(key).or_default() += 1;
+        WaitGuard { waiters: self.clone(), key }
     }
 
     /// An ask waits for message `msg` until the guard is dropped.
@@ -132,19 +123,19 @@ impl Waiters {
 
     /// Could an ask be (about to be) waiting for message `m`?
     pub fn may_wait(&self, m: &AgentMessage) -> bool {
-        let g = self.counts.lock();
+        let g = self.0.lock();
         g.contains_key(&WaitKey::Msg(m.id)) || g.contains_key(&WaitKey::Asking(m.to_agent, m.from_session))
     }
 }
 
 pub struct WaitGuard {
-    counts: Arc<Mutex<HashMap<WaitKey, u32>>>,
+    waiters: Waiters,
     key: WaitKey,
 }
 
 impl Drop for WaitGuard {
     fn drop(&mut self) {
-        let mut g = self.counts.lock();
+        let mut g = self.waiters.0.lock();
         if let Some(n) = g.get_mut(&self.key) {
             *n -= 1;
             if *n == 0 {
@@ -158,9 +149,6 @@ impl Drop for WaitGuard {
 /// taken yet becomes this ask's reply.
 pub fn status(hub: &Hub, msg: i64) -> MsgStatus {
     let mut s = hub.agents().msg_status(hub.store(), msg);
-    if let Some(p) = hub.replies.return_only.lock().get_mut(&msg) {
-        p.result.get_or_insert_with(|| keep(hub, msg, &p.answer));
-    }
     let Some(m) = hub.store().agent_message(msg).ok().flatten() else { return s };
     if !m.answer.as_ref().is_some_and(|a| returnable(&m, a)) {
         return s;
@@ -318,10 +306,26 @@ pub async fn reply(hub: &Arc<Hub>, caller: SessionId, msg_id: i64, text: String,
     if !wake {
         crate::quiet::check_text(&text).map_err(|e| anyhow::anyhow!(e))?;
     }
-    let now = hub.agents().prov(caller);
+    // The agent this session is now, its lead flag and its provenance, read together: a lead flag
+    // turned off meanwhile can't lift newer scheduled work.
+    let (now_agent, now) = hub.agents().session_agent_prov(caller);
+    let Some(me) = now_agent.filter(|a| a.id == me.id) else {
+        anyhow::bail!("this session is no longer the agent {} that message {msg_id} was delivered to", me.name);
+    };
     let lead = agents::is_lead(&me);
     let route = answer_route(&m, now, lead);
     let origins = answer_origins(&m, now, lead);
+    // Lead work can't wait for a later turn (only a lead turn could show it): a quiet reply that
+    // would wait for one is refused before it is stored, so the message's one reply is still
+    // there for wake=true. One shown in the message log (the human or a schedule asked) or that
+    // can't be delivered waits for no turn. Neither does one a waiting ask takes, but that case
+    // is rare and is refused too: the retry with wake=true still reaches the ask.
+    if !wake
+        && matches!(asker(hub, &m), Asker::Agent(_) | Asker::Session(_))
+        && let Err(e) = crate::quiet::check_quiet_origin(route.origin)
+    {
+        anyhow::bail!(e);
+    }
     // Kept for a later turn, it carries one origin to check when that turn takes it: a reply
     // rooted in two kinds of unattended work goes the waking way, checked against both now.
     if !wake && origins.len() > 1 {
@@ -331,7 +335,7 @@ pub async fn reply(hub: &Arc<Hub>, caller: SessionId, msg_id: i64, text: String,
             list.join(" and ")
         );
     }
-    let mut answer = Answer {
+    let answer = Answer {
         text,
         at: now_ms(),
         from_session: caller,
@@ -344,46 +348,19 @@ pub async fn reply(hub: &Arc<Hub>, caller: SessionId, msg_id: i64, text: String,
         session: None,
         quiet: !wake,
     };
-    let returnable = returnable(&m, &answer);
-    let return_only = {
-        let mut pending = hub.replies.return_only.lock();
-        if pending.contains_key(&msg_id) {
-            anyhow::bail!("a reply to message {msg_id} is waiting to be taken");
-        }
-        if !wake && let Err(why) = crate::quiet::check_quiet_origin(route.origin)
-            && matches!(asker(hub, &m), Asker::Agent(_) | Asker::Session(_))
-        {
-            if !returnable || !hub.replies.may_wait(&m) {
-                anyhow::bail!("{why}");
-            }
-            answer.status = AnswerStatus::Returned;
-            answer.note = Some("returned to the ask that was waiting for it".into());
-            pending.insert(msg_id, ReturnOnly { answer, result: None });
-            Some(why)
-        } else {
-            keep(hub, msg_id, &answer)?;
-            None
-        }
-    };
+    keep(hub, msg_id, &answer)?;
     // In its own task, so a caller that goes away doesn't leave it half delivered.
     let h = hub.clone();
+    let returnable = returnable(&m, &answer);
     let done = tokio::spawn(async move {
         // An ask waiting for this message (or about to) takes it at its next check.
         let start = tokio::time::Instant::now();
         while returnable
             && start.elapsed() < WAITER_MAX
             && h.replies.may_wait(&m)
-            && match &return_only {
-                Some(_) => h.replies.return_only.lock()[&msg_id].result.is_none(),
-                None => current(&h, msg_id).is_some_and(|a| a.status == AnswerStatus::Pending),
-            }
+            && current(&h, msg_id).is_some_and(|a| a.status == AnswerStatus::Pending)
         {
             tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        if let Some(why) = return_only {
-            let p = h.replies.return_only.lock().remove(&msg_id).expect("staged reply");
-            p.result.ok_or_else(|| anyhow::anyhow!(why))??;
-            return Ok(p.answer);
         }
         finish(&h, msg_id).await
     })
@@ -391,20 +368,22 @@ pub async fn reply(hub: &Arc<Hub>, caller: SessionId, msg_id: i64, text: String,
     Ok(result_json(msg_id, &done))
 }
 
+/// Store the answer, charging the replier's send slot (MCP's rate limit) under the limiter's
+/// lock: a reply over the limit isn't stored, and one that lost to another reply isn't charged
+/// (nothing else can take a slot in between, so the refund is this reply's own). The charge is
+/// saved after the answer: a restart in between leaves the reply uncharged, never charged and lost.
 fn keep(hub: &Hub, msg_id: i64, answer: &Answer) -> anyhow::Result<()> {
-    let mcp = hub.mcp();
-    let caller = answer.from_session;
-    if let Some(st) = &mcp {
-        crate::mcp::tools::reserve_send(st, caller).map_err(|e| anyhow::anyhow!(e))?;
-    }
-    let stored = hub.store().set_agent_answer(msg_id, answer);
-    if !matches!(stored, Ok(true)) {
-        if let Some(st) = &mcp
-            && let Err(e) = st.edit_guard(|g| g.sends.refund(caller))
-        {
-            tracing::warn!("{e}");
-        }
-        stored?;
+    let store = || hub.store().set_agent_answer(msg_id, answer);
+    let stored = match hub.mcp() {
+        Some(st) => crate::mcp::tools::with_send_slot(&st, answer.from_session, || {
+            let r = store();
+            let charged = matches!(r, Ok(true));
+            (r, charged)
+        })
+        .map_err(|e| anyhow::anyhow!(e))?,
+        None => store(),
+    };
+    if !stored? {
         anyhow::bail!("you already replied to message {msg_id}; a message takes one reply");
     }
     agents::publish_message(hub, msg_id);
@@ -851,6 +830,12 @@ mod tests {
         let v = reply(&hub, 3, deep, "deep".into(), true).await.unwrap();
         assert_eq!(v["status"], "refused", "{v}");
         assert!(v["note"].as_str().unwrap().contains("hop"), "{v}");
+        // The owner turns lead off: the next reply from scheduled work is the schedule's again.
+        make_lead(false);
+        let m = msg(&hub, &lena, "ada", Some(2), Origin::Human, 1, false);
+        let v = reply(&hub, 3, m, "done".into(), true).await.unwrap();
+        assert_eq!((v["status"].as_str(), v["origin"].as_str()), (Some("refused"), Some("schedule")), "{v}");
+        assert_eq!(hub.agents().send_prov(3).map(|p| p.origin), Some(Origin::Schedule));
     }
 
     #[tokio::test]
@@ -878,43 +863,42 @@ mod tests {
         assert_eq!(finish(&hub, m).await.unwrap().status, AnswerStatus::Returned);
     }
 
+    /// On lead work a quiet reply to an asking agent is refused even while an ask waits for it
+    /// (rare; it would wait for no turn there): nothing is kept or charged, and the waking retry
+    /// reaches the waiting ask.
     #[tokio::test]
-    async fn a_quiet_lead_reply_reaches_a_waiting_ask_or_leaves_room_for_a_retry() {
-        for cancelled in [false, true] {
-            let hub = fixture();
-            let scout = agent(&hub, "scout", SessionKind::Codex, 3);
-            agent(&hub, "ada", SessionKind::Claude, 2);
-            let mut st = crate::mcp::McpState::new(crate::mcp::backend::HubBackend(hub.clone()));
-            st.limits.send_per_window = 1;
-            let st = Arc::new(st);
-            hub.set_mcp(Arc::downgrade(&st));
-            let m = msg(&hub, &scout, "ada", Some(2), Origin::Lead, 1, false);
-            let waiting = hub.replies.wait(m);
-            let replied = crate::mcp::call_as(&hub, 3, "reply", json!({"msg_id": m, "text": "done", "wake": false}));
-            tokio::pin!(replied);
-            assert!(futures::poll!(&mut replied).is_pending());
-            assert!(current(&hub, m).is_none());
-            if !cancelled {
-                assert_eq!(status(&hub, m).reply.as_deref(), Some("done"));
+    async fn a_quiet_lead_reply_is_refused_and_the_waking_retry_reaches_the_waiting_ask() {
+        let hub = fixture();
+        let scout = agent(&hub, "scout", SessionKind::Codex, 3);
+        agent(&hub, "ada", SessionKind::Claude, 2);
+        let mut st = crate::mcp::McpState::new(crate::mcp::backend::HubBackend(hub.clone()));
+        st.limits.send_per_window = 1;
+        let st = Arc::new(st);
+        hub.set_mcp(Arc::downgrade(&st));
+        let m = msg(&hub, &scout, "ada", Some(2), Origin::Lead, 1, false);
+        let waiting = hub.replies.wait(m);
+        let e = crate::mcp::call_as(&hub, 3, "reply", json!({"msg_id": m, "text": "done", "wake": false})).await.unwrap_err();
+        assert!(e.contains("origin=lead") && e.contains("wake=true"), "{e}");
+        assert!(current(&hub, m).is_none());
+        // The retry takes the one slot the refusal left free, and the ask's next check takes it.
+        let ask = async {
+            let mut got = None;
+            for _ in 0..50 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                if let Some(r) = status(&hub, m).reply { got = Some(r); break; }
             }
             drop(waiting);
-            if cancelled {
-                let e = replied.await.unwrap_err();
-                assert!(e.contains("origin=lead") && e.contains("wake=true"), "{e}");
-                assert!(current(&hub, m).is_none());
-                let v = crate::mcp::call_as(&hub, 3, "reply", json!({"msg_id": m, "text": "waking retry"})).await.unwrap();
-                assert_eq!(answer_of(&hub, m).text, "waking retry", "{v}");
-            } else {
-                replied.await.unwrap();
-                assert_eq!(answer_of(&hub, m).status, AnswerStatus::Returned);
-            }
-            let next = msg(&hub, &scout, "ada", Some(2), Origin::Lead, 1, false);
-            let e = crate::mcp::call_as(&hub, 3, "reply", json!({"msg_id": next, "text": "done", "wake": false})).await.unwrap_err();
-            assert!(e.contains("origin=lead") && e.contains("wake=true"), "{e}");
-            assert!(current(&hub, next).is_none());
-            let e = crate::mcp::call_as(&hub, 3, "reply", json!({"msg_id": next, "text": "done"})).await.unwrap_err();
-            assert!(e.contains("rate limit"), "{e}");
-        }
+            got
+        };
+        let (v, got) = tokio::join!(crate::mcp::call_as(&hub, 3, "reply", json!({"msg_id": m, "text": "waking retry"})), ask);
+        assert_eq!(got.as_deref(), Some("waking retry"));
+        assert!(v.unwrap().contains("\"returned\""));
+        assert_eq!(answer_of(&hub, m).status, AnswerStatus::Returned);
+        // The slot is used now: a reply over the limit isn't kept.
+        let next = msg(&hub, &scout, "ada", Some(2), Origin::Lead, 1, false);
+        let e = crate::mcp::call_as(&hub, 3, "reply", json!({"msg_id": next, "text": "done"})).await.unwrap_err();
+        assert!(e.contains("rate limit"), "{e}");
+        assert!(current(&hub, next).is_none());
     }
 
     #[tokio::test]

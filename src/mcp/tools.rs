@@ -292,13 +292,13 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "reply",
             "Reply to a message later",
-            "Answer a message you received (its first line is [muster msg <id> from ...]) after the turn that received it ended, e.g. once a long job finishes: say so in that turn's reply, then call this with the result. Only for messages delivered to you, once per message. If the sender's ask_agent is still waiting, it returns this text, but only when your answer brings no scheduled or webhook origin the question didn't have and is at most one hop past the question (not, say, when you answer from deeper work in another chain); otherwise it is delivered to the sender as a new message (\"Late reply to your message <id>\") with the same origin rule, hop limit, caps and input queue as ask_agent, or, if the human asked, shown in the agents panel. With wake=false, unless a waiting ask takes it, the sender gets it at the start of its next turn that can take it instead of a new turn; like tell_agent's, it can wait several turns, so choose it only when the sender needn't act now (Claude senders only; at most 6,000 characters (an emoji such as 😀 counts as two) and 150 lines; a reply rooted in both scheduled and webhook work goes with wake=true). It is stored first: a refused delivery is reported, never lost. Rate limited with send_message (20 per minute).",
+            "Answer a message you received (its first line is [muster msg <id> from ...]) after the turn that received it ended, e.g. once a long job finishes: say so in that turn's reply, then call this with the result. Only for messages delivered to you, once per message. If the sender's ask_agent is still waiting, it returns this text, but only when your answer brings no scheduled or webhook origin the question didn't have and is at most one hop past the question (not, say, when you answer from deeper work in another chain); otherwise it is delivered to the sender as a new message (\"Late reply to your message <id>\") with the same origin rule, hop limit, caps and input queue as ask_agent, or, if the human asked, shown in the agents panel. With wake=false, unless a waiting ask takes it, the sender gets it at the start of its next turn that can take it instead of a new turn; like tell_agent's, it can wait several turns, so choose it only when the sender needn't act now (Claude senders only; at most 6,000 characters (an emoji such as 😀 counts as two) and 150 lines; a reply rooted in both scheduled and webhook work goes with wake=true; so does one on scheduled work a lead agent passes on (origin=lead) when an existing agent or a live session asked, even if its ask is still waiting). It is stored first: a refused delivery is reported, never lost. Rate limited with send_message (20 per minute).",
             json!({
                 "type": "object",
                 "properties": {
                     "msg_id": {"type": "integer", "description": "The id from the message's [muster msg <id> ...] line."},
                     "text": {"type": "string", "description": "Your answer; multi-line is fine."},
-                    "wake": {"type": "boolean", "default": true, "description": "false: if no waiting ask of the sender can take the answer (see above), it waits for the sender's next turn that can take it instead of starting one."}
+                    "wake": {"type": "boolean", "default": true, "description": "false: if no waiting ask of the sender can take the answer (see above), it waits for the sender's next turn that can take it instead of starting one. Refused on lead work (origin=lead) when an existing agent or a live session asked."}
                 },
                 "required": ["msg_id", "text"],
                 "additionalProperties": false
@@ -872,8 +872,7 @@ pub(super) fn caller_route<B: Backend>(st: &McpState<B>, caller: SessionId) -> c
 /// The provenance what the caller sends or spawns starts from: its own, or the human's when it is
 /// a lead agent's session (`agents::sending_prov`).
 pub(super) fn caller_prov<B: Backend>(st: &McpState<B>, caller: SessionId) -> Option<crate::agents::Prov> {
-    let lead = st.backend.agents().iter().any(|a| a.session_id == Some(caller) && crate::agents::is_lead(a));
-    crate::agents::sending_prov(st.backend.prov(caller), lead)
+    st.backend.send_prov(caller)
 }
 
 /// The caller's workspace (None if its channel is gone).
@@ -1731,16 +1730,49 @@ async fn reply<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_>) ->
     st.backend.agent_reply(caller, msg_id, text, wake).await.map(|v| pretty(&v)).map_err(|e| format!("{e:#}"))
 }
 
-pub(crate) fn reserve_send<B: Backend>(st: &McpState<B>, caller: SessionId) -> Result<(), String> {
+fn reserve_send<B: Backend>(st: &McpState<B>, caller: SessionId) -> Result<(), String> {
     if let Err(wait_s) = st.edit_guard(|g| g.sends.check_and_record(
         caller, now_ms(), st.limits.send_per_window, st.limits.send_window_ms,
     ))? {
-        return Err(format!(
-            "rate limit: at most {} messages per minute. Try again in {wait_s}s.",
-            st.limits.send_per_window
-        ));
+        return Err(rate_limited(st, wait_s));
     }
     Ok(())
+}
+
+fn rate_limited<B: Backend>(st: &McpState<B>, wait_s: u64) -> String {
+    format!("rate limit: at most {} messages per minute. Try again in {wait_s}s.", st.limits.send_per_window)
+}
+
+/// Take one of `caller`'s send slots and run `act` under the rate limiter's lock, so no other
+/// send takes or gives back a slot in between (`agent_reply::keep`). `act` runs only when a slot
+/// is free and returns its result and whether the slot stays taken. Once `act` has run, its
+/// result stands even if saving the limiter fails (logged; the slot then isn't charged).
+pub(crate) fn with_send_slot<B: Backend, T>(
+    st: &McpState<B>,
+    caller: SessionId,
+    act: impl FnOnce() -> (T, bool),
+) -> Result<T, String> {
+    let mut out = None;
+    let saved = st.edit_guard(|g| {
+        g.sends.check_and_record(caller, now_ms(), st.limits.send_per_window, st.limits.send_window_ms)?;
+        let (t, charged) = act();
+        if !charged {
+            g.sends.refund(caller);
+        }
+        out = Some(t);
+        Ok(())
+    });
+    match (out, saved) {
+        (Some(t), saved) => {
+            if let Err(e) = saved {
+                tracing::warn!("{e}");
+            }
+            Ok(t)
+        }
+        (None, Ok(Err(wait_s))) => Err(rate_limited(st, wait_s)),
+        (None, Err(e)) => Err(e),
+        (None, Ok(Ok(()))) => unreachable!("act runs whenever a slot is free"),
+    }
 }
 
 /// `start_fresh`: a promoted named agent asks for its own fresh start (src/self_handoff.rs). Only

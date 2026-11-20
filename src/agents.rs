@@ -1383,15 +1383,19 @@ impl Registry {
         self.inner.lock().runtime.prov.get(&id).copied()
     }
 
-    /// Is session `id` a lead agent's current session (`is_lead`)?
-    pub fn is_lead_session(&self, id: SessionId) -> bool {
-        self.inner.lock().agents.values().any(|b| b.session_id == Some(id) && is_lead(b))
+    /// The named agent session `id` is linked to now and the session's provenance, read under
+    /// one lock: a lead flag turned off meanwhile can't be paired with newer scheduled work.
+    pub fn session_agent_prov(&self, id: SessionId) -> (Option<Agent>, Option<Prov>) {
+        let g = self.inner.lock();
+        let agent = g.agents.values().find(|b| b.session_id == Some(id)).cloned();
+        (agent, g.runtime.prov.get(&id).copied())
     }
 
     /// The provenance what session `id` sends or spawns starts from (`sending_prov`): its own,
-    /// or the human's for a lead agent's session.
+    /// or the human's for a lead agent's session (both read together, `session_agent_prov`).
     pub fn send_prov(&self, id: SessionId) -> Option<Prov> {
-        sending_prov(self.prov(id), self.is_lead_session(id))
+        let (agent, prov) = self.session_agent_prov(id);
+        sending_prov(prov, agent.as_ref().is_some_and(is_lead))
     }
 
     /// A session spawned by an agent starts with the spawner's provenance.

@@ -172,20 +172,21 @@ pub fn status(hub: &Hub, msg: i64) -> MsgStatus {
 }
 
 /// The route of a reply to `m` from a session whose provenance is `now`. A lead agent's reply
-/// (`lead`, `agents::sending_prov`) counts as the human's: origin `human`, the hop as for anyone.
+/// (`lead`, `agents::sending_prov`) passes scheduled work on as `lead` (`Origin::lifted`); the
+/// hop as for anyone.
 pub fn answer_route(m: &AgentMessage, now: Option<Prov>, lead: bool) -> Route {
     let (origin, hop) = now.map_or((Origin::Human, 0), |p| (p.origin, p.hop));
-    let origin = if lead { Origin::Human } else { m.origin.max(origin) };
+    let origin = m.origin.max(origin);
+    let origin = if lead { origin.lifted() } else { origin };
     agents::outgoing(Some(Prov { origin, hop: m.hop.max(hop), msg_id: Some(m.id) }))
 }
 
 /// The non-human origins a reply to `m` from a session whose provenance is `now` is rooted in
-/// (none for a lead agent's reply).
+/// (a lead agent's scheduled work as `lead`).
 pub fn answer_origins(m: &AgentMessage, now: Option<Prov>, lead: bool) -> Vec<Origin> {
-    if lead {
-        return Vec::new();
-    }
-    let mut o: Vec<Origin> = [Some(m.origin), now.map(|p| p.origin)].into_iter().flatten().filter(|o| *o != Origin::Human).collect();
+    let mut o: Vec<Origin> = [Some(m.origin), now.map(|p| p.origin)].into_iter().flatten()
+        .map(|o| if lead { o.lifted() } else { o })
+        .filter(|o| *o != Origin::Human).collect();
     o.sort();
     o.dedup();
     o
@@ -464,7 +465,7 @@ async fn deliver(hub: &Arc<Hub>, m: &AgentMessage, mut a: Answer) -> Answer {
         }
         Asker::Session(s) => {
             let claude = std::iter::once(a.origin).chain(a.origins.iter().copied());
-            if let Some(why) = claude.map(|o| crate::mcp::guard::check_claude_origin(s.kind, o)).find_map(Result::err) {
+            if let Some(why) = claude.map(|o| crate::mcp::guard::check_session_route(s.kind, o, a.hop)).find_map(Result::err) {
                 set(&mut a, AnswerStatus::Refused, format!("not delivered to session {}: {why}", s.id));
                 return a;
             }
@@ -748,9 +749,9 @@ mod tests {
         assert!(v["note"].as_str().unwrap().contains("hop"), "{v}");
     }
 
-    /// A lead agent's late reply counts as the human's (`Agent::lead`), even from a scheduled
-    /// turn: it reaches a Claude asker that refuses the same reply from a non-lead. Its hop still
-    /// counts.
+    /// A lead agent's late reply from a scheduled turn goes as `lead` (`Agent::lead`): it reaches a
+    /// Claude asker that refuses the same reply from a non-lead. A trigger's work isn't lifted, and
+    /// its hop still counts.
     #[tokio::test]
     async fn a_lead_agents_reply_counts_as_the_humans() {
         let hub = fixture();
@@ -767,21 +768,24 @@ mod tests {
         hub.agents().set_prov(3, sched).unwrap();
         let v = reply(&hub, 3, m, "done".into(), true).await.unwrap();
         assert_eq!(v["status"], "refused", "{v}");
-        // A lead: the same reply goes as the human's, one hop on, rooted in nothing unattended.
+        // A lead: the same reply goes as `lead`, one hop on, and Ada (human only) takes it.
         make_lead(true);
         let m = msg(&hub, &lena, "ada", Some(2), Origin::Human, 1, false);
         hub.agents().set_prov(3, sched).unwrap();
         let v = reply(&hub, 3, m, "done".into(), true).await.unwrap();
-        assert_ne!(v["status"], "refused", "{v}");
+        // Past every guard: this fixture has no terminals, so only the typing itself fails.
+        assert!(v["status"] == "undelivered" && v["note"].as_str().unwrap().contains("terminal host is not configured"), "{v}");
         let a = answer_of(&hub, m);
-        assert_eq!((a.origin, a.hop, a.origins.len()), (Origin::Human, 2, 0));
+        assert_eq!((a.origin, a.hop, a.origins.clone()), (Origin::Lead, 2, vec![Origin::Lead]));
         let mm = hub.store().agent_message(m).unwrap().unwrap();
-        assert_eq!(answer_route(&mm, sched, true), Route { origin: Origin::Human, hop: 2, reply_to: Some(m) });
-        // Even to a message from a scheduled chain; past the hop limit it is refused all the same.
+        assert_eq!(answer_route(&mm, sched, true), Route { origin: Origin::Lead, hop: 2, reply_to: Some(m) });
+        // The human's work stays the human's; a trigger's is never lifted.
+        assert_eq!(answer_route(&mm, None, true).origin, Origin::Human);
         let w = msg(&hub, &lena, "ada", Some(2), Origin::Webhook, 1, false);
         let ww = hub.store().agent_message(w).unwrap().unwrap();
-        assert_eq!(answer_route(&ww, sched, true).origin, Origin::Human);
-        assert!(answer_origins(&ww, sched, true).is_empty());
+        assert_eq!(answer_route(&ww, sched, true).origin, Origin::Webhook);
+        assert_eq!(answer_origins(&ww, sched, true), vec![Origin::Lead, Origin::Webhook]);
+        // Past the hop limit it is refused all the same.
         let deep = msg(&hub, &lena, "ada", Some(2), Origin::Human, crate::mcp::guard::MAX_AGENT_HOPS, false);
         let v = reply(&hub, 3, deep, "deep".into(), true).await.unwrap();
         assert_eq!(v["status"], "refused", "{v}");

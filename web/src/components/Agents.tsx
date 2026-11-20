@@ -255,7 +255,7 @@ function AgentRow({ a, now, selected }: { a: Agent; now: number; selected: boole
           {st.label}
           {st.since !== null && ` · ${ago(st.since, now)}`}
           {a.lead && (
-            <span class="ap-auto" data-tip="Lead agent: what it sends counts as yours, even from a reminder or a schedule">lead</span>
+            <span class="ap-auto" data-tip="Lead agent: what it sends from a reminder or a schedule counts as yours">lead</span>
           )}
           {a.autostart && <span class="ap-auto" data-tip="Starts with the daemon">auto</span>}
           {a.sleep_after_min != null && !st.asleep && (
@@ -1597,14 +1597,14 @@ export function AgentDialog(
                     <span class="toggle-thumb" />
                   </span>
                   <span>
-                    Lead agent <span class="muted">(its messages count as yours)</span>
+                    Lead agent <span class="muted">(its messages from scheduled work count as yours)</span>
                   </span>
                 </label>
                 <span id="lead-hint" class="field-hint sleep-after">
-                  What it sends and the sessions it starts count as started by you, even when a reminder, a
-                  schedule or another agent started its turn. So it can start Claude builders and message Claude
-                  agents from there. Each message still counts one step, and a chain stops after 8. It can't set
-                  reminders or schedules from those turns. Only you can turn this on.
+                  In a turn a reminder or a schedule started, it can still start Claude builders and message
+                  Claude agents, which take its messages as if you sent them. Each message still counts one step,
+                  and a chain stops after 8. Work a trigger started keeps the usual rules, and nothing scheduled
+                  work reaches can set reminders or schedules. Only you can turn this on.
                 </span>
               </div>
             )}

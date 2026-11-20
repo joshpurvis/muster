@@ -129,7 +129,7 @@ pub fn unattended_cap_refusal(agent: &str, recent: usize, cap: u32) -> String {
 /// May a message with `origin` at `hop` be delivered to agent `agent` (which accepts `accepts`
 /// and was sent `recent` messages in the last 24 hours)?
 pub fn check_agent_delivery(agent: &str, accepts: &[Origin], origin: Origin, hop: u32, recent: usize) -> Result<(), String> {
-    if !accepts.contains(&origin) {
+    if !accepts.contains(&origin.accepted_as()) {
         let list: Vec<&str> = accepts.iter().map(|o| o.as_str()).collect();
         return Err(format!(
             "agent {agent} accepts only {} messages, and this one is origin={} (the chain it belongs to was started by a {}, not the human). \
@@ -155,9 +155,9 @@ pub fn check_agent_delivery(agent: &str, accepts: &[Origin], origin: Origin, hop
 
 /// Claude agents that aren't agents (no accepts list of their own) take human-rooted work only,
 /// like a Claude agent by default: no messages or spawns from a scheduled or triggered chain,
-/// unless the chain passed through a lead agent (`origin` is then `human`).
+/// unless a lead agent passed the scheduled work on (`Origin::Lead`).
 pub fn check_claude_origin(kind: SessionKind, origin: Origin) -> Result<(), String> {
-    if kind == SessionKind::Claude && origin != Origin::Human {
+    if kind == SessionKind::Claude && origin.accepted_as() != Origin::Human {
         return Err(format!(
             "you are handling an origin={} message, and Claude agents only take work the human started. Use a Codex agent or agent \
              for it, or ask the human (who can also make an agent a lead agent: what a lead sends counts as the human's).",
@@ -165,6 +165,24 @@ pub fn check_claude_origin(kind: SessionKind, origin: Origin) -> Result<(), Stri
         ));
     }
     Ok(())
+}
+
+/// The hop limit for what reaches a session without an agent's accept list (a spawned session's
+/// start, `send_message`, keys, a reply typed into a session): a turn there may not start deeper
+/// than an agent message could.
+pub fn check_hop(hop: u32) -> Result<(), String> {
+    if hop > MAX_AGENT_HOPS {
+        return Err(format!(
+            "agent message chain too deep: this would be hop {hop} and the maximum is {MAX_AGENT_HOPS}. Answer with what you have, or ask the human."
+        ));
+    }
+    Ok(())
+}
+
+/// `check_claude_origin` and `check_hop` for a route into a session.
+pub fn check_session_route(kind: SessionKind, origin: Origin, hop: u32) -> Result<(), String> {
+    check_claude_origin(kind, origin)?;
+    check_hop(hop)
 }
 
 /// Number of ancestors of `id` (0 for a human-started session). Cycle-safe.

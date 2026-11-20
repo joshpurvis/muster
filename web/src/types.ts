@@ -224,7 +224,7 @@ export interface TimelineEvent {
 }
 
 /** Where a message chain started (docs/MCP.md "Agents"). */
-export type Origin = "human" | "schedule" | "webhook" | `addon:${string}`;
+export type Origin = "human" | "lead" | "schedule" | "webhook" | `addon:${string}`; // "lead": scheduled work a lead agent passed on, never in accepts_origins
 
 /** A named agent (`agent.list`, `agent_upserted`; src/agents.rs `agent_json`). */
 /** Where an agent's model runs (src/openrouter.rs): the CLI's own login, or OpenRouter (pay per

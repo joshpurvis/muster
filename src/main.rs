@@ -625,11 +625,12 @@ enum AgentCmd {
         /// it off. Claude agents only.
         #[arg(long, value_name = "on|off", value_parser = ["on", "off"])]
         tools_up_front: Option<String>,
-        /// Make this Claude agent a lead agent: what it sends (ask_agent, tell_agent, reply,
-        /// send_message) and the sessions it starts count as the human's, even in a turn a
-        /// reminder, a schedule or a trigger started, so it can start Claude builders and message
-        /// Claude agents from those turns. Each message still counts one hop (8 at most).
-        /// Reminders and schedules keep their rule. Off by default. Only the human turns it on
+        /// Make this Claude agent a lead agent: in a turn a reminder or a schedule started, what it
+        /// sends (ask_agent, tell_agent, reply, send_message) and the sessions it starts go as
+        /// origin=lead, which Claude agents and sessions take like the human's, so it can start
+        /// Claude builders and message Claude agents from those turns. Each message still counts
+        /// one hop (8 at most). A trigger's work keeps the usual rules, and nothing scheduled
+        /// work reaches can set reminders or schedules. Off by default. Only the human turns it on
         /// (refused inside a Muster tab); anyone may turn it off. Claude agents only.
         #[arg(long, value_name = "on|off", value_parser = ["on", "off"])]
         lead: Option<String>,

@@ -1010,11 +1010,12 @@ sends only what changed (`schedule.settings.set`). The dialog scrolls in a short
   Applies from its next start." The closed More options line says "Message tools up front" when
   on. Only the owner's click turns it on (as for Can start itself fresh).
 - **Lead agent** (Edit only, Claude agents, off by default; after Load message tools up front):
-  what it sends and the sessions it starts count as the owner's, even in a turn a reminder, a
-  schedule or another agent started (`lead`, docs/MCP.md "Lead agents"). The hint leads with
-  that, then what it allows (starting Claude builders, messaging Claude agents), that each message
-  still counts one step and a chain stops after 8, that reminders and schedules keep their rule,
-  and that only the owner turns it on. The closed More options line says "Lead agent" when on, and
+  in a turn a reminder or a schedule started, what it sends and the sessions it starts go as
+  origin `lead`, which Claude agents take like the owner's (`lead`, docs/MCP.md "Lead agents").
+  The hint leads with that (starting Claude builders, messaging Claude agents), then that each
+  message still counts one step and a chain stops after 8, that a trigger's work keeps the usual
+  rules and nothing scheduled work reaches can set reminders or schedules, and that only the owner
+  turns it on. The closed More options line says "Lead agent" when on, and
   the agent's row in the list shows a "lead" tag. Only the owner's click turns it on (as for Can
   start itself fresh); it applies at once.
 - Edit saves only changed fields (`agent.update`); provider, model, effort and permissions apply

@@ -3834,6 +3834,8 @@ mod tests {
         assert_eq!((a.session_id, a.channel_id, a.resume_id.as_deref()), (Some(7), Some(4), Some("conv-1")));
         assert_eq!(a.permissions.claude_mode, ClaudeMode::Plan);
         assert!(!a.autostart);
+        // An agent from before migration v33 is never a lead.
+        assert!(!a.lead);
         let m = s.agent_message(1).unwrap().unwrap();
         assert_eq!((m.to_agent, m.reply.as_deref(), m.text.as_deref(), m.refused.as_deref()), (3, Some("ok"), None, None));
         assert_eq!(m.to_name.as_deref(), Some("Ada"));

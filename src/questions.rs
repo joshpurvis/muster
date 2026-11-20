@@ -1582,6 +1582,9 @@ mod tests {
         // A scheduled run can't record the human's answer.
         hub.agents().set_prov(2, Some(Prov { origin: Origin::Schedule, hop: 0, msg_id: None })).unwrap();
         assert!(record(&hub, 2, rec(1, "Q1 a", json!("a"))).await.unwrap_err().to_string().contains("origin=schedule"));
+        // Nor scheduled work a lead agent passed on.
+        hub.agents().set_prov(2, Some(Prov { origin: Origin::Lead, hop: 2, msg_id: None })).unwrap();
+        assert!(record(&hub, 2, rec(1, "Q1 a", json!("a"))).await.unwrap_err().to_string().contains("origin=lead"));
         hub.agents().set_prov(2, None).unwrap();
         // The lead records it: stored first, then sent to the writer by name (this fixture has no
         // terminals, so the send itself fails, and says so; the smoke test types it in).

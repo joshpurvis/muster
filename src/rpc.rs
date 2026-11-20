@@ -798,7 +798,7 @@ async fn dispatch_inner(hub: &Arc<Hub>, who: &Principal, method: &str, params: V
                 Caller::Shell(s) => {
                     let source = shell_source(hub, s);
                     if let crate::agents::Source::Chain(prov) = source {
-                        crate::mcp::guard::check_claude_origin(target.kind, prov.origin).map_err(RpcError)?;
+                        crate::mcp::guard::check_session_route(target.kind, prov.origin, prov.hop).map_err(RpcError)?;
                         if let Some(b) = hub.agents().by_session(p.id) {
                             return Err(RpcError(format!("session {} is the agent {}: use `muster ask {}`", p.id, b.name, b.name)));
                         }
@@ -1025,7 +1025,9 @@ async fn dispatch_inner(hub: &Arc<Hub>, who: &Principal, method: &str, params: V
             // count as the human's input; keys from the human (or a human-rooted shell) do.
             let caller = caller(hub, p.from_session)?;
             let chain = match caller {
-                Caller::Agent(s) => Some(crate::agents::outgoing(hub.agents().send_prov(s))),
+                // Keys stay on the turn's own origin, a lead's too: a lead's lifted origin is for
+                // its messages and spawns, not raw input (which skips the receiver's accept list).
+                Caller::Agent(s) => Some(crate::agents::outgoing(hub.agents().prov(s))),
                 Caller::Shell(s) => hub.agents().prov(s).map(|pv| crate::agents::outgoing(Some(pv))),
                 Caller::Human => None,
             };
@@ -1034,7 +1036,7 @@ async fn dispatch_inner(hub: &Arc<Hub>, who: &Principal, method: &str, params: V
             let admitted = match chain {
                 Some(r) => {
                     let target = hub.session(p.id).ok_or_else(|| RpcError(format!("no such session: {}", p.id)))?;
-                    crate::mcp::guard::check_claude_origin(target.kind, r.origin).map_err(RpcError)?;
+                    crate::mcp::guard::check_session_route(target.kind, r.origin, r.hop).map_err(RpcError)?;
                     // Keys can start a turn as well as a prompt can: an OpenRouter session's
                     // spend caps apply to unattended keys too.
                     if r.origin != crate::agents::Origin::Human && target.provider == crate::openrouter::Provider::OpenRouter {
@@ -1950,7 +1952,7 @@ fn spawn_prov(
         Caller::Agent(s) => crate::agents::outgoing(hub.agents().send_prov(s)),
     };
     if let Some(k) = kind {
-        crate::mcp::guard::check_claude_origin(k, route.origin).map_err(RpcError)?;
+        crate::mcp::guard::check_session_route(k, route.origin, route.hop).map_err(RpcError)?;
     }
     Ok(Some(route.prov(None)))
 }
@@ -3038,6 +3040,27 @@ mod tests {
         assert_eq!(hub.agents().prov(2), None);
     }
 
+    /// A lead agent's CLI: `muster new` from its scheduled turn starts a Claude session (as
+    /// `lead`), but its keys keep the turn's own origin (raw input skips accept lists).
+    #[tokio::test]
+    async fn a_lead_agents_cli_spawns_as_lead_but_its_keys_stay_scheduled() {
+        let (hub, _st) = fixture();
+        agent(&hub, "rpc-lead");
+        let a = hub.agents().get("rpc-lead").unwrap();
+        hub.agents().link_session(hub.store(), a.id, Some(2)).unwrap();
+        let mut u: crate::agents::AgentUpdate = serde_json::from_value(json!({"name": "rpc-lead", "lead": true})).unwrap();
+        u.by_owner = true;
+        crate::agents::update_switch(&hub, u, false).unwrap();
+        hub.agents().set_prov(2, Some(SCHED)).unwrap();
+        assert_eq!(hub.agents().send_prov(2).unwrap().origin, Origin::Lead);
+        let e = call(&hub, "session.input", json!({"id": 2, "data": "x", "from_session": 2})).await.unwrap_err();
+        assert!(e.contains("origin=schedule"), "{e}");
+        assert_eq!(spawn_prov(&hub, Some(2), Some(SessionKind::Claude)).ok().flatten(), Some(Prov { origin: Origin::Lead, hop: 2, msg_id: None }));
+        // At the hop limit, no deeper start.
+        hub.agents().set_prov(2, Some(Prov { origin: Origin::Schedule, hop: crate::mcp::guard::MAX_AGENT_HOPS, msg_id: None })).unwrap();
+        assert!(spawn_prov(&hub, Some(2), Some(SessionKind::Claude)).err().is_some_and(|e| e.0.contains("hop 9")));
+    }
+
     /// Every event of kind `kind` (`agent_upserted`, ...) received so far, as JSON.
     fn drain(rx: &mut broadcast::Receiver<ServerEvent>, kind: &str) -> Vec<Value> {
         let mut out = Vec::new();
@@ -3658,11 +3681,11 @@ mod tests {
     #[tokio::test]
     async fn only_the_human_makes_a_lead_agent() {
         let (hub, _st) = fixture();
-        agent(&hub, "rpc-otto");
-        let persona = || std::fs::read_to_string(crate::agents::home_dir_for("rpc-otto").join("CLAUDE.md")).unwrap();
-        let on = json!({"name": "rpc-otto", "lead": true});
+        agent(&hub, "rpc-lena");
+        let persona = || std::fs::read_to_string(crate::agents::home_dir_for("rpc-lena").join("CLAUDE.md")).unwrap();
+        let on = json!({"name": "rpc-lena", "lead": true});
         assert!(grants_owner_switch("agent.update", &on));
-        assert!(!grants_owner_switch("agent.update", &json!({"name": "rpc-otto", "lead": false})));
+        assert!(!grants_owner_switch("agent.update", &json!({"name": "rpc-lena", "lead": false})));
         // A script's call, or one on a session's behalf (even from the window): refused.
         let e = call(&hub, "agent.update", on.clone()).await.unwrap_err();
         assert!(e.contains("only the human") && e.contains("--lead on"), "{e}");
@@ -3677,7 +3700,7 @@ mod tests {
         assert!(r["error"]["message"].as_str().unwrap_or_default().contains("only the human"), "{r}");
         let e = owner_terminal(&hub, &Principal::Device { id: 1 }, None, &on).await.unwrap_err();
         assert!(e.contains("paired device"), "{e}");
-        assert!(!hub.agents().get("rpc-otto").unwrap().lead);
+        assert!(!hub.agents().get("rpc-lena").unwrap().lead);
         assert!(!persona().contains("## Lead agent"));
         // The owner's terminal turns it on; the persona file tells the agent.
         let r = OWNER_TERMINAL.scope(true, call(&hub, "agent.update", on.clone())).await.unwrap();
@@ -3685,11 +3708,22 @@ mod tests {
         assert!(persona().contains("## Lead agent"), "the persona says it is a lead");
         assert!(hub.store().load_agents().unwrap()[0].lead, "saved");
         // Off from anywhere, and the window turns it on again.
-        let r = call(&hub, "agent.update", json!({"name": "rpc-otto", "lead": false})).await.unwrap();
+        let r = call(&hub, "agent.update", json!({"name": "rpc-lena", "lead": false})).await.unwrap();
         assert_eq!(r["lead"], false);
         assert!(!persona().contains("## Lead agent"));
-        let r = dispatch_via(&hub, &Principal::Local, "agent.update", on, Via::Window).await.map_err(|e| e.0).unwrap();
+        let r = dispatch_via(&hub, &Principal::Local, "agent.update", on.clone(), Via::Window).await.map_err(|e| e.0).unwrap();
         assert_eq!(r["lead"], true);
+        // Taking it back is saved even when the persona file can't be rewritten (here a link,
+        // which Muster never writes through); turning it on again is not.
+        let file = crate::agents::home_dir_for("rpc-lena").join("CLAUDE.md");
+        std::fs::remove_file(&file).unwrap();
+        std::os::unix::fs::symlink("/dev/null", &file).unwrap();
+        let r = call(&hub, "agent.update", json!({"name": "rpc-lena", "lead": false})).await.unwrap();
+        assert_eq!(r["lead"], false);
+        assert!(!hub.store().load_agents().unwrap()[0].lead, "saved");
+        assert!(dispatch_via(&hub, &Principal::Local, "agent.update", on, Via::Window).await.is_err());
+        assert!(!hub.agents().get("rpc-lena").unwrap().lead);
+        std::fs::remove_file(&file).unwrap();
         // Codex agents can't be leads, not even from the window.
         crate::agents::create(&hub, NewAgent {
             working_location: None,

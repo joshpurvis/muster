@@ -2945,6 +2945,23 @@ pub fn start_fresh(d: &Discovery, file: &std::path::Path, as_json: bool) -> anyh
 mod tests {
     use super::*;
 
+    /// `muster agent edit NAME --lead on|off` sends `lead` (and, inside a Muster tab, the session
+    /// that asked, so the backend refuses turning it on there).
+    #[test]
+    fn agent_edit_sends_lead() {
+        let opts = |lead: Option<bool>| AgentOpts {
+            profile: None, switch: SwitchOpts::default(), provider: None, name: "alpha".into(), kind: None, model: None,
+            effort: None, persona: None, accepts: None, autostart: None, sleep_after: None, self_handoff: None,
+            tools_up_front: None, lead, claude_mode: None, codex_sandbox: None,
+        };
+        assert_eq!(opts(Some(true)).params(&json!({})).unwrap()["lead"], true);
+        assert_eq!(opts(Some(false)).params(&json!({})).unwrap()["lead"], false);
+        assert!(opts(None).params(&json!({})).unwrap().get("lead").is_none());
+        if env_session().is_some() {
+            assert!(opts(Some(true)).params(&json!({})).unwrap().get("from_session").is_some());
+        }
+    }
+
     /// `muster agent start --fresh` says the prompts that were waiting are kept; `muster agent ls`
     /// names why an agent's prompts wait.
     #[test]

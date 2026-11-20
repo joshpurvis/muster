@@ -169,10 +169,12 @@ is handling, set when muster submits an attributed prompt to it (any agent's sen
 or agent message, the agent's CLI calls included), and copied into sessions it spawns, which keep
 it until they get another attributed prompt. What a session sends carries its origin at hop+1.
 Only the human, through a client connection, makes a session human-rooted again; a hook can't.
-Delivery is refused when the agent doesn't accept the origin, past hop 4, or past 200 messages
-to the agent in 24 hours (constants in `src/mcp/guard.rs`). Claude sessions that aren't named
-agents follow the Claude default: no message, keys or spawn of a Claude agent from a non-human
-chain. Details and the limits that remain (the client token, runtime-only provenance):
+Delivery is refused when the agent doesn't accept the origin, past hop 8 (4 at first), or past
+200 messages to the agent in 24 hours (constants in `src/mcp/guard.rs`). Claude sessions that
+aren't named agents follow the Claude default: no message, keys or spawn of a Claude agent from a
+non-human chain. A lead agent (the human's setting) passes its scheduled work on as `lead`, which
+accept lists and the Claude default take like `human` while every other rule still treats it as
+unattended (docs/MCP.md "Lead agents"). Details and the limits that remain (the client token, runtime-only provenance):
 docs/MCP.md "Agents".
 
 Defaults: Claude agents accept `human` only; Codex agents accept `human`, `schedule` and

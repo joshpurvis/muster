@@ -706,6 +706,7 @@ impl Hub {
                 crate::agents::Origin::Webhook => "a webhook message",
                 crate::agents::Origin::Addon(_) => "an add-on message",
                 crate::agents::Origin::Human => "a message",
+                crate::agents::Origin::Lead => "a message a lead agent passed on from scheduled work",
             }
         };
         let text = format!(

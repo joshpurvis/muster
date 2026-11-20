@@ -431,7 +431,7 @@ pub async fn take_run(hub: &Hub, id: SessionId, run: u64, msg: Option<i64>, widt
                 Some(t) => hop <= t.hop && (o == Origin::Human || (o == t.origin && (!bills || cleared == Some(o)))),
             };
             let a: Vec<AgentMessage> = a.iter()
-                .filter(|m| fits(m.origin, m.hop) && named.is_none_or(|ag| ag.accepts_origins.contains(&m.origin)))
+                .filter(|m| fits(m.origin, m.hop) && named.is_none_or(|ag| ag.accepts_origins.contains(&m.origin.accepted_as())))
                 .cloned().collect();
             let s: Vec<SessionQuiet> = s.iter().filter(|q| fits(q.origin, q.hop)).cloned().collect();
             let (text, shown, left) = context(&a, &s, named.is_some(), now);

@@ -1073,7 +1073,10 @@ async fn spawn_session<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args
     if let Some(p) = &prompt {
         check_no_shell_escape(st, kind, p)?;
     }
-    guard::check_claude_origin(kind, caller_origin(st, caller).0)?;
+    // One route for the check and the child's provenance: a lead flag changed meanwhile can't
+    // start a child the check didn't pass. The child starts at that hop: no deeper than a message.
+    let route = caller_route(st, caller);
+    guard::check_session_route(kind, route.origin, route.hop)?;
     let me = caller_session(st, caller)?;
     let target_channel = match new_channel {
         Some(_) => None,
@@ -1177,7 +1180,7 @@ async fn spawn_session<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args
         window_id: None,
         from_session: None,
         // The child starts with the caller's provenance and keeps it (agents.rs).
-        prov: Some(caller_route(st, caller).prov(None)),
+        prov: Some(route.prov(None)),
         agent_id: None,
     };
     let info = match st.backend.spawn_session(req).await {
@@ -1257,7 +1260,9 @@ async fn send_message<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<
             b.name, b.name, b.name
         ));
     }
-    guard::check_claude_origin(info.kind, caller_origin(st, caller).0)?;
+    // One route for the checks and the message (quiet or typed in).
+    let route = caller_route(st, caller);
+    guard::check_session_route(info.kind, route.origin, route.hop)?;
     let mut width = None;
     if let (Some(me), Some(ch)) = (
         st.backend.session(caller),
@@ -1292,7 +1297,7 @@ async fn send_message<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<
         }
         let from = crate::agents::sender_label(st.backend.agents().iter().find(|b| b.session_id == Some(caller)), caller);
         let bind = run.zip(width).map(|(run, width)| crate::quiet::Bind { run, width });
-        return match st.backend.session_quiet(&info, from, Some(caller), caller_route(st, caller), text, bind) {
+        return match st.backend.session_quiet(&info, from, Some(caller), route, text, bind) {
             Ok(v) => Ok(pretty(&v)),
             Err(e) => {
                 if let Err(error) = st.edit_guard(|g| g.sends.refund(caller)) { tracing::warn!("{error}"); }
@@ -1333,7 +1338,7 @@ async fn send_message<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<
             text,
             mode,
             format!("session:{caller}"),
-            crate::agents::Source::Chain(caller_route(st, caller).prov(None)),
+            crate::agents::Source::Chain(route.prov(None)),
         )
         .await
     {

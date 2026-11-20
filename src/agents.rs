@@ -49,10 +49,16 @@ use crate::openrouter::Provider;
 use crate::store::Store;
 
 /// Where a message chain started. Claude agents accept `human` only by default (PLAN.md §10).
+/// The order is strictness: the stricter of two origins (`max`) wins when chains meet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub enum Origin {
     Human,
+    /// Scheduled work a lead agent passed on (`sending_prov`): taken like the human's wherever an
+    /// origin is accepted (`accepted_as`), still unattended for reminders, schedules, recorded
+    /// answers, triggers and the unattended and spend caps (they ask `!= Human`). An older backend
+    /// reads it from the database as `webhook`.
+    Lead,
     Schedule,
     Webhook,
     Addon(crate::addon::Identity),
@@ -62,6 +68,7 @@ impl Origin {
     pub fn as_str(&self) -> &str {
         match self {
             Origin::Human => "human",
+            Origin::Lead => "lead",
             Origin::Schedule => "schedule",
             Origin::Webhook => "webhook",
             Origin::Addon(id) => id.as_str(),
@@ -70,9 +77,27 @@ impl Origin {
     pub fn parse(s: &str) -> Option<Origin> {
         match s.trim().to_ascii_lowercase().as_str() {
             "human" => Some(Origin::Human),
+            "lead" => Some(Origin::Lead),
             "schedule" => Some(Origin::Schedule),
             "webhook" => Some(Origin::Webhook),
             other => crate::addon::Identity::parse(other).map(Origin::Addon),
+        }
+    }
+    /// The origin an accept list (an agent's, or the plain Claude rule) checks this one as: a lead
+    /// agent's passed-on work as the human's.
+    pub fn accepted_as(self) -> Origin {
+        match self {
+            Origin::Lead => Origin::Human,
+            o => o,
+        }
+    }
+    /// What a lead agent's message or spawn carries for work of this origin (`sending_prov`):
+    /// scheduled work (a reminder, a schedule, or work a lead passed on) becomes `lead`; the
+    /// human's stays the human's, and a trigger's or an add-on's stays as it is.
+    pub fn lifted(self) -> Origin {
+        match self {
+            Origin::Schedule | Origin::Lead => Origin::Lead,
+            o => o,
         }
     }
 }
@@ -286,12 +311,14 @@ pub fn is_lead(a: &Agent) -> bool {
 }
 
 /// The provenance a session's messages and spawns start from: its own (`prov`), except that a lead
-/// agent's session (`lead`) counts as the human's whatever started its turn: origin `human`, its
-/// hop kept, so the chain still ends at `guard::MAX_AGENT_HOPS`. Reminders and schedules read
-/// the session's own provenance, not this.
+/// agent's session (`lead`) handling scheduled work sends it on as `lead` (`Origin::lifted`),
+/// which accept lists take like the human's: its hop kept, so the chain still ends at
+/// `guard::MAX_AGENT_HOPS`. A trigger's or an add-on's work is never lifted. Reminders and
+/// schedules read the session's own provenance, and `lead` downstream, so neither a lead nor
+/// anything it reaches can make one from that work.
 pub fn sending_prov(prov: Option<Prov>, lead: bool) -> Option<Prov> {
     match prov {
-        Some(p) if lead => Some(Prov { origin: Origin::Human, ..p }),
+        Some(p) if lead => Some(Prov { origin: p.origin.lifted(), ..p }),
         p => p,
     }
 }
@@ -353,12 +380,13 @@ pub fn persona_text_for(a: &Agent) -> String {
 
 /// What a lead agent's persona file adds (`Agent::lead`).
 pub const LEAD_SECTION: &str = "\n## Lead agent\n\n\
-     The human made you a lead agent: what you send and start counts as the human's, whatever started \
-     your turn. In a turn a reminder, a schedule or a trigger started, you can still start sessions \
+     The human made you a lead agent: in a turn a reminder or a schedule started (origin=schedule, or \
+     origin=lead for scheduled work another lead passed on), you can still start sessions \
      (`spawn_session`) and message Claude agents and sessions (`ask_agent`, `tell_agent`, \
-     `send_message`, `reply`); they get your messages as origin=human. Each message still counts one \
-     hop, and a chain ends after 8. Reminders and schedules keep their rule: none from a scheduled or \
-     triggered turn.\n";
+     `send_message`, `reply`). They get your messages as origin=lead, which they take like the human's. \
+     Each message still counts one hop, and a chain ends after 8. Work a trigger started \
+     (origin=webhook) keeps the usual rules, and no scheduled work, yours or what it reaches, can set \
+     reminders or schedules.\n";
 
 pub fn persona_text(name: &str, kind: SessionKind, persona: &str) -> String {
     let persona = persona.trim();
@@ -2067,8 +2095,14 @@ pub fn update_switch(hub: &Hub, req: AgentUpdate, outside: bool) -> anyhow::Resu
     // follows the right.
     if next.persona != cur.persona || next.self_handoff != cur.self_handoff || next.lead != cur.lead {
         let home = PathBuf::from(&next.home_dir);
-        ensure_home(&home)?;
-        write_persona(&home.join(persona_file(next.kind)), &persona_text_for(&next))?;
+        let written = ensure_home(&home).and_then(|()| write_persona(&home.join(persona_file(next.kind)), &persona_text_for(&next)));
+        // Taking a right back (lead or self handoff off, nothing else in the file changed) is saved
+        // even when the file can't be written: the stored flag is what Muster checks.
+        let only_revokes = next.persona == cur.persona && !(next.lead && !cur.lead) && !(next.self_handoff && !cur.self_handoff);
+        match written {
+            Err(e) if only_revokes => tracing::warn!(agent = %next.name, "rewriting the persona file after taking a right back: {e:#}"),
+            r => r?,
+        }
     }
     let next = hub.agents().set_config(hub.store(), &next)?;
     let switch = moving.map(|to| Switch {

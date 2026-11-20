@@ -67,7 +67,7 @@ Choices made while building it:
 - A trigger URL is `POST /api/trigger/<name>` with a Bearer secret (64 hex), loopback only; the
   secret never appears in `schedule.list` (only `trigger.secret`, the human's).
 - "Then…" steps: a success step and a failure step per level (failure may just notify), nested up
-  to 4 levels in the API (the UI and CLI offer one level). Each is a run of kind `chain` one hop
+  to 8 levels in the API (4 at first: the hop limit) (the UI and CLI offer one level). Each is a run of kind `chain` one hop
   further, so the hop limit (8) bounds chains. Steps don't count toward the schedule's daily cap or
   floor and don't hold back its next run.
 - Spend is read from OpenRouter's `GET /api/v1/key` (`usage_daily` for the overall cap; per agent,

@@ -654,7 +654,7 @@ pub async fn deliver(hub: &Arc<Hub>, l: &Letter<'_>) -> Delivery {
             if s.kind == SessionKind::Shell {
                 return outcome(DeliveryStatus::Refused, format!("not delivered: session {} is a shell", s.id));
             }
-            if let Err(why) = crate::mcp::guard::check_claude_origin(s.kind, route.origin) {
+            if let Err(why) = crate::mcp::guard::check_session_route(s.kind, route.origin, route.hop) {
                 return outcome(DeliveryStatus::Refused, format!("not delivered to session {}: {why}", s.id));
             }
             let text = format!("{}\n{}", (l.envelope)(&l.from, route.origin, route.hop), (l.text)(note.as_deref()));

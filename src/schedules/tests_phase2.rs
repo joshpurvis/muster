@@ -107,6 +107,9 @@ fn edits_by_its_agent_unattended_work_or_muster_itself_never_fire() {
     f.hub.agents().set_prov(43, Some(Prov { origin: Origin::Schedule, hop: 0, msg_id: Some(8) })).unwrap();
     crate::notes::append(&f.hub, id, "sched", by(Some(43), "agent")).unwrap();
     assert!(held(&f, s.id).is_none(), "unattended (scheduled) work");
+    f.hub.agents().set_prov(44, Some(Prov { origin: Origin::Lead, hop: 2, msg_id: Some(7) })).unwrap();
+    crate::notes::append(&f.hub, id, "passed on", by(Some(44), "agent")).unwrap();
+    assert!(held(&f, s.id).is_none(), "scheduled work a lead agent passed on");
     // Muster appending a run's reply (an agent author without a session).
     crate::notes::append(&f.hub, id, "## reply", by(None, "agent")).unwrap();
     assert!(held(&f, s.id).is_none(), "a run's reply put in the note");

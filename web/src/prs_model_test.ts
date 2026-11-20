@@ -51,6 +51,12 @@ Deno.test("waiting cards: ready first, then can't merge yet, then not now; oldes
   equal(nextReady(list, list[0])?.id, 5);
 });
 
+Deno.test("a card merged from this window keeps its place in the waiting strip, so nothing shifts", () => {
+  const cards = [pr(1), pr(2, { status: "merged" }), pr(3), pr(4, { status: "merged" })];
+  equal(sortWaiting(cards).map((p) => p.id), [1, 3]);
+  equal(sortWaiting(cards, new Set([2])).map((p) => p.id), [1, 2, 3]);
+});
+
 Deno.test("the tab shows while something waits or merged lately", () => {
   const now = 100 * 3600_000;
   equal(worthShowing([], now), false);

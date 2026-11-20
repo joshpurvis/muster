@@ -15,7 +15,9 @@ export type ConnStatus = "connecting" | "open" | "reconnecting" | "no_token" | "
 export const connStatus = signal<ConnStatus>("connecting");
 
 export class RpcError extends Error {
-  constructor(public method: string, message: string) {
+  /** `answered`: the backend itself answered with this error (false: the call was lost, timed out
+   * or never sent, so whether the backend acted on it is unknown or no). */
+  constructor(public method: string, message: string, public answered = false) {
     super(message);
   }
 }
@@ -265,7 +267,7 @@ class Rpc {
       clearTimeout(p.timer);
       if (msg.error) {
         const err = msg.error as { message?: string };
-        p.reject(new RpcError(p.method, err.message ?? String(msg.error)));
+        p.reject(new RpcError(p.method, err.message ?? String(msg.error), true));
       } else p.resolve(msg.result);
       return;
     }

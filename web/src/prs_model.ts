@@ -59,15 +59,17 @@ export const GROUPS: [Group, string][] = [["ready", "Ready to merge"], ["cant", 
 export function groupOf(p: Pr): Group {
   if (p.later != null) return "later";
   const s = cardState(p);
-  return s === "ready" || s === "merging" ? "ready" : "cant";
+  return s === "ready" || s === "merging" || s === "merged" ? "ready" : "cant";
 }
 
 const GROUP_ORDER: Record<Group, number> = { ready: 0, cant: 1, later: 2 };
 
 /** The cards waiting for the human (waiting, merging, stale): ready first, then can't merge yet,
- * then set aside; oldest first in each. */
-export function sortWaiting(ps: Iterable<Pr>): Pr[] {
-  return [...ps].filter((p) => p.status === "waiting" || p.status === "merging" || p.status === "stale")
+ * then set aside; oldest first in each. `kept`: cards merged from this window since the tab was
+ * shown, which keep their places (marked merged), so nothing shifts under the pointer. */
+export function sortWaiting(ps: Iterable<Pr>, kept?: ReadonlySet<number>): Pr[] {
+  return [...ps].filter((p) => p.status === "waiting" || p.status === "merging" || p.status === "stale"
+    || (p.status === "merged" && kept?.has(p.id)))
     .sort((a, b) => GROUP_ORDER[groupOf(a)] - GROUP_ORDER[groupOf(b)] || a.created_at - b.created_at || a.id - b.id);
 }
 

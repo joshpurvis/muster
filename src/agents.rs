@@ -2104,6 +2104,9 @@ pub struct AgentSession {
     pub started: bool,
     /// The agent was asleep since then (Unix ms), and this call woke it (src/sleep.rs).
     pub woke: Option<i64>,
+    /// This call started a process in a new conversation (`starts_new_conversation`: Start
+    /// fresh, a pending account move, a first start), so no old conversation is re-read.
+    pub new_conversation: bool,
 }
 
 /// `agent.start`: the agent's live session, else restart its exited one, else a new session in
@@ -2174,7 +2177,7 @@ fn fake_fresh_start(hub: &Arc<Hub>, name: &str, ok: &(dyn Fn(&SessionInfo) -> bo
     }
     hub.fence_conversation(sid);
     let agent = hub.agents().reset_for_start(hub.store(), agent.id, &agent.working_location)?;
-    Ok(AgentSession { agent, session, started: true, woke: None })
+    Ok(AgentSession { agent, session, started: true, woke: None, new_conversation: true })
 }
 
 async fn start_guarded(hub: &Arc<Hub>, name: &str, fresh: bool, window: Option<WindowId>,
@@ -2215,7 +2218,7 @@ async fn start_once(hub: &Arc<Hub>, name: &str, fresh: bool, window: Option<Wind
         && session.state != AgentState::Exited
         && hub.live_session_ids().contains(&sid)
     {
-        return Ok(AgentSession { agent, session, started: false, woke: None });
+        return Ok(AgentSession { agent, session, started: false, woke: None, new_conversation: false });
     }
     // Before fresh clears the resume ID, or a restart touches a live process.
     hub.check_account_profile(agent.account_profile_id)?;
@@ -2232,6 +2235,7 @@ async fn start_once(hub: &Arc<Hub>, name: &str, fresh: bool, window: Option<Wind
         agent = hub.agents().reset_for_start(hub.store(), agent.id, &agent.working_location)?;
     }
     let args = agent_args(agent.kind, agent.model.as_deref(), agent.effort.as_deref(), agent.resume_id.as_deref())?;
+    let new_conversation = starts_new_conversation(&agent, &args);
     let home = PathBuf::from(&agent.home_dir);
     ensure_home(&home)?;
     prepare_handoff(hub, &agent)?;
@@ -2254,7 +2258,10 @@ async fn start_once(hub: &Arc<Hub>, name: &str, fresh: bool, window: Option<Wind
     agent.asleep_at = None;
     let id = agent.id;
     let handoff = agent.handoff.as_ref().map(|h| h.at);
-    let r = run_agent(hub, agent, fresh, window, args, woke).await;
+    let r = run_agent(hub, agent, fresh, window, args, woke).await.map(|mut s| {
+        s.new_conversation = new_conversation && s.started;
+        s
+    });
     let r = match (r, handoff) {
         (Ok(mut s), Some(at)) if s.started => {
             handed_off(hub, id, at);
@@ -2277,6 +2284,16 @@ async fn start_once(hub: &Arc<Hub>, name: &str, fresh: bool, window: Option<Wind
     r
 }
 
+/// A start of `agent` with `args` begins a new conversation: Claude without `--resume` (Start
+/// fresh, a pending account move, a first start, or a saved id it can't use), Codex without a
+/// saved thread. Read from what the launch will actually do, not from why.
+fn starts_new_conversation(agent: &Agent, args: &[String]) -> bool {
+    match agent.kind {
+        SessionKind::Claude => !crate::cache::continues_conversation(agent.kind, args),
+        _ => !agent.resume_id.as_deref().is_some_and(valid_resume_id),
+    }
+}
+
 /// The run part of `start_locked`: restart the agent's exited session, else a new one in its tab.
 async fn run_agent(hub: &Arc<Hub>, mut agent: Agent, fresh: bool, window: Option<WindowId>, args: Vec<String>,
     woke: Option<i64>) -> anyhow::Result<AgentSession> {
@@ -2287,7 +2304,7 @@ async fn run_agent(hub: &Arc<Hub>, mut agent: Agent, fresh: bool, window: Option
     {
         let live = info.state != AgentState::Exited && hub.live_session_ids().contains(&sid);
         if live && !fresh {
-            return Ok(AgentSession { agent, session: info, started: false, woke });
+            return Ok(AgentSession { agent, session: info, started: false, woke, new_conversation: false });
         }
         hub.set_session_extra_args(sid, args)?;
         follow_account(hub, &agent, sid)?;
@@ -2299,7 +2316,7 @@ async fn run_agent(hub: &Arc<Hub>, mut agent: Agent, fresh: bool, window: Option
         let session = restarted?;
         hub.agents().update(hub.store(), agent.id, |a| a.channel_id = Some(channel.id))?;
         agent.channel_id = Some(channel.id);
-        return Ok(AgentSession { agent, session, started: true, woke });
+        return Ok(AgentSession { agent, session, started: true, woke, new_conversation: false });
     }
     hub.agents().update(hub.store(), agent.id, |a| a.channel_id = Some(channel.id))?;
     agent.channel_id = Some(channel.id);
@@ -2323,7 +2340,7 @@ async fn run_agent(hub: &Arc<Hub>, mut agent: Agent, fresh: bool, window: Option
         })
         .await?;
     agent.session_id = Some(session.id);
-    Ok(AgentSession { agent, session, started: true, woke })
+    Ok(AgentSession { agent, session, started: true, woke, new_conversation: false })
 }
 
 /// Select a dedicated channel without changing or stopping the current run.
@@ -2842,6 +2859,8 @@ pub struct Delivery {
     pub started: bool,
     /// The agent was asleep and this message woke it (src/sleep.rs).
     pub woke: bool,
+    /// That wake started a new conversation (a pending account move): nothing old was re-read.
+    pub new_conversation: bool,
 }
 
 /// The record of a message to `agent` (not yet stored).
@@ -2966,7 +2985,7 @@ async fn deliver_inner(hub: &Arc<Hub>, mut out: Outgoing, held: Option<&StartHel
         return Err(Refused(format!("the agent {} this was for was removed, and the name now belongs to another agent", out.agent)).into());
     }
     if let Some(at) = bs.woke {
-        crate::sleep::note_woke(hub, &bs.agent, &bs.session, at, &format!("a message from {} arrived", out.from), false);
+        crate::sleep::note_woke(hub, &bs, at, &format!("a message from {} arrived", out.from), false);
     }
     let sid = bs.session.id;
     let mut msg = message_record(&bs.agent, &out.from, out.from_session, out.route, &out.text);
@@ -3012,6 +3031,7 @@ async fn deliver_inner(hub: &Arc<Hub>, mut out: Outgoing, held: Option<&StartHel
                 queued: o.queued,
                 started: bs.started,
                 woke: bs.woke.is_some(),
+                new_conversation: bs.new_conversation,
             })
         }
         Err(e) => {
@@ -3287,9 +3307,11 @@ pub fn ask_result(
         "waited_ms": waited_ms,
     });
     if d.woke {
-        out["woke_note"] = json!(format!(
-            "{agent} was asleep: this message woke it, so it re-read its conversation before answering"
-        ));
+        out["woke_note"] = json!(if d.new_conversation {
+            format!("{agent} was asleep: this message woke it into a new conversation, so it did not re-read an old one")
+        } else {
+            format!("{agent} was asleep: this message woke it, so it re-read its conversation before answering")
+        });
     }
     match verdict {
         AskVerdict::Unattributed => {
@@ -4036,6 +4058,32 @@ pub fn memory_delete(a: &Agent, path: &str) -> anyhow::Result<Value> {
 mod tests {
     use super::*;
     use crate::mcp::guard::test_session;
+
+    /// A start reads as a new conversation from what it launches: Claude without `--resume`,
+    /// Codex without a saved thread.
+    #[test]
+    fn a_start_is_a_new_conversation_only_without_a_resume() {
+        let claude = Agent { resume_id: Some("0f7e3c1a-58b2-4d0e-9a6c-2b1d4e5f6a7b".into()), ..agent(SessionKind::Claude) };
+        let args = agent_args(SessionKind::Claude, None, None, claude.resume_id.as_deref()).unwrap();
+        assert!(!starts_new_conversation(&claude, &args));
+        let fresh = Agent { resume_id: None, ..claude };
+        assert!(starts_new_conversation(&fresh, &agent_args(SessionKind::Claude, None, None, None).unwrap()));
+        let codex = Agent { resume_id: Some("thread-1".into()), ..agent(SessionKind::Codex) };
+        assert!(!starts_new_conversation(&codex, &[]));
+        assert!(starts_new_conversation(&Agent { resume_id: None, ..codex }, &[]));
+    }
+
+    /// ask_agent's note after a wake: a re-read only when the wake resumed the conversation.
+    #[test]
+    fn the_ask_wake_note_says_which_conversation_it_woke_into() {
+        let d = |new_conversation| Delivery { msg_id: 1, session_id: 1, sent_at_ms: 0, delivered: true, queued: 0,
+            started: true, woke: true, new_conversation };
+        let route = Route { origin: Origin::Human, hop: 0, reply_to: None };
+        let note = |new| ask_result("ada", &d(new), route, &test_session(1, None), &AskVerdict::Wait, 0, None)["woke_note"]
+            .as_str().unwrap().to_string();
+        assert!(note(false).contains("re-read its conversation"), "{}", note(false));
+        assert!(note(true).contains("new conversation") && !note(true).contains("re-read its"), "{}", note(true));
+    }
 
     fn agent(kind: SessionKind) -> Agent {
         Agent {

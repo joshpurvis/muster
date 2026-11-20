@@ -289,6 +289,7 @@ impl Backend for Arc<Mock> {
             queued: 0,
             started: false,
             woke: false,
+            new_conversation: false,
         })
     }
     fn agent_refused(&self, m: crate::agents::AgentMessage, why: &str) {

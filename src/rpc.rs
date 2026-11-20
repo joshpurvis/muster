@@ -1036,7 +1036,17 @@ async fn dispatch_inner(hub: &Arc<Hub>, who: &Principal, method: &str, params: V
             let admitted = match chain {
                 Some(r) => {
                     let target = hub.session(p.id).ok_or_else(|| RpcError(format!("no such session: {}", p.id)))?;
+                    // Raw keys carry no route into the turn they start, so a Claude session takes
+                    // them only from the human's own chain: never from scheduled work, a lead's
+                    // passed-on work (`lead`) included.
                     crate::mcp::guard::check_session_route(target.kind, r.origin, r.hop).map_err(RpcError)?;
+                    if target.kind == SessionKind::Claude && r.origin != crate::agents::Origin::Human {
+                        return Err(RpcError(format!(
+                            "you are handling an origin={} message, and keys typed into a Claude session must come from work the human started; \
+                             send a message instead (muster send, or ask_agent for an agent)",
+                            r.origin.as_str()
+                        )));
+                    }
                     // Keys can start a turn as well as a prompt can: an OpenRouter session's
                     // spend caps apply to unattended keys too.
                     if r.origin != crate::agents::Origin::Human && target.provider == crate::openrouter::Provider::OpenRouter {
@@ -3056,6 +3066,11 @@ mod tests {
         let e = call(&hub, "session.input", json!({"id": 2, "data": "x", "from_session": 2})).await.unwrap_err();
         assert!(e.contains("origin=schedule"), "{e}");
         assert_eq!(spawn_prov(&hub, Some(2), Some(SessionKind::Claude)).ok().flatten(), Some(Prov { origin: Origin::Lead, hop: 2, msg_id: None }));
+        // A session on the lead's passed-on work (a builder it started) can't type keys into a
+        // Claude session either: they would start a turn that carries no route.
+        hub.agents().set_prov(3, Some(Prov { origin: Origin::Lead, hop: 2, msg_id: None })).unwrap();
+        let e = call(&hub, "session.input", json!({"id": 2, "data": "x", "from_session": 3})).await.unwrap_err();
+        assert!(e.contains("origin=lead") && e.contains("keys typed into a Claude session"), "{e}");
         // At the hop limit, no deeper start.
         hub.agents().set_prov(2, Some(Prov { origin: Origin::Schedule, hop: crate::mcp::guard::MAX_AGENT_HOPS, msg_id: None })).unwrap();
         assert!(spawn_prov(&hub, Some(2), Some(SessionKind::Claude)).err().is_some_and(|e| e.0.contains("hop 9")));

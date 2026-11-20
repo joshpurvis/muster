@@ -131,10 +131,11 @@ pub fn unattended_cap_refusal(agent: &str, recent: usize, cap: u32) -> String {
 pub fn check_agent_delivery(agent: &str, accepts: &[Origin], origin: Origin, hop: u32, recent: usize) -> Result<(), String> {
     if !accepts.contains(&origin.accepted_as()) {
         let list: Vec<&str> = accepts.iter().map(|o| o.as_str()).collect();
+        let lead = if origin == Origin::Schedule { ", or to make the sending agent a lead agent" } else { "" };
         return Err(format!(
             "agent {agent} accepts only {} messages, and this one is origin={} (the chain it belongs to was started by a {}, not the human). \
              Claude agents take human-started work only by default; route scheduled or triggered work to a Codex agent, or ask the human \
-             to run it (or to recreate the agent with --accepts, or to make the sending agent a lead agent).",
+             to run it (or to recreate the agent with --accepts{lead}).",
             if list.is_empty() { "no".to_string() } else { list.join("/") },
             origin.as_str(),
             origin.as_str()
@@ -158,9 +159,14 @@ pub fn check_agent_delivery(agent: &str, accepts: &[Origin], origin: Origin, hop
 /// unless a lead agent passed the scheduled work on (`Origin::Lead`).
 pub fn check_claude_origin(kind: SessionKind, origin: Origin) -> Result<(), String> {
     if kind == SessionKind::Claude && origin.accepted_as() != Origin::Human {
+        let lead = if origin == Origin::Schedule {
+            " (who can also make the agent that sends it a lead agent: scheduled work a lead passes on is taken like the human's)"
+        } else {
+            ""
+        };
         return Err(format!(
             "you are handling an origin={} message, and Claude agents only take work the human started. Use a Codex agent or agent \
-             for it, or ask the human (who can also make an agent a lead agent: what a lead sends counts as the human's).",
+             for it, or ask the human{lead}.",
             origin.as_str()
         ));
     }

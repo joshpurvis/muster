@@ -133,7 +133,7 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "spawn_session",
             "Spawn session",
-            "Start a new agent (claude or codex) or shell session, recorded as your child. By default it starts in YOUR channel (same working directory). Pass channel_id to use another existing channel of your workspace, or new_channel to create a fresh channel (a new tab in your channel's window; by default with its own git worktree + branch, so parallel work doesn't collide; without a name it is named after the agent's task). A Claude child inherits the calling Claude session's account profile, including Default; otherwise the workspace default applies. The agent runs with the target channel's permission profile (Codex sandbox, Claude permission mode; see whoami/list_channels), which only the human can change; a new_channel gets your channel's profile. There is no way to request more: a channel_id whose profile would give this kind of agent more than your channel has is refused. The prompt, if given, is delivered once the agent is ready. A shell can't be given a prompt unless the human allowed it. A Claude session can't be started while you handle scheduled or triggered work (origin schedule or webhook), unless you are a lead agent. Returns immediately; use wait_for_state to wait for it. Limits: spawn depth 3, 32 live children per caller, 32 agent-spawned sessions in total, 10 spawns per 10 minutes per caller, 10 open agent-created channels.",
+            "Start a new agent (claude or codex) or shell session, recorded as your child. By default it starts in YOUR channel (same working directory). Pass channel_id to use another existing channel of your workspace, or new_channel to create a fresh channel (a new tab in your channel's window; by default with its own git worktree + branch, so parallel work doesn't collide; without a name it is named after the agent's task). A Claude child inherits the calling Claude session's account profile, including Default; otherwise the workspace default applies. The agent runs with the target channel's permission profile (Codex sandbox, Claude permission mode; see whoami/list_channels), which only the human can change; a new_channel gets your channel's profile. There is no way to request more: a channel_id whose profile would give this kind of agent more than your channel has is refused. The prompt, if given, is delivered once the agent is ready. A shell can't be given a prompt unless the human allowed it. A Claude session can't be started while you handle scheduled or triggered work (origin schedule or webhook), unless you are a lead agent handling scheduled work (not a trigger's). Returns immediately; use wait_for_state to wait for it. Limits: spawn depth 3, 32 live children per caller, 32 agent-spawned sessions in total, 10 spawns per 10 minutes per caller, 10 open agent-created channels.",
             json!({
                 "type": "object",
                 "properties": {
@@ -253,14 +253,14 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "list_agents",
             "List agents",
-            "List the named agents: persistent agents (claude or codex) with their own home folder, memory and resumed conversation, which you can ask things with ask_agent. Each has name, kind, model, accepts_origins (which message origins it takes: human, schedule, webhook), lead (a lead agent: what it sends and spawns counts as the human's, whatever started its turn; only the human sets it), its session and state, and asleep (its process was stopped while idle: asking it wakes it, which re-reads its whole conversation unless a pending account move starts it in a new one, so only ask when you need it). Also returns your_origin: the origin and hop a message you send now would carry (human for a lead agent, whatever started your turn).",
+            "List the named agents: persistent agents (claude or codex) with their own home folder, memory and resumed conversation, which you can ask things with ask_agent. Each has name, kind, model, accepts_origins (which message origins it takes: human, schedule, webhook), lead (a lead agent: scheduled work it sends or spawns goes as origin=lead, taken like the human's; only the human sets it), its session and state, and asleep (its process was stopped while idle: asking it wakes it, which re-reads its whole conversation unless a pending account move starts it in a new one, so only ask when you need it). Also returns your_origin: the origin and hop a message you send now would carry (lead for a lead agent handling scheduled work).",
             empty_schema(),
             true,
         ),
         tool(
             "ask_agent",
             "Ask agent",
-            "Ask an agent something and wait for its answer. Starts the agent if it isn't running (or wakes it if asleep: woke is true), delivers the text (after a one-line [muster msg ...] header naming you, the origin and the hop) through its input queue, waits until its turn ends, and returns {reply, state, timed_out, msg_id}. reply is the agent's final message for that turn (null if it stopped on a permission prompt or question: check state). Refused when the agent doesn't accept your origin (a chain started by a schedule or webhook can't reach a Claude agent by default, unless it passed through a lead agent: what a lead agent sends counts as the human's), when the chain is more than 8 hops deep, or past the agent's 200 messages a day. Rate limited with send_message (20 per minute).",
+            "Ask an agent something and wait for its answer. Starts the agent if it isn't running (or wakes it if asleep: woke is true), delivers the text (after a one-line [muster msg ...] header naming you, the origin and the hop) through its input queue, waits until its turn ends, and returns {reply, state, timed_out, msg_id}. reply is the agent's final message for that turn (null if it stopped on a permission prompt or question: check state). Refused when the agent doesn't accept your origin (a chain started by a schedule or webhook can't reach a Claude agent by default; scheduled work a lead agent passes on goes as origin=lead, which is taken like the human's), when the chain is more than 8 hops deep, or past the agent's 200 messages a day. Rate limited with send_message (20 per minute).",
             json!({
                 "type": "object",
                 "properties": {
@@ -1297,6 +1297,7 @@ async fn send_message<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<
         }
         let from = crate::agents::sender_label(st.backend.agents().iter().find(|b| b.session_id == Some(caller)), caller);
         let bind = run.zip(width).map(|(run, width)| crate::quiet::Bind { run, width });
+        crate::quiet::check_quiet_origin(route.origin)?;
         return match st.backend.session_quiet(&info, from, Some(caller), route, text, bind) {
             Ok(v) => Ok(pretty(&v)),
             Err(e) => {
@@ -1654,6 +1655,7 @@ async fn tell_agent<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_
     let AgentSend { agent, out, width } = agent_send(st, caller, name, text)?;
     let route = out.route;
     if !wake {
+        crate::quiet::check_quiet_origin(route.origin)?;
         return match st.backend.agent_quiet(out, width).await {
             Ok(q) => Ok(pretty(&json!({
                 "agent": agent.name,

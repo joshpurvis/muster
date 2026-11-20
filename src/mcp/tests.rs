@@ -1819,10 +1819,12 @@ async fn a_lead_agents_scheduled_turn_counts_as_the_humans() {
     assert_eq!((out.origin, out.hop, out.reply_to), (Origin::Lead, 2, Some(77)));
     let (t, err) = call_as(&st, "tok3", "tell_agent", json!({"agent": "bea", "text": "x", "wake": true})).await;
     assert!(!err, "{t}");
-    // A note kept for bea's next turn carries `lead` too (bea takes it like the human's).
+    // A note on lead work can't wait for a later turn (none would show it): refused, both ways.
     let (t, err) = call_as(&st, "tok3", "tell_agent", json!({"agent": "bea", "text": "fyi", "wake": false})).await;
-    assert!(!err, "{t}");
-    assert_eq!(m.d.lock().quiet.last().unwrap().route.origin, Origin::Lead);
+    assert!(err && t.contains("origin=lead") && t.contains("wake=true"), "{t}");
+    let (t, err) = call_as(&st, "tok3", "send_message", json!({"session_id": 7, "text": "fyi", "wake": false})).await;
+    assert!(err && t.contains("origin=lead") && t.contains("wake=true"), "{t}");
+    assert!(m.d.lock().quiet.is_empty());
     let (t, err) = call_as(&st, "tok3", "send_message", json!({"session_id": 7, "text": "x"})).await;
     assert!(!err, "{t}");
     assert_eq!(*m.d.lock().sources.last().unwrap(), Source::Chain(Prov { origin: Origin::Lead, hop: 2, msg_id: None }));

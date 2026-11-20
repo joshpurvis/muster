@@ -383,7 +383,8 @@ pub const LEAD_SECTION: &str = "\n## Lead agent\n\n\
      The human made you a lead agent: in a turn a reminder or a schedule started (origin=schedule, or \
      origin=lead for scheduled work another lead passed on), you can still start sessions \
      (`spawn_session`) and message Claude agents and sessions (`ask_agent`, `tell_agent`, \
-     `send_message`, `reply`). They get your messages as origin=lead, which they take like the human's. \
+     `send_message`, `reply`, with wake=true: a message that waits for a later turn is refused there). \
+     They get your messages as origin=lead, which they take like the human's. \
      Each message still counts one hop, and a chain ends after 8. Work a trigger started \
      (origin=webhook) keeps the usual rules, and no scheduled work, yours or what it reaches, can set \
      reminders or schedules.\n";
@@ -3198,6 +3199,9 @@ pub async fn quiet_checked(hub: &Hub, out: Outgoing, width: Option<i64>) -> anyh
         Refused(why).into()
     };
     if let Err(why) = crate::quiet::check_receiver(a.kind, &a.name) {
+        return Err(refuse(why));
+    }
+    if let Err(why) = crate::quiet::check_quiet_origin(out.route.origin) {
         return Err(refuse(why));
     }
     // A late reply starts with its one-line "Late reply to your message" header

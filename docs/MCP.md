@@ -797,15 +797,20 @@ next reminder. The stricter origin still wins when chains meet (`human` < `lead`
 lifted, and what isn't:
 - the human's work stays `human`; a trigger's (`webhook`) or an add-on's work is never lifted, so
   outside triggers stay blocked from Claude agents even through a lead;
-- `muster keys` from a lead keeps its turn's own origin (raw input skips the receiver's accept list);
+- keys (`muster keys`) reach a Claude session only from the human's own chain: never from scheduled
+  work, `lead` included (raw input carries no route into the turn it starts);
+- a message on `lead` work can't wait for a later turn (`tell_agent`, `send_message` or `reply`
+  with `wake: false` is refused; send it with `wake: true`): only a `lead` turn could show it;
 - what reaches a lead is unchanged: its accepted origins decide what it takes.
 
 Codex agents can't be leads (refused; a flag written into the database by hand is ignored), and no
 tool sets it: turning it on takes a click in Muster's window or the owner's terminal, the check
 `tools_up_front` makes; anyone may turn it off, which is saved even when the persona file can't be
 rewritten. A lead's persona file says it is one ("Lead agent"). An older backend reads a stored
-`lead` as `webhook` (the strictest it knows); one started on runtime state holding a live `lead`
-provenance refuses that state, so roll back only after a reload with no lead work in flight.
+`lead` origin column as `webhook` (the strictest it knows), but a late reply stored with `lead` in
+its JSON drops out of its message log, and it refuses to start on runtime attribution state that
+holds a `lead` provenance, which an idle session keeps until its next attributed prompt: rolling
+back after lead work ran can need that state cleared first.
 
 An agent's reply is attributed per message: the message whose prompt was submitted (confirmed by the
 envelope in UserPromptSubmit) owns the next final message; a prompt without an envelope in between
@@ -1409,7 +1414,7 @@ Default `states`: `idle, needs_approval, asking_question, error, stuck, exited`,
 | Other workspaces | Off by default, see below. |
 | `post_to_channel` rate | **30 per 60 s** per caller |
 | Self-messaging | Refused (`session_id` == caller; `ask_agent` of the caller's own agent) |
-| Agent origins | `ask_agent` is refused unless the agent's `accepts_origins` contains the message's origin. Defaults: Claude agents `human`; Codex agents `human`, `schedule`, `webhook`. A Claude session that isn't a named agent takes `human` only: `send_message` to one, or `spawn_session` of `kind: claude`, from a non-human chain is refused. |
+| Agent origins | `ask_agent` is refused unless the agent's `accepts_origins` contains the message's origin. Defaults: Claude agents `human`; Codex agents `human`, `schedule`, `webhook`. A Claude session that isn't a named agent takes `human` only: `send_message` to one, or `spawn_session` of `kind: claude`, from a non-human chain is refused. `lead` (scheduled work a lead agent passed on) is taken like `human` in both, but never as keys or as a message that waits for a later turn (see "Lead agents"). |
 | Agent hops | Max hop **8** (`guard::MAX_AGENT_HOPS`); a message from the human or a trigger is hop 0. A lead agent's messages count too, and the limit also holds for what reaches a plain session (`send_message`, a spawned session's start, keys, a reply typed in: `guard::check_hop`). |
 | Agent daily cap | **200** messages delivered to one agent per rolling 24 hours, any origin (`guard::AGENT_DAILY_PROMPT_CAP`; counted from `agent_messages`, so it survives restarts, and re-checked in the same transaction as the insert, so concurrent asks over MCP and the CLI can't overshoot). |
 | Agent messages | Only through `ask_agent` and `tell_agent`: `send_message` to an agent's session is refused. `ask_agent` shares `send_message`'s rate limit, size limit, text cleaning, `!` rule and permission-widening check, against the widest of the agent session's current tab and the agent's own tab (its profile before it has one). An agent only ever runs in its own tab (stored on the agent), never a same-named one. |

@@ -196,7 +196,8 @@ pub fn answer_origins(m: &AgentMessage, now: Option<Prov>, lead: bool) -> Vec<Or
 /// the question's own chain didn't have and is no deeper in the chain than an answer in the
 /// question's own turn (one hop on): otherwise it goes the guarded way, as a new message.
 fn returnable(m: &AgentMessage, a: &Answer) -> bool {
-    a.origins.iter().all(|o| *o == m.origin) && a.hop <= m.hop.saturating_add(1)
+    // A lead's reply to scheduled work it was asked in is that work passed on (`Origin::lifted`).
+    a.origins.iter().all(|o| *o == m.origin || *o == m.origin.lifted()) && a.hop <= m.hop.saturating_add(1)
 }
 
 /// Did message `m` reach its agent? Never for a refused one.
@@ -1019,6 +1020,17 @@ mod tests {
         assert!(returnable(&m, &a(None)));
         assert!(returnable(&m, &a(Some(Prov { origin: Origin::Human, hop: 1, msg_id: Some(m.id) }))));
         assert!(!returnable(&m, &a(Some(Prov { origin: Origin::Human, hop: 4, msg_id: None }))));
+        // A lead's reply in the scheduled turn it was asked in is that work passed on: taken.
+        let s = hub.store().agent_message(msg(&hub, &b, "human", None, Origin::Schedule, 1, false)).unwrap().unwrap();
+        let sched = Some(Prov { origin: Origin::Schedule, hop: 1, msg_id: Some(s.id) });
+        let r = answer_route(&s, sched, true);
+        let lead = Answer { text: "x".into(), at: 0, from_session: 2, origin: r.origin, hop: r.hop, origins: answer_origins(&s, sched, true),
+            status: AnswerStatus::Pending, note: None, msg: None, session: None, quiet: false };
+        assert!(returnable(&s, &lead));
+        // A non-lead's reply from a trigger's work to a scheduled question is not.
+        let hook = Some(Prov { origin: Origin::Webhook, hop: 1, msg_id: None });
+        let w = Answer { origins: answer_origins(&s, hook, false), ..lead };
+        assert!(!returnable(&s, &w));
     }
 
 }

@@ -436,15 +436,17 @@ merges, never a model.
   can count down and merge at once. Only that card's Cancel (or Esc in the tab while the card is
   shown) stops it, or the card changing under it (posted again, no longer mergeable: a toast says
   why); its pill and its row in the list show … ("merging soon") until it ends. Nothing is sent
-  until the countdown ends, nothing at all if the window has lost its connection then, and
-  closing or reloading the window ends every countdown unsent. Then `pr.merge`: "Asking GitHub to
-  merge", and the card ends merged ("<repo> #<n> is in master as commit abc1234", whether its poster
+  until the countdown ends, nothing at all if the window has lost its connection then or its timer
+  ran over 30 s late (a window asleep), and closing or reloading the window ends every countdown not
+  yet sent. A send that fails says why on the card (and in a toast) until Merge is clicked again.
+  Then Muster asks GitHub to merge ("Asking GitHub to merge"), and the card ends merged ("<repo> #<n> is in master as commit abc1234", whether its poster
   was told, with **Next waiting** at the dock's other end), refused (a red banner with why and
   GitHub's first line; Merge off until a read passes), or "Not known yet" when Muster asked GitHub
   but couldn't confirm the result (Check again settles it). A result never takes focus, changes
   the card shown or switches to **Merged**: wherever the human is typing stays focused, and a card
-  merged from here keeps its place in the Waiting strip (marked ✓) until the tab is shown again or
-  the filter changes. Plain Enter and Space on Merge do nothing; Merge ignores clicks for 0.6 s
+  sent to merge from here keeps its place in the Waiting strip (marked ✓ once merged) until the tab
+  is shown again or the filter changes after its merge has ended. Esc with the large view or the
+  list open closes that, not the countdown. Plain Enter and Space on Merge do nothing; Merge ignores clicks for 0.6 s
   after its card appears or changes, a Cancel, a reorder, or the large view or list closing, and
   says so under the button when it ignores one. There is no other shortcut for it.
 - **Stale**: when GitHub's newest commit isn't the one posted, the card says **Changed since it was

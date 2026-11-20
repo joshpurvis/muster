@@ -22,7 +22,7 @@ import {
   prs, prsFilter, refreshPrs, REFRESH_EVERY_MS, repoName, type Rule, rules, selectedPr, setLater, shortSha, sizeOf,
   sortWaiting, stepPicture, tagText, target, titleOf, toldText, waitingPrs,
 } from "../prs.ts";
-import { cancelMerge, mergedHere, queuedMerges, startMerge } from "../prs_merges.ts";
+import { cancelMerge, clearSettled, failedMerges, mergedHere, queuedMerges, startMerge } from "../prs_merges.ts";
 import { ageText, clockText } from "../questions_model.ts";
 import type { Pr } from "../types.ts";
 import { agents, sessions, toast } from "../state.ts";
@@ -90,7 +90,7 @@ export function PrsView() {
   }, []);
 
   // A new visit to the tab starts the Waiting strip afresh (cards merged meanwhile leave it).
-  useEffect(() => { mergedHere.value = new Set(); }, []);
+  useEffect(() => clearSettled(), []);
 
   // GitHub is read when the tab is shown and every 2 minutes while it is and the window is in
   // view (never in the background).
@@ -130,8 +130,9 @@ export function PrsView() {
   };
   const showFilter = (f: "waiting" | "merged") => {
     prsFilter.value = f;
-    mergedHere.value = new Set();
-    selectedPr.value = (f === "waiting" ? waiting : merged)[0]?.id ?? null;
+    clearSettled();
+    // From the lists as they are after the clear (a card merged from here leaves Waiting now).
+    selectedPr.value = (f === "waiting" ? waitingPrs.peek() : merged)[0]?.id ?? null;
     setMenu(false);
   };
   const openZoom = (p: Pr, index: number) => {
@@ -228,7 +229,7 @@ function Strip({ list, current, onPick }: { list: Pr[]; current: Pr | undefined;
         const mark = queuedMark(p) ?? pillMark(p);
         return (
           <button key={p.id} id={`prs-pill-${p.id}`} type="button" role="tab" aria-selected={on} aria-controls="prs-stage"
-            tabIndex={on || (!current && p === list[0]) ? 0 : -1}
+            tabIndex={on || (!list.some((x) => x.id === current?.id) && p === list[0]) ? 0 : -1}
             aria-label={`#${p.number} ${p.repo}: ${titleOf(p)}. ${mark.status}`}
             class={cx("pb-pill", on && "on", p.status === "merged" && "done", p.later != null && p.status !== "merged" && "later")}
             data-tip={`${p.repo} · ${titleOf(p)}`}
@@ -437,6 +438,13 @@ function Dock({ p, now, order, onPick }: { p: Pr; now: number; order: string; on
   const [words, setWords] = useState("");
   const [mergeWidth, setMergeWidth] = useState(0);
   const guard = useRef(performance.now());
+  const hintTimer = useRef<ReturnType<typeof setTimeout>>();
+  const say = (text: string) => {
+    clearTimeout(hintTimer.current);
+    setHint(text);
+    hintTimer.current = setTimeout(() => setHint(""), 3000);
+  };
+  useEffect(() => () => clearTimeout(hintTimer.current), []);
   const ref = useRef<HTMLDivElement>(null);
   const s = cardState(p);
   const can = canMerge(p);
@@ -446,18 +454,23 @@ function Dock({ p, now, order, onPick }: { p: Pr; now: number; order: string; on
   // dock is shown).
   const queued = queuedMerges.value.get(p.id);
   const counting = queued?.phase === "count" && p.status === "waiting";
+  // Why this card's last send from here failed, until Merge is clicked again.
+  const failed = failedMerges.value.get(p.id);
   // Re-renders the seconds left while it counts down.
   useNow(counting ? 200 : 60_000);
 
-  // Merge ignores clicks for a moment after its card appears or changes, the list reorders, or
-  // the large view or list closes. Before paint, so no click lands in between.
-  useLayoutEffect(() => { guard.current = performance.now(); }, [p.updated_at, p.head_sha, p.post, order, bump]);
+  // Merge ignores clicks for a moment after its card appears or changes, the list reorders, the
+  // large view or list closes, or Merge comes back in Cancel's place (a send that failed). Before
+  // paint, so no click lands in between.
+  useLayoutEffect(() => { guard.current = performance.now(); }, [p.updated_at, p.head_sha, p.post, order, bump, !!queued]);
 
-  // Esc anywhere in the tab cancels the countdown of the card shown.
+  // Esc anywhere in the tab cancels the countdown of the card shown, unless the large view or the
+  // list is open (Esc closes that).
   useEffect(() => {
     if (!counting) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Escape" || !(e.target as HTMLElement)?.closest?.(".prs-view")) return;
+      if (document.querySelector(".prs-view .pm-lightbox, .prs-view .pb-menu")) return;
       e.preventDefault();
       e.stopPropagation();
       cancel();
@@ -469,8 +482,7 @@ function Dock({ p, now, order, onPick }: { p: Pr; now: number; order: string; on
   const start = () => {
     if (!can || queued || !p.github) return;
     if (performance.now() - guard.current < CLICK_GUARD_MS) {
-      setHint("That click came right after the card changed, so Merge ignored it: click again.");
-      setTimeout(() => setHint(""), 3000);
+      say("That click came right after the card changed, so Merge ignored it: click again.");
       return;
     }
     setMergeWidth(ref.current?.querySelector<HTMLElement>(".pm-merge")?.offsetWidth ?? 0);
@@ -556,7 +568,8 @@ function Dock({ p, now, order, onPick }: { p: Pr; now: number; order: string; on
   );
 
   if (s === "merged" || s === "closed") {
-    const next = nextReady(waitingPrs.value, p);
+    // Not one already counting down or being sent from here.
+    const next = nextReady(waitingPrs.value.filter((x) => x.id === p.id || !queuedMerges.value.has(x.id)), p);
     return (
       <div class="pb-dock" ref={ref}>
         <div class="pb-dock-in">
@@ -676,8 +689,7 @@ function Dock({ p, now, order, onPick }: { p: Pr; now: number; order: string; on
                   if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); start(); }
                   else if (e.key === "Enter" || e.key === " ") {
                     e.preventDefault();
-                    setHint("Ctrl+Enter starts Merge; Enter and Space do nothing here.");
-                    setTimeout(() => setHint(""), 3000);
+                    say("Ctrl+Enter starts Merge; Enter and Space do nothing here.");
                   }
                 }}>
                 <IconMerge />Merge {target(p)}
@@ -687,12 +699,14 @@ function Dock({ p, now, order, onPick }: { p: Pr; now: number; order: string; on
         <div class="pb-fine">
           {going && (
             <span class="pm-over" aria-hidden="true">
-              Into {baseName(p)} as a merge commit. {counting ? "Cancel or Esc stops it. You can move on: it merges on its own." : "You can move on meanwhile."}
+              Into {baseName(p)} as a merge commit. {counting ? "Cancel or Esc stops it. You can move on: Muster asks GitHub to merge when the countdown ends." : "You can move on meanwhile."}
             </span>
           )}
           <span class={cx("pm-idle", going && "pm-held")}>
             {hint
               ? <span class="off" role="status">{hint}</span>
+              : failed && can
+              ? <span class="off" role="status">Not merged: {failed}</span>
               : can
               ? <span class="pm-fine-text">A merge commit into {baseName(p)}; Muster leaves the branch alone. You get {COUNTDOWN_S} seconds to cancel, and can move on meanwhile.</span>
               : off && <span class="off">Merge is off: {off}.</span>}

@@ -33,6 +33,10 @@ export interface QueueDeps {
   changed: (all: ReadonlyMap<number, Queued>) => void;
 }
 
+/** A countdown whose timer runs this late (a window asleep or throttled) sends nothing. */
+export const LATE_MS = 30_000;
+export const LATE_TEXT = "the window was asleep when its countdown ended, so nothing was sent: click Merge again";
+
 export function mergeQueue(countdownMs: number, deps: QueueDeps) {
   const all = new Map<number, Queued>();
   const timers = new Map<number, unknown>();
@@ -42,6 +46,12 @@ export function mergeQueue(countdownMs: number, deps: QueueDeps) {
     timers.delete(id);
     const q = all.get(id);
     if (!q || q.phase !== "count") return;
+    if (deps.now() - q.endsAt > LATE_MS) {
+      all.delete(id);
+      changed();
+      deps.failed(q.seen, new Error(LATE_TEXT));
+      return;
+    }
     all.set(id, { ...q, phase: "send" });
     changed();
     deps.send(q.seen).then(

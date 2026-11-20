@@ -1,4 +1,4 @@
-import { mergeQueue, type Queued, type Seen } from "./prs_merge_queue.ts";
+import { LATE_MS, mergeQueue, type Queued, type Seen } from "./prs_merge_queue.ts";
 
 function assertEquals(a: unknown, b: unknown) {
   if (JSON.stringify(a) !== JSON.stringify(b)) throw new Error(`Expected ${JSON.stringify(b)}, got ${JSON.stringify(a)}`);
@@ -83,5 +83,14 @@ Deno.test("while sent and waiting for Muster's answer, the card shows as sending
   assertEquals(q.stop(1), false);
   answer();
   await tick(0);
+  assertEquals(shown().size, 0);
+});
+
+Deno.test("a countdown whose timer fires very late (the window asleep) sends nothing and says so", async () => {
+  const { q, tick, sent, failed, shown } = setup();
+  q.start(seen(1));
+  await tick(5000 + LATE_MS + 1);
+  assertEquals(sent, []);
+  assertEquals(failed, [1]);
   assertEquals(shown().size, 0);
 });

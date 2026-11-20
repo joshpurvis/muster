@@ -11,8 +11,19 @@ import { toast } from "./state.ts";
 
 /** Each card counting down or being sent from this window, by card id. */
 export const queuedMerges = signal<ReadonlyMap<number, Queued>>(new Map());
-/** Cards merged from this window since the tab was shown: the Waiting strip keeps their places. */
+/** Cards sent to merge from this window since the tab was shown: the Waiting strip keeps their
+ * places (a merged one is shown there, marked merged). */
 export const mergedHere = signal<ReadonlySet<number>>(new Set());
+/** Why a card's last send from here failed (shown on its card until Merge is clicked again). */
+export const failedMerges = signal<ReadonlyMap<number, string>>(new Map());
+
+/** Forget the cards whose merge has ended (the tab shown again, the filter changed); one still
+ * counting down or merging keeps its place. */
+export function clearSettled() {
+  const q = queuedMerges.peek();
+  const cards = prs.peek();
+  mergedHere.value = new Set([...mergedHere.peek()].filter((id) => q.has(id) || cards.get(id)?.status === "merging"));
+}
 
 const errText = (e: unknown) => (e instanceof Error ? e.message : String(e));
 const nameOf = (id: number) => {
@@ -24,17 +35,35 @@ const queue = mergeQueue(COUNTDOWN_S * 1000, {
   now: () => Date.now(),
   setTimer: (fn, ms) => setTimeout(fn, ms),
   clearTimer: (t) => clearTimeout(t as number),
-  send: async (seen: Seen) => {
-    await mergePr(seen);
+  // Kept in the strip from the moment it is sent: an answer lost on the way can't drop it.
+  send: (seen: Seen) => {
     mergedHere.value = new Set(mergedHere.peek()).add(seen.id);
+    return mergePr(seen);
   },
-  // Not sent (disconnected, or refused at the click): the card is back to its Merge.
-  failed: (seen, e) => toast("error", `${nameOf(seen.id)}: ${errText(e)}`, 8000),
+  // Not sent (disconnected, asleep, or refused at the click): the card is back to its Merge, and
+  // says why until Merge is clicked again.
+  failed: (seen, e) => {
+    const p = prs.peek().get(seen.id);
+    if (p?.status !== "merging" && p?.status !== "merged") {
+      const kept = new Set(mergedHere.peek());
+      kept.delete(seen.id);
+      mergedHere.value = kept;
+    }
+    failedMerges.value = new Map(failedMerges.peek()).set(seen.id, errText(e));
+    toast("error", `${nameOf(seen.id)}: ${errText(e)}`, 8000);
+  },
   changed: (all) => { queuedMerges.value = all; },
 });
 
 /** Start card `seen.id`'s countdown (false: it has one already). */
-export const startMerge = (seen: Seen) => queue.start(seen);
+export function startMerge(seen: Seen): boolean {
+  if (failedMerges.peek().has(seen.id)) {
+    const f = new Map(failedMerges.peek());
+    f.delete(seen.id);
+    failedMerges.value = f;
+  }
+  return queue.start(seen);
+}
 /** Cancel card `id`'s countdown (false: none, or sent already). */
 export const cancelMerge = (id: number) => queue.stop(id);
 

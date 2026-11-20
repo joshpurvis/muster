@@ -39,6 +39,7 @@ mod renderer;
 mod replay_tail;
 mod pty;
 mod questions;
+mod quiet;
 mod prs;
 mod relay;
 mod rpc;
@@ -445,12 +446,17 @@ carries that session's origin (docs/MCP.md, \"Agents\").")]
     /// Inside an agent's session: answer a message it received, after the turn that received it.
     #[command(after_help = "Examples:\n  muster reply 42 the benchmarks finished: all green\n  cat report.md | muster reply 42 -\n\n\
 Runs the session's MCP `reply` tool: once per message, only for messages Muster delivered to this\n\
-agent. The asker gets it as a new message, or the human in the agents panel (docs/MCP.md, \"Late replies\").")]
+agent. The asker gets it as a new message, or the human in the agents panel (docs/MCP.md, \"Late replies\").\n\
+With --no-wake an asker that stopped waiting gets it at the start of its next turn that can take it instead.")]
     Reply {
         /// The message's id, from its `[muster msg <id> ...]` line.
         msg_id: i64,
         /// Words, joined by spaces. None or `-`: read stdin.
         text: Vec<String>,
+        /// Don't start a turn for it: unless a waiting ask takes it, the asker gets it at the
+        /// start of its next turn that can take it (docs/MCP.md, "Quiet messages").
+        #[arg(long)]
+        no_wake: bool,
         /// Print the result as JSON.
         #[arg(long)]
         json: bool,
@@ -555,7 +561,7 @@ enum AgentCmd {
         /// Start it whenever the daemon starts.
         #[arg(long)]
         autostart: bool,
-        /// Stop its process after this long idle (minutes, 90m, 2h); the next message wakes it
+        /// Stop its process after this long idle (minutes, 90m, 2h); a message sent with wake on wakes it
         /// into the same conversation. Default: never.
         #[arg(long, value_name = "TIME")]
         sleep_after: Option<String>,
@@ -611,6 +617,14 @@ enum AgentCmd {
         /// terminal outside Muster (refused inside any Muster tab). Anyone may turn it off.
         #[arg(long, value_name = "on|off", value_parser = ["on", "off"])]
         self_handoff: Option<String>,
+        /// Load Muster's message tools (ask_agent, tell_agent, reply, send_message, whoami,
+        /// note_read, note_append) up front in this Claude agent's sessions instead of through
+        /// tool search: about 2,200 more tokens on every request, mostly cached, one model call
+        /// less each time one of them would be searched for. Off by default; applies from its
+        /// next start. Only the human turns it on (refused inside a Muster tab); anyone may turn
+        /// it off. Claude agents only.
+        #[arg(long, value_name = "on|off", value_parser = ["on", "off"])]
+        tools_up_front: Option<String>,
         #[command(flatten)]
         perms: AgentPerms,
     },
@@ -839,6 +853,7 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
                     autostart: Some(autostart),
                     sleep_after,
                     self_handoff: None,
+                    tools_up_front: None,
                     claude_mode: perms.claude_mode,
                     codex_sandbox: perms.codex_sandbox,
                 },
@@ -858,6 +873,7 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
                 autostart,
                 sleep_after,
                 self_handoff,
+                tools_up_front,
                 perms,
             } => cli::agent_edit(
                 d,
@@ -874,6 +890,7 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
                     autostart: autostart.map(|a| a == "on"),
                     sleep_after,
                     self_handoff: self_handoff.map(|a| a == "on"),
+                    tools_up_front: tools_up_front.map(|a| a == "on"),
                     claude_mode: perms.claude_mode,
                     codex_sandbox: perms.codex_sandbox,
                 },
@@ -900,7 +917,7 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
             timeout,
             json,
         } => cli::ask(d, &agent, &text, timeout, json),
-        Cmd::Reply { msg_id, text, json } => cli::reply(d, msg_id, &text, json),
+        Cmd::Reply { msg_id, text, no_wake, json } => cli::reply(d, msg_id, &text, !no_wake, json),
         Cmd::StartFresh { file, json } => cli::start_fresh(d, &file, json),
         _ => unreachable!("dispatched in main"),
     }
@@ -1958,11 +1975,20 @@ async fn daemon_main(openrouter_key: Option<openrouter::ApiKey>, launch: Option<
         // Pull request cards likewise: a merge a restart cut off, results on their way (src/prs.rs).
         let cards = prs::unfinished(&hub);
         tokio::spawn(async move {
+            // What waited for a plain session's run that ended while no backend ran is dropped
+            // before any new run or late reply (src/quiet.rs).
+            quiet::reconcile(&hub);
+            // Messages that waited a week unshown expire (src/quiet.rs; hourly below too), before
+            // late replies are recovered: recovery then sees an overdue carrier as expired, as
+            // the overlay does, instead of recording it delivered.
+            quiet::expire(&hub, model::now_ms());
             agents::autostart(&hub).await;
             // An answer that had started its agent in a new conversation is that conversation's
             // first message; the other answers come after late replies (src/questions.rs).
             questions::resume(&hub, answers_first).await;
             agent_reply::resume(&hub, unfinished).await;
+            // The tabs count what still waits for a later turn.
+            quiet::refresh_all(&hub);
             questions::resume(&hub, answers).await;
             prs::resume(&hub, cards).await;
         });
@@ -1981,7 +2007,11 @@ async fn daemon_main(openrouter_key: Option<openrouter::ApiKey>, launch: Option<
             loop {
                 t.tick().await;
                 let h = hub.clone();
-                let _ = tokio::task::spawn_blocking(move || h.prune_events()).await;
+                let _ = tokio::task::spawn_blocking(move || {
+                    h.prune_events();
+                    // Quiet messages unshown for a week (src/quiet.rs), even with no turn to take them.
+                    quiet::expire(&h, model::now_ms());
+                }).await;
             }
         });
     }
@@ -2078,6 +2108,7 @@ mod tests {
         // Provenance comes from the calling session, never from a flag.
         assert!(parse(&["ask", "ada", "hi", "--origin", "human"]).is_err());
         assert!(parse(&["reply", "42", "all", "green"]).is_ok());
+        assert!(parse(&["reply", "--no-wake", "42", "all", "green"]).is_ok());
         assert!(parse(&["reply", "x", "hi"]).is_err());
         assert!(matches!(parse(&["agent", "start", "ada", "--fresh"]), Ok(Cmd::Agent { .. })));
     }

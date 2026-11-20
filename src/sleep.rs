@@ -30,7 +30,7 @@
 //! uncached, which costs the owner real usage. The tab says so before a wake, the wake is noted
 //! in the timeline, and a message typed in after the wake gets the cold-start mark as any
 //! message to a cold agent does. A wake that fails leaves the agent asleep, says why (its
-//! asleep bar, a notice), and the next message or typing tries again.
+//! asleep bar, a notice), and a message sent with wake on, or typing, tries again.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -709,9 +709,9 @@ pub async fn sleep(hub: &Arc<Hub>, name: &str, why: Why) -> anyhow::Result<Agent
     crate::agents::publish(hub, &a);
     let idle = now - idle_since(&info, human_at(hub, info.id, now));
     let text = match why {
-        Why::Manual => format!("{} is asleep. The next message wakes it.", a.name),
+        Why::Manual => format!("{} is asleep. A message sent with wake on wakes it.", a.name),
         Why::Idle => format!(
-            "{} fell asleep after {} idle. The next message wakes it.",
+            "{} fell asleep after {} idle. A message sent with wake on wakes it.",
             a.name,
             crate::cache::idle_text(idle)
         ),
@@ -794,7 +794,7 @@ pub(crate) fn unconfirmed(e: &anyhow::Error) -> bool {
 }
 
 /// The start that was waking agent `agent` (asleep since `asleep_at`) failed with `e`. With no
-/// run going, it is asleep again (not "stopped"): its next message, or typing into its tab,
+/// run going, it is asleep again (not "stopped"): a message sent with wake on, or typing into its tab,
 /// tries again. The keys held for it are dropped (said), and its asleep bar says why. A launch
 /// that is only unconfirmed (`unconfirmed`) hasn't failed: the wake goes on, and `settle`
 /// waits for the launch to be adopted (it is ready) or retired (the wake failed after all).
@@ -964,7 +964,7 @@ async fn ended_early(hub: &Arc<Hub>, agent: i64, tab: SessionId, asleep_at: i64)
     let name = hub.agents().by_id(agent).map(|a| a.name).unwrap_or_else(|| "The agent".into());
     tracing::warn!(agent = name, "waking: {e:#}");
     let lost = if wake_lost(hub, agent, asleep_at, &e, false) { " What you typed into its tab meanwhile wasn't sent." } else { "" };
-    hub.notice("warn", format!("{name} couldn't be woken: {e:#}. It is asleep again; the next message, or typing into its tab, tries again.{lost}"));
+    hub.notice("warn", format!("{name} couldn't be woken: {e:#}. It is asleep again; a message sent with wake on, or typing into its tab, tries again.{lost}"));
     true
 }
 
@@ -1212,7 +1212,7 @@ pub(crate) fn wake_soon(hub: &Arc<Hub>, agent: i64, tab: Option<SessionId>, caus
                         Cause::Typing => ("you typed into its tab", true),
                         Cause::Panel => ("you clicked in one of its panels", false),
                     };
-                    note_woke(&hub, &s.agent, &s.session, at, what, say_cost);
+                    note_woke(&hub, &s, at, what, say_cost);
                 }
             }
             // The launch is unconfirmed, not failed: the wake goes on (`settle`).
@@ -1258,7 +1258,7 @@ pub(crate) async fn for_send(hub: &Arc<Hub>, id: SessionId) -> anyhow::Result<(S
     match crate::agents::wake_if_asleep(hub, a.id).await? {
         Some(s) => {
             if let Some(at) = s.woke {
-                note_woke(hub, &s.agent, &s.session, at, "you sent it a message", true);
+                note_woke(hub, &s, at, "you sent it a message", true);
             }
             Ok((s.session.id, Some(guard)))
         }
@@ -1274,26 +1274,34 @@ pub fn wake_cost(info: &SessionInfo, now: i64) -> Option<i64> {
 
 /// Say in the agent's timeline that `cause` woke it (asleep since `asleep_at`); `say_cost`: and,
 /// when its cache had likely expired, what the wake costs (a message Muster types in gets the
-/// cold-start note of its own instead).
-pub(crate) fn note_woke(hub: &Hub, agent: &Agent, session: &SessionInfo, asleep_at: i64, cause: &str, say_cost: bool) {
+/// cold-start note of its own instead). A wake into a new conversation (`new_conversation`:
+/// Start fresh, a pending account move) re-reads none of the old one: it says so instead.
+pub(crate) fn note_woke(hub: &Hub, s: &crate::agents::AgentSession, asleep_at: i64, cause: &str, say_cost: bool) {
+    let (agent, session) = (&s.agent, &s.session);
     let now = now_ms();
     let cold = wake_cost(session, now);
-    let mut text = format!(
-        "Woke {} after {} asleep: {cause}.",
-        agent.name,
-        crate::cache::idle_text(now - asleep_at)
-    );
-    if say_cost && let Some(idle) = cold {
+    let text = woke_text(&agent.name, now - asleep_at, cause, if say_cost { cold } else { None }, s.new_conversation);
+    tracing::info!(agent = agent.name, "{text}");
+    hub.log_event(Some(session.channel_id), Some(session.id), EventKind::System, json!({
+        "text": text, "level": "info",
+        "woke": {"agent": agent.name, "asleep_ms": now - asleep_at, "cold_idle_ms": cold, "cause": cause,
+                 "new_conversation": s.new_conversation},
+    }));
+}
+
+/// The timeline line of a wake: asleep for `asleep_ms` until `cause` woke it; `cold_idle`: it had
+/// been idle that long and its cache had likely expired, so the wake re-reads at full cost.
+fn woke_text(name: &str, asleep_ms: i64, cause: &str, cold_idle: Option<i64>, new_conversation: bool) -> String {
+    let mut text = format!("Woke {name} after {} asleep: {cause}.", crate::cache::idle_text(asleep_ms));
+    if new_conversation {
+        text.push_str(" It starts in a new conversation, so its old one is not re-read.");
+    } else if let Some(idle) = cold_idle {
         text.push_str(&format!(
             " It had been idle {}: its prompt cache had likely expired, so it re-reads the whole conversation at full cost.",
             crate::cache::idle_text(idle)
         ));
     }
-    tracing::info!(agent = agent.name, "{text}");
-    hub.log_event(Some(session.channel_id), Some(session.id), EventKind::System, json!({
-        "text": text, "level": "info",
-        "woke": {"agent": agent.name, "asleep_ms": now - asleep_at, "cold_idle_ms": cold, "cause": cause},
-    }));
+    text
 }
 
 /// What to make of an agent saved as asleep whose session's run `live` is (`reconcile`).
@@ -1434,7 +1442,7 @@ mod tests {
             created_at: 0,
             autostart: false,
             sleep_after_min: Some(30),
-            asleep_at: None, self_handoff: false, self_handoff_at: None,
+            asleep_at: None, self_handoff: false, self_handoff_at: None, tools_up_front: false,
         }
     }
 
@@ -1531,6 +1539,24 @@ mod tests {
         for typing in [&b"a"[..], b"\x1b[Ia", b"\r", b"\x7f", b"\x1b[D", b"\x03", b"\x1b[<0;10", b"\x1b[M #",
             b"\x1b[1;5D", b"\x1b[3~", b"\x1b[Z", b"\x1bOP", b"\x1b[H", b"\x1b[200~hi\x1b[201~", b"\x1b]11;rgb:0/0/0", b"\x1b"] {
             assert!(!reports_only(typing), "{typing:?}");
+        }
+    }
+
+    /// The timeline line of a wake: Wake into the same conversation names the re-read's cost once
+    /// its cache has likely expired; Start fresh (a new conversation) never claims a re-read.
+    #[test]
+    fn a_wake_into_a_new_conversation_claims_no_re_read() {
+        const H: i64 = 3_600_000;
+        let same = woke_text("alpha", 2 * H, "you chose Wake", Some(3 * H), false);
+        assert!(same.starts_with("Woke alpha after 2 h asleep: you chose Wake."), "{same}");
+        assert!(same.contains("re-reads the whole conversation at full cost"), "{same}");
+        let warm = woke_text("alpha", 2 * H, "you chose Wake", None, false);
+        assert!(!warm.contains("re-read") && !warm.contains("new conversation"), "{warm}");
+        for cold in [Some(3 * H), None] {
+            let fresh = woke_text("alpha", 2 * H, "you chose Start fresh", cold, true);
+            assert!(fresh.starts_with("Woke alpha after 2 h asleep: you chose Start fresh."), "{fresh}");
+            assert!(fresh.contains("new conversation, so its old one is not re-read"), "{fresh}");
+            assert!(!fresh.contains("full cost") && !fresh.contains("re-reads"), "{fresh}");
         }
     }
 

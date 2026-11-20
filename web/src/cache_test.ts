@@ -51,7 +51,7 @@ Deno.test("copy and lifetimes", () => {
   assertEquals(ttlText(90), "1 h 30 min");
   assertEquals(
     coldText(sess(), 80 * MIN),
-    "Idle 1 h 20 m. The prompt cache has likely expired, so your next message re-reads the whole conversation at full cost.",
+    "Idle 1 h 20 m. The prompt cache has likely expired, so the next turn re-reads the whole conversation at full cost.",
   );
   assertEquals(ttlFor(sess(), DEFAULT_CACHE_TTL), 60);
   assertEquals(ttlFor(sess({ provider: "openrouter" }), DEFAULT_CACHE_TTL), 5);

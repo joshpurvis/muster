@@ -8,6 +8,7 @@ import type {
   AgentMessage,
   AgentState,
   LateAnswer,
+  QuietState,
   ModelCatalog,
   OpenRouterModel,
   Origin,
@@ -23,7 +24,7 @@ export interface AgentStatus {
   state: AgentState | null;
   /** Its session is running (clicking it only pulls the tab). */
   live: boolean;
-  /** Asleep: stopped while idle, the next message wakes it (src/sleep.rs). */
+  /** Asleep: stopped while idle, the next message sent with wake on wakes it (src/sleep.rs). */
   asleep: boolean;
   label: string;
   /** Unix ms the state began (null: never started). */
@@ -58,13 +59,14 @@ export function parseSleepAfter(v: string): number | null {
   return n >= SLEEP_AFTER_MIN && n <= SLEEP_AFTER_MAX ? n : null;
 }
 
-/** The asleep bar's sentence: how long it has slept, that the next message wakes it, and when
- * its prompt cache has likely expired, what that wake costs (`cold`). */
+/** The asleep bar's sentence: how long it has slept, that the next message sent with wake on (a
+ * quiet one waits instead) or typing wakes it, and when its prompt cache has likely expired, what
+ * that wake costs (`cold`). */
 export function asleepText(name: string, asleepAt: number | null | undefined, cold: boolean, now: number): string {
   const lead = asleepAt != null && now - asleepAt >= 60_000
     ? `${name} has been asleep for ${idleText(now - asleepAt)}`
     : `${name} is asleep`;
-  return `${lead}. The next message, or typing here, wakes it` +
+  return `${lead}. The next message sent with wake on, or typing here, wakes it` +
     (cold
       ? `: it re-reads the whole conversation at full cost, since its prompt cache has likely expired.`
       : " into the same conversation.");
@@ -73,7 +75,7 @@ export function asleepText(name: string, asleepAt: number | null | undefined, co
 /** The asleep bar's line after a wake that failed (`wake_error`): still asleep, how to try again,
  * and what a wake costs once its prompt cache has likely expired (`cold`). */
 export function wakeFailedText(name: string, error: string, cold: boolean): string {
-  return `Waking ${name} failed: ${error.replace(/\.$/, "")}. It is still asleep: the next message, or typing here, tries again` +
+  return `Waking ${name} failed: ${error.replace(/\.$/, "")}. It is still asleep: the next message sent with wake on, or typing here, tries again` +
     (cold ? ", and re-reads the whole conversation at full cost." : ".");
 }
 
@@ -381,6 +383,94 @@ export function lateText(a: LateAnswer): string {
     case "undelivered":
       return `Kept here, not delivered${a.note ? `: ${a.note.replace(/^not delivered:? ?/, "")}` : ""}.`;
   }
+}
+
+/** "14:05": the local time of `ms`. */
+export function hhmm(ms: number): string {
+  const d = new Date(ms);
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+}
+
+/** Where a quiet message stands (sent with wake=false, src/quiet.rs): a short chip and a sentence.
+ * Null for an ordinary or refused message. */
+export function quietStatus(
+  m: AgentMessage,
+  time: (ms: number) => string = hhmm,
+): { state: "waiting" | "shown" | "expired"; chip: string; text: string } | null {
+  if (!m.quiet || m.refused) return null;
+  if (m.shown_at != null) {
+    return { state: "shown", chip: "shown", text: `Shown to ${m.to} at the start of a turn, ${time(m.shown_at)}.` };
+  }
+  if (m.expired_at != null) {
+    return { state: "expired", chip: "expired", text: `Expired after 7 days without being shown to ${m.to}.` };
+  }
+  return {
+    state: "waiting",
+    chip: "waits for a turn",
+    text: `Waits for ${m.to}'s next turn that can take it and arrives as context when that turn starts. ` +
+      `Sending it didn't wake ${m.to}.`,
+  };
+}
+
+/** How a late reply sent quietly (`answer.quiet`) stands: where the message carrying it is now
+ * (waiting, shown at HH:MM, expired, dropped), not only the note stored when it was kept. From
+ * the daemon's `answer.quiet_state`, else (an older daemon) from the carrying agent message when
+ * it is loaded. Null when it didn't go quietly, or neither says. */
+export function quietAnswerText(
+  a: LateAnswer,
+  carrier: AgentMessage | undefined,
+  time: (ms: number) => string = hhmm,
+): string | null {
+  return quietAnswer(a, carrier, time)?.text ?? null;
+}
+
+/** A late reply's status as the log's chip, its tip and the message's overlay all show it: where
+ * its carrier stands for one sent quietly (`quietAnswerText`), else the note stored with it
+ * (`lateText`). `failed`: it never reached the asker (refused, undelivered, or a quiet carrier
+ * that expired or was dropped). */
+export function lateStatus(
+  a: LateAnswer,
+  carrier: AgentMessage | undefined,
+  time: (ms: number) => string = hhmm,
+): { failed: boolean; text: string } {
+  const q = quietAnswer(a, carrier, time);
+  if (q) return { failed: q.state === "expired" || q.state === "dropped", text: q.text };
+  return { failed: a.status === "refused" || a.status === "undelivered", text: lateText(a) };
+}
+
+function quietAnswer(
+  a: LateAnswer,
+  carrier: AgentMessage | undefined,
+  time: (ms: number) => string,
+): { state: QuietState["state"]; text: string } | null {
+  if (!a.quiet || a.status !== "delivered") return null;
+  let q: QuietState | null = a.quiet_state ?? null;
+  if (!q && a.msg != null && carrier?.id === a.msg) {
+    const s = quietStatus(carrier, time);
+    if (!s) return null;
+    q = { state: s.state, at: carrier.shown_at ?? carrier.expired_at, msg: carrier.id, to: carrier.to };
+  }
+  if (!q) return null;
+  const who = q.session != null ? `session ${q.session}` : q.to ?? "the asker";
+  const msg = q.msg != null ? ` (message ${q.msg})` : "";
+  const text = (() => {
+    switch (q.state) {
+      case "waiting":
+        return `Waits for ${who}'s next turn that can take it${msg}; it arrives as context when that turn starts.`;
+      case "shown":
+        return `Shown to ${who} at the start of a turn${q.at != null ? `, ${time(q.at)}` : ""}${msg}.`;
+      case "expired":
+        return `Expired after 7 days without being shown to ${who}${msg}.`;
+      case "dropped":
+        return `Not delivered: ${q.reason ?? `${who} ended before a turn took it`}${msg}.`;
+    }
+  })();
+  return { state: q.state, text };
+}
+
+/** The tab badge's tip: quiet messages waiting for a later turn of the session. */
+export function quietWaitingText(n: number): string {
+  return `${n} message${n === 1 ? "" : "s"} waiting for a later turn (sent without waking it)`;
 }
 
 // ---------------- moving to another account (docs/ACCOUNT_PROFILES.md) ----------------

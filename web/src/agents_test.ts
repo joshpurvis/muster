@@ -16,6 +16,7 @@ import {
   effortsFor,
   feedFor,
   firstLine,
+  lateStatus,
   lateText,
   keepForKind,
   listedModels,
@@ -28,12 +29,15 @@ import {
   providerPendingNote,
   sessionOnOpenRouter,
   priceLabel,
+  quietAnswerText,
+  quietStatus,
+  quietWaitingText,
   readMemoryFile,
   unattendedWarning,
   upsertMessage,
   vendorGroups,
 } from "./agents.ts";
-import type { Agent, AgentMessage, ModelCatalog, OpenRouterModel, SessionInfo } from "./types.ts";
+import type { Agent, AgentMessage, LateAnswer, ModelCatalog, OpenRouterModel, SessionInfo } from "./types.ts";
 
 function check(cond: boolean, msg: string) {
   if (!cond) throw new Error(msg);
@@ -147,14 +151,14 @@ Deno.test("sleep: the idle time field and the asleep bar's words", () => {
   const MIN = 60_000;
   assertEquals(
     asleepText("ada", 0, false, 90 * MIN),
-    "ada has been asleep for 1 h 30 m. The next message, or typing here, wakes it into the same conversation.",
+    "ada has been asleep for 1 h 30 m. The next message sent with wake on, or typing here, wakes it into the same conversation.",
   );
   const cold = asleepText("ada", null, true, 0);
   check(cold.startsWith("ada is asleep. The next message") && cold.includes("full cost"), cold);
   // A wake that failed: still asleep, says why and how to try again.
   assertEquals(
     wakeFailedText("ada", "account profile Work is disabled.", false),
-    "Waking ada failed: account profile Work is disabled. It is still asleep: the next message, or typing here, tries again.",
+    "Waking ada failed: account profile Work is disabled. It is still asleep: the next message sent with wake on, or typing here, tries again.",
   );
   check(wakeFailedText("ada", "x", true).endsWith("at full cost."), "the cost still said");
 });
@@ -387,6 +391,111 @@ Deno.test("a message that carried a late reply is told by its own text", () => {
   check(carriesLateReply(msg(9, 1, { reply_to: 4, text: 'Late reply to your message 4 ("x"):\nok' })), "carrier");
   check(!carriesLateReply(msg(9, 1, { reply_to: 4, text: "while handling 4" })), "ordinary chained message");
   check(!carriesLateReply(msg(9, 1, { reply_to: 5, text: "Late reply to your message 4:\nok" })), "another message's");
+});
+
+Deno.test("a quiet message says whether it waits, was shown or expired", () => {
+  const t = (ms: number) => `t${ms}`;
+  assertEquals(quietStatus(msg(9)), null);
+  assertEquals(quietStatus(msg(9, 1, { quiet: true, refused: "agent ada has 20 messages waiting" })), null);
+  const waiting = quietStatus(msg(9, 1, { quiet: true, shown_at: null, expired_at: null }), t)!;
+  assertEquals(waiting.state, "waiting");
+  assertEquals(waiting.chip, "waits for a turn");
+  // It waits for a turn that can take it: a schedule's note waits for a turn of its own kind.
+  assertEquals(
+    waiting.text,
+    "Waits for ada's next turn that can take it and arrives as context when that turn starts. Sending it didn't wake ada.",
+  );
+  const shown = quietStatus(msg(9, 1, { quiet: true, shown_at: 5000 }), t)!;
+  assertEquals([shown.state, shown.chip, shown.text], ["shown", "shown", "Shown to ada at the start of a turn, t5000."]);
+  const expired = quietStatus(msg(9, 1, { quiet: true, expired_at: 7000 }), t)!;
+  assertEquals(expired.state, "expired");
+  // It may have waited through turns of another kind: no claim that none came.
+  assertEquals(expired.text, "Expired after 7 days without being shown to ada.");
+  // An older daemon (no fields) reads as an ordinary message.
+  assertEquals(quietStatus(msg(9, 1, { quiet: undefined })), null);
+});
+
+Deno.test("a late reply that went quietly says where its carrying message stands", () => {
+  const t = (ms: number) => `t${ms}`;
+  const answer = (over: Partial<LateAnswer> = {}): LateAnswer => ({
+    text: "done", at: 0, from_session: 3, origin: "human", hop: 2, status: "delivered",
+    note: "waits for ada's next turn that can take it, as message 12", msg: 12, session: 5, quiet: true, ...over,
+  });
+  const carrier = (over: Partial<AgentMessage> = {}) => msg(12, 1, { quiet: true, ...over });
+  assertEquals(
+    quietAnswerText(answer(), carrier(), t),
+    "Waits for ada's next turn that can take it (message 12); it arrives as context when that turn starts.",
+  );
+  assertEquals(
+    quietAnswerText(answer(), carrier({ shown_at: 9000 }), t),
+    "Shown to ada at the start of a turn, t9000 (message 12).",
+  );
+  assertEquals(
+    quietAnswerText(answer(), carrier({ expired_at: 9000 }), t),
+    "Expired after 7 days without being shown to ada (message 12).",
+  );
+  // Not quiet, not delivered, or (an older daemon) the carrier not loaded: the stored note says it.
+  assertEquals(quietAnswerText(answer({ quiet: false }), carrier(), t), null);
+  assertEquals(quietAnswerText(answer({ status: "refused" }), carrier(), t), null);
+  assertEquals(quietAnswerText(answer(), undefined, t), null);
+  assertEquals(quietAnswerText(answer(), msg(13, 1, { quiet: true }), t), null);
+});
+
+Deno.test("a quiet late reply's status comes from the daemon whatever page holds its carrier", () => {
+  const t = (ms: number) => `t${ms}`;
+  const answer = (quiet_state: LateAnswer["quiet_state"]): LateAnswer => ({
+    text: "done", at: 0, from_session: 3, origin: "human", hop: 2, status: "delivered",
+    note: "waits for ada's next turn that can take it, as message 12", msg: 12, quiet: true, quiet_state,
+  });
+  // The carrier isn't loaded (log paging): the daemon's state still says where it stands.
+  assertEquals(
+    quietAnswerText(answer({ state: "shown", at: 9000, msg: 12, to: "ada" }), undefined, t),
+    "Shown to ada at the start of a turn, t9000 (message 12).",
+  );
+  assertEquals(
+    quietAnswerText(answer({ state: "expired", at: 9000, msg: 12, to: "ada" }), undefined, t),
+    "Expired after 7 days without being shown to ada (message 12).",
+  );
+  // A plain session's carrier has no agent message at all.
+  assertEquals(
+    quietAnswerText(answer({ state: "waiting", session: 5 }), undefined, t),
+    "Waits for session 5's next turn that can take it; it arrives as context when that turn starts.",
+  );
+  assertEquals(
+    quietAnswerText(answer({ state: "dropped", reason: "the session ended before its next turn", session: 5 }), undefined, t),
+    "Not delivered: the session ended before its next turn.",
+  );
+  assertEquals(quietAnswerText(answer({ state: "shown", at: 4000, session: 5 }), undefined, t), "Shown to session 5 at the start of a turn, t4000.");
+});
+
+Deno.test("the log's late reply chip and the overlay show one status for a quiet late reply", () => {
+  const t = (ms: number) => `t${ms}`;
+  const answer = (over: Partial<LateAnswer> = {}): LateAnswer => ({
+    text: "done", at: 0, from_session: 3, origin: "human", hop: 2, status: "delivered",
+    note: "waits for session 5's next turn that can take it", session: 5, quiet: true, ...over,
+  });
+  // The carrier was dropped (the asking session ended): not delivered, whatever the stored note said.
+  assertEquals(
+    lateStatus(answer({ quiet_state: { state: "dropped", reason: "the session ended before its next turn", session: 5 } }), undefined, t),
+    { failed: true, text: "Not delivered: the session ended before its next turn." },
+  );
+  assertEquals(
+    lateStatus(answer({ quiet_state: { state: "expired", session: 5 } }), undefined, t).failed,
+    true,
+  );
+  assertEquals(
+    lateStatus(answer({ quiet_state: { state: "shown", at: 4000, session: 5 } }), undefined, t),
+    { failed: false, text: "Shown to session 5 at the start of a turn, t4000." },
+  );
+  // Not quiet: the stored status and note.
+  assertEquals(lateStatus(answer({ quiet: false, note: "delivered to ada as message 9" }), undefined, t),
+    { failed: false, text: "Delivered to ada as message 9." });
+  assertEquals(lateStatus(answer({ quiet: false, status: "undelivered", note: null }), undefined, t).failed, true);
+});
+
+Deno.test("the tab badge counts quiet messages waiting", () => {
+  assertEquals(quietWaitingText(1), "1 message waiting for a later turn (sent without waking it)");
+  assertEquals(quietWaitingText(3), "3 messages waiting for a later turn (sent without waking it)");
 });
 
 Deno.test("Save notes first is offered only to a running, idle agent with room", () => {

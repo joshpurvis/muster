@@ -313,7 +313,7 @@ fn agent(name: &str, kind: SessionKind, provider: Provider, accepts: Vec<Origin>
         session_id: None,
         resume_id: None,
         created_at: 0,
-        autostart: false, sleep_after_min: None, asleep_at: None, self_handoff: false, self_handoff_at: None,
+        autostart: false, sleep_after_min: None, asleep_at: None, self_handoff: false, self_handoff_at: None, tools_up_front: false,
     }
 }
 

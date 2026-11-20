@@ -21,7 +21,7 @@ pub struct ToolOutput {
 
 /// Tool names in the order `tools/list` returns them (deterministic, per spec guidance).
 #[cfg(test)]
-pub const TOOL_NAMES: [&str; 41] = [
+pub const TOOL_NAMES: [&str; 42] = [
     "request_session", "reply_session", "session_messages", "subscribe_channel", "channel_updates",
     "whoami",
     "list_channels",
@@ -35,6 +35,7 @@ pub const TOOL_NAMES: [&str; 41] = [
     "get_diff",
     "list_agents",
     "ask_agent",
+    "tell_agent",
     "reply",
     "start_fresh",
     "panel_open", "panel_update", "panel_close", "list_panels", "wait_for_panel_event", "panel_event",
@@ -73,6 +74,29 @@ pub(super) fn tool(name: &str, title: &str, description: &str, schema: Value, re
 
 fn empty_schema() -> Value {
     json!({"type": "object", "properties": {}, "additionalProperties": false})
+}
+
+/// The tools a Claude agent with "Load message tools up front" (`Agent::tools_up_front`) gets in
+/// its prompt from the start, instead of through Claude Code's tool search: marked with
+/// `_meta["anthropic/alwaysLoad"]` (honoured per tool by Claude Code 2.1.325). About 2,200 tokens.
+pub const UP_FRONT: [&str; 7] = ["ask_agent", "tell_agent", "reply", "send_message", "whoami", "note_read", "note_append"];
+
+/// `tools/list` for `caller`: `tool_definitions`, with `UP_FRONT` marked for a Claude agent's
+/// Claude session when the agent loads them up front (the mark is Claude Code's; Codex never
+/// gets it).
+pub fn tool_list<B: Backend>(st: &McpState<B>, caller: SessionId) -> Vec<Value> {
+    let mut defs = tool_definitions();
+    let claude = st.backend.session(caller).is_some_and(|s| s.kind == SessionKind::Claude);
+    let up_front = claude && st.backend.agents().iter()
+        .any(|a| a.session_id == Some(caller) && a.kind == SessionKind::Claude && a.tools_up_front);
+    if up_front {
+        for d in &mut defs {
+            if d["name"].as_str().is_some_and(|n| UP_FRONT.contains(&n)) {
+                d["_meta"]["anthropic/alwaysLoad"] = json!(true);
+            }
+        }
+    }
+    defs
 }
 
 pub fn tool_definitions() -> Vec<Value> {
@@ -139,13 +163,14 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "send_message",
             "Send message",
-            "Send a prompt to another agent session in your workspace. It goes through the injection queue: if the agent is busy it is delivered when the agent becomes ready (set interrupt=true to interrupt its current turn first). Cannot target yourself or (unless the human allowed it) shell sessions, and cannot answer permission prompts: only the human approves those. Rate limited to 20 per minute per caller. Returns delivered/queued and sent_at_ms (pass it as after_ms to wait_for_state if you want to be explicit).",
+            "Send a prompt to another agent session in your workspace (a named agent's session takes messages through ask_agent, or tell_agent for a note that needs no answer). It goes through the injection queue: if the agent is busy it is delivered when the agent becomes ready (set interrupt=true to interrupt its current turn first). Returns delivered/queued and sent_at_ms (pass it as after_ms to wait_for_state if you want to be explicit). With wake=false it is kept instead, unseen, for that session's next turn that can take it, and arrives as context at the start of that turn: nothing is typed in and the session isn't woken. It waits while the session runs with wider permissions than when you sent it, and is dropped if the session's process ends first, so choose wake=false only for what can wait (Claude sessions only; not with interrupt; at most 6,000 characters (an emoji such as 😀 counts as two) and 150 lines). Then it returns status \"waiting\", quiet_id and sent_at_ms. Cannot target yourself or (unless the human allowed it) shell sessions, and cannot answer permission prompts: only the human approves those. Rate limited to 20 per minute per caller.",
             json!({
                 "type": "object",
                 "properties": {
                     "session_id": session_id,
                     "text": {"type": "string", "description": "Message text; multi-line is fine."},
-                    "interrupt": {"type": "boolean", "default": false, "description": "Interrupt the agent's current turn, then deliver."}
+                    "interrupt": {"type": "boolean", "default": false, "description": "Interrupt the agent's current turn, then deliver."},
+                    "wake": {"type": "boolean", "default": true, "description": "false: keep it for the session's next turn that can take it instead of typing it in now."}
                 },
                 "required": ["session_id", "text"],
                 "additionalProperties": false
@@ -228,7 +253,7 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "list_agents",
             "List agents",
-            "List the named agents: persistent agents (claude or codex) with their own home folder, memory and resumed conversation, which you can ask things with ask_agent. Each has name, kind, model, accepts_origins (which message origins it takes: human, schedule, webhook), its session and state, and asleep (its process was stopped while idle: asking it wakes it, which re-reads its whole conversation, so only ask when you need it). Also returns your_origin: the origin and hop a message you send now would carry.",
+            "List the named agents: persistent agents (claude or codex) with their own home folder, memory and resumed conversation, which you can ask things with ask_agent. Each has name, kind, model, accepts_origins (which message origins it takes: human, schedule, webhook), its session and state, and asleep (its process was stopped while idle: asking it wakes it, which re-reads its whole conversation unless a pending account move starts it in a new one, so only ask when you need it). Also returns your_origin: the origin and hop a message you send now would carry.",
             empty_schema(),
             true,
         ),
@@ -249,14 +274,31 @@ pub fn tool_definitions() -> Vec<Value> {
             false,
         ),
         tool(
+            "tell_agent",
+            "Tell agent",
+            "Send a named agent a report or a note without waiting for an answer. With wake=false it waits, unseen, for the agent's next turn that can take it (whoever starts that turn: the human, another message, a schedule), and arrives as context at the start of that turn, after the prompt: nothing is typed in, and an asleep or stopped agent stays that way. A turn takes it only where the message itself could have gone: a scheduled or webhook note waits for a turn of its own kind, a note from deeper in a chain than the message a turn answers waits for another turn, and a note waits while the agent runs with wider permissions than when you sent it or its OpenRouter spend caps are reached. So it can wait several turns, or expire unseen after 7 days: choose wake=false only for what can wait. With wake=true it is delivered now like ask_agent's message (the agent starts or wakes if needed), but you don't wait for the turn. Use ask_agent when you need the answer. Same origin rule, hop limit, daily caps and rate limit as ask_agent. A message with wake=false is at most 6,000 characters (an emoji such as 😀 counts as two) and 150 lines, and at most 20 wait for one agent; Claude agents only.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "agent": {"type": "string", "description": "Agent name (see list_agents), case-insensitive."},
+                    "text": {"type": "string", "description": "The report or note; multi-line is fine."},
+                    "wake": {"type": "boolean", "description": "true: deliver now, starting or waking the agent if needed. false: keep it for the agent's next turn that can take it."}
+                },
+                "required": ["agent", "text", "wake"],
+                "additionalProperties": false
+            }),
+            false,
+        ),
+        tool(
             "reply",
             "Reply to a message later",
-            "Answer a message you received (its first line is [muster msg <id> from ...]) after the turn that received it ended, e.g. once a long job finishes: say so in that turn's reply, then call this with the result. Only for messages delivered to you, once per message. If the sender's ask_agent is still waiting, it returns this text; otherwise it is delivered to the sender as a new message (\"Late reply to your message <id>\") with the same origin rule, hop limit, caps and input queue as ask_agent, or, if the human asked, shown in the agents panel. It is stored first: a refused delivery is reported, never lost. Rate limited with send_message (20 per minute).",
+            "Answer a message you received (its first line is [muster msg <id> from ...]) after the turn that received it ended, e.g. once a long job finishes: say so in that turn's reply, then call this with the result. Only for messages delivered to you, once per message. If the sender's ask_agent is still waiting, it returns this text, but only when your answer brings no scheduled or webhook origin the question didn't have and is at most one hop past the question (not, say, when you answer from deeper work in another chain); otherwise it is delivered to the sender as a new message (\"Late reply to your message <id>\") with the same origin rule, hop limit, caps and input queue as ask_agent, or, if the human asked, shown in the agents panel. With wake=false, unless a waiting ask takes it, the sender gets it at the start of its next turn that can take it instead of a new turn; like tell_agent's, it can wait several turns, so choose it only when the sender needn't act now (Claude senders only; at most 6,000 characters (an emoji such as 😀 counts as two) and 150 lines; a reply rooted in both scheduled and webhook work goes with wake=true). It is stored first: a refused delivery is reported, never lost. Rate limited with send_message (20 per minute).",
             json!({
                 "type": "object",
                 "properties": {
                     "msg_id": {"type": "integer", "description": "The id from the message's [muster msg <id> ...] line."},
-                    "text": {"type": "string", "description": "Your answer; multi-line is fine."}
+                    "text": {"type": "string", "description": "Your answer; multi-line is fine."},
+                    "wake": {"type": "boolean", "default": true, "description": "false: if no waiting ask of the sender can take the answer (see above), it waits for the sender's next turn that can take it instead of starting one."}
                 },
                 "required": ["msg_id", "text"],
                 "additionalProperties": false
@@ -503,6 +545,7 @@ fn session_json(s: &SessionInfo, caller: SessionId) -> Value {
         "detail": s.state_detail,
         "state_since_ms": s.state_since,
         "queued": s.queued,
+        "quiet_waiting": s.quiet_waiting,
         "parent_id": s.parent_id,
         "title": s.title,
         "exit_code": s.exit_code,
@@ -613,6 +656,7 @@ pub async fn call_tool<B: Backend>(
         // accepted (same guards), not listed.
         "list_agents" | "list_bots" => list_agents(st, caller),
         "ask_agent" | "ask_bot" => ask_agent(st, caller, &a).await,
+        "tell_agent" => tell_agent(st, caller, &a).await,
         "reply" => reply(st, caller, &a).await,
         "start_fresh" => start_fresh(st, caller, &a),
         "panel_open" | "panel_update" | "panel_close" | "list_panels" | "wait_for_panel_event" | "panel_event" => panel_tool(st, caller, name, map).await,
@@ -1177,6 +1221,10 @@ async fn send_message<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<
     let target = a.session_id("session_id")?;
     let text = a.req_str("text")?;
     let interrupt = a.bool("interrupt")?.unwrap_or(false);
+    let wake = a.bool("wake")?.unwrap_or(true);
+    if !wake && interrupt {
+        return Err("interrupt and wake=false can't be used together: a message kept for a later turn can't interrupt. Use wake=true with interrupt=true.".into());
+    }
     if target == caller {
         return Err("you cannot send a message to yourself".into());
     }
@@ -1190,20 +1238,25 @@ async fn send_message<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<
         ));
     }
     let info = reachable_session(st, caller, target)?;
+    // The run these checks are about: a message kept for a later turn is for this run only.
+    let run = st.backend.session_run(target);
     super::communication::check(st, caller, &info, false)?;
-    // An agent only takes messages through ask_agent, which applies its origin rules.
+    // An agent only takes messages through ask_agent or tell_agent, which apply its origin rules.
     if let Some(b) = st.backend.agents().into_iter().find(|b| b.session_id == Some(target)) {
         return Err(format!(
-            "session {target} is the agent {}: use ask_agent(agent=\"{}\") so its origin rules apply and you get its reply",
-            b.name, b.name
+            "session {target} is the agent {}: use ask_agent(agent=\"{}\") so its origin rules apply and you get its reply, \
+             or tell_agent(agent=\"{}\") for a note that doesn't need an answer",
+            b.name, b.name, b.name
         ));
     }
     guard::check_claude_origin(info.kind, caller_origin(st, caller).0)?;
+    let mut width = None;
     if let (Some(me), Some(ch)) = (
         st.backend.session(caller),
         st.backend.channel(info.channel_id),
     ) {
         check_not_more_permissive(st, &me, &ch, info.kind)?;
+        width = Some(crate::quiet::width(ch.permissions.claude_mode));
     }
     if info.kind == SessionKind::Shell && !st.limits.allow_shell {
         return Err(format!(
@@ -1217,6 +1270,27 @@ async fn send_message<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<
     check_no_shell_escape(st, info.kind, &text)?;
     if info.state == AgentState::Exited {
         return Err(format!("session {target} has exited"));
+    }
+    if !wake {
+        crate::quiet::check_receiver(info.kind, &format!("session {target}"))?;
+        crate::quiet::check_text(&text)?;
+        if let Err(wait_s) = st.edit_guard(|g| g.sends.check_and_record(
+            caller, now_ms(), st.limits.send_per_window, st.limits.send_window_ms,
+        ))? {
+            return Err(format!(
+                "rate limit: at most {} messages per minute. Try again in {wait_s}s.",
+                st.limits.send_per_window
+            ));
+        }
+        let from = crate::agents::sender_label(st.backend.agents().iter().find(|b| b.session_id == Some(caller)), caller);
+        let bind = run.zip(width).map(|(run, width)| crate::quiet::Bind { run, width });
+        return match st.backend.session_quiet(&info, from, Some(caller), caller_route(st, caller), text, bind) {
+            Ok(v) => Ok(pretty(&v)),
+            Err(e) => {
+                if let Err(error) = st.edit_guard(|g| g.sends.refund(caller)) { tracing::warn!("{error}"); }
+                Err(format!("{e:#}"))
+            }
+        };
     }
     if interrupt && info.state == AgentState::NeedsApproval {
         return Err(format!(
@@ -1423,17 +1497,20 @@ fn list_agents<B: Backend>(st: &McpState<B>, caller: SessionId) -> TResult {
 /// Agents are a shared service: any session may ask one, whatever its workspace (asking runs no
 /// command anywhere, and the origin rule, hop limit, daily cap and permission check apply).
 /// Driving an agent's terminal with the other tools stays under the workspace rule.
-async fn ask_agent<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_>) -> TResult {
-    // `bot`: the argument's name under the old `ask_bot`.
-    let name = match a.req_str("agent") {
-        Ok(n) => n,
-        Err(e) => a.req_str("bot").map_err(|_| e)?,
-    };
-    let text = a.req_str("text")?;
-    let timeout_s = a
-        .int("timeout_seconds")?
-        .unwrap_or(AGENT_ASK_DEFAULT_S)
-        .clamp(1, st.limits.wait_max_s as i64) as u64;
+/// An agent message that passed every check `ask_agent` and `tell_agent` share (the rate
+/// limit's slot is taken: refund it if nothing is stored).
+struct AgentSend {
+    agent: crate::agents::Agent,
+    out: crate::agents::Outgoing,
+    /// The receiver's Claude permission mode the permission check ran against (`quiet::width`):
+    /// a quiet message keeps it, so a wider run never takes it.
+    width: i64,
+}
+
+/// The checks before any message to a named agent: the name, size and text rules, the
+/// permission width over the agent's tabs, the origin rule, hop limit and daily cap, then the
+/// rate limit. Policy refusals are kept for the agents panel's log.
+fn agent_send<B: Backend>(st: &McpState<B>, caller: SessionId, name: &str, text: &str) -> Result<AgentSend, String> {
     let agent = st
         .backend
         .agents()
@@ -1495,6 +1572,22 @@ async fn ask_agent<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_>
         from_session: Some(caller),
         route,
     };
+    Ok(AgentSend { agent, out, width: crate::quiet::width(perms.claude_mode) })
+}
+
+async fn ask_agent<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_>) -> TResult {
+    // `bot`: the argument's name under the old `ask_bot`.
+    let name = match a.req_str("agent") {
+        Ok(n) => n,
+        Err(e) => a.req_str("bot").map_err(|_| e)?,
+    };
+    let text = a.req_str("text")?;
+    let timeout_s = a
+        .int("timeout_seconds")?
+        .unwrap_or(AGENT_ASK_DEFAULT_S)
+        .clamp(1, st.limits.wait_max_s as i64) as u64;
+    let AgentSend { agent, out, .. } = agent_send(st, caller, name, text)?;
+    let route = out.route;
     // A reply that comes before this ask starts waiting below still goes to it.
     let asking = st.backend.agent_asking(agent.id, caller);
     let d = match st.backend.agent_deliver(out).await {
@@ -1529,11 +1622,83 @@ async fn ask_agent<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_>
     Ok(pretty(&crate::agents::ask_result(&agent.name, &d, route, &info, &verdict, waited_ms, tail)))
 }
 
+/// `tell_agent`: an agent message nobody waits for. wake=true delivers it as `ask_agent` does,
+/// without waiting for the turn; wake=false keeps it for the agent's next turn that can take it (src/quiet.rs),
+/// after the same checks.
+async fn tell_agent<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_>) -> TResult {
+    let name = a.req_str("agent")?;
+    let text = a.req_str("text")?;
+    let wake = a.bool("wake")?.ok_or_else(|| {
+        "wake is required: true delivers it now (starting or waking the agent), false keeps it for the agent's next turn that can take it".to_string()
+    })?;
+    if !wake {
+        // Refused before the rate limit's slot is taken.
+        if let Some(agent) = st.backend.agents().into_iter().find(|b| b.name.eq_ignore_ascii_case(name.trim())) {
+            crate::quiet::check_receiver(agent.kind, &agent.name)?;
+        }
+        crate::quiet::check_text(&clean_text(text))?;
+    }
+    let AgentSend { agent, out, width } = agent_send(st, caller, name, text)?;
+    let route = out.route;
+    if !wake {
+        return match st.backend.agent_quiet(out, width).await {
+            Ok(q) => Ok(pretty(&json!({
+                "agent": agent.name,
+                "msg_id": q.msg_id,
+                "wake": false,
+                "status": "waiting",
+                "waiting": q.waiting,
+                "origin": route.origin,
+                "hop": route.hop,
+                "sent_at_ms": q.sent_at_ms,
+                "note": format!("{} sees this at the start of its next turn that can take it; it was not woken", agent.name),
+            }))),
+            Err(e) => {
+                if let Err(error) = st.edit_guard(|g| g.sends.refund(caller)) { tracing::warn!("{error}"); }
+                Err(format!("could not keep the message for agent {}: {e:#}", agent.name))
+            }
+        };
+    }
+    let d = match st.backend.agent_deliver(out).await {
+        Ok(d) => d,
+        Err(e) => {
+            if e.downcast_ref::<crate::inject::DeliveryPending>().is_none() {
+                if let Err(error) = st.edit_guard(|g| g.sends.refund(caller)) { tracing::warn!("{error}"); }
+            }
+            return Err(format!("could not deliver to agent {}: {e:#}", agent.name));
+        }
+    };
+    if let Err(error) = st.edit_guard(|g| {
+        g.last_send.insert(d.session_id, d.sent_at_ms);
+        if !d.delivered { g.note_queued(d.session_id, d.queued); }
+    }) { tracing::warn!("{error}"); }
+    let note = match (d.woke, d.started, d.delivered) {
+        (true, _, _) => format!("{} was asleep: it is waking, and the message is typed in once it is ready", agent.name),
+        (_, true, _) => format!("{} wasn't running: it is starting, and the message is typed in once it is ready", agent.name),
+        (_, _, true) => format!("typed into {}'s input", agent.name),
+        _ => format!("queued for {}: typed in when its current turn ends", agent.name),
+    };
+    Ok(pretty(&json!({
+        "agent": agent.name,
+        "msg_id": d.msg_id,
+        "wake": true,
+        "status": if d.delivered { "delivered" } else { "queued" },
+        "session_id": d.session_id,
+        "woke": d.woke,
+        "started": d.started,
+        "origin": route.origin,
+        "hop": route.hop,
+        "sent_at_ms": d.sent_at_ms,
+        "note": note,
+    })))
+}
+
 /// The caller (a named agent) answers a message it received, after the turn that received it
 /// (src/agent_reply.rs). Same size limit, text cleaning, `!` rule and rate limit as ask_agent.
 async fn reply<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_>) -> TResult {
     let msg_id = a.req_int("msg_id")?;
     let text = a.req_str("text")?;
+    let wake = a.bool("wake")?.unwrap_or(true);
     caller_session(st, caller)?;
     if text.chars().count() > st.limits.max_message_chars {
         return Err(format!("text too long (max {} characters)", st.limits.max_message_chars));
@@ -1548,6 +1713,10 @@ async fn reply<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_>) ->
             "a reply starting with `!` would run as a shell command where it is typed, which agents may not do. Rephrase it. {HOW_SHELL}"
         ));
     }
+    // Refused before the rate limit's slot is taken.
+    if !wake {
+        crate::quiet::check_text(&text)?;
+    }
     if let Err(wait_s) = st.edit_guard(|g| g.sends.check_and_record(
         caller, now_ms(), st.limits.send_per_window, st.limits.send_window_ms,
     ))? {
@@ -1556,7 +1725,7 @@ async fn reply<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_>) ->
             st.limits.send_per_window
         ));
     }
-    match st.backend.agent_reply(caller, msg_id, text).await {
+    match st.backend.agent_reply(caller, msg_id, text, wake).await {
         Ok(v) => Ok(pretty(&v)),
         Err(e) => {
             // Refused before anything was stored or sent: the slot isn't used.

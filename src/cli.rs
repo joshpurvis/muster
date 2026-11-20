@@ -2521,6 +2521,8 @@ pub struct AgentOpts {
     pub sleep_after: Option<String>,
     /// `agent edit --self-handoff on|off`.
     pub self_handoff: Option<bool>,
+    /// `agent edit --tools-up-front on|off`.
+    pub tools_up_front: Option<bool>,
     pub claude_mode: Option<String>,
     pub codex_sandbox: Option<String>,
 }
@@ -2573,12 +2575,18 @@ impl AgentOpts {
         if let Some(a) = &self.sleep_after {
             set("sleep_after_min", json!(parse_sleep_after(a)?));
         }
+        if let Some(on) = self.tools_up_front {
+            set("tools_up_front", json!(on));
+        }
         if let Some(on) = self.self_handoff {
             set("self_handoff", json!(on));
-            // Granting it inside a Muster session is refused: say whose call it is (`agent.update`).
-            if let Some(id) = env_session() {
-                set("from_session", json!(id));
-            }
+        }
+        // Granting self handoff or turning on tools up front inside a Muster session is refused:
+        // say whose call it is (`agent.update`).
+        if (self.self_handoff.is_some() || self.tools_up_front.is_some())
+            && let Some(id) = env_session()
+        {
+            set("from_session", json!(id));
         }
         if self.claude_mode.is_some() || self.codex_sandbox.is_some() {
             set(
@@ -2613,7 +2621,7 @@ fn print_agent(verb: &str, b: &Value, name: &str) {
         );
     }
     if let Some(m) = b["sleep_after_min"].as_u64() {
-        println!("  sleeps after {} idle; the next message wakes it", crate::cache::idle_text(m as i64 * 60_000));
+        println!("  sleeps after {} idle; a message sent with wake on wakes it", crate::cache::idle_text(m as i64 * 60_000));
     }
 }
 
@@ -2746,10 +2754,10 @@ fn queue_wait_line(a: &Value) -> Option<String> {
     })
 }
 
-/// `muster agent sleep`: stop an idle agent's process now; its next message wakes it.
+/// `muster agent sleep`: stop an idle agent's process now; a message sent with wake on wakes it.
 pub fn agent_sleep(d: &Discovery, name: &str) -> anyhow::Result<()> {
     let a = client::rpc_with_timeout(d, "agent.sleep", json!({ "name": name }), Duration::from_secs(30))?;
-    println!("{} is asleep; the next message wakes it", a["name"].as_str().unwrap_or(name));
+    println!("{} is asleep; a message sent with wake on wakes it", a["name"].as_str().unwrap_or(name));
     Ok(())
 }
 
@@ -2763,17 +2771,28 @@ pub fn agent_rm(d: &Discovery, name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `muster agent start`'s line for the `agent.start` result `r`: the session id, and whether it
+/// woke the agent into its conversation (a re-read) or into a new one (`--fresh`: none).
+fn agent_start_line(r: &Value, fresh: bool) -> String {
+    let id = r["session"]["id"].as_u64().unwrap_or(0);
+    // An older daemon doesn't send `new_conversation`: `--fresh` always starts a new one, and an
+    // agent left without a saved conversation (a pending account move cleared it) does too.
+    let new_conversation = r["new_conversation"].as_bool().unwrap_or(fresh || r["agent"]["resumable"] == false);
+    if r["woke"] == true && new_conversation {
+        format!("{id} (woke it into a new conversation: its old one is not re-read)")
+    } else if r["woke"] == true {
+        format!("{id} (woke it: it re-reads its conversation)")
+    } else if r["started"] == true {
+        id.to_string()
+    } else {
+        format!("{id} (already running)")
+    }
+}
+
 /// `muster agent start`: prints the session id (like `muster new`).
 pub fn agent_start(d: &Discovery, name: &str, fresh: bool) -> anyhow::Result<()> {
     let r = client::rpc_with_timeout(d, "agent.start", json!({ "name": name, "fresh": fresh }), Duration::from_secs(30))?;
-    let id = r["session"]["id"].as_u64().unwrap_or(0);
-    if r["woke"] == true {
-        println!("{id} (woke it: it re-reads its conversation)");
-    } else if r["started"] == true {
-        println!("{id}");
-    } else {
-        println!("{id} (already running)");
-    }
+    println!("{}", agent_start_line(&r, fresh));
     if let Some(line) = kept_prompts_line(&r, fresh) {
         println!("{line}");
     }
@@ -2848,7 +2867,7 @@ pub fn ask(d: &Discovery, agent: &str, words: &[String], timeout: u64, as_json: 
 /// `muster reply`: inside an agent's session, its MCP `reply` (answer message `msg_id` later),
 /// called with the session's own token: never on another session's behalf. Prints how it
 /// reached the asker; exit 1 when the delivery was refused.
-pub fn reply(d: &Discovery, msg_id: i64, words: &[String], as_json: bool) -> anyhow::Result<()> {
+pub fn reply(d: &Discovery, msg_id: i64, words: &[String], wake: bool, as_json: bool) -> anyhow::Result<()> {
     if env_session().is_none() {
         anyhow::bail!("muster reply runs inside an agent's session (it answers a message Muster delivered to that agent)");
     }
@@ -2863,7 +2882,7 @@ pub fn reply(d: &Discovery, msg_id: i64, words: &[String], as_json: bool) -> any
         std::io::stdin().lock().read_to_string(&mut s)?;
         Ok(s)
     })?;
-    let r = session_tool(d, &token, "reply", json!({"msg_id": msg_id, "text": text}))?;
+    let r = session_tool(d, &token, "reply", json!({"msg_id": msg_id, "text": text, "wake": wake}))?;
     if as_json {
         print_json(&r)?;
     } else {
@@ -2938,6 +2957,27 @@ mod tests {
         assert_eq!(queue_wait_line(&json!({"name": "builder-2", "queued": 1, "queue_waits": null})).as_deref(),
             Some("builder-2: 1 prompt waits to be typed"));
         assert_eq!(queue_wait_line(&json!({"name": "builder-2"})), None);
+    }
+
+    /// `muster agent start`: an asleep agent woken with `--fresh` starts a new conversation, so the
+    /// line never says it re-reads the old one; a plain wake does.
+    #[test]
+    fn agent_start_line_says_which_conversation_a_wake_starts() {
+        let r = |v: Value| agent_start_line(&v, false);
+        let woke = json!({"session": {"id": 7}, "started": true, "woke": true, "new_conversation": false});
+        assert_eq!(r(woke.clone()), "7 (woke it: it re-reads its conversation)");
+        let fresh = json!({"session": {"id": 7}, "started": true, "woke": true, "new_conversation": true});
+        assert_eq!(agent_start_line(&fresh, true), "7 (woke it into a new conversation: its old one is not re-read)");
+        // A pending account move starts a new conversation without --fresh: the daemon says so.
+        assert_eq!(r(fresh), "7 (woke it into a new conversation: its old one is not re-read)");
+        // An older daemon without `new_conversation`: --fresh decides.
+        let old = json!({"session": {"id": 7}, "started": true, "woke": true});
+        assert_eq!(agent_start_line(&old, true), "7 (woke it into a new conversation: its old one is not re-read)");
+        assert_eq!(r(old), "7 (woke it: it re-reads its conversation)");
+        let moved = json!({"session": {"id": 7}, "started": true, "woke": true, "agent": {"resumable": false}});
+        assert_eq!(r(moved), "7 (woke it into a new conversation: its old one is not re-read)");
+        assert_eq!(agent_start_line(&json!({"session": {"id": 7}, "started": true, "woke": false}), true), "7");
+        assert_eq!(r(json!({"session": {"id": 7}, "started": false, "woke": false})), "7 (already running)");
     }
 
     fn snap() -> Snapshot {

@@ -171,15 +171,22 @@ pub fn status(hub: &Hub, msg: i64) -> MsgStatus {
     s
 }
 
-/// The route of a reply to `m` from a session whose provenance is `now`.
-pub fn answer_route(m: &AgentMessage, now: Option<Prov>) -> Route {
+/// The route of a reply to `m` from a session whose provenance is `now`. A lead agent's reply
+/// (`lead`, `agents::sending_prov`) passes scheduled work on as `lead` (`Origin::lifted`); the
+/// hop as for anyone.
+pub fn answer_route(m: &AgentMessage, now: Option<Prov>, lead: bool) -> Route {
     let (origin, hop) = now.map_or((Origin::Human, 0), |p| (p.origin, p.hop));
-    agents::outgoing(Some(Prov { origin: m.origin.max(origin), hop: m.hop.max(hop), msg_id: Some(m.id) }))
+    let origin = m.origin.max(origin);
+    let origin = if lead { origin.lifted() } else { origin };
+    agents::outgoing(Some(Prov { origin, hop: m.hop.max(hop), msg_id: Some(m.id) }))
 }
 
-/// The non-human origins a reply to `m` from a session whose provenance is `now` is rooted in.
-pub fn answer_origins(m: &AgentMessage, now: Option<Prov>) -> Vec<Origin> {
-    let mut o: Vec<Origin> = [Some(m.origin), now.map(|p| p.origin)].into_iter().flatten().filter(|o| *o != Origin::Human).collect();
+/// The non-human origins a reply to `m` from a session whose provenance is `now` is rooted in
+/// (a lead agent's scheduled work as `lead`).
+pub fn answer_origins(m: &AgentMessage, now: Option<Prov>, lead: bool) -> Vec<Origin> {
+    let mut o: Vec<Origin> = [Some(m.origin), now.map(|p| p.origin)].into_iter().flatten()
+        .map(|o| if lead { o.lifted() } else { o })
+        .filter(|o| *o != Origin::Human).collect();
     o.sort();
     o.dedup();
     o
@@ -189,7 +196,8 @@ pub fn answer_origins(m: &AgentMessage, now: Option<Prov>) -> Vec<Origin> {
 /// the question's own chain didn't have and is no deeper in the chain than an answer in the
 /// question's own turn (one hop on): otherwise it goes the guarded way, as a new message.
 fn returnable(m: &AgentMessage, a: &Answer) -> bool {
-    a.origins.iter().all(|o| *o == m.origin) && a.hop <= m.hop.saturating_add(1)
+    // A lead's reply to scheduled work it was asked in is that work passed on (`Origin::lifted`).
+    a.origins.iter().all(|o| *o == m.origin || *o == m.origin.lifted()) && a.hop <= m.hop.saturating_add(1)
 }
 
 /// Did message `m` reach its agent? Never for a refused one.
@@ -298,9 +306,26 @@ pub async fn reply(hub: &Arc<Hub>, caller: SessionId, msg_id: i64, text: String,
     if !wake {
         crate::quiet::check_text(&text).map_err(|e| anyhow::anyhow!(e))?;
     }
-    let now = hub.agents().prov(caller);
-    let route = answer_route(&m, now);
-    let origins = answer_origins(&m, now);
+    // The agent this session is now, its lead flag and its provenance, read together: a lead flag
+    // turned off meanwhile can't lift newer scheduled work.
+    let (now_agent, now) = hub.agents().session_agent_prov(caller);
+    let Some(me) = now_agent.filter(|a| a.id == me.id) else {
+        anyhow::bail!("this session is no longer the agent {} that message {msg_id} was delivered to", me.name);
+    };
+    let lead = agents::is_lead(&me);
+    let route = answer_route(&m, now, lead);
+    let origins = answer_origins(&m, now, lead);
+    // Lead work can't wait for a later turn (only a lead turn could show it): a quiet reply that
+    // would wait for one is refused before it is stored, so the message's one reply is still
+    // there for wake=true. One shown in the message log (the human or a schedule asked) or that
+    // can't be delivered waits for no turn. Neither does one a waiting ask takes, but that case
+    // is rare and is refused too: the retry with wake=true still reaches the ask.
+    if !wake
+        && matches!(asker(hub, &m), Asker::Agent(_) | Asker::Session(_))
+        && let Err(e) = crate::quiet::check_quiet_origin(route.origin)
+    {
+        anyhow::bail!(e);
+    }
     // Kept for a later turn, it carries one origin to check when that turn takes it: a reply
     // rooted in two kinds of unattended work goes the waking way, checked against both now.
     if !wake && origins.len() > 1 {
@@ -323,10 +348,7 @@ pub async fn reply(hub: &Arc<Hub>, caller: SessionId, msg_id: i64, text: String,
         session: None,
         quiet: !wake,
     };
-    if !hub.store().set_agent_answer(msg_id, &answer)? {
-        anyhow::bail!("you already replied to message {msg_id}; a message takes one reply");
-    }
-    agents::publish_message(hub, msg_id);
+    keep(hub, msg_id, &answer)?;
     // In its own task, so a caller that goes away doesn't leave it half delivered.
     let h = hub.clone();
     let returnable = returnable(&m, &answer);
@@ -344,6 +366,28 @@ pub async fn reply(hub: &Arc<Hub>, caller: SessionId, msg_id: i64, text: String,
     })
     .await??;
     Ok(result_json(msg_id, &done))
+}
+
+/// Store the answer, charging the replier's send slot (MCP's rate limit) under the limiter's
+/// lock: a reply over the limit isn't stored, and one that lost to another reply isn't charged
+/// (nothing else can take a slot in between, so the refund is this reply's own). The charge is
+/// saved after the answer: a restart in between leaves the reply uncharged, never charged and lost.
+fn keep(hub: &Hub, msg_id: i64, answer: &Answer) -> anyhow::Result<()> {
+    let store = || hub.store().set_agent_answer(msg_id, answer);
+    let stored = match hub.mcp() {
+        Some(st) => crate::mcp::tools::with_send_slot(&st, answer.from_session, || {
+            let r = store();
+            let charged = matches!(r, Ok(true));
+            (r, charged)
+        })
+        .map_err(|e| anyhow::anyhow!(e))?,
+        None => store(),
+    };
+    if !stored? {
+        anyhow::bail!("you already replied to message {msg_id}; a message takes one reply");
+    }
+    agents::publish_message(hub, msg_id);
+    Ok(())
 }
 
 fn current(hub: &Hub, msg: i64) -> Option<Answer> {
@@ -457,7 +501,7 @@ async fn deliver(hub: &Arc<Hub>, m: &AgentMessage, mut a: Answer) -> Answer {
         }
         Asker::Session(s) => {
             let claude = std::iter::once(a.origin).chain(a.origins.iter().copied());
-            if let Some(why) = claude.map(|o| crate::mcp::guard::check_claude_origin(s.kind, o)).find_map(Result::err) {
+            if let Some(why) = claude.map(|o| crate::mcp::guard::check_session_route(s.kind, o, a.hop)).find_map(Result::err) {
                 set(&mut a, AnswerStatus::Refused, format!("not delivered to session {}: {why}", s.id));
                 return a;
             }
@@ -708,12 +752,12 @@ mod tests {
         let scout = agent(&hub, "scout", SessionKind::Codex, 3);
         let id = msg(&hub, &scout, "ada", Some(2), Origin::Human, 2, false);
         let m = hub.store().agent_message(id).unwrap().unwrap();
-        assert_eq!(answer_route(&m, None), Route { origin: Origin::Human, hop: 3, reply_to: Some(id) });
+        assert_eq!(answer_route(&m, None, false), Route { origin: Origin::Human, hop: 3, reply_to: Some(id) });
         // Replying while it handles a scheduled message: the reply is unattended work too.
         let sched = Prov { origin: Origin::Schedule, hop: 0, msg_id: Some(1) };
-        assert_eq!(answer_route(&m, Some(sched)), Route { origin: Origin::Schedule, hop: 3, reply_to: Some(id) });
+        assert_eq!(answer_route(&m, Some(sched), false), Route { origin: Origin::Schedule, hop: 3, reply_to: Some(id) });
         let deep = Prov { origin: Origin::Human, hop: 4, msg_id: None };
-        assert_eq!(answer_route(&m, Some(deep)).hop, 5);
+        assert_eq!(answer_route(&m, Some(deep), false).hop, 5);
     }
 
     #[tokio::test]
@@ -735,10 +779,63 @@ mod tests {
             && x.text.as_deref().is_some_and(|t| t.starts_with("Late reply to your message"))));
         // At the hop limit a reply chain ends.
         hub.agents().set_prov(3, None).unwrap();
-        let deep = msg(&hub, &scout, "ada", Some(2), Origin::Human, 4, false);
+        let deep = msg(&hub, &scout, "ada", Some(2), Origin::Human, crate::mcp::guard::MAX_AGENT_HOPS, false);
         let v = reply(&hub, 3, deep, "deep".into(), true).await.unwrap();
         assert_eq!(v["status"], "refused", "{v}");
         assert!(v["note"].as_str().unwrap().contains("hop"), "{v}");
+    }
+
+    /// A lead agent's late reply from a scheduled turn goes as `lead` (`Agent::lead`): it reaches a
+    /// Claude asker that refuses the same reply from a non-lead. A trigger's work isn't lifted, and
+    /// its hop still counts.
+    #[tokio::test]
+    async fn a_lead_agents_reply_counts_as_the_humans() {
+        let hub = fixture();
+        let lena = agent(&hub, "lena", SessionKind::Claude, 3);
+        agent(&hub, "ada", SessionKind::Claude, 2);
+        let make_lead = |on: bool| {
+            let mut u: agents::AgentUpdate = serde_json::from_value(json!({"name": "lena", "lead": on})).unwrap();
+            u.by_owner = true;
+            agents::update_switch(&hub, u, false).unwrap();
+        };
+        let sched = Some(Prov { origin: Origin::Schedule, hop: 0, msg_id: None });
+        // Not a lead: replying from a reminder turn is refused at Ada (human only).
+        let m = msg(&hub, &lena, "ada", Some(2), Origin::Human, 1, false);
+        hub.agents().set_prov(3, sched).unwrap();
+        let v = reply(&hub, 3, m, "done".into(), true).await.unwrap();
+        assert_eq!(v["status"], "refused", "{v}");
+        // A lead: the same reply goes as `lead`, one hop on, and Ada (human only) takes it.
+        make_lead(true);
+        let m = msg(&hub, &lena, "ada", Some(2), Origin::Human, 1, false);
+        hub.agents().set_prov(3, sched).unwrap();
+        // Kept for a later turn it would wait unseen: refused before it is stored, so the one
+        // reply is still there for wake=true.
+        let e = reply(&hub, 3, m, "done".into(), false).await.unwrap_err().to_string();
+        assert!(e.contains("origin=lead") && e.contains("wake=true"), "{e}");
+        let v = reply(&hub, 3, m, "done".into(), true).await.unwrap();
+        // Past every guard: this fixture has no terminals, so only the typing itself fails.
+        assert!(v["status"] == "undelivered" && v["note"].as_str().unwrap().contains("terminal host is not configured"), "{v}");
+        let a = answer_of(&hub, m);
+        assert_eq!((a.origin, a.hop, a.origins.clone()), (Origin::Lead, 2, vec![Origin::Lead]));
+        let mm = hub.store().agent_message(m).unwrap().unwrap();
+        assert_eq!(answer_route(&mm, sched, true), Route { origin: Origin::Lead, hop: 2, reply_to: Some(m) });
+        // The human's work stays the human's; a trigger's is never lifted.
+        assert_eq!(answer_route(&mm, None, true).origin, Origin::Human);
+        let w = msg(&hub, &lena, "ada", Some(2), Origin::Webhook, 1, false);
+        let ww = hub.store().agent_message(w).unwrap().unwrap();
+        assert_eq!(answer_route(&ww, sched, true).origin, Origin::Webhook);
+        assert_eq!(answer_origins(&ww, sched, true), vec![Origin::Lead, Origin::Webhook]);
+        // Past the hop limit it is refused all the same.
+        let deep = msg(&hub, &lena, "ada", Some(2), Origin::Human, crate::mcp::guard::MAX_AGENT_HOPS, false);
+        let v = reply(&hub, 3, deep, "deep".into(), true).await.unwrap();
+        assert_eq!(v["status"], "refused", "{v}");
+        assert!(v["note"].as_str().unwrap().contains("hop"), "{v}");
+        // The owner turns lead off: the next reply from scheduled work is the schedule's again.
+        make_lead(false);
+        let m = msg(&hub, &lena, "ada", Some(2), Origin::Human, 1, false);
+        let v = reply(&hub, 3, m, "done".into(), true).await.unwrap();
+        assert_eq!((v["status"].as_str(), v["origin"].as_str()), (Some("refused"), Some("schedule")), "{v}");
+        assert_eq!(hub.agents().send_prov(3).map(|p| p.origin), Some(Origin::Schedule));
     }
 
     #[tokio::test]
@@ -764,6 +861,55 @@ mod tests {
         assert!(hub.store().agent_messages(Some(ada.id), None, 10).unwrap().is_empty());
         // A finished reply is never taken or delivered again.
         assert_eq!(finish(&hub, m).await.unwrap().status, AnswerStatus::Returned);
+    }
+
+    /// On lead work a quiet reply to an asking agent is refused even while an ask waits for it
+    /// (rare; it would wait for no turn there): nothing is kept or charged, and the waking retry
+    /// reaches the waiting ask.
+    #[tokio::test]
+    async fn a_quiet_lead_reply_is_refused_and_the_waking_retry_reaches_the_waiting_ask() {
+        let hub = fixture();
+        let scout = agent(&hub, "scout", SessionKind::Codex, 3);
+        agent(&hub, "ada", SessionKind::Claude, 2);
+        let mut st = crate::mcp::McpState::new(crate::mcp::backend::HubBackend(hub.clone()));
+        st.limits.send_per_window = 1;
+        let st = Arc::new(st);
+        hub.set_mcp(Arc::downgrade(&st));
+        let m = msg(&hub, &scout, "ada", Some(2), Origin::Lead, 1, false);
+        let waiting = hub.replies.wait(m);
+        let e = crate::mcp::call_as(&hub, 3, "reply", json!({"msg_id": m, "text": "done", "wake": false})).await.unwrap_err();
+        assert!(e.contains("origin=lead") && e.contains("wake=true"), "{e}");
+        assert!(current(&hub, m).is_none());
+        // The retry takes the one slot the refusal left free, and the ask's next check takes it.
+        let ask = async {
+            let mut got = None;
+            for _ in 0..50 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                if let Some(r) = status(&hub, m).reply { got = Some(r); break; }
+            }
+            drop(waiting);
+            got
+        };
+        let (v, got) = tokio::join!(crate::mcp::call_as(&hub, 3, "reply", json!({"msg_id": m, "text": "waking retry"})), ask);
+        assert_eq!(got.as_deref(), Some("waking retry"));
+        assert!(v.unwrap().contains("\"returned\""));
+        assert_eq!(answer_of(&hub, m).status, AnswerStatus::Returned);
+        // The slot is used now: a reply over the limit isn't kept.
+        let next = msg(&hub, &scout, "ada", Some(2), Origin::Lead, 1, false);
+        let e = crate::mcp::call_as(&hub, 3, "reply", json!({"msg_id": next, "text": "done"})).await.unwrap_err();
+        assert!(e.contains("rate limit"), "{e}");
+        assert!(current(&hub, next).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_quiet_lead_reply_can_go_to_the_message_log() {
+        let hub = fixture();
+        let scout = agent(&hub, "scout", SessionKind::Codex, 3);
+        for from in ["human", "schedule"] {
+            let m = msg(&hub, &scout, from, None, Origin::Lead, 1, false);
+            let v = reply(&hub, 3, m, "done".into(), false).await.unwrap();
+            assert_eq!(v["status"], "shown", "{v}");
+        }
     }
 
     #[tokio::test]
@@ -961,13 +1107,24 @@ mod tests {
         let b = agent(&hub, "beta", SessionKind::Claude, 2);
         let m = hub.store().agent_message(msg(&hub, &b, "human", None, Origin::Human, 1, false)).unwrap().unwrap();
         let a = |now: Option<Prov>| {
-            let r = answer_route(&m, now);
-            Answer { text: "x".into(), at: 0, from_session: 2, origin: r.origin, hop: r.hop, origins: answer_origins(&m, now),
+            let r = answer_route(&m, now, false);
+            Answer { text: "x".into(), at: 0, from_session: 2, origin: r.origin, hop: r.hop, origins: answer_origins(&m, now, false),
                 status: AnswerStatus::Pending, note: None, msg: None, session: None, quiet: false }
         };
         assert!(returnable(&m, &a(None)));
         assert!(returnable(&m, &a(Some(Prov { origin: Origin::Human, hop: 1, msg_id: Some(m.id) }))));
         assert!(!returnable(&m, &a(Some(Prov { origin: Origin::Human, hop: 4, msg_id: None }))));
+        // A lead's reply in the scheduled turn it was asked in is that work passed on: taken.
+        let s = hub.store().agent_message(msg(&hub, &b, "human", None, Origin::Schedule, 1, false)).unwrap().unwrap();
+        let sched = Some(Prov { origin: Origin::Schedule, hop: 1, msg_id: Some(s.id) });
+        let r = answer_route(&s, sched, true);
+        let lead = Answer { text: "x".into(), at: 0, from_session: 2, origin: r.origin, hop: r.hop, origins: answer_origins(&s, sched, true),
+            status: AnswerStatus::Pending, note: None, msg: None, session: None, quiet: false };
+        assert!(returnable(&s, &lead));
+        // A non-lead's reply from a trigger's work to a scheduled question is not.
+        let hook = Some(Prov { origin: Origin::Webhook, hop: 1, msg_id: None });
+        let w = Answer { origins: answer_origins(&s, hook, false), ..lead };
+        assert!(!returnable(&s, &w));
     }
 
 }

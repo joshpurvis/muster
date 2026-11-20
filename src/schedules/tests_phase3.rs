@@ -96,8 +96,9 @@ fn proposals_are_refused_from_unattended_work_and_for_agents_that_dont_take_it()
     let f = Fixture::new(at(LONDON, "2026-10-19T10:00"));
     no_quiet_hours(&f);
     as_agent(&f, "worker", 41);
-    // Handling a scheduled run (or anything a schedule or trigger started): no new schedules.
-    for origin in [Origin::Schedule, Origin::Webhook] {
+    // Handling a scheduled run (or anything a schedule or trigger started, scheduled work a lead
+    // agent passed on included: a builder reporting back to its lead): no new schedules.
+    for origin in [Origin::Schedule, Origin::Webhook, Origin::Lead] {
         f.hub.agents().set_prov(41, Some(Prov { origin, hop: 0, msg_id: Some(1) })).unwrap();
         let e = err(tool(&f, 41, "propose_schedule", json!({"prompt": "p", "cron": "0 9 * * *", "reason": "r"})));
         assert!(e.contains("nothing started by a schedule or trigger may make schedules"), "{e}");

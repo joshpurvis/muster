@@ -195,6 +195,17 @@ impl Shown {
     }
 }
 
+/// A message on a lead agent's passed-on scheduled work (`Origin::Lead`) can't wait for a later
+/// turn: only a turn of its own kind could take it, and a plain session never has one. Sent now
+/// (wake=true), it starts that turn itself.
+pub fn check_quiet_origin(origin: Origin) -> Result<(), String> {
+    if origin == Origin::Lead {
+        return Err("this message is scheduled work a lead agent passed on (origin=lead), which can't wait for a later turn: \
+             no turn the receiver takes otherwise could show it. Send it with wake=true".into());
+    }
+    Ok(())
+}
+
 /// Only Claude sessions take quiet messages: their `UserPromptSubmit` hook carries them into
 /// the turn. `who` names the receiver in the refusal.
 pub fn check_receiver(kind: SessionKind, who: &str) -> Result<(), String> {
@@ -431,7 +442,7 @@ pub async fn take_run(hub: &Hub, id: SessionId, run: u64, msg: Option<i64>, widt
                 Some(t) => hop <= t.hop && (o == Origin::Human || (o == t.origin && (!bills || cleared == Some(o)))),
             };
             let a: Vec<AgentMessage> = a.iter()
-                .filter(|m| fits(m.origin, m.hop) && named.is_none_or(|ag| ag.accepts_origins.contains(&m.origin)))
+                .filter(|m| fits(m.origin, m.hop) && named.is_none_or(|ag| ag.accepts_origins.contains(&m.origin.accepted_as())))
                 .cloned().collect();
             let s: Vec<SessionQuiet> = s.iter().filter(|q| fits(q.origin, q.hop)).cloned().collect();
             let (text, shown, left) = context(&a, &s, named.is_some(), now);
@@ -540,6 +551,7 @@ pub fn refresh_all(hub: &Hub) {
 pub fn send_session(hub: &Hub, to: &SessionInfo, from: String, from_session: Option<SessionId>, route: Route,
     text: String, bind: Option<Bind>, late_reply_to: Option<i64>) -> anyhow::Result<Value> {
     check_receiver(to.kind, &format!("session {}", to.id)).map_err(|e| anyhow::anyhow!(e))?;
+    check_quiet_origin(route.origin).map_err(|e| anyhow::anyhow!(e))?;
     if route.hop > crate::mcp::guard::MAX_AGENT_HOPS {
         anyhow::bail!(
             "agent message chain too deep: this would be hop {} and the maximum is {}. Answer with what you have, or ask the human.",

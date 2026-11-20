@@ -2523,6 +2523,8 @@ pub struct AgentOpts {
     pub self_handoff: Option<bool>,
     /// `agent edit --tools-up-front on|off`.
     pub tools_up_front: Option<bool>,
+    /// `agent edit --lead on|off`.
+    pub lead: Option<bool>,
     pub claude_mode: Option<String>,
     pub codex_sandbox: Option<String>,
 }
@@ -2581,9 +2583,12 @@ impl AgentOpts {
         if let Some(on) = self.self_handoff {
             set("self_handoff", json!(on));
         }
-        // Granting self handoff or turning on tools up front inside a Muster session is refused:
-        // say whose call it is (`agent.update`).
-        if (self.self_handoff.is_some() || self.tools_up_front.is_some())
+        if let Some(on) = self.lead {
+            set("lead", json!(on));
+        }
+        // Granting self handoff, turning on tools up front or making a lead agent inside a Muster
+        // session is refused: say whose call it is (`agent.update`).
+        if (self.self_handoff.is_some() || self.tools_up_front.is_some() || self.lead.is_some())
             && let Some(id) = env_session()
         {
             set("from_session", json!(id));
@@ -2939,6 +2944,23 @@ pub fn start_fresh(d: &Discovery, file: &std::path::Path, as_json: bool) -> anyh
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `muster agent edit NAME --lead on|off` sends `lead` (and, inside a Muster tab, the session
+    /// that asked, so the backend refuses turning it on there).
+    #[test]
+    fn agent_edit_sends_lead() {
+        let opts = |lead: Option<bool>| AgentOpts {
+            profile: None, switch: SwitchOpts::default(), provider: None, name: "alpha".into(), kind: None, model: None,
+            effort: None, persona: None, accepts: None, autostart: None, sleep_after: None, self_handoff: None,
+            tools_up_front: None, lead, claude_mode: None, codex_sandbox: None,
+        };
+        assert_eq!(opts(Some(true)).params(&json!({})).unwrap()["lead"], true);
+        assert_eq!(opts(Some(false)).params(&json!({})).unwrap()["lead"], false);
+        assert!(opts(None).params(&json!({})).unwrap().get("lead").is_none());
+        if env_session().is_some() {
+            assert!(opts(Some(true)).params(&json!({})).unwrap().get("from_session").is_some());
+        }
+    }
 
     /// `muster agent start --fresh` says the prompts that were waiting are kept; `muster agent ls`
     /// names why an agent's prompts wait.

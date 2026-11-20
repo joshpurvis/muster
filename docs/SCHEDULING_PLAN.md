@@ -2,7 +2,7 @@
 
 ## Plain English
 
-Phases 1, 2 and 3 of this plan are built: schedules with history, pause and skip, downtime and busy rules, alerts and replies into notes; then triggers (a note you allow, a branch moving, a PR or CI failure on GitHub, a local trigger URL), "Then…" steps that hand a reply to the next agent, and a daily dollar cap for OpenRouter agents; then agents proposing schedules that you approve with a click (a one-off reminder for itself up to a day ahead needs no approval), and a trigger for files appearing in a folder you chose (see "Status"). Phone alerts for schedules wait for the phone's push alerts. Before it, Muster couldn't run anything on a schedule, though the pieces that make it safe were in place: every message records whether a person, a schedule or a webhook started it, agents choose which of those they accept, chains stop after 4 hops, an agent takes at most 200 messages a day, and a "Background worker" template exists. This plan adds real schedules (every weekday at 9:00, or once at 15:30 tomorrow) with a run history, pause and skip, sensible behaviour after downtime or when the agent is busy, and alerts when a run fails. After that come triggers that aren't about time (a note changes, a PR opens, a commit lands, one agent finishes so the next starts) and spend caps for pay-per-use agents. Last, agents get a guarded way to propose schedules for themselves. Unattended work goes to Codex or OpenRouter agents by default. A Claude subscription agent only runs on a schedule if you opt in, and even then with Claude Code's own limits.
+Phases 1, 2 and 3 of this plan are built: schedules with history, pause and skip, downtime and busy rules, alerts and replies into notes; then triggers (a note you allow, a branch moving, a PR or CI failure on GitHub, a local trigger URL), "Then…" steps that hand a reply to the next agent, and a daily dollar cap for OpenRouter agents; then agents proposing schedules that you approve with a click (a one-off reminder for itself up to a day ahead needs no approval), and a trigger for files appearing in a folder you chose (see "Status"). Phone alerts for schedules wait for the phone's push alerts. Before it, Muster couldn't run anything on a schedule, though the pieces that make it safe were in place: every message records whether a person, a schedule or a webhook started it, agents choose which of those they accept, chains stop after 4 hops (8 since lead agents came, docs/MCP.md "Lead agents"), an agent takes at most 200 messages a day, and a "Background worker" template exists. This plan adds real schedules (every weekday at 9:00, or once at 15:30 tomorrow) with a run history, pause and skip, sensible behaviour after downtime or when the agent is busy, and alerts when a run fails. After that come triggers that aren't about time (a note changes, a PR opens, a commit lands, one agent finishes so the next starts) and spend caps for pay-per-use agents. Last, agents get a guarded way to propose schedules for themselves. Unattended work goes to Codex or OpenRouter agents by default. A Claude subscription agent only runs on a schedule if you opt in, and even then with Claude Code's own limits.
 
 ## Status
 
@@ -67,8 +67,8 @@ Choices made while building it:
 - A trigger URL is `POST /api/trigger/<name>` with a Bearer secret (64 hex), loopback only; the
   secret never appears in `schedule.list` (only `trigger.secret`, the human's).
 - "Then…" steps: a success step and a failure step per level (failure may just notify), nested up
-  to 4 levels in the API (the UI and CLI offer one level). Each is a run of kind `chain` one hop
-  further, so the 4-hop limit bounds chains. Steps don't count toward the schedule's daily cap or
+  to 8 levels in the API (4 at first: the hop limit) (the UI and CLI offer one level). Each is a run of kind `chain` one hop
+  further, so the hop limit (8) bounds chains. Steps don't count toward the schedule's daily cap or
   floor and don't hold back its next run.
 - Spend is read from OpenRouter's `GET /api/v1/key` (`usage_daily` for the overall cap; per agent,
   rises in `usage` split among the OpenRouter agents working in between). Chosen over price ×
@@ -209,7 +209,7 @@ The "Today" section below describes the code before Phase 1.
 ## Today (before Phase 1)
 
 - **No triggers.** Nothing in the daemon fires on time or on events. Schedules and webhooks are listed as deferred in PLAN.md §10.
-- **The policy exists.** There are three origins: human, schedule and webhook. Each agent has a list of the origins it accepts. Claude agents default to human only, Codex agents to all three. The New/Edit agent dialog shows an amber warning when you tick Schedule or Webhook on a Claude agent. Chains stop after 4 hops, and each agent takes at most 200 messages per rolling 24 hours. Both limits count every origin, the human's included.
+- **The policy exists.** There are three origins: human, schedule and webhook. Each agent has a list of the origins it accepts. Claude agents default to human only, Codex agents to all three. The New/Edit agent dialog shows an amber warning when you tick Schedule or Webhook on a Claude agent. Chains stop after 8 hops (4 at first), and each agent takes at most 200 messages per rolling 24 hours. Both limits count every origin, the human's included.
 - **The plumbing is there.** The daemon's internal "ask an agent" call already takes an origin, delivers through the same queue as everything else, and waits for the reply. Each message is stored with its text, origin, hop, reply and any refusal reason, so the agents panel's message log is already a history of runs.
 - **An outcome is already detected.** A finished ask ends in one of these: replied; blocked (stopped on an approval prompt, a question or an error); no reply; agent ended; timed out.
 - **Alerts are thin.** Desktop notifications fire only when a session needs you, and there are in-app notices. Phone push is planned (Android phase 2) but not built.
@@ -261,7 +261,7 @@ The "Today" section below describes the code before Phase 1.
 
 **8. Chaining: when X finishes, run Y (M).** *Example:* when the nightly "run the test suite" schedule on worker replies, ask the reviewer agent: "Here are last night's failures: {reply}. File a note with likely causes." There is also a failure branch: "if it's blocked, notify me instead".
 - *How it looks:* a "Then…" step at the bottom of the schedule dialog: on success or on failure, ask agent Y with a prompt that can quote the reply.
-- *Limits:* each step is one hop further down the same chain, so the existing 4-hop limit bounds chains and stops loops.
+- *Limits:* each step is one hop further down the same chain, so the existing hop limit (8) bounds chains and stops loops.
 - *Depends on:* 1, 2.
 
 **9. Triggers beyond time (M each).** All of them use the existing "webhook" origin, shown in the UI as "Triggered", so the existing accept/refuse rules apply unchanged.
@@ -338,7 +338,7 @@ they can't waste usage.
 | Run outcome (replied/blocked/no reply/ended/waiting) | src/agents.rs:656, src/agents.rs:670 |
 | Autostart at daemon start | src/agents.rs:1404, src/main.rs:1093 |
 | Background worker / PR reviewer templates | src/agents.rs:1871, src/agents.rs:1884 |
-| Hop limit 4, daily cap 200 | src/mcp/guard.rs:110, src/mcp/guard.rs:112 |
+| Hop limit 8, daily cap 200 | src/mcp/guard.rs:112, src/mcp/guard.rs:114 |
 | Origin refusal text; Claude non-agent rule | src/mcp/guard.rs:121, src/mcp/guard.rs:144 |
 | Stored message history (text, reply, refused) | src/agents.rs:123, src/store.rs:266 |
 | Amber warning for Claude + Schedule | docs/UI.md:400 |

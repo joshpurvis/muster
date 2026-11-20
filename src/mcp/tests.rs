@@ -1698,7 +1698,7 @@ fn with_agents(m: &Mock) {
             session_id: Some(id),
             resume_id: None,
             created_at: 0,
-            autostart: false, sleep_after_min: None, asleep_at: None, self_handoff: false, self_handoff_at: None, tools_up_front: false,
+            autostart: false, sleep_after_min: None, asleep_at: None, self_handoff: false, self_handoff_at: None, tools_up_front: false, lead: false,
         });
         d.replies.insert(id, format!("{name} says hi"));
     }
@@ -1771,6 +1771,130 @@ async fn ask_agent_origin_rule_hops_and_cap() {
     let refused = m.d.lock().refused.clone();
     assert_eq!(refused.len(), 4, "{refused:?}");
     assert!(refused[0].1.contains("accepts only human") && refused[3].1.contains("last 24 hours"));
+}
+
+/// A lead agent (`Agent::lead`) passes its scheduled work on as `lead`, which Claude agents and
+/// sessions take like the human's; a non-lead's scheduled turn stays refused, a trigger's work is
+/// never lifted, a Codex agent gains nothing from the flag, the hop limit still holds (for plain
+/// sessions and spawns too), and no MCP tool can set it.
+#[tokio::test]
+async fn a_lead_agents_scheduled_turn_counts_as_the_humans() {
+    use crate::agents::{Origin, Prov, Source};
+    let (m, mut st) = state();
+    with_agents(&m);
+    // A second Claude agent to message: bea (session 6).
+    {
+        let mut d = m.d.lock();
+        let mut bea = d.agents.iter().find(|a| a.name == "ada").unwrap().clone();
+        (bea.id, bea.name, bea.session_id, bea.home_dir) = (6, "bea".into(), Some(6), "/data/agents/bea".into());
+        d.agents.push(bea);
+        d.sessions.insert(6, session(6, 20, SessionKind::Claude, None));
+        d.live.insert(6);
+        d.tokens.insert("tok6".into(), 6);
+        d.replies.insert(6, "bea says hi".into());
+        // And a plain Claude session in the agents' workspace (7).
+        d.sessions.insert(7, session(7, 20, SessionKind::Claude, None));
+        d.live.insert(7);
+    }
+    let set_lead = |name: &str, on: bool| m.d.lock().agents.iter_mut().find(|a| a.name == name).unwrap().lead = on;
+    // Ada (not a lead) handles a reminder: no Claude agent, Claude session or Claude spawn.
+    inbound(&m, 3, Origin::Schedule, 1);
+    let (t, err) = call_as(&st, "tok3", "ask_agent", json!({"agent": "bea", "text": "x"})).await;
+    assert!(err && t.contains("accepts only human"), "{t}");
+    let (t, err) = call_as(&st, "tok3", "tell_agent", json!({"agent": "bea", "text": "x", "wake": true})).await;
+    assert!(err && t.contains("accepts only human"), "{t}");
+    let (t, err) = call_as(&st, "tok3", "send_message", json!({"session_id": 7, "text": "x"})).await;
+    assert!(err && t.contains("origin=schedule"), "{t}");
+    let (t, err) = call_as(&st, "tok3", "spawn_session", json!({"kind": "claude"})).await;
+    assert!(err && t.contains("origin=schedule"), "{t}");
+    // The same turn once the human made ada a lead: all go through as `lead`, one hop on.
+    set_lead("ada", true);
+    let v = parse(&call_as(&st, "tok3", "list_agents", json!({})).await.0);
+    assert_eq!(v["your_origin"], json!({"origin": "lead", "hop": 2}));
+    let (t, err) = call_as(&st, "tok3", "ask_agent", json!({"agent": "bea", "text": "x"})).await;
+    assert!(!err, "{t}");
+    let v = parse(&t);
+    assert_eq!((v["reply"].as_str(), v["origin"].as_str(), v["hop"].as_u64()), (Some("bea says hi"), Some("lead"), Some(2)));
+    let out = m.d.lock().deliveries.last().unwrap().route;
+    assert_eq!((out.origin, out.hop, out.reply_to), (Origin::Lead, 2, Some(77)));
+    let (t, err) = call_as(&st, "tok3", "tell_agent", json!({"agent": "unknown", "text": "fyi", "wake": false})).await;
+    assert!(err && t.contains("no agent named unknown"), "{t}");
+    // A note on lead work can't wait for a later turn. Each refusal leaves the only slot free.
+    let send_per_window = st.limits.send_per_window;
+    st.limits.send_per_window = 1;
+    for (tool, mut args) in [
+        ("tell_agent", json!({"agent": "bea", "text": "fyi", "wake": false})),
+        ("send_message", json!({"session_id": 7, "text": "fyi", "wake": false})),
+    ] {
+        st.edit_guard(|g| g.sends.forget(3)).unwrap();
+        let (t, err) = call_as(&st, "tok3", tool, args.clone()).await;
+        assert!(err && t.contains("origin=lead") && t.contains("wake=true"), "{t}");
+        args["wake"] = json!(true);
+        let (t, err) = call_as(&st, "tok3", tool, args).await;
+        assert!(!err, "{t}");
+    }
+    st.limits.send_per_window = send_per_window;
+    assert!(m.d.lock().quiet.is_empty());
+    assert_eq!(*m.d.lock().sources.last().unwrap(), Source::Chain(Prov { origin: Origin::Lead, hop: 2, msg_id: None }));
+    let (t, err) = call_as(&st, "tok3", "spawn_session", json!({"kind": "claude", "prompt": "build it"})).await;
+    assert!(!err, "{t}");
+    // The builder it started is on the lead's chain, two hops down: it can message Claude agents
+    // too, and what it sends (a report back to its lead included) stays `lead`, never `human`.
+    let child = parse(&t)["session"]["id"].as_u64().unwrap() as SessionId;
+    assert_eq!(m.d.lock().prov.get(&child).copied(), Some(Prov { origin: Origin::Lead, hop: 2, msg_id: None }));
+    m.d.lock().tokens.insert("tokc".into(), child);
+    let (t, err) = call_as(&st, "tokc", "ask_agent", json!({"agent": "bea", "text": "x"})).await;
+    assert!(!err, "{t}");
+    assert_eq!(m.d.lock().deliveries.last().unwrap().route.origin, Origin::Lead);
+    // Ada's own provenance is unchanged: what it handles is still the reminder.
+    assert_eq!(m.d.lock().prov.get(&3).unwrap().origin, Origin::Schedule);
+    // Work a lead passed on, handled by the lead itself, is passed on as `lead` again.
+    inbound(&m, 3, Origin::Lead, 3);
+    let (t, err) = call_as(&st, "tok3", "ask_agent", json!({"agent": "bea", "text": "x"})).await;
+    assert!(!err && parse(&t)["origin"] == "lead", "{t}");
+    // A trigger's work is never lifted, lead or not.
+    inbound(&m, 3, Origin::Webhook, 1);
+    let (t, err) = call_as(&st, "tok3", "ask_agent", json!({"agent": "bea", "text": "x"})).await;
+    assert!(err && t.contains("origin=webhook"), "{t}");
+    let (t, err) = call_as(&st, "tok3", "spawn_session", json!({"kind": "claude"})).await;
+    assert!(err && t.contains("origin=webhook"), "{t}");
+    let (t, err) = call_as(&st, "tok3", "send_message", json!({"session_id": 7, "text": "x"})).await;
+    assert!(err && t.contains("origin=webhook"), "{t}");
+    // The hop limit holds for a lead: at hop 8 its next message would be hop 9, and that goes
+    // for a plain session and a spawn as much as for an agent.
+    inbound(&m, 3, Origin::Schedule, crate::mcp::guard::MAX_AGENT_HOPS);
+    let (t, err) = call_as(&st, "tok3", "ask_agent", json!({"agent": "bea", "text": "x"})).await;
+    assert!(err && t.contains("hop 9") && t.contains("maximum is 8"), "{t}");
+    let (t, err) = call_as(&st, "tok3", "send_message", json!({"session_id": 7, "text": "x"})).await;
+    assert!(err && t.contains("hop 9"), "{t}");
+    let (t, err) = call_as(&st, "tok3", "send_message", json!({"session_id": 7, "text": "x", "wake": false})).await;
+    assert!(err && t.contains("hop 9"), "{t}");
+    let (t, err) = call_as(&st, "tok3", "spawn_session", json!({"kind": "codex"})).await;
+    assert!(err && t.contains("hop 9"), "{t}");
+    // Turned off, the reminder turn is refused again.
+    inbound(&m, 3, Origin::Schedule, 1);
+    set_lead("ada", false);
+    let (t, err) = call_as(&st, "tok3", "ask_agent", json!({"agent": "bea", "text": "x"})).await;
+    assert!(err && t.contains("accepts only human"), "{t}");
+    // A Codex agent with the flag stored gains nothing (Muster refuses to set it; this is a hand edit).
+    set_lead("cody", true);
+    inbound(&m, 4, Origin::Schedule, 1);
+    let (t, err) = call_as(&st, "tok4", "ask_agent", json!({"agent": "bea", "text": "x"})).await;
+    assert!(err && t.contains("accepts only human"), "{t}");
+    let (t, err) = call_as(&st, "tok4", "spawn_session", json!({"kind": "claude"})).await;
+    assert!(err && t.contains("origin=schedule"), "{t}");
+    // No MCP tool can make an agent a lead: none takes a `lead` argument or edits agents, and a
+    // call to one that would is unknown.
+    for tool in super::tools::tool_definitions() {
+        let name = tool["name"].as_str().unwrap();
+        assert!(tool["inputSchema"]["properties"].get("lead").is_none(), "{name} takes `lead`");
+        assert!(!name.contains("edit_agent") && !name.contains("update_agent"), "{name}");
+    }
+    for name in ["update_agent", "agent.update", "edit_agent"] {
+        let r = legacy(&st, "tools/call", json!({"name": name, "arguments": {"name": "ada", "lead": true}})).await;
+        assert!(r.to_string().contains("Unknown tool"), "{name}: {r}");
+    }
+    assert!(!m.d.lock().agents.iter().find(|a| a.name == "ada").unwrap().lead);
 }
 
 #[tokio::test]

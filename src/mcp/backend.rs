@@ -85,6 +85,12 @@ pub trait Backend: Send + Sync + 'static {
     fn agents(&self) -> Vec<Agent>;
     /// The caller's provenance (None: human-rooted).
     fn prov(&self, caller: SessionId) -> Option<Prov>;
+    /// The provenance what the caller sends or spawns starts from (`agents::sending_prov`): its
+    /// own, lifted when it is a lead agent's session. The daemon reads both under one lock.
+    fn send_prov(&self, caller: SessionId) -> Option<Prov> {
+        let lead = self.agents().iter().any(|a| a.session_id == Some(caller) && crate::agents::is_lead(a));
+        crate::agents::sending_prov(self.prov(caller), lead)
+    }
     /// Messages delivered to the agent at or after `since` (unix ms).
     fn agent_messages_since(&self, agent_id: i64, since: i64) -> usize;
     /// Start the agent if needed, record and send the message (`agents::deliver`).
@@ -216,6 +222,9 @@ impl Backend for HubBackend {
     }
     fn prov(&self, caller: SessionId) -> Option<Prov> {
         self.0.agents().prov(caller)
+    }
+    fn send_prov(&self, caller: SessionId) -> Option<Prov> {
+        self.0.agents().send_prov(caller)
     }
     fn agent_messages_since(&self, agent_id: i64, since: i64) -> usize {
         // Unreadable: count as full (refuse) rather than unlimited.

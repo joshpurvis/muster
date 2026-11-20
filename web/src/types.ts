@@ -224,7 +224,7 @@ export interface TimelineEvent {
 }
 
 /** Where a message chain started (docs/MCP.md "Agents"). */
-export type Origin = "human" | "schedule" | "webhook" | `addon:${string}`;
+export type Origin = "human" | "lead" | "schedule" | "webhook" | `addon:${string}`; // "lead": scheduled work a lead agent passed on, never in accepts_origins
 
 /** A named agent (`agent.list`, `agent_upserted`; src/agents.rs `agent_json`). */
 /** Where an agent's model runs (src/openrouter.rs): the CLI's own login, or OpenRouter (pay per
@@ -290,6 +290,8 @@ export interface Agent {
   /** Its sessions get Muster's message tools in the prompt from the start, instead of through
    * Claude Code's tool search (src/mcp/tools.rs `UP_FRONT`). Older daemons: absent. */
   tools_up_front?: boolean;
+  /** A lead agent: what it sends from scheduled work goes as origin "lead", taken like the human's (docs/MCP.md "Lead agents"). Absent from an older backend. */
+  lead?: boolean;
   /** Why its last wake failed, while it is still asleep (it stays asleep; the next message or
    * typing tries again). */
   wake_error?: string;

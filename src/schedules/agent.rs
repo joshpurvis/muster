@@ -112,7 +112,11 @@ fn attended(hub: &Hub, caller: SessionId) -> anyhow::Result<()> {
     if let Some(p) = hub.agents().prov(caller)
         && p.origin != Origin::Human
     {
-        let what = if p.origin == Origin::Webhook { "triggered" } else { "scheduled" };
+        let what = match p.origin {
+            Origin::Webhook => "triggered",
+            Origin::Lead => "scheduled (passed on by a lead agent)",
+            _ => "scheduled",
+        };
         anyhow::bail!(
             "you're handling {what} work, and nothing started by a schedule or trigger may make schedules \
              (so one can't set up the next). Once the human writes to you again you can propose one, or \

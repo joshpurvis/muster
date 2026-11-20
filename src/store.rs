@@ -648,6 +648,12 @@ const MIGRATIONS: &[&str] = &[
     CREATE UNIQUE INDEX quiet_messages_late_reply ON quiet_messages(to_session, late_reply_to) WHERE late_reply_to IS NOT NULL;
     ALTER TABLE agents ADD COLUMN tools_up_front INTEGER NOT NULL DEFAULT 0;
     "#,
+    // v33: `lead`: the human made this Claude agent a lead agent (`Agent::lead`): what it sends
+    // and spawns counts as the human's, whatever started its turn. An older backend ignores it
+    // (the agent's sends are checked by their own origin again).
+    r#"
+    ALTER TABLE agents ADD COLUMN lead INTEGER NOT NULL DEFAULT 0;
+    "#,
 ];
 
 /// The first non-blank line of `head`, trimmed, at most 120 characters (a note's preview).
@@ -1413,7 +1419,7 @@ impl Store {
             "SELECT id, name, kind, model, effort, persona, home_dir, permissions, accepts_origins, session_id,
                     resume_id, created_at, channel_id, autostart, account_profile_id, provider, sleep_after_min, asleep_at,
                     asleep_autostart, working_location, reset_on_next_start, handoff_from, self_handoff, self_handoff_at,
-                    tools_up_front
+                    tools_up_front, lead
              FROM agents ORDER BY id",
         )?;
         let rows = st.query_map([], |r| {
@@ -1451,6 +1457,7 @@ impl Store {
                 self_handoff: r.get::<_, i64>(22)? != 0,
                 self_handoff_at: r.get(23)?,
                 tools_up_front: r.get::<_, i64>(24)? != 0,
+                lead: r.get::<_, i64>(25)? != 0,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -1464,9 +1471,9 @@ impl Store {
             "INSERT INTO agents (name, kind, model, effort, persona, home_dir, permissions, accepts_origins,
                                session_id, resume_id, created_at, channel_id, autostart, account_profile_id, provider,
                                sleep_after_min, asleep_at, asleep_autostart, working_location, reset_on_next_start,
-                               handoff_from, self_handoff, self_handoff_at, tools_up_front)
+                               handoff_from, self_handoff, self_handoff_at, tools_up_front, lead)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21,
-                     ?22, ?23, ?24)",
+                     ?22, ?23, ?24, ?25)",
             params![
                 b.name,
                 b.kind.as_str(),
@@ -1491,7 +1498,8 @@ impl Store {
                 b.handoff.as_ref().map(serde_json::to_string).transpose()?,
                 b.self_handoff as i64,
                 b.self_handoff_at,
-                b.tools_up_front as i64
+                b.tools_up_front as i64,
+                b.lead as i64
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -1534,7 +1542,8 @@ impl Store {
                     autostart = CASE WHEN asleep_at IS NULL THEN ?7 ELSE 0 END,
                     asleep_autostart = CASE WHEN asleep_at IS NULL THEN NULL ELSE ?7 END,
                     provider = ?8, sleep_after_min = ?9, working_location = ?10, reset_on_next_start = ?11,
-                    account_profile_id = ?12, handoff_from = ?13, self_handoff = ?14, tools_up_front = ?15 WHERE id = ?1",
+                    account_profile_id = ?12, handoff_from = ?13, self_handoff = ?14, tools_up_front = ?15,
+                    lead = ?16 WHERE id = ?1",
             params![
                 b.id,
                 b.model,
@@ -1550,7 +1559,8 @@ impl Store {
                 b.account_profile_id,
                 b.handoff.as_ref().map(serde_json::to_string).transpose()?,
                 b.self_handoff as i64,
-                b.tools_up_front as i64
+                b.tools_up_front as i64,
+                b.lead as i64
             ],
         )?;
         Ok(())
@@ -3688,7 +3698,7 @@ mod tests {
             session_id: None,
             resume_id: None,
             created_at: 5,
-            autostart: false, sleep_after_min: None, asleep_at: None, self_handoff: false, self_handoff_at: None, tools_up_front: false,
+            autostart: false, sleep_after_min: None, asleep_at: None, self_handoff: false, self_handoff_at: None, tools_up_front: false, lead: false,
         };
         b.id = s.insert_agent(&b).unwrap();
         // Names are unique case-insensitively.
@@ -3824,6 +3834,8 @@ mod tests {
         assert_eq!((a.session_id, a.channel_id, a.resume_id.as_deref()), (Some(7), Some(4), Some("conv-1")));
         assert_eq!(a.permissions.claude_mode, ClaudeMode::Plan);
         assert!(!a.autostart);
+        // An agent from before migration v33 is never a lead.
+        assert!(!a.lead);
         let m = s.agent_message(1).unwrap().unwrap();
         assert_eq!((m.to_agent, m.reply.as_deref(), m.text.as_deref(), m.refused.as_deref()), (3, Some("ok"), None, None));
         assert_eq!(m.to_name.as_deref(), Some("Ada"));

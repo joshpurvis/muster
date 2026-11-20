@@ -95,10 +95,10 @@ and targets in them are refused.
 | `wait_for_state` | `session_id`, `states?`, `timeout_seconds? = 300` (max 1800), `after_ms?` | `{state, detail, reached, timed_out, ended, waited_ms, queued, …}`. |
 | `post_to_channel` | `text`, `channel_id?` (default: caller's) | Logs an `agent_post` event (`{session_id, text}`) on the human-visible timeline. |
 | `get_diff` | `channel_id?` (default: caller's), `max_bytes? = 60000` (max 400000) | `worktree::diff(channel.cwd, channel.base_branch)`. Past `max_bytes` it is cut at a line boundary with a note listing the changed files (first 200). |
-| `list_agents` | — | `{agents: [{id, name, kind, model, effort, persona, permissions, accepts_origins, autostart, home_dir, channel_id, session_id, state, detail, resumable, created_at, sleep_after_min, asleep, asleep_at, self_handoff, self_handoff_at, tools_up_front, is_me}], your_origin: {origin, hop}}`. All agents, whatever the caller's workspace. `asleep`: its process was stopped while idle (state `exited`, detail `asleep`); asking it wakes it, which re-reads its whole conversation unless a pending account move starts it in a new one (docs/PROTOCOL.md "Sleep and wake"). Listing never wakes anyone. |
+| `list_agents` | — | `{agents: [{id, name, kind, model, effort, persona, permissions, accepts_origins, autostart, home_dir, channel_id, session_id, state, detail, resumable, created_at, sleep_after_min, asleep, asleep_at, self_handoff, self_handoff_at, tools_up_front, lead, is_me}], your_origin: {origin, hop}}`. `lead`: a lead agent (see "Lead agents" under Agents); a lead's `your_origin` is then `lead` in a scheduled turn. All agents, whatever the caller's workspace. `asleep`: its process was stopped while idle (state `exited`, detail `asleep`); asking it wakes it, which re-reads its whole conversation unless a pending account move starts it in a new one (docs/PROTOCOL.md "Sleep and wake"). Listing never wakes anyone. |
 | `ask_agent` | `agent` (name, case-insensitive), `text`, `timeout_seconds? = 600` (max 1800) | `{agent, msg_id, session_id, reply, state, detail, timed_out, ended, origin, hop, sent_at_ms, started, woke, woke_note?, waited_ms, note?, unattributed_output?}`. Starts the agent if it has no live session (`woke: true` when it was asleep: it restarted into its conversation first), sends `[muster msg <id> from <sender> origin=<o> hop=<n>]` plus the text through the injection queue (`from = "session:<caller>"`), then waits for **this message's** turn: until the agent reports a final message attributed to it (Stop hook, Codex notify), or, after the message was typed in, stops on a prompt, question or error (`reply: null` and a `note`), or exits. If the agent goes idle after it with no attributed final message (3 s grace), `reply` is null and `unattributed_output` holds its last 60 terminal lines, with a `note` that they may belong to another prompt. The agent's `reply` to this message while the ask waits ends it with that text as `reply`. On timeout a `note` says a later answer comes as a new message (or, sent with wake=false, at the start of the next turn). See "Agents" below. |
 | `tell_agent` | `agent`, `text`, `wake` (required) | A message nobody waits for an answer to. `wake: true`: delivered now as `ask_agent`'s message is (the agent starts or wakes if needed), without waiting for the turn: `{agent, msg_id, wake, status: "delivered"\|"queued", session_id, woke, started, origin, hop, sent_at_ms, note}`. `wake: false`: kept for the agent's next turn that can take it (`{agent, msg_id, wake, status: "waiting", waiting, origin, hop, sent_at_ms, note}`); see "Quiet messages" below. Same checks as `ask_agent` either way. |
-| `reply` | `msg_id`, `text`, `wake? = true` | `{msg_id, status, delivered, note, delivered_as, session_id, origin, hop}`. Answers a message delivered to the caller's agent after the turn that received it; see "Late replies" below. A waiting ask returns it only when it brings no origin the question's chain didn't have and is at most one hop past the question; otherwise it goes as a new message. With `wake: false`, unless a waiting ask takes it, the asker gets it at the start of its next turn that can take it instead of a new turn (refused, nothing stored, when the reply is rooted in two kinds of unattended work). Errors (nothing stored, no rate-limit slot used): the caller isn't a named agent, the message wasn't delivered to it (unknown, another agent's, refused, still queued), it already has a reply, empty or over 100 000 chars, starts with `!` (unless shell commands are allowed), or, with `wake: false`, over 6,000 characters (an emoji such as 😀 counts as two) or 150 lines. |
+| `reply` | `msg_id`, `text`, `wake? = true` | `{msg_id, status, delivered, note, delivered_as, session_id, origin, hop}`. Answers a message delivered to the caller's agent after the turn that received it; see "Late replies" below. A waiting ask returns it only when it brings no origin the question's chain didn't have and is at most one hop past the question; otherwise it goes as a new message. With `wake: false`, unless a waiting ask takes it, the asker gets it at the start of its next turn that can take it instead of a new turn (refused, nothing stored, when the reply is rooted in two kinds of unattended work, or on `lead` work when an existing agent or a live session asked: send it with `wake: true`). Errors (nothing stored, no rate-limit slot used): the caller isn't a named agent, the message wasn't delivered to it (unknown, another agent's, refused, still queued), it already has a reply, empty or over 100 000 chars, starts with `!` (unless shell commands are allowed), or, with `wake: false`, over 6,000 characters (an emoji such as 😀 counts as two) or 150 lines. |
 | `start_fresh` | `file` (absolute, or relative to the caller's working directory; at most 4096 bytes) | `{status: "waiting", file, note}`. A named Claude agent the human promoted asks for its own fresh start; see "Self handoff" below. Only ever for the caller itself (no target argument). Refused (and recorded in its tab's timeline) when the caller isn't a named agent, isn't promoted (the error says how the human grants it), is a Codex agent (not supported yet), already has a request waiting, started fresh less than 30 minutes ago, or the file doesn't exist, isn't a regular file, or lies outside its home folder and working directory once symlinks are resolved. Counts toward the per-minute post rate limit. |
 
 `whoami` also returns `agent` (the caller's agent name, or null) and `origin: {origin, hop}`.
@@ -779,6 +779,41 @@ provenance: `human`, hop 0):
 | UserPromptSubmit with an envelope | Counts only for an unanswered message muster delivered to that session; unknown, foreign or answered ids are ignored. |
 | UserPromptSubmit that showed quiet messages | Raised to the stricter of the turn's and every shown message's (a non-human origin wins, then the higher hop), in the same transaction as the turn's attribution. A hop-3 message read during a turn the human started keeps the turn at hop 3. |
 
+**Lead agents.** The human can make a Claude agent a lead agent (`lead`; Edit agent > More
+options > "Lead agent", or `muster agent edit <name> --lead on` from a terminal outside Muster).
+In a turn a reminder or a schedule started (origin `schedule`, or `lead` below), what a lead
+agent's session sends or spawns goes as origin `lead` (`agents::sending_prov`): its
+`ask_agent`, `tell_agent`, `send_message`, `reply` (and the same through `muster ask/send/reply/new`)
+and `spawn_session`, with its own hop one on, and the sessions it starts begin with that
+provenance. `lead` is taken like `human` wherever an origin is checked against an accept list or
+the plain Claude rule (`Origin::accepted_as`), so a lead's reminder turn can start a Claude builder
+or ask a Claude agent, and whatever that agent sends on carries `lead` too: the next hop behaves
+as the human's. Everywhere else `lead` is still unattended work, like `schedule`: `set_reminder`,
+`propose_schedule`, `record_answer` and `start_fresh` refuse it, a note edit made in it fires no
+note trigger, it counts toward the receiver's unattended daily cap, and the OpenRouter spend caps
+apply. So a builder reporting back to its lead can't turn the lead's turn into one that sets the
+next reminder. The stricter origin still wins when chains meet (`human` < `lead` < `schedule` <
+`webhook`). The hop still counts: a chain through a lead ends at hop 8 like any other. What is
+lifted, and what isn't:
+- the human's work stays `human`; a trigger's (`webhook`) or an add-on's work is never lifted, so
+  outside triggers stay blocked from Claude agents even through a lead;
+- keys (`muster keys`) reach a Claude session only from the human's own chain: never from scheduled
+  work, `lead` included (raw input carries no route into the turn it starts);
+- a message on `lead` work can't wait for a later turn, since only a `lead` turn could show it:
+  `tell_agent`, `send_message`, and a `reply` to an existing agent or a live session (even one
+  whose ask is still waiting) are refused with `wake: false` before anything is kept or counted; send it with
+  `wake: true`. A `reply` the human or a schedule asked is shown in the message log either way;
+- what reaches a lead is unchanged: its accepted origins decide what it takes.
+
+Codex agents can't be leads (refused; a flag written into the database by hand is ignored), and no
+tool sets it: turning it on takes a click in Muster's window or the owner's terminal, the check
+`tools_up_front` makes; anyone may turn it off, which is saved even when the persona file can't be
+rewritten. A lead's persona file says it is one ("Lead agent"). An older backend reads a stored
+`lead` origin column as `webhook` (the strictest it knows), but a late reply stored with `lead` in
+its JSON drops out of its message log, and it refuses to start on runtime attribution state that
+holds a `lead` provenance (an idle session keeps one until its next attributed prompt) or on a saved
+prompt queue holding one: rolling back after lead work ran can need that state cleared first.
+
 An agent's reply is attributed per message: the message whose prompt was submitted (confirmed by the
 envelope in UserPromptSubmit) owns the next final message; a prompt without an envelope in between
 takes the turn, and its final message belongs to no agent message.
@@ -805,7 +840,8 @@ long job finishes: it says so in that turn's reply, then calls `reply {msg_id, t
   plain session is marked "may not have arrived" rather than typed again).
 - *Route:* the stricter of the message's chain and the replier's current provenance (a
   non-human origin wins, then the higher hop), one hop on. So a reply written while handling a
-  scheduled job is unattended work, and a reply chain ends at hop 4 like any other. The reply
+  scheduled job is unattended work, and a reply chain ends at hop 8 like any other. A lead agent's
+  reply passes scheduled work on as `lead` (also in `origins`), its hop counted the same way. The reply
   also keeps every non-human origin it is rooted in (`origins`: a webhook-rooted question
   answered during scheduled work is both), and an asking agent must accept each of them; a
   Claude session takes none. A waiting ask takes the reply only when it brings no origin the
@@ -834,7 +870,10 @@ long job finishes: it says so in that turn's reply, then calls `reply {msg_id, t
   the start of its next turn that can take it (a Codex session is not delivered to:
   `undelivered`). An ask still waiting takes it either way, under the first row's rule (no new
   origin, at most one hop past the question; `agent_reply::returnable`), and the human's and a schedule's rows
-  are unchanged. Same checks as the waking way: for an asking agent, its accepted origins for the
+  are unchanged. On `lead` work a quiet reply to an existing agent or a live session is refused before it is
+  stored, even while an ask waits for it (rare: the retry with `wake: true` still reaches that
+  ask); one the human or a schedule asked is shown as usual, and one whose asker is gone is kept
+  as usual. Same checks as the waking way: for an asking agent, its accepted origins for the
   reply's origin and every origin it is rooted in, and the hop limit; for a plain session, the
   hop limit and the plain Claude rule on the reply's route; all before anything is kept. A reply
   rooted in two kinds of unattended work is refused with `wake: false` before it is stored (send
@@ -1380,8 +1419,8 @@ Default `states`: `idle, needs_approval, asking_question, error, stuck, exited`,
 | Other workspaces | Off by default, see below. |
 | `post_to_channel` rate | **30 per 60 s** per caller |
 | Self-messaging | Refused (`session_id` == caller; `ask_agent` of the caller's own agent) |
-| Agent origins | `ask_agent` is refused unless the agent's `accepts_origins` contains the message's origin. Defaults: Claude agents `human`; Codex agents `human`, `schedule`, `webhook`. A Claude session that isn't a named agent takes `human` only: `send_message` to one, or `spawn_session` of `kind: claude`, from a non-human chain is refused. |
-| Agent hops | Max hop **4** (`guard::MAX_AGENT_HOPS`); a message from the human or a trigger is hop 0. |
+| Agent origins | `ask_agent` is refused unless the agent's `accepts_origins` contains the message's origin. Defaults: Claude agents `human`; Codex agents `human`, `schedule`, `webhook`. A Claude session that isn't a named agent takes `human` only: `send_message` to one, or `spawn_session` of `kind: claude`, from a non-human chain is refused. `lead` (scheduled work a lead agent passed on) is taken like `human` in both, but never as keys or as a message that waits for a later turn (see "Lead agents"). |
+| Agent hops | Max hop **8** (`guard::MAX_AGENT_HOPS`); a message from the human or a trigger is hop 0. A lead agent's messages count too, and the limit also holds for what reaches a plain session (`send_message`, a spawned session's start, keys, a reply typed in: `guard::check_hop`). |
 | Agent daily cap | **200** messages delivered to one agent per rolling 24 hours, any origin (`guard::AGENT_DAILY_PROMPT_CAP`; counted from `agent_messages`, so it survives restarts, and re-checked in the same transaction as the insert, so concurrent asks over MCP and the CLI can't overshoot). |
 | Agent messages | Only through `ask_agent` and `tell_agent`: `send_message` to an agent's session is refused. `ask_agent` shares `send_message`'s rate limit, size limit, text cleaning, `!` rule and permission-widening check, against the widest of the agent session's current tab and the agent's own tab (its profile before it has one). An agent only ever runs in its own tab (stored on the agent), never a same-named one. |
 | Message size | 100 000 chars (`send_message`), 20 000 chars (`post_to_channel`); a quiet message (`wake: false`) 6,000 chars and 150 lines |

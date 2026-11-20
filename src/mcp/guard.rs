@@ -107,8 +107,9 @@ pub const AGENTS_MAY_APPROVE: bool = false;
 // ----- agents (PLAN.md §10) -----
 
 /// Max hop of an agent message: a message from the human or a trigger is hop 0, a message an agent
-/// sends while handling a hop-N message is hop N+1. Deeper chains are refused.
-pub const MAX_AGENT_HOPS: u32 = 4;
+/// sends while handling a hop-N message is hop N+1. Deeper chains are refused, a lead agent's
+/// messages included (`agents::sending_prov` keeps the hop).
+pub const MAX_AGENT_HOPS: u32 = 8;
 /// Messages muster delivers to one agent per rolling 24 hours (any origin, the human's included).
 pub const AGENT_DAILY_PROMPT_CAP: usize = 200;
 pub const AGENT_CAP_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
@@ -128,12 +129,13 @@ pub fn unattended_cap_refusal(agent: &str, recent: usize, cap: u32) -> String {
 /// May a message with `origin` at `hop` be delivered to agent `agent` (which accepts `accepts`
 /// and was sent `recent` messages in the last 24 hours)?
 pub fn check_agent_delivery(agent: &str, accepts: &[Origin], origin: Origin, hop: u32, recent: usize) -> Result<(), String> {
-    if !accepts.contains(&origin) {
+    if !accepts.contains(&origin.accepted_as()) {
         let list: Vec<&str> = accepts.iter().map(|o| o.as_str()).collect();
+        let lead = if origin == Origin::Schedule { ", or to make the sending agent a lead agent" } else { "" };
         return Err(format!(
             "agent {agent} accepts only {} messages, and this one is origin={} (the chain it belongs to was started by a {}, not the human). \
              Claude agents take human-started work only by default; route scheduled or triggered work to a Codex agent, or ask the human \
-             to run it (or to recreate the agent with --accepts).",
+             to run it (or to recreate the agent with --accepts{lead}).",
             if list.is_empty() { "no".to_string() } else { list.join("/") },
             origin.as_str(),
             origin.as_str()
@@ -153,16 +155,40 @@ pub fn check_agent_delivery(agent: &str, accepts: &[Origin], origin: Origin, hop
 }
 
 /// Claude agents that aren't agents (no accepts list of their own) take human-rooted work only,
-/// like a Claude agent by default: no messages or spawns from a scheduled or triggered chain.
+/// like a Claude agent by default: no messages or spawns from a scheduled or triggered chain,
+/// unless a lead agent passed the scheduled work on (`Origin::Lead`).
 pub fn check_claude_origin(kind: SessionKind, origin: Origin) -> Result<(), String> {
-    if kind == SessionKind::Claude && origin != Origin::Human {
+    if kind == SessionKind::Claude && origin.accepted_as() != Origin::Human {
+        let lead = if origin == Origin::Schedule {
+            " (who can also make the agent that sends it a lead agent: scheduled work a lead passes on is taken like the human's)"
+        } else {
+            ""
+        };
         return Err(format!(
             "you are handling an origin={} message, and Claude agents only take work the human started. Use a Codex agent or agent \
-             for it, or ask the human.",
+             for it, or ask the human{lead}.",
             origin.as_str()
         ));
     }
     Ok(())
+}
+
+/// The hop limit for what reaches a session without an agent's accept list (a spawned session's
+/// start, `send_message`, keys, a reply typed into a session): a turn there may not start deeper
+/// than an agent message could.
+pub fn check_hop(hop: u32) -> Result<(), String> {
+    if hop > MAX_AGENT_HOPS {
+        return Err(format!(
+            "agent message chain too deep: this would be hop {hop} and the maximum is {MAX_AGENT_HOPS}. Answer with what you have, or ask the human."
+        ));
+    }
+    Ok(())
+}
+
+/// `check_claude_origin` and `check_hop` for a route into a session.
+pub fn check_session_route(kind: SessionKind, origin: Origin, hop: u32) -> Result<(), String> {
+    check_claude_origin(kind, origin)?;
+    check_hop(hop)
 }
 
 /// Number of ancestors of `id` (0 for a human-started session). Cycle-safe.
@@ -553,6 +579,11 @@ mod tests {
     #[test]
     fn agent_hop_limit_and_daily_cap() {
         let all = [Origin::Human];
+        // Eight hops pass, the ninth is refused.
+        assert_eq!(MAX_AGENT_HOPS, 8);
+        assert!(check_agent_delivery("a", &all, Origin::Human, 8, 0).is_ok());
+        let e = check_agent_delivery("a", &all, Origin::Human, 9, 0).unwrap_err();
+        assert!(e.contains("hop 9") && e.contains("maximum is 8"), "{e}");
         assert!(check_agent_delivery("a", &all, Origin::Human, MAX_AGENT_HOPS, 0).is_ok());
         let e = check_agent_delivery("a", &all, Origin::Human, MAX_AGENT_HOPS + 1, 0).unwrap_err();
         assert!(e.contains("too deep"), "{e}");

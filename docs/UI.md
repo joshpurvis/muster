@@ -902,7 +902,7 @@ sends only what changed (`schedule.settings.set`). The dialog scrolls in a short
 - **Then…** (under More options): "When it replies, ask [nobody · an agent]" with a
   prompt box when an agent is picked, and "When it fails (blocked, refused, no reply, an error)"
   as Nothing more · Notify me · Ask an agent (an agent and a prompt). The hint explains `{reply}`
-  and `{outcome}` and that each step is one hop further (4 at most), or, for Notify me, that a
+  and `{outcome}` and that each step is one hop further (8 at most), or, for Notify me, that a
   failure always notifies then. Missing agents or prompts block Save with the reason. Deeper steps
   made with the API stay as they are while the step above them still asks an agent (a hint says how
   deep it goes). A step's Claude subscription agent shows in the preview too (quiet hours by
@@ -1009,6 +1009,15 @@ sends only what changed (`schedule.settings.set`). The dialog scrolls in a short
   doesn't look each one up first. About 2,200 more tokens on every request, mostly cached.
   Applies from its next start." The closed More options line says "Message tools up front" when
   on. Only the owner's click turns it on (as for Can start itself fresh).
+- **Lead agent** (Edit only, Claude agents, off by default; after Load message tools up front):
+  in a turn a reminder or a schedule started, what it sends and the sessions it starts go as
+  origin `lead`, which Claude agents take like the owner's (`lead`, docs/MCP.md "Lead agents").
+  The hint leads with that (starting Claude builders, messaging Claude agents), then that each
+  message still counts one step and a chain stops after 8, that a trigger's work keeps the usual
+  rules and nothing scheduled work reaches can set reminders or schedules, and that only the owner
+  turns it on. The closed More options line says "Lead agent" when on, and
+  the agent's row in the list shows a "lead" tag. Only the owner's click turns it on (as for Can
+  start itself fresh); it applies at once.
 - Edit saves only changed fields (`agent.update`); provider, model, effort and permissions apply
   from the agent's next start, which the toast says when it runs. Edit's title shows the
   OpenRouter badge for an agent on it.

@@ -438,7 +438,10 @@ merges, never a model.
   why); its pill and its row in the list show … ("merging soon") until it ends. Nothing is sent
   until the countdown ends, nothing at all if the window has lost its connection then or its timer
   ran over 30 s late (a window asleep), and closing or reloading the window ends every countdown not
-  yet sent. A send that fails says why on the card (and in a toast) until Merge is clicked again.
+  yet sent. A send that fails says why on the card (and in a toast) until Merge is clicked again
+  or the card is posted again; when the send went out but Muster's answer was lost (the
+  connection dropped), the card says Muster may be merging it and keeps its place until Muster
+  answers (a second Merge can't merge it twice: Muster refuses a card already merging).
   Then Muster asks GitHub to merge ("Asking GitHub to merge"), and the card ends merged ("<repo> #<n> is in master as commit abc1234", whether its poster
   was told, with **Next waiting** at the dock's other end), refused (a red banner with why and
   GitHub's first line; Merge off until a read passes), or "Not known yet" when Muster asked GitHub

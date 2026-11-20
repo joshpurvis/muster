@@ -7,6 +7,7 @@
 import { effect, signal } from "@preact/signals";
 import { mergeQueue, type Queued, type Seen } from "./prs_merge_queue.ts";
 import { canMerge, COUNTDOWN_S, mergePr, offReason, prs, target } from "./prs.ts";
+import { rpc, RpcError } from "./rpc.ts";
 import { toast } from "./state.ts";
 
 /** Each card counting down or being sent from this window, by card id. */
@@ -14,8 +15,13 @@ export const queuedMerges = signal<ReadonlyMap<number, Queued>>(new Map());
 /** Cards sent to merge from this window since the tab was shown: the Waiting strip keeps their
  * places (a merged one is shown there, marked merged). */
 export const mergedHere = signal<ReadonlySet<number>>(new Set());
-/** Why a card's last send from here failed (shown on its card until Merge is clicked again). */
-export const failedMerges = signal<ReadonlyMap<number, string>>(new Map());
+/** Why a card's last send from here failed, for the post and commit tried (shown on that card
+ * until Merge is clicked again). */
+export const failedMerges = signal<ReadonlyMap<number, { text: string; post: number; sha: string }>>(new Map());
+/** Cards whose `pr.merge` went out on an open connection (until its failure is handled). */
+const sentOpen = new Set<number>();
+const LOST = "its answer was lost on the way, so Muster may be merging it: the card updates when Muster is reachable " +
+  "again, and Merge again can't merge it twice";
 
 /** Forget the cards whose merge has ended (the tab shown again, the filter changed); one still
  * counting down or merging keeps its place. */
@@ -38,19 +44,25 @@ const queue = mergeQueue(COUNTDOWN_S * 1000, {
   // Kept in the strip from the moment it is sent: an answer lost on the way can't drop it.
   send: (seen: Seen) => {
     mergedHere.value = new Set(mergedHere.peek()).add(seen.id);
-    return mergePr(seen);
+    if (rpc.isOpen) sentOpen.add(seen.id);
+    return mergePr(seen).then((r) => { sentOpen.delete(seen.id); return r; });
   },
   // Not sent (disconnected, asleep, or refused at the click): the card is back to its Merge, and
   // says why until Merge is clicked again.
   failed: (seen, e) => {
     const p = prs.peek().get(seen.id);
-    if (p?.status !== "merging" && p?.status !== "merged") {
+    // Sent on an open connection and not answered by Muster (lost, timed out): it may have been
+    // taken, so the card keeps its place and says the outcome is unknown.
+    const lost = !(e instanceof RpcError && e.answered) && sentOpen.has(seen.id);
+    sentOpen.delete(seen.id);
+    if (!lost && p?.status !== "merging" && p?.status !== "merged") {
       const kept = new Set(mergedHere.peek());
       kept.delete(seen.id);
       mergedHere.value = kept;
     }
-    failedMerges.value = new Map(failedMerges.peek()).set(seen.id, errText(e));
-    toast("error", `${nameOf(seen.id)}: ${errText(e)}`, 8000);
+    const text = lost ? LOST : errText(e);
+    failedMerges.value = new Map(failedMerges.peek()).set(seen.id, { text, post: seen.post, sha: seen.sha });
+    toast("error", `${nameOf(seen.id)}: ${text}`, 8000);
   },
   changed: (all) => { queuedMerges.value = all; },
 });

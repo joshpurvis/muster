@@ -454,8 +454,9 @@ function Dock({ p, now, order, onPick }: { p: Pr; now: number; order: string; on
   // dock is shown).
   const queued = queuedMerges.value.get(p.id);
   const counting = queued?.phase === "count" && p.status === "waiting";
-  // Why this card's last send from here failed, until Merge is clicked again.
-  const failed = failedMerges.value.get(p.id);
+  // Why this card's last send from here failed (for this post and commit), until Merge is clicked again.
+  const tried = failedMerges.value.get(p.id);
+  const failed = tried && tried.post === p.post && tried.sha === p.head_sha ? tried.text : undefined;
   // Re-renders the seconds left while it counts down.
   useNow(counting ? 200 : 60_000);
 
@@ -469,7 +470,7 @@ function Dock({ p, now, order, onPick }: { p: Pr; now: number; order: string; on
   useEffect(() => {
     if (!counting) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key !== "Escape" || !(e.target as HTMLElement)?.closest?.(".prs-view")) return;
+      if (e.key !== "Escape" || e.repeat || !(e.target as HTMLElement)?.closest?.(".prs-view")) return;
       if (document.querySelector(".prs-view .pm-lightbox, .prs-view .pb-menu")) return;
       e.preventDefault();
       e.stopPropagation();

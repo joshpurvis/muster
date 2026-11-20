@@ -254,6 +254,9 @@ function AgentRow({ a, now, selected }: { a: Agent; now: number; selected: boole
         <span class="ap-row-sub">
           {st.label}
           {st.since !== null && ` · ${ago(st.since, now)}`}
+          {a.lead && (
+            <span class="ap-auto" data-tip="Lead agent: what it sends counts as yours, even from a reminder or a schedule">lead</span>
+          )}
           {a.autostart && <span class="ap-auto" data-tip="Starts with the daemon">auto</span>}
           {a.sleep_after_min != null && !st.asleep && (
             <span class="ap-auto" data-tip={`Sleeps after ${idleText(a.sleep_after_min * 60_000)} idle; the next message sent with wake on wakes it`}>
@@ -733,6 +736,8 @@ interface Draft {
   selfHandoff: boolean;
   /** Muster's message tools in the prompt from the start (Edit, Claude only). */
   toolsUpFront: boolean;
+  /** A lead agent: what it sends counts as the human's (Edit, Claude only; the human's to set). */
+  lead: boolean;
 }
 
 function fromTemplate(t: AgentTemplate): Draft {
@@ -752,6 +757,7 @@ function fromTemplate(t: AgentTemplate): Draft {
     sleepAfter: String(SLEEP_AFTER_DEFAULT),
     selfHandoff: false,
     toolsUpFront: false,
+    lead: false,
   };
 }
 
@@ -772,6 +778,7 @@ function fromAgent(a: Agent): Draft {
     sleepAfter: String(a.sleep_after_min ?? SLEEP_AFTER_DEFAULT),
     selfHandoff: !!a.self_handoff,
     toolsUpFront: !!a.tools_up_front,
+    lead: !!a.lead,
   };
 }
 
@@ -791,6 +798,7 @@ const BLANK: Draft = {
   sleepAfter: String(SLEEP_AFTER_DEFAULT),
   selfHandoff: false,
   toolsUpFront: false,
+  lead: false,
 };
 
 let templateCache: AgentTemplate[] | null = null;
@@ -950,12 +958,15 @@ export function AgentDialog(
   const canSelfHandoff = !!agent && agent.kind === "claude" && agent.self_handoff !== undefined;
   /** Message tools up front: an existing Claude agent on a backend that knows it. */
   const canToolsUpFront = !!agent && agent.kind === "claude" && agent.tools_up_front !== undefined;
+  /** Lead agent: an existing Claude agent on a backend that knows it. */
+  const canLead = !!agent && agent.kind === "claude" && agent.lead !== undefined;
   const moreSummary = [
     or && (d.provider === "openrouter" ? "OpenRouter" : "Subscription"),
     d.autostart ? "Autostart on" : "No autostart",
     d.sleep ? (sleepMin ? `Sleeps after ${sleepMin} min idle` : "Sleep time needs fixing") : "Never sleeps",
     canSelfHandoff && d.selfHandoff && "Can start itself fresh",
     canToolsUpFront && d.toolsUpFront && "Message tools up front",
+    canLead && d.lead && "Lead agent",
   ].filter(Boolean).join(" · ");
   const keyHint = or && !or.key_present && (
     <span class="field-hint or-key-hint" id="agent-provider-hint">
@@ -1014,6 +1025,7 @@ export function AgentDialog(
       if ((agent.sleep_after_min ?? 0) !== sleepMin) patch.sleep_after_min = sleepMin;
       if (canSelfHandoff && d.selfHandoff !== before.selfHandoff) patch.self_handoff = d.selfHandoff;
       if (canToolsUpFront && d.toolsUpFront !== before.toolsUpFront) patch.tools_up_front = d.toolsUpFront;
+      if (canLead && d.lead !== before.lead) patch.lead = d.lead;
       if (d.accepts.join() !== before.accepts.join()) patch.accepts = d.accepts;
       if (JSON.stringify(d.permissions) !== JSON.stringify(before.permissions)) {
         patch.permissions = d.permissions;
@@ -1568,6 +1580,31 @@ export function AgentDialog(
                   Puts Muster's message tools (ask_agent, tell_agent, reply and four more) in its prompt from the
                   start, so it doesn't look each one up first. About 2,200 more tokens on every request, mostly
                   cached. Applies from its next start.
+                </span>
+              </div>
+            )}
+            {canLead && (
+              <div class="sleep-field">
+                <label class="toggle">
+                  <input
+                    type="checkbox"
+                    data-field="lead"
+                    aria-describedby="lead-hint"
+                    checked={d.lead}
+                    onChange={(e) => set({ lead: (e.target as HTMLInputElement).checked })}
+                  />
+                  <span class="toggle-track">
+                    <span class="toggle-thumb" />
+                  </span>
+                  <span>
+                    Lead agent <span class="muted">(its messages count as yours)</span>
+                  </span>
+                </label>
+                <span id="lead-hint" class="field-hint sleep-after">
+                  What it sends and the sessions it starts count as started by you, even when a reminder, a
+                  schedule or another agent started its turn. So it can start Claude builders and message Claude
+                  agents from there. Each message still counts one step, and a chain stops after 8. It can't set
+                  reminders or schedules from those turns. Only you can turn this on.
                 </span>
               </div>
             )}

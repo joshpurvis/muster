@@ -1565,7 +1565,7 @@ export function ScheduleDialog(
                       ? steps.error
                       : d.then.failMode === "notify"
                       ? "A failure also sends you a notice and a desktop notification, whatever Notify me says."
-                      : <><code>{"{reply}"}</code> quotes the reply as data, <code>{"{outcome}"}</code> says how it ended. Each step is one hop further down the same chain (messages stop after 4 hops).</>}
+                      : <><code>{"{reply}"}</code> quotes the reply as data, <code>{"{outcome}"}</code> says how it ended. Each step is one hop further down the same chain (messages stop after 8 hops).</>}
                   </span>
                 </span>
                 {nestedSteps(sched?.then) > 0 && (

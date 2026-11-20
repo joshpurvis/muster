@@ -170,8 +170,8 @@ pub enum GhEvent {
 }
 
 /// The "Then…" steps of a schedule: what runs after a run (or a step) ends, on success (a
-/// reply) or on failure. Each step is one hop further down the same chain, so the 4-hop limit
-/// bounds chains.
+/// reply) or on failure. Each step is one hop further down the same chain, so the hop limit
+/// (`guard::MAX_AGENT_HOPS`, 8) bounds chains.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Then {
     #[serde(default, skip_serializing_if = "Option::is_none")]

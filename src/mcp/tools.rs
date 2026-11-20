@@ -133,7 +133,7 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "spawn_session",
             "Spawn session",
-            "Start a new agent (claude or codex) or shell session, recorded as your child. By default it starts in YOUR channel (same working directory). Pass channel_id to use another existing channel of your workspace, or new_channel to create a fresh channel (a new tab in your channel's window; by default with its own git worktree + branch, so parallel work doesn't collide; without a name it is named after the agent's task). A Claude child inherits the calling Claude session's account profile, including Default; otherwise the workspace default applies. The agent runs with the target channel's permission profile (Codex sandbox, Claude permission mode; see whoami/list_channels), which only the human can change; a new_channel gets your channel's profile. There is no way to request more: a channel_id whose profile would give this kind of agent more than your channel has is refused. The prompt, if given, is delivered once the agent is ready. A shell can't be given a prompt unless the human allowed it. Returns immediately; use wait_for_state to wait for it. Limits: spawn depth 3, 32 live children per caller, 32 agent-spawned sessions in total, 10 spawns per 10 minutes per caller, 10 open agent-created channels.",
+            "Start a new agent (claude or codex) or shell session, recorded as your child. By default it starts in YOUR channel (same working directory). Pass channel_id to use another existing channel of your workspace, or new_channel to create a fresh channel (a new tab in your channel's window; by default with its own git worktree + branch, so parallel work doesn't collide; without a name it is named after the agent's task). A Claude child inherits the calling Claude session's account profile, including Default; otherwise the workspace default applies. The agent runs with the target channel's permission profile (Codex sandbox, Claude permission mode; see whoami/list_channels), which only the human can change; a new_channel gets your channel's profile. There is no way to request more: a channel_id whose profile would give this kind of agent more than your channel has is refused. The prompt, if given, is delivered once the agent is ready. A shell can't be given a prompt unless the human allowed it. A Claude session can't be started while you handle scheduled or triggered work (origin schedule or webhook), unless you are a lead agent. Returns immediately; use wait_for_state to wait for it. Limits: spawn depth 3, 32 live children per caller, 32 agent-spawned sessions in total, 10 spawns per 10 minutes per caller, 10 open agent-created channels.",
             json!({
                 "type": "object",
                 "properties": {
@@ -253,14 +253,14 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "list_agents",
             "List agents",
-            "List the named agents: persistent agents (claude or codex) with their own home folder, memory and resumed conversation, which you can ask things with ask_agent. Each has name, kind, model, accepts_origins (which message origins it takes: human, schedule, webhook), its session and state, and asleep (its process was stopped while idle: asking it wakes it, which re-reads its whole conversation unless a pending account move starts it in a new one, so only ask when you need it). Also returns your_origin: the origin and hop a message you send now would carry.",
+            "List the named agents: persistent agents (claude or codex) with their own home folder, memory and resumed conversation, which you can ask things with ask_agent. Each has name, kind, model, accepts_origins (which message origins it takes: human, schedule, webhook), lead (a lead agent: what it sends and spawns counts as the human's, whatever started its turn; only the human sets it), its session and state, and asleep (its process was stopped while idle: asking it wakes it, which re-reads its whole conversation unless a pending account move starts it in a new one, so only ask when you need it). Also returns your_origin: the origin and hop a message you send now would carry (human for a lead agent, whatever started your turn).",
             empty_schema(),
             true,
         ),
         tool(
             "ask_agent",
             "Ask agent",
-            "Ask an agent something and wait for its answer. Starts the agent if it isn't running (or wakes it if asleep: woke is true), delivers the text (after a one-line [muster msg ...] header naming you, the origin and the hop) through its input queue, waits until its turn ends, and returns {reply, state, timed_out, msg_id}. reply is the agent's final message for that turn (null if it stopped on a permission prompt or question: check state). Refused when the agent doesn't accept your origin (a chain started by a schedule or webhook can't reach a Claude agent by default), when the chain is more than 4 hops deep, or past the agent's 200 messages a day. Rate limited with send_message (20 per minute).",
+            "Ask an agent something and wait for its answer. Starts the agent if it isn't running (or wakes it if asleep: woke is true), delivers the text (after a one-line [muster msg ...] header naming you, the origin and the hop) through its input queue, waits until its turn ends, and returns {reply, state, timed_out, msg_id}. reply is the agent's final message for that turn (null if it stopped on a permission prompt or question: check state). Refused when the agent doesn't accept your origin (a chain started by a schedule or webhook can't reach a Claude agent by default, unless it passed through a lead agent: what a lead agent sends counts as the human's), when the chain is more than 8 hops deep, or past the agent's 200 messages a day. Rate limited with send_message (20 per minute).",
             json!({
                 "type": "object",
                 "properties": {
@@ -863,9 +863,17 @@ pub(super) fn caller_origin<B: Backend>(st: &McpState<B>, caller: SessionId) -> 
     (r.origin, r.hop)
 }
 
-/// The route of anything the caller sends or spawns now: its provenance, one hop on.
+/// The route of anything the caller sends or spawns now: its provenance, one hop on (a lead
+/// agent's as the human's, `agents::sending_prov`).
 pub(super) fn caller_route<B: Backend>(st: &McpState<B>, caller: SessionId) -> crate::agents::Route {
-    crate::agents::outgoing(st.backend.prov(caller))
+    crate::agents::outgoing(caller_prov(st, caller))
+}
+
+/// The provenance what the caller sends or spawns starts from: its own, or the human's when it is
+/// a lead agent's session (`agents::sending_prov`).
+pub(super) fn caller_prov<B: Backend>(st: &McpState<B>, caller: SessionId) -> Option<crate::agents::Prov> {
+    let lead = st.backend.agents().iter().any(|a| a.session_id == Some(caller) && crate::agents::is_lead(a));
+    crate::agents::sending_prov(st.backend.prov(caller), lead)
 }
 
 /// The caller's workspace (None if its channel is gone).
@@ -1541,7 +1549,7 @@ fn agent_send<B: Backend>(st: &McpState<B>, caller: SessionId, name: &str, text:
     let from = crate::agents::sender_label(st.backend.agents().iter().find(|b| b.session_id == Some(caller)), caller);
     // Policy refusals (permissions, origin, hops, cap) are kept for the agents panel's log.
     let refused = |why: String| {
-        let proposed = crate::agents::proposed_route(st.backend.prov(caller), None);
+        let proposed = crate::agents::proposed_route(caller_prov(st, caller), None);
         st.backend
             .agent_refused(crate::agents::message_record(&agent, &from, Some(caller), proposed, &text), &why);
         why
@@ -1555,7 +1563,7 @@ fn agent_send<B: Backend>(st: &McpState<B>, caller: SessionId, name: &str, text:
     let recent = st
         .backend
         .agent_messages_since(agent.id, now_ms() - guard::AGENT_CAP_WINDOW_MS);
-    let route = crate::agents::route(&agent, st.backend.prov(caller), None, recent).map_err(refused)?;
+    let route = crate::agents::route(&agent, caller_prov(st, caller), None, recent).map_err(refused)?;
     if let Err(wait_s) = st.edit_guard(|g| g.sends.check_and_record(
         caller, now_ms(), st.limits.send_per_window, st.limits.send_window_ms,
     ))? {

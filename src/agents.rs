@@ -18,6 +18,11 @@
 //! human's only if the daemon saw human input for that session through a client connection
 //! since the last attributed delivery (`note_human_input`). No entry = human-rooted, hop 0.
 //!
+//! Lead agents (`Agent::lead`, set only by the human): what a lead agent's session sends or spawns
+//! starts from `sending_prov`, origin `human` with the session's own hop, whatever started its
+//! turn. Its own provenance stays as delivered, so reminders and schedules (which read it) keep
+//! their rule.
+//!
 //! Messages to agents also get a one-line envelope
 //! (`[muster msg <id> from <sender> origin=<origin> hop=<n>]`) and an `agent_messages` row; the
 //! agent's final message for the turn that ran it (Stop hook, Codex notify) is that row's reply.
@@ -198,6 +203,10 @@ pub struct Agent {
     /// (`mcp::tools::UP_FRONT`). Claude agents only, off by default, turned on only by the human;
     /// applies from its next start.
     pub tools_up_front: bool,
+    /// A lead agent: what it sends and spawns counts as the human's, whatever started its turn
+    /// (`sending_prov`). Claude agents only, off by default, turned on only by the human
+    /// (`check_lead`); no agent can set it, on itself or another.
+    pub lead: bool,
 }
 
 /// One message muster delivered to an agent (or refused to: `refused`).
@@ -270,6 +279,23 @@ impl Route {
     }
 }
 
+/// Does `a` count as the human for what it sends (`Agent::lead`)? Only a Claude agent: a Codex
+/// agent never does, whatever its stored flag says.
+pub fn is_lead(a: &Agent) -> bool {
+    a.lead && a.kind == SessionKind::Claude
+}
+
+/// The provenance a session's messages and spawns start from: its own (`prov`), except that a lead
+/// agent's session (`lead`) counts as the human's whatever started its turn: origin `human`, its
+/// hop kept, so the chain still ends at `guard::MAX_AGENT_HOPS`. Reminders and schedules read
+/// the session's own provenance, not this.
+pub fn sending_prov(prov: Option<Prov>, lead: bool) -> Option<Prov> {
+    match prov {
+        Some(p) if lead => Some(Prov { origin: Origin::Human, ..p }),
+        p => p,
+    }
+}
+
 /// The route of a message sent by a session with provenance `prov`: its origin, one hop on.
 /// No provenance: human-rooted, hop 0.
 pub fn outgoing(prov: Option<Prov>) -> Route {
@@ -313,14 +339,26 @@ pub fn persona_file(kind: SessionKind) -> &'static str {
 }
 
 /// `persona_text` for an agent's record: with the fresh-start section when the human let it
-/// start itself fresh (`Agent::self_handoff`).
+/// start itself fresh (`Agent::self_handoff`), and the lead section for a lead agent.
 pub fn persona_text_for(a: &Agent) -> String {
     let mut t = persona_text(&a.name, a.kind, &a.persona);
     if a.self_handoff && a.kind == SessionKind::Claude {
         t.push_str(&crate::self_handoff::persona_section());
     }
+    if is_lead(a) {
+        t.push_str(LEAD_SECTION);
+    }
     t
 }
+
+/// What a lead agent's persona file adds (`Agent::lead`).
+pub const LEAD_SECTION: &str = "\n## Lead agent\n\n\
+     The human made you a lead agent: what you send and start counts as the human's, whatever started \
+     your turn. In a turn a reminder, a schedule or a trigger started, you can still start sessions \
+     (`spawn_session`) and message Claude agents and sessions (`ask_agent`, `tell_agent`, \
+     `send_message`, `reply`); they get your messages as origin=human. Each message still counts one \
+     hop, and a chain ends after 8. Reminders and schedules keep their rule: none from a scheduled or \
+     triggered turn.\n";
 
 pub fn persona_text(name: &str, kind: SessionKind, persona: &str) -> String {
     let persona = persona.trim();
@@ -1241,6 +1279,7 @@ impl Registry {
         a.handoff = next.handoff.clone();
         a.self_handoff = next.self_handoff;
         a.tools_up_front = next.tools_up_front;
+        a.lead = next.lead;
         store.update_agent_config(&a)?;
         *b = a.clone();
         Ok(a)
@@ -1313,6 +1352,17 @@ impl Registry {
     /// The session's provenance (None: human-rooted).
     pub fn prov(&self, id: SessionId) -> Option<Prov> {
         self.inner.lock().runtime.prov.get(&id).copied()
+    }
+
+    /// Is session `id` a lead agent's current session (`is_lead`)?
+    pub fn is_lead_session(&self, id: SessionId) -> bool {
+        self.inner.lock().agents.values().any(|b| b.session_id == Some(id) && is_lead(b))
+    }
+
+    /// The provenance what session `id` sends or spawns starts from (`sending_prov`): its own,
+    /// or the human's for a lead agent's session.
+    pub fn send_prov(&self, id: SessionId) -> Option<Prov> {
+        sending_prov(self.prov(id), self.is_lead_session(id))
     }
 
     /// A session spawned by an agent starts with the spawner's provenance.
@@ -1786,7 +1836,7 @@ pub fn create(hub: &Hub, req: NewAgent) -> anyhow::Result<Agent> {
             asleep_at: None,
             self_handoff: false,
             self_handoff_at: None,
-            tools_up_front: false,
+            tools_up_front: false, lead: false,
         },
     )?;
     publish(hub, &a);
@@ -1845,6 +1895,10 @@ pub struct AgentUpdate {
     /// agents only; turning it on needs `by_owner`, turning it off works from anywhere.
     #[serde(default)]
     pub tools_up_front: Option<bool>,
+    /// Make it a lead agent (`Agent::lead`). Claude agents only; turning it on needs `by_owner`,
+    /// turning it off works from anywhere.
+    #[serde(default)]
+    pub lead: Option<bool>,
     /// The call is the human's own: a click in Muster's window, or the CLI from a terminal
     /// outside every Muster session (`rpc::owner_terminal`). Set by the RPC layer, never by
     /// the caller (not a request field).
@@ -1887,6 +1941,27 @@ fn check_tools_up_front(a: &Agent, by_owner: bool) -> anyhow::Result<()> {
          message tools up front\") in Muster's window, or with `muster agent edit {name} --tools-up-front on` in a terminal \
          outside Muster. This call came from inside a Muster session (an agent, or a shell tab), from a script, or from a \
          program Muster can't identify, so it may be an agent's",
+        name = a.name
+    );
+    Ok(())
+}
+
+/// May this `agent.update` make `a` a lead agent? Only a Claude agent (Codex agents keep the origin
+/// rules), and only by the human (`by_owner`, as for `check_tools_up_front`): a lead's messages and
+/// spawns count as the human's even in a scheduled or triggered turn. Turning it off works from
+/// anywhere.
+fn check_lead(a: &Agent, by_owner: bool) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        a.kind == SessionKind::Claude,
+        "only Claude agents can be lead agents: {} is a Codex agent, and scheduled or triggered work it handles stays \
+         under the origin rules",
+        a.name
+    );
+    anyhow::ensure!(
+        by_owner,
+        "only the human can make {name} a lead agent: in Edit agent (More options, \"Lead agent\") in Muster's window, or \
+         with `muster agent edit {name} --lead on` in a terminal outside Muster. This call came from inside a Muster \
+         session (an agent, or a shell tab), from a script, or from a program Muster can't identify, so it may be an agent's",
         name = a.name
     );
     Ok(())
@@ -1979,11 +2054,18 @@ pub fn update_switch(hub: &Hub, req: AgentUpdate, outside: bool) -> anyhow::Resu
         }
         next.tools_up_front = on;
     }
+    if let Some(on) = req.lead {
+        if on && !cur.lead {
+            check_lead(&cur, req.by_owner)?;
+        }
+        next.lead = on;
+    }
     if outside && let Some(why) = widens_unattended(hub, &cur, &next) {
         anyhow::bail!("{why}");
     }
-    // The persona file tells a promoted agent about its fresh start, so it follows the right.
-    if next.persona != cur.persona || next.self_handoff != cur.self_handoff {
+    // The persona file tells a promoted agent about its fresh start or its lead role, so it
+    // follows the right.
+    if next.persona != cur.persona || next.self_handoff != cur.self_handoff || next.lead != cur.lead {
         let home = PathBuf::from(&next.home_dir);
         ensure_home(&home)?;
         write_persona(&home.join(persona_file(next.kind)), &persona_text_for(&next))?;
@@ -3241,7 +3323,7 @@ pub async fn ask(
     {
         anyhow::bail!("an agent can't ask itself");
     }
-    let prov = from_session.and_then(|s| hub.agents().prov(s));
+    let prov = from_session.and_then(|s| hub.agents().send_prov(s));
     let from = match from_session {
         Some(s) => format!("session:{s}"),
         None => proposed_route(prov, forced).origin.as_str().to_string(),
@@ -3367,6 +3449,7 @@ pub fn agent_json(b: &Agent, session: Option<&SessionInfo>) -> Value {
         "self_handoff": b.self_handoff,
         "self_handoff_at": b.self_handoff_at,
         "tools_up_front": b.tools_up_front,
+        "lead": b.lead,
     })
 }
 
@@ -4102,7 +4185,7 @@ mod tests {
             session_id: Some(9),
             resume_id: None,
             created_at: 0,
-            autostart: false, sleep_after_min: None, asleep_at: None, self_handoff: false, self_handoff_at: None, tools_up_front: false,
+            autostart: false, sleep_after_min: None, asleep_at: None, self_handoff: false, self_handoff_at: None, tools_up_front: false, lead: false,
         }
     }
 

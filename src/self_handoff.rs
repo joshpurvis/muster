@@ -611,7 +611,7 @@ mod tests {
             asleep_at: None,
             self_handoff: true,
             self_handoff_at: None,
-            tools_up_front: false,
+            tools_up_front: false, lead: false,
         }
     }
 

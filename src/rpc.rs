@@ -1025,7 +1025,7 @@ async fn dispatch_inner(hub: &Arc<Hub>, who: &Principal, method: &str, params: V
             // count as the human's input; keys from the human (or a human-rooted shell) do.
             let caller = caller(hub, p.from_session)?;
             let chain = match caller {
-                Caller::Agent(s) => Some(crate::agents::outgoing(hub.agents().prov(s))),
+                Caller::Agent(s) => Some(crate::agents::outgoing(hub.agents().send_prov(s))),
                 Caller::Shell(s) => hub.agents().prov(s).map(|pv| crate::agents::outgoing(Some(pv))),
                 Caller::Human => None,
             };
@@ -1185,12 +1185,12 @@ async fn dispatch_inner(hub: &Arc<Hub>, who: &Principal, method: &str, params: V
         }
         "agent.update" => {
             require_local(who, method)?;
-            // `muster agent edit --self-handoff` or `--tools-up-front` inside a session names it
+            // `muster agent edit --self-handoff`, `--tools-up-front` or `--lead` inside a session names it
             // (never a request field).
             let mut params = params;
             let from_session = params.as_object_mut().and_then(|o| o.remove("from_session")).filter(|v| !v.is_null());
             let mut p: crate::agents::AgentUpdate = parse(params)?;
-            // Only the human grants self handoff or turns on tools up front: a click in the window,
+            // Only the human grants self handoff, turns on tools up front or makes a lead agent: a click in the window,
             // or the CLI from a terminal outside every session (`owner_terminal`, checked by
             // `http_call`).
             p.by_owner = from_session.is_none()
@@ -1947,7 +1947,7 @@ fn spawn_prov(
             None => return Ok(None),
             p => crate::agents::outgoing(p),
         },
-        Caller::Agent(s) => crate::agents::outgoing(hub.agents().prov(s)),
+        Caller::Agent(s) => crate::agents::outgoing(hub.agents().send_prov(s)),
     };
     if let Some(k) = kind {
         crate::mcp::guard::check_claude_origin(k, route.origin).map_err(RpcError)?;
@@ -2123,16 +2123,16 @@ pub fn url_origin(url: &str) -> Option<String> {
 tokio::task_local! {
     /// This `/api/rpc` call passed `owner_terminal`: the CLI run by the human from a terminal
     /// outside every Muster session. Read only by `agent.update` (granting self handoff, turning
-    /// on tools up front).
+    /// on tools up front, making a lead agent).
     static OWNER_TERMINAL: bool;
 }
 
 /// Does this call turn on something only the human may (`owner_terminal`): an agent's self
-/// handoff (src/self_handoff.rs) or its message tools up front (src/mcp/tools.rs), either alone
-/// or both?
+/// handoff (src/self_handoff.rs), its message tools up front (src/mcp/tools.rs) or its lead role
+/// (`agents::Agent::lead`), alone or together?
 fn grants_owner_switch(method: &str, params: &Value) -> bool {
     method == "agent.update"
-        && ["self_handoff", "tools_up_front"].iter().any(|k| params.get(*k) == Some(&Value::Bool(true)))
+        && ["self_handoff", "tools_up_front", "lead"].iter().any(|k| params.get(*k) == Some(&Value::Bool(true)))
 }
 
 /// Is the `/api/rpc` call on connection `peer` the human's own: the client token, on no session's
@@ -3650,6 +3650,56 @@ mod tests {
         // The owner's terminal, the edit on its own: on.
         let r = OWNER_TERMINAL.scope(true, call(&hub, "agent.update", on)).await.unwrap();
         assert_eq!(r["tools_up_front"], true);
+    }
+
+    /// The lead role: only the human turns it on (the window, or `muster agent edit NAME --lead on`
+    /// from the owner's terminal); a session's CLI, a script or a paired device is refused, a Codex
+    /// agent can't have it, and anyone may turn it off. The persona file says so.
+    #[tokio::test]
+    async fn only_the_human_makes_a_lead_agent() {
+        let (hub, _st) = fixture();
+        agent(&hub, "rpc-otto");
+        let persona = || std::fs::read_to_string(crate::agents::home_dir_for("rpc-otto").join("CLAUDE.md")).unwrap();
+        let on = json!({"name": "rpc-otto", "lead": true});
+        assert!(grants_owner_switch("agent.update", &on));
+        assert!(!grants_owner_switch("agent.update", &json!({"name": "rpc-otto", "lead": false})));
+        // A script's call, or one on a session's behalf (even from the window): refused.
+        let e = call(&hub, "agent.update", on.clone()).await.unwrap_err();
+        assert!(e.contains("only the human") && e.contains("--lead on"), "{e}");
+        let mut from = on.clone();
+        from["from_session"] = json!(2);
+        let e = dispatch_via(&hub, &Principal::Local, "agent.update", from.clone(), Via::Window).await.map_err(|e| e.0).unwrap_err();
+        assert!(e.contains("only the human"), "{e}");
+        let e = OWNER_TERMINAL.scope(true, call(&hub, "agent.update", from)).await.unwrap_err();
+        assert!(e.contains("only the human"), "{e}");
+        let body = serde_json::to_vec(&json!({"id": 1, "method": "agent.update", "params": on})).unwrap();
+        let r = http_call(&hub, &Principal::Local, &body, None).await;
+        assert!(r["error"]["message"].as_str().unwrap_or_default().contains("only the human"), "{r}");
+        let e = owner_terminal(&hub, &Principal::Device { id: 1 }, None, &on).await.unwrap_err();
+        assert!(e.contains("paired device"), "{e}");
+        assert!(!hub.agents().get("rpc-otto").unwrap().lead);
+        assert!(!persona().contains("## Lead agent"));
+        // The owner's terminal turns it on; the persona file tells the agent.
+        let r = OWNER_TERMINAL.scope(true, call(&hub, "agent.update", on.clone())).await.unwrap();
+        assert_eq!(r["lead"], true);
+        assert!(persona().contains("## Lead agent"), "the persona says it is a lead");
+        assert!(hub.store().load_agents().unwrap()[0].lead, "saved");
+        // Off from anywhere, and the window turns it on again.
+        let r = call(&hub, "agent.update", json!({"name": "rpc-otto", "lead": false})).await.unwrap();
+        assert_eq!(r["lead"], false);
+        assert!(!persona().contains("## Lead agent"));
+        let r = dispatch_via(&hub, &Principal::Local, "agent.update", on, Via::Window).await.map_err(|e| e.0).unwrap();
+        assert_eq!(r["lead"], true);
+        // Codex agents can't be leads, not even from the window.
+        crate::agents::create(&hub, NewAgent {
+            working_location: None,
+            account_profile: None, provider: None, name: "rpc-cody".into(), kind: Some(SessionKind::Codex), model: None,
+            effort: None, persona: None, accepts: None, permissions: None, autostart: false, sleep_after_min: None,
+        }).unwrap();
+        let e = dispatch_via(&hub, &Principal::Local, "agent.update", json!({"name": "rpc-cody", "lead": true}), Via::Window)
+            .await.map_err(|e| e.0).unwrap_err();
+        assert!(e.contains("Codex"), "{e}");
+        assert!(!hub.agents().get("rpc-cody").unwrap().lead);
     }
 
     /// `start_fresh` (MCP; `muster start-fresh` calls it): refused, and recorded, unless the agent

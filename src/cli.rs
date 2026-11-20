@@ -2523,6 +2523,8 @@ pub struct AgentOpts {
     pub self_handoff: Option<bool>,
     /// `agent edit --tools-up-front on|off`.
     pub tools_up_front: Option<bool>,
+    /// `agent edit --lead on|off`.
+    pub lead: Option<bool>,
     pub claude_mode: Option<String>,
     pub codex_sandbox: Option<String>,
 }
@@ -2581,9 +2583,12 @@ impl AgentOpts {
         if let Some(on) = self.self_handoff {
             set("self_handoff", json!(on));
         }
-        // Granting self handoff or turning on tools up front inside a Muster session is refused:
-        // say whose call it is (`agent.update`).
-        if (self.self_handoff.is_some() || self.tools_up_front.is_some())
+        if let Some(on) = self.lead {
+            set("lead", json!(on));
+        }
+        // Granting self handoff, turning on tools up front or making a lead agent inside a Muster
+        // session is refused: say whose call it is (`agent.update`).
+        if (self.self_handoff.is_some() || self.tools_up_front.is_some() || self.lead.is_some())
             && let Some(id) = env_session()
         {
             set("from_session", json!(id));

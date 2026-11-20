@@ -5277,7 +5277,7 @@ mod tests {
                     session_id: Some(2),
                     resume_id: None,
                     created_at: 0,
-                    autostart: false, sleep_after_min: None, asleep_at: None, self_handoff: false, self_handoff_at: None, tools_up_front: false,
+                    autostart: false, sleep_after_min: None, asleep_at: None, self_handoff: false, self_handoff_at: None, tools_up_front: false, lead: false,
                 })
                 .unwrap();
         })
@@ -5840,7 +5840,7 @@ mod tests {
                 account_profile_id: None, provider: Provider::OpenRouter, id: 0, name: "ada".into(),
                 kind: SessionKind::Claude, model: None, effort: None, persona: String::new(), home_dir: "/x".into(), working_location: Default::default(), reset_on_next_start: false, handoff: None,
                 permissions: Permissions::default(), accepts_origins: crate::agents::default_accepts(SessionKind::Claude),
-                channel_id: Some(1), session_id: Some(2), resume_id: None, created_at: 0, autostart: false, sleep_after_min: None, asleep_at: None, self_handoff: false, self_handoff_at: None, tools_up_front: false,
+                channel_id: Some(1), session_id: Some(2), resume_id: None, created_at: 0, autostart: false, sleep_after_min: None, asleep_at: None, self_handoff: false, self_handoff_at: None, tools_up_front: false, lead: false,
             }).unwrap();
             store.save_terminal(2, record).unwrap();
         };
@@ -6674,7 +6674,7 @@ mod tests {
                     kind: SessionKind::Codex, model: None, effort: None, persona: String::new(),
                     home_dir: "/x".into(), working_location: Default::default(), reset_on_next_start: false, handoff: None, permissions: Permissions::default(),
                     accepts_origins: crate::agents::default_accepts(SessionKind::Codex),
-                    channel_id: Some(1), session_id: Some(3), resume_id: None, created_at: 0, autostart: false, sleep_after_min: None, asleep_at: None, self_handoff: false, self_handoff_at: None, tools_up_front: false,
+                    channel_id: Some(1), session_id: Some(3), resume_id: None, created_at: 0, autostart: false, sleep_after_min: None, asleep_at: None, self_handoff: false, self_handoff_at: None, tools_up_front: false, lead: false,
                 }).unwrap();
             }
         });
@@ -6966,7 +6966,7 @@ mod tests {
             kind: SessionKind::Codex, model: None, effort: None, persona: String::new(),
             home_dir: "/x".into(), working_location: Default::default(), reset_on_next_start: false, handoff: None, permissions: Permissions::default(),
             accepts_origins: crate::agents::default_accepts(SessionKind::Codex),
-            channel_id: None, session_id: None, resume_id: resume.map(Into::into), created_at: 0, autostart: false, sleep_after_min: None, asleep_at: None, self_handoff: false, self_handoff_at: None, tools_up_front: false,
+            channel_id: None, session_id: None, resume_id: resume.map(Into::into), created_at: 0, autostart: false, sleep_after_min: None, asleep_at: None, self_handoff: false, self_handoff_at: None, tools_up_front: false, lead: false,
         };
         let legacy = store.insert_agent(&agent("old", Some("th-title"))).unwrap();
         let confirmed = store.insert_agent(&agent("new", Some("th-1"))).unwrap();

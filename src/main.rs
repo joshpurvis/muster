@@ -625,6 +625,14 @@ enum AgentCmd {
         /// it off. Claude agents only.
         #[arg(long, value_name = "on|off", value_parser = ["on", "off"])]
         tools_up_front: Option<String>,
+        /// Make this Claude agent a lead agent: what it sends (ask_agent, tell_agent, reply,
+        /// send_message) and the sessions it starts count as the human's, even in a turn a
+        /// reminder, a schedule or a trigger started, so it can start Claude builders and message
+        /// Claude agents from those turns. Each message still counts one hop (8 at most).
+        /// Reminders and schedules keep their rule. Off by default. Only the human turns it on
+        /// (refused inside a Muster tab); anyone may turn it off. Claude agents only.
+        #[arg(long, value_name = "on|off", value_parser = ["on", "off"])]
+        lead: Option<String>,
         #[command(flatten)]
         perms: AgentPerms,
     },
@@ -854,6 +862,7 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
                     sleep_after,
                     self_handoff: None,
                     tools_up_front: None,
+                    lead: None,
                     claude_mode: perms.claude_mode,
                     codex_sandbox: perms.codex_sandbox,
                 },
@@ -874,6 +883,7 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
                 sleep_after,
                 self_handoff,
                 tools_up_front,
+                lead,
                 perms,
             } => cli::agent_edit(
                 d,
@@ -891,6 +901,7 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
                     sleep_after,
                     self_handoff: self_handoff.map(|a| a == "on"),
                     tools_up_front: tools_up_front.map(|a| a == "on"),
+                    lead: lead.map(|a| a == "on"),
                     claude_mode: perms.claude_mode,
                     codex_sandbox: perms.codex_sandbox,
                 },

@@ -339,19 +339,19 @@ fn chain_steps_are_checked_and_bounded_by_the_hop_limit() {
     assert!(e.to_string().contains("ada doesn't take scheduled work"), "{e}");
     let e = f.create(json!({"agent": "worker", "prompt": "p", "when": cron, "then": {"on_success": {"notify": true}}})).unwrap_err();
     assert!(e.to_string().contains("only the failure branch"), "{e}");
-    // Five levels deep: one more than the 4-hop limit allows.
-    let mut deep = json!({"agent": "orla", "prompt": "5"});
-    for n in (1..5).rev() {
+    // Nine levels deep: one more than the 8-hop limit allows.
+    let mut deep = json!({"agent": "orla", "prompt": "9"});
+    for n in (1..9).rev() {
         deep = json!({"agent": "orla", "prompt": n.to_string(), "then": {"on_success": deep}});
     }
     let e = f.create(json!({"agent": "worker", "prompt": "p", "when": cron, "then": {"on_success": deep.clone()}})).unwrap_err();
-    assert!(e.to_string().contains("at most 4 steps"), "{e}");
-    let four = deep["then"]["on_success"].clone();
+    assert!(e.to_string().contains("at most 8 steps"), "{e}");
+    let eight = deep["then"]["on_success"].clone();
     let s = f.create(json!({"agent": "worker", "prompt": "p", "when": cron,
-        "then": {"on_success": four, "on_failure": {"notify": true}}})).unwrap();
+        "then": {"on_success": eight, "on_failure": {"notify": true}}})).unwrap();
     let orla = f.hub.agents().get("orla").unwrap();
-    assert_eq!(step_agents(s.then.as_ref()), vec![orla.id; 4]);
-    assert_eq!(step_at(s.then.as_ref(), "sss").unwrap().prompt, "4");
+    assert_eq!(step_agents(s.then.as_ref()), vec![orla.id; 8]);
+    assert_eq!(step_at(s.then.as_ref(), "sssssss").unwrap().prompt, "8");
     assert!(step_at(s.then.as_ref(), "f").unwrap().notify);
     assert!(step_at(s.then.as_ref(), "sf").is_none());
     // A Claude subscription agent in a step brings the 7-day expiry.
@@ -380,9 +380,9 @@ async fn a_reply_starts_the_next_step_one_hop_further() {
     assert!(text.starts_with("Failures: \n[The reply of worker, quoted below") && text.contains("> 2 failed") && text.ends_with("(replied)"), "{text}");
     assert_eq!(prov, Prov { origin: Origin::Schedule, hop: 0, msg_id: Some(msg) });
     assert_eq!(crate::agents::outgoing(Some(prov)).hop, 1, "the step goes one hop further");
-    // A step at hop 4 is the last the guard lets through.
-    assert!(crate::mcp::guard::check_agent_delivery("x", &[Origin::Schedule], Origin::Schedule, 4, 0).is_ok());
-    assert!(crate::mcp::guard::check_agent_delivery("x", &[Origin::Schedule], Origin::Schedule, 5, 0).is_err());
+    // A step at hop 8 is the last the guard lets through.
+    assert!(crate::mcp::guard::check_agent_delivery("x", &[Origin::Schedule], Origin::Schedule, 8, 0).is_ok());
+    assert!(crate::mcp::guard::check_agent_delivery("x", &[Origin::Schedule], Origin::Schedule, 9, 0).is_err());
     // A skip starts nothing; a failure takes the failure branch (notify: no run).
     let before = f.runs(s.id).len();
     let mut skipped = Run::new(s.id, 2, RunKind::Scheduled, 2);

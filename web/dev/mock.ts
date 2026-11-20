@@ -606,6 +606,7 @@ interface MockAgent {
   self_handoff_at: number | null;
   /** Muster's message tools load up front in its sessions (src/mcp/tools.rs `UP_FRONT`). */
   tools_up_front: boolean;
+  lead: boolean;
 }
 
 const DEFAULT_PERMS = { codex_sandbox: "workspace_write", claude_mode: "default" };
@@ -749,6 +750,7 @@ function newAgent(p: any): MockAgent {
     self_handoff: false,
     self_handoff_at: null,
     tools_up_front: false,
+    lead: false,
   };
   agentList.push(a);
   memory.set(a.name, new Map());
@@ -1296,6 +1298,10 @@ async function agentMethod(method: string, p: any): Promise<unknown> {
         a.self_handoff = !!p.self_handoff;
       }
       if ("tools_up_front" in p) a.tools_up_front = !!p.tools_up_front;
+      if ("lead" in p) {
+        if (p.lead && a.kind !== "claude") throw new Error(`only Claude agents can be lead agents: ${a.name} is a Codex agent`);
+        a.lead = !!p.lead;
+      }
       if ("permissions" in p) a.permissions = p.permissions;
       if ("accepts" in p) {
         if (!Array.isArray(p.accepts) || !p.accepts.length || p.accepts.some((o: string) => !["human", "schedule", "webhook"].includes(o))) {

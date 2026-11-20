@@ -171,14 +171,20 @@ pub fn status(hub: &Hub, msg: i64) -> MsgStatus {
     s
 }
 
-/// The route of a reply to `m` from a session whose provenance is `now`.
-pub fn answer_route(m: &AgentMessage, now: Option<Prov>) -> Route {
+/// The route of a reply to `m` from a session whose provenance is `now`. A lead agent's reply
+/// (`lead`, `agents::sending_prov`) counts as the human's: origin `human`, the hop as for anyone.
+pub fn answer_route(m: &AgentMessage, now: Option<Prov>, lead: bool) -> Route {
     let (origin, hop) = now.map_or((Origin::Human, 0), |p| (p.origin, p.hop));
-    agents::outgoing(Some(Prov { origin: m.origin.max(origin), hop: m.hop.max(hop), msg_id: Some(m.id) }))
+    let origin = if lead { Origin::Human } else { m.origin.max(origin) };
+    agents::outgoing(Some(Prov { origin, hop: m.hop.max(hop), msg_id: Some(m.id) }))
 }
 
-/// The non-human origins a reply to `m` from a session whose provenance is `now` is rooted in.
-pub fn answer_origins(m: &AgentMessage, now: Option<Prov>) -> Vec<Origin> {
+/// The non-human origins a reply to `m` from a session whose provenance is `now` is rooted in
+/// (none for a lead agent's reply).
+pub fn answer_origins(m: &AgentMessage, now: Option<Prov>, lead: bool) -> Vec<Origin> {
+    if lead {
+        return Vec::new();
+    }
     let mut o: Vec<Origin> = [Some(m.origin), now.map(|p| p.origin)].into_iter().flatten().filter(|o| *o != Origin::Human).collect();
     o.sort();
     o.dedup();
@@ -299,8 +305,9 @@ pub async fn reply(hub: &Arc<Hub>, caller: SessionId, msg_id: i64, text: String,
         crate::quiet::check_text(&text).map_err(|e| anyhow::anyhow!(e))?;
     }
     let now = hub.agents().prov(caller);
-    let route = answer_route(&m, now);
-    let origins = answer_origins(&m, now);
+    let lead = hub.agents().is_lead_session(caller);
+    let route = answer_route(&m, now, lead);
+    let origins = answer_origins(&m, now, lead);
     // Kept for a later turn, it carries one origin to check when that turn takes it: a reply
     // rooted in two kinds of unattended work goes the waking way, checked against both now.
     if !wake && origins.len() > 1 {
@@ -708,12 +715,12 @@ mod tests {
         let scout = agent(&hub, "scout", SessionKind::Codex, 3);
         let id = msg(&hub, &scout, "ada", Some(2), Origin::Human, 2, false);
         let m = hub.store().agent_message(id).unwrap().unwrap();
-        assert_eq!(answer_route(&m, None), Route { origin: Origin::Human, hop: 3, reply_to: Some(id) });
+        assert_eq!(answer_route(&m, None, false), Route { origin: Origin::Human, hop: 3, reply_to: Some(id) });
         // Replying while it handles a scheduled message: the reply is unattended work too.
         let sched = Prov { origin: Origin::Schedule, hop: 0, msg_id: Some(1) };
-        assert_eq!(answer_route(&m, Some(sched)), Route { origin: Origin::Schedule, hop: 3, reply_to: Some(id) });
+        assert_eq!(answer_route(&m, Some(sched), false), Route { origin: Origin::Schedule, hop: 3, reply_to: Some(id) });
         let deep = Prov { origin: Origin::Human, hop: 4, msg_id: None };
-        assert_eq!(answer_route(&m, Some(deep)).hop, 5);
+        assert_eq!(answer_route(&m, Some(deep), false).hop, 5);
     }
 
     #[tokio::test]
@@ -735,7 +742,47 @@ mod tests {
             && x.text.as_deref().is_some_and(|t| t.starts_with("Late reply to your message"))));
         // At the hop limit a reply chain ends.
         hub.agents().set_prov(3, None).unwrap();
-        let deep = msg(&hub, &scout, "ada", Some(2), Origin::Human, 4, false);
+        let deep = msg(&hub, &scout, "ada", Some(2), Origin::Human, crate::mcp::guard::MAX_AGENT_HOPS, false);
+        let v = reply(&hub, 3, deep, "deep".into(), true).await.unwrap();
+        assert_eq!(v["status"], "refused", "{v}");
+        assert!(v["note"].as_str().unwrap().contains("hop"), "{v}");
+    }
+
+    /// A lead agent's late reply counts as the human's (`Agent::lead`), even from a scheduled
+    /// turn: it reaches a Claude asker that refuses the same reply from a non-lead. Its hop still
+    /// counts.
+    #[tokio::test]
+    async fn a_lead_agents_reply_counts_as_the_humans() {
+        let hub = fixture();
+        let lena = agent(&hub, "lena", SessionKind::Claude, 3);
+        agent(&hub, "ada", SessionKind::Claude, 2);
+        let make_lead = |on: bool| {
+            let mut u: agents::AgentUpdate = serde_json::from_value(json!({"name": "lena", "lead": on})).unwrap();
+            u.by_owner = true;
+            agents::update_switch(&hub, u, false).unwrap();
+        };
+        let sched = Some(Prov { origin: Origin::Schedule, hop: 0, msg_id: None });
+        // Not a lead: replying from a reminder turn is refused at Ada (human only).
+        let m = msg(&hub, &lena, "ada", Some(2), Origin::Human, 1, false);
+        hub.agents().set_prov(3, sched).unwrap();
+        let v = reply(&hub, 3, m, "done".into(), true).await.unwrap();
+        assert_eq!(v["status"], "refused", "{v}");
+        // A lead: the same reply goes as the human's, one hop on, rooted in nothing unattended.
+        make_lead(true);
+        let m = msg(&hub, &lena, "ada", Some(2), Origin::Human, 1, false);
+        hub.agents().set_prov(3, sched).unwrap();
+        let v = reply(&hub, 3, m, "done".into(), true).await.unwrap();
+        assert_ne!(v["status"], "refused", "{v}");
+        let a = answer_of(&hub, m);
+        assert_eq!((a.origin, a.hop, a.origins.len()), (Origin::Human, 2, 0));
+        let mm = hub.store().agent_message(m).unwrap().unwrap();
+        assert_eq!(answer_route(&mm, sched, true), Route { origin: Origin::Human, hop: 2, reply_to: Some(m) });
+        // Even to a message from a scheduled chain; past the hop limit it is refused all the same.
+        let w = msg(&hub, &lena, "ada", Some(2), Origin::Webhook, 1, false);
+        let ww = hub.store().agent_message(w).unwrap().unwrap();
+        assert_eq!(answer_route(&ww, sched, true).origin, Origin::Human);
+        assert!(answer_origins(&ww, sched, true).is_empty());
+        let deep = msg(&hub, &lena, "ada", Some(2), Origin::Human, crate::mcp::guard::MAX_AGENT_HOPS, false);
         let v = reply(&hub, 3, deep, "deep".into(), true).await.unwrap();
         assert_eq!(v["status"], "refused", "{v}");
         assert!(v["note"].as_str().unwrap().contains("hop"), "{v}");
@@ -961,8 +1008,8 @@ mod tests {
         let b = agent(&hub, "beta", SessionKind::Claude, 2);
         let m = hub.store().agent_message(msg(&hub, &b, "human", None, Origin::Human, 1, false)).unwrap().unwrap();
         let a = |now: Option<Prov>| {
-            let r = answer_route(&m, now);
-            Answer { text: "x".into(), at: 0, from_session: 2, origin: r.origin, hop: r.hop, origins: answer_origins(&m, now),
+            let r = answer_route(&m, now, false);
+            Answer { text: "x".into(), at: 0, from_session: 2, origin: r.origin, hop: r.hop, origins: answer_origins(&m, now, false),
                 status: AnswerStatus::Pending, note: None, msg: None, session: None, quiet: false }
         };
         assert!(returnable(&m, &a(None)));

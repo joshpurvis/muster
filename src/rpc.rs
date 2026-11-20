@@ -1039,7 +1039,6 @@ async fn dispatch_inner(hub: &Arc<Hub>, who: &Principal, method: &str, params: V
                     // Raw keys carry no route into the turn they start, so a Claude session takes
                     // them only from the human's own chain: never from scheduled work, a lead's
                     // passed-on work (`lead`) included.
-                    crate::mcp::guard::check_session_route(target.kind, r.origin, r.hop).map_err(RpcError)?;
                     if target.kind == SessionKind::Claude && r.origin != crate::agents::Origin::Human {
                         return Err(RpcError(format!(
                             "you are handling an origin={} message, and keys typed into a Claude session must come from work the human started; \
@@ -1047,6 +1046,7 @@ async fn dispatch_inner(hub: &Arc<Hub>, who: &Principal, method: &str, params: V
                             r.origin.as_str()
                         )));
                     }
+                    crate::mcp::guard::check_session_route(target.kind, r.origin, r.hop).map_err(RpcError)?;
                     // Keys can start a turn as well as a prompt can: an OpenRouter session's
                     // spend caps apply to unattended keys too.
                     if r.origin != crate::agents::Origin::Human && target.provider == crate::openrouter::Provider::OpenRouter {

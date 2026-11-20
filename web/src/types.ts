@@ -290,7 +290,7 @@ export interface Agent {
   /** Its sessions get Muster's message tools in the prompt from the start, instead of through
    * Claude Code's tool search (src/mcp/tools.rs `UP_FRONT`). Older daemons: absent. */
   tools_up_front?: boolean;
-  /** A lead agent: what it sends counts as the human's (docs/MCP.md "Lead agents"). Absent from an older backend. */
+  /** A lead agent: what it sends from scheduled work goes as origin "lead", taken like the human's (docs/MCP.md "Lead agents"). Absent from an older backend. */
   lead?: boolean;
   /** Why its last wake failed, while it is still asleep (it stays asleep; the next message or
    * typing tries again). */

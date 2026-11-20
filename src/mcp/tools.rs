@@ -1287,6 +1287,7 @@ async fn send_message<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<
     if !wake {
         crate::quiet::check_receiver(info.kind, &format!("session {target}"))?;
         crate::quiet::check_text(&text)?;
+        crate::quiet::check_quiet_origin(route.origin)?;
         if let Err(wait_s) = st.edit_guard(|g| g.sends.check_and_record(
             caller, now_ms(), st.limits.send_per_window, st.limits.send_window_ms,
         ))? {
@@ -1297,7 +1298,6 @@ async fn send_message<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<
         }
         let from = crate::agents::sender_label(st.backend.agents().iter().find(|b| b.session_id == Some(caller)), caller);
         let bind = run.zip(width).map(|(run, width)| crate::quiet::Bind { run, width });
-        crate::quiet::check_quiet_origin(route.origin)?;
         return match st.backend.session_quiet(&info, from, Some(caller), route, text, bind) {
             Ok(v) => Ok(pretty(&v)),
             Err(e) => {
@@ -1651,6 +1651,7 @@ async fn tell_agent<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_
             crate::quiet::check_receiver(agent.kind, &agent.name)?;
         }
         crate::quiet::check_text(&clean_text(text))?;
+        crate::quiet::check_quiet_origin(caller_route(st, caller).origin)?;
     }
     let AgentSend { agent, out, width } = agent_send(st, caller, name, text)?;
     let route = out.route;

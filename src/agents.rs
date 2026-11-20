@@ -228,8 +228,8 @@ pub struct Agent {
     /// (`mcp::tools::UP_FRONT`). Claude agents only, off by default, turned on only by the human;
     /// applies from its next start.
     pub tools_up_front: bool,
-    /// A lead agent: what it sends and spawns counts as the human's, whatever started its turn
-    /// (`sending_prov`). Claude agents only, off by default, turned on only by the human
+    /// A lead agent: what it sends and spawns from scheduled work goes as `Origin::Lead`, taken
+    /// like the human's by accept lists (`sending_prov`). Claude agents only, off by default, turned on only by the human
     /// (`check_lead`); no agent can set it, on itself or another.
     pub lead: bool,
 }

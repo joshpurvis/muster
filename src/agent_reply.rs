@@ -312,6 +312,11 @@ pub async fn reply(hub: &Arc<Hub>, caller: SessionId, msg_id: i64, text: String,
     let origins = answer_origins(&m, now, lead);
     // Kept for a later turn, it carries one origin to check when that turn takes it: a reply
     // rooted in two kinds of unattended work goes the waking way, checked against both now.
+    // Lead work can't wait for a later turn: refused before it is stored, so the one reply this
+    // message takes is still there for wake=true.
+    if !wake {
+        crate::quiet::check_quiet_origin(route.origin).map_err(|e| anyhow::anyhow!(e))?;
+    }
     if !wake && origins.len() > 1 {
         let list: Vec<&str> = origins.iter().map(Origin::as_str).collect();
         anyhow::bail!(
@@ -773,6 +778,10 @@ mod tests {
         make_lead(true);
         let m = msg(&hub, &lena, "ada", Some(2), Origin::Human, 1, false);
         hub.agents().set_prov(3, sched).unwrap();
+        // Kept for a later turn it would wait unseen: refused before it is stored, so the one
+        // reply is still there for wake=true.
+        let e = reply(&hub, 3, m, "done".into(), false).await.unwrap_err().to_string();
+        assert!(e.contains("origin=lead") && e.contains("wake=true"), "{e}");
         let v = reply(&hub, 3, m, "done".into(), true).await.unwrap();
         // Past every guard: this fixture has no terminals, so only the typing itself fails.
         assert!(v["status"] == "undelivered" && v["note"].as_str().unwrap().contains("terminal host is not configured"), "{v}");

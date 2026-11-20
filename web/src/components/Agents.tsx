@@ -736,7 +736,7 @@ interface Draft {
   selfHandoff: boolean;
   /** Muster's message tools in the prompt from the start (Edit, Claude only). */
   toolsUpFront: boolean;
-  /** A lead agent: what it sends counts as the human's (Edit, Claude only; the human's to set). */
+  /** A lead agent: what it sends from scheduled work is taken like the human's (Edit, Claude only; the human's to set). */
   lead: boolean;
 }
 

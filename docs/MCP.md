@@ -800,7 +800,8 @@ lifted, and what isn't:
 - keys (`muster keys`) reach a Claude session only from the human's own chain: never from scheduled
   work, `lead` included (raw input carries no route into the turn it starts);
 - a message on `lead` work can't wait for a later turn (`tell_agent`, `send_message` or `reply`
-  with `wake: false` is refused; send it with `wake: true`): only a `lead` turn could show it;
+  with `wake: false` is refused before anything is kept or counted; send it with `wake: true`):
+  only a `lead` turn could show it;
 - what reaches a lead is unchanged: its accepted origins decide what it takes.
 
 Codex agents can't be leads (refused; a flag written into the database by hand is ignored), and no
@@ -809,8 +810,8 @@ tool sets it: turning it on takes a click in Muster's window or the owner's term
 rewritten. A lead's persona file says it is one ("Lead agent"). An older backend reads a stored
 `lead` origin column as `webhook` (the strictest it knows), but a late reply stored with `lead` in
 its JSON drops out of its message log, and it refuses to start on runtime attribution state that
-holds a `lead` provenance, which an idle session keeps until its next attributed prompt: rolling
-back after lead work ran can need that state cleared first.
+holds a `lead` provenance (an idle session keeps one until its next attributed prompt) or on a saved
+prompt queue holding one: rolling back after lead work ran can need that state cleared first.
 
 An agent's reply is attributed per message: the message whose prompt was submitted (confirmed by the
 envelope in UserPromptSubmit) owns the next final message; a prompt without an envelope in between

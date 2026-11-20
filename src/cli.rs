@@ -2737,7 +2737,21 @@ pub fn agent_ls(d: &Discovery, as_json: bool) -> anyhow::Result<()> {
             use_color()
         )
     );
+    for line in list.iter().filter_map(queue_wait_line) {
+        println!("{line}");
+    }
     Ok(())
+}
+
+/// Under `muster agent ls`: an agent with prompts waiting, and why they wait.
+fn queue_wait_line(a: &Value) -> Option<String> {
+    let n = a["queued"].as_u64().filter(|n| *n > 0)?;
+    let name = a["name"].as_str().unwrap_or("?");
+    let prompts = if n == 1 { "1 prompt waits".to_string() } else { format!("{n} prompts wait") };
+    Some(match a["queue_waits"].as_str() {
+        Some(why) => format!("{name}: {prompts}: {why}"),
+        None => format!("{name}: {prompts} to be typed"),
+    })
 }
 
 /// `muster agent sleep`: stop an idle agent's process now; a message sent with wake on wakes it.
@@ -2768,6 +2782,9 @@ pub fn agent_start(d: &Discovery, name: &str, fresh: bool) -> anyhow::Result<()>
     } else {
         println!("{id} (already running)");
     }
+    if let Some(line) = kept_prompts_line(&r, fresh) {
+        println!("{line}");
+    }
     if r["provider_pending"] == true {
         eprintln!(
             "note: it still runs on {}; its new provider applies when it restarts (`muster agent start {name} --fresh`, or stop and start it)",
@@ -2775,6 +2792,15 @@ pub fn agent_start(d: &Discovery, name: &str, fresh: bool) -> anyhow::Result<()>
         );
     }
     Ok(())
+}
+
+/// After `muster agent start --fresh`: the prompts waiting for it (those kept from before the
+/// start among them) go into the new conversation.
+fn kept_prompts_line(r: &Value, fresh: bool) -> Option<String> {
+    let n = r["queued_prompts"].as_u64().filter(|n| fresh && *n > 0)?;
+    let what = if n == 1 { "1 prompt waits".to_string() } else { format!("{n} prompts wait") };
+    Some(format!("{what}: typed into the new conversation once it is ready (`muster queue {}` lists them)",
+        r["session"]["id"].as_u64().unwrap_or(0)))
 }
 
 /// `muster ask`: `agent.ask` (waits for the reply), prints the reply. Exit 124 on timeout; 1
@@ -2902,6 +2928,25 @@ pub fn start_fresh(d: &Discovery, file: &std::path::Path, as_json: bool) -> anyh
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `muster agent start --fresh` says the prompts that were waiting are kept; `muster agent ls`
+    /// names why an agent's prompts wait.
+    #[test]
+    fn queued_prompts_are_named_with_why_they_wait() {
+        let r = |n: u64| json!({"session": {"id": 41}, "queued_prompts": n});
+        assert_eq!(kept_prompts_line(&r(2), true).as_deref(),
+            Some("2 prompts wait: typed into the new conversation once it is ready (`muster queue 41` lists them)"));
+        assert_eq!(kept_prompts_line(&r(1), true).as_deref(),
+            Some("1 prompt waits: typed into the new conversation once it is ready (`muster queue 41` lists them)"));
+        assert_eq!(kept_prompts_line(&r(0), true), None);
+        assert_eq!(kept_prompts_line(&r(2), false), None, "a plain start keeps its queue anyway");
+        assert_eq!(kept_prompts_line(&json!({"session": {"id": 41}}), true), None, "an older daemon");
+        let a = json!({"name": "builder-2", "queued": 3, "queue_waits": "unsent text is in the input box: send it or clear it"});
+        assert_eq!(queue_wait_line(&a).as_deref(), Some("builder-2: 3 prompts wait: unsent text is in the input box: send it or clear it"));
+        assert_eq!(queue_wait_line(&json!({"name": "builder-2", "queued": 1, "queue_waits": null})).as_deref(),
+            Some("builder-2: 1 prompt waits to be typed"));
+        assert_eq!(queue_wait_line(&json!({"name": "builder-2"})), None);
+    }
 
     fn snap() -> Snapshot {
         let h = json!({

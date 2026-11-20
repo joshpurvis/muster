@@ -2291,7 +2291,12 @@ async fn run_agent(hub: &Arc<Hub>, mut agent: Agent, fresh: bool, window: Option
         }
         hub.set_session_extra_args(sid, args)?;
         follow_account(hub, &agent, sid)?;
-        let session = hub.restart_session_at(sid, Some((channel.id, cwd))).await?;
+        // A fresh start of a running agent keeps the prompts still waiting to be typed: the new
+        // conversation gets them once it is ready (src/inject.rs `carry_over`).
+        if live { crate::inject::carry_over(hub, sid)?; }
+        let restarted = hub.restart_session_at(sid, Some((channel.id, cwd))).await;
+        if live { crate::inject::after_restart(hub, sid); }
+        let session = restarted?;
         hub.agents().update(hub.store(), agent.id, |a| a.channel_id = Some(channel.id))?;
         agent.channel_id = Some(channel.id);
         return Ok(AgentSession { agent, session, started: true, woke });

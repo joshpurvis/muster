@@ -120,7 +120,7 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "list_sessions",
             "List sessions",
-            "List terminal sessions (agents and shells), including exited ones. Each has id, channel_id, kind (claude|codex|shell), name, state, detail (e.g. the pending approval or question), queued (messages waiting to be delivered), parent_id (the session that spawned it via MCP) and is_me.",
+            "List terminal sessions (agents and shells), including exited ones. Each has id, channel_id, kind (claude|codex|shell), name, state, detail (e.g. the pending approval or question), queued (messages waiting to be delivered) and, when some wait, queue_waits (why they are not typed yet, e.g. unsent text in its input box; null when the next is about to be typed), parent_id (the session that spawned it via MCP) and is_me.",
             json!({
                 "type": "object",
                 "properties": {
@@ -979,7 +979,13 @@ fn list_sessions<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_>) 
         .iter()
         .filter(|s| filter.is_none_or(|c| s.channel_id == c))
         .filter(|s| check_session_reach(st, caller, s).is_ok())
-        .map(|s| { let mut v = session_json(s, caller); v["reachability"] = super::communication::reachability(st, caller, s); v })
+        .map(|s| {
+            let mut v = session_json(s, caller);
+            v["reachability"] = super::communication::reachability(st, caller, s);
+            // Prompts that wait: why, in plain words (a draft in the input box, a delivery to review).
+            if s.queued > 0 { v["queue_waits"] = json!(st.backend.queue_waits(s.id)); }
+            v
+        })
         .collect();
     Ok(pretty(&Value::Array(out)))
 }

@@ -228,7 +228,7 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "list_agents",
             "List agents",
-            "List the named agents: persistent agents (claude or codex) with their own home folder, memory and resumed conversation, which you can ask things with ask_agent. Each has name, kind, model, accepts_origins (which message origins it takes: human, schedule, webhook), its session and state, and asleep (its process was stopped while idle: asking it wakes it, which re-reads its whole conversation, so only ask when you need it). Also returns your_origin: the origin and hop a message you send now would carry.",
+            "List the named agents: persistent agents (claude or codex) with their own home folder, memory and resumed conversation, which you can ask things with ask_agent. Each has name, kind, model, accepts_origins (which message origins it takes: human, schedule, webhook), its session and state, and asleep (its process was stopped while idle: asking it wakes it, which re-reads its whole conversation unless a pending account move starts it in a new one, so only ask when you need it). Also returns your_origin: the origin and hop a message you send now would carry.",
             empty_schema(),
             true,
         ),

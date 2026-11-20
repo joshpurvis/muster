@@ -45,7 +45,14 @@ import {
 } from "../cache.ts";
 import type { Channel, Panel, SessionInfo, SessionKind } from "../types.ts";
 import { profileName } from "../account_profiles.ts";
-import { asleepText, isAsleep, OPENROUTER_BADGE, sessionOnOpenRouter, wakeFailedText } from "../agents.ts";
+import {
+  asleepText,
+  isAsleep,
+  OPENROUTER_BADGE,
+  quietWaitingText,
+  sessionOnOpenRouter,
+  wakeFailedText,
+} from "../agents.ts";
 import { STATE_LABEL } from "../types.ts";
 import { connStatus } from "../rpc.ts";
 import * as A from "../actions.ts";
@@ -60,6 +67,7 @@ import {
   IconCheck,
   IconChevronDown,
   IconCodex,
+  IconMail,
   IconMaximize,
   IconMinimize,
   IconNote,
@@ -792,12 +800,13 @@ function GroupTab(
     tabText(label),
     c?.name,
     onOpenRouter ? `${OPENROUTER_BADGE}: billed per token to your OpenRouter key` : null,
-    cold ? `Cold: idle ${idleText(idleFor(s, cacheNow()) ?? 0)}, the next message re-reads the conversation`
+    cold ? `Cold: idle ${idleText(idleFor(s, cacheNow()) ?? 0)}, the next turn re-reads the whole conversation at full cost`
       : dot ? `Idle, ${CACHE_DOT_LABEL[dot]}` : null,
     s.kind === "claude" ? `Claude profile: ${profileName(accountProfiles.value, s.account_profile_id)}` : null,
     c ? tildify(c.cwd, home) : null,
     c?.branch ? `⎇ ${c.branch}` : null,
     s.state_detail || STATE_LABEL[s.state],
+    s.quiet_waiting ? quietWaitingText(s.quiet_waiting) : null,
   ].filter(Boolean).join(" · ");
   const edit = isRenaming ? r!.fields : null;
   return (
@@ -815,9 +824,13 @@ function GroupTab(
       aria-selected={active}
       aria-label={cold ? `${tabText(label)}, prompt cache likely expired`
         : dot ? `${tabText(label)}, ${CACHE_DOT_LABEL[dot]}` : tabText(label)}
+      // Its badge's count, for keyboard and screen reader users too (the badge itself isn't focusable).
+      aria-description={s.quiet_waiting ? quietWaitingText(s.quiet_waiting) : undefined}
       tabIndex={active ? 0 : -1}
       data-tab-sid={s.id}
       data-tip={tip}
+      // The tip (with its waiting count) also shows when the keyboard reaches the tab.
+      data-tip-focus={s.quiet_waiting ? "" : undefined}
       onPointerDown={(e) => {
         if (isRenaming || (e.target as HTMLElement).closest("button")) return;
         startTabDrag(e, s, tabText(label), () => A.revealSession(s.id));
@@ -866,10 +879,16 @@ function GroupTab(
       {onOpenRouter && <span class="tab-or" aria-label={OPENROUTER_BADGE}>OpenRouter</span>}
       {cold && <span class="tab-cold" aria-label="Prompt cache likely expired">cold</span>}
       {asleep && (
-        <span class="tab-asleep" data-tip="Asleep: the next message, or typing here, wakes it">asleep</span>
+        <span class="tab-asleep" data-tip="Asleep: a message sent with wake on, or typing here, wakes it">asleep</span>
       )}
       {c && <PermBadge c={c} />}
       {s.queued > 0 && <span class="tab-queued" data-tip={`${s.queued} queued`}>{s.queued}</span>}
+      {!!s.quiet_waiting && (
+        <span class="tab-quiet" data-tip={quietWaitingText(s.quiet_waiting)} aria-label={quietWaitingText(s.quiet_waiting)}>
+          <IconMail size={11} />
+          {s.quiet_waiting}
+        </span>
+      )}
       <button
         type="button"
         class="tab-close"
@@ -964,7 +983,7 @@ function InputPausedBar({ s }: { s: SessionInfo }) {
 /** Idle periods (`coldKey`) whose cold bar has been announced in this page. */
 const announcedCold = new Set<string>();
 const COLD_ANNOUNCEMENT =
-  "the prompt cache has likely expired, so the next message re-reads the whole conversation at full cost.";
+  "the prompt cache has likely expired, so the next turn re-reads the whole conversation at full cost.";
 
 /** The agent idled past its prompt cache's lifetime (src/cache.ts). Never takes the keyboard:
  * its buttons don't take focus on press, and the terminal keeps it. Dismissed for this idle

@@ -402,6 +402,9 @@ pub struct SessionInfo {
     pub rows: u16,
     /// Messages waiting in the injection queue.
     pub queued: u32,
+    /// Quiet messages waiting for its next turn (src/quiet.rs). Runtime only: recounted at start.
+    #[serde(default)]
+    pub quiet_waiting: u32,
     /// Built-in subagents (Claude Code's Agent/Task tool) the agent is running right now, from
     /// its hooks. Runtime only: not persisted, 0 after a restart.
     #[serde(default)]

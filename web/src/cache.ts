@@ -98,8 +98,8 @@ export function coldKey(s: SessionInfo): string {
 /** The bar's sentence. */
 export function coldText(s: SessionInfo, now: number): string {
   const idle = idleFor(s, now);
-  return `${idle === null ? "Idle" : `Idle ${idleText(idle)}`}. The prompt cache has likely expired, so your ` +
-    `next message re-reads the whole conversation at full cost.`;
+  return `${idle === null ? "Idle" : `Idle ${idleText(idle)}`}. The prompt cache has likely expired, so the ` +
+    `next turn re-reads the whole conversation at full cost.`;
 }
 
 /** The lifetime that applies to `s` (minutes), for tooltips. */

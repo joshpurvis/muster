@@ -1881,6 +1881,52 @@ impl Hub {
         }
     }
 
+    /// The run (terminal generation) session `id` is on now: quiet messages are offered to, and
+    /// confirmed by, one run (src/quiet.rs).
+    pub(crate) fn session_run(&self, id: SessionId) -> Option<u64> {
+        self.inner.lock().sessions.get(&id).map(|e| e.generation)
+    }
+
+    /// The session and run a session token belongs to, read together (src/quiet.rs).
+    pub(crate) fn session_run_by_token(&self, token: &str) -> Option<(SessionId, u64)> {
+        if token.is_empty() {
+            return None;
+        }
+        let g = self.inner.lock();
+        let id = *g.tokens.get(token)?;
+        Some((id, g.sessions.get(&id)?.generation))
+    }
+
+    /// Run `f` while session `id` is on run `run`: the sessions' lock is held throughout, so no
+    /// new run replaces it meanwhile (src/quiet.rs `take_run`). `f` may take the agent
+    /// registry's and the store's locks (the order hooks take them in), never the hub's. None:
+    /// the session is on another run, or gone.
+    pub(crate) fn with_run<R>(&self, id: SessionId, run: u64, f: impl FnOnce() -> R) -> Option<R> {
+        let g = self.inner.lock();
+        if g.sessions.get(&id).map(|e| e.generation) != Some(run) {
+            return None;
+        }
+        let r = f();
+        drop(g);
+        Some(r)
+    }
+
+    /// Update the count of quiet messages waiting for the session's next turn (src/quiet.rs).
+    pub fn set_quiet_waiting(&self, id: SessionId, n: u32) {
+        let mut g = self.inner.lock();
+        let Some(e) = g.sessions.get_mut(&id) else { return };
+        if e.info.quiet_waiting != n {
+            e.info.quiet_waiting = n;
+            self.publish_session(&e.info);
+        }
+    }
+
+    /// Tests: put a session on run `generation` (a new run, without a terminal).
+    #[cfg(test)]
+    pub(crate) fn set_generation_for_test(&self, id: SessionId, generation: u64) {
+        if let Some(e) = self.inner.lock().sessions.get_mut(&id) { e.generation = generation; }
+    }
+
     /// Tests: put a restored (exited) session in another state without a terminal.
     #[cfg(test)]
     pub(crate) fn set_state_for_test(&self, id: SessionId, state: AgentState) {
@@ -2022,7 +2068,7 @@ impl Hub {
             // Said in the tab: the CLI printed why (e.g. "No conversation found") above.
             failed_resume_detail(code)
         } else if self.agents.sleep.is_asleep(id) {
-            // Stopped to sleep (src/sleep.rs): the next message wakes it.
+            // Stopped to sleep (src/sleep.rs): a message sent with wake on wakes it.
             crate::sleep::ASLEEP_DETAIL.to_string()
         } else {
             format!("exit code {code}")
@@ -2038,6 +2084,9 @@ impl Hub {
                 return;
             }
         }
+        // Quiet messages waiting for an ordinary session's next turn end with its process
+        // (src/quiet.rs); a named agent's wait for the agent, whatever run takes them.
+        crate::quiet::session_ended(self, id);
         self.log_event(
             Some(channel_id),
             Some(id),
@@ -3086,7 +3135,7 @@ impl Hub {
                 exit_code: None,
                 cols,
                 rows,
-                queued: 0,
+                queued: 0, quiet_waiting: 0,
                 subagents: 0,
                 background: 0,
                 size_owner: None,
@@ -3281,6 +3330,9 @@ impl Hub {
             }
         }
         let generation = self.store.next_terminal_generation(self.generation_floor)?;
+        // A new run: quiet messages kept for an ordinary session's previous run are dropped with
+        // it (src/quiet.rs), even when its exit is never reported (a restart replacing it).
+        crate::quiet::session_ended(self, id);
         let (info, extra_args, port_base, permissions, resume) = {
             let mut g = self.inner.lock();
             let cwd = PathBuf::from(
@@ -3969,6 +4021,8 @@ impl Hub {
         let _ = std::fs::remove_dir_all(paths::session_dir(id));
         self.replay_cache.lock().remove(&id);
         self.save_conversation_turn(&entry.info);
+        // Quiet messages waiting for its next turn go with the tab, once it is gone (src/quiet.rs).
+        crate::quiet::session_ended(self, id);
         self.agents.forget_session(id);
         self.emit(ServerEvent::SessionRemoved { id });
         let cid = entry.info.channel_id;
@@ -4457,6 +4511,8 @@ impl Hub {
             crate::schedules::on_reply(self, m);
         }
         if let Some(a) = fx.agent.and_then(|a| self.agents.by_id(a)) { crate::agents::publish(self, &a); }
+        // Quiet messages this turn showed: their log entries and the tab's count (src/quiet.rs).
+        if let Some(shown) = &fx.quiet { crate::quiet::shown(self, id, shown); }
         self.log_event(Some(info.channel_id), Some(id), EventKind::Hook,
             serde_json::json!({"session_id": id, "event": event, "summary": hook_summary(&payload)}));
         if from != info.state {
@@ -5221,7 +5277,7 @@ mod tests {
                     session_id: Some(2),
                     resume_id: None,
                     created_at: 0,
-                    autostart: false, sleep_after_min: None, asleep_at: None, self_handoff: false, self_handoff_at: None,
+                    autostart: false, sleep_after_min: None, asleep_at: None, self_handoff: false, self_handoff_at: None, tools_up_front: false,
                 })
                 .unwrap();
         })
@@ -5578,7 +5634,7 @@ mod tests {
         hub.inner.lock().sessions.get_mut(&2).unwrap().generation = 42;
         let message = || hub.store.insert_agent_message(&AgentMessage { id: 0, from: "fixture".into(),
             from_session: None, to_agent: 1, to_session: Some(2), origin: Origin::Schedule, hop: 1,
-            reply_to: None, created_at: 1, reply: None, replied_at: None, text: None, refused: None, to_name: None, cold_idle_ms: None, answer: None }).unwrap();
+            reply_to: None, created_at: 1, reply: None, replied_at: None, text: None, refused: None, to_name: None, cold_idle_ms: None, answer: None, quiet: false, shown_at: None, expired_at: None }).unwrap();
         let first = message();
         let next = message();
         let source = |msg| Source::Chain(Prov { origin: Origin::Schedule, hop: 1, msg_id: Some(msg) });
@@ -5784,7 +5840,7 @@ mod tests {
                 account_profile_id: None, provider: Provider::OpenRouter, id: 0, name: "ada".into(),
                 kind: SessionKind::Claude, model: None, effort: None, persona: String::new(), home_dir: "/x".into(), working_location: Default::default(), reset_on_next_start: false, handoff: None,
                 permissions: Permissions::default(), accepts_origins: crate::agents::default_accepts(SessionKind::Claude),
-                channel_id: Some(1), session_id: Some(2), resume_id: None, created_at: 0, autostart: false, sleep_after_min: None, asleep_at: None, self_handoff: false, self_handoff_at: None,
+                channel_id: Some(1), session_id: Some(2), resume_id: None, created_at: 0, autostart: false, sleep_after_min: None, asleep_at: None, self_handoff: false, self_handoff_at: None, tools_up_front: false,
             }).unwrap();
             store.save_terminal(2, record).unwrap();
         };
@@ -6618,7 +6674,7 @@ mod tests {
                     kind: SessionKind::Codex, model: None, effort: None, persona: String::new(),
                     home_dir: "/x".into(), working_location: Default::default(), reset_on_next_start: false, handoff: None, permissions: Permissions::default(),
                     accepts_origins: crate::agents::default_accepts(SessionKind::Codex),
-                    channel_id: Some(1), session_id: Some(3), resume_id: None, created_at: 0, autostart: false, sleep_after_min: None, asleep_at: None, self_handoff: false, self_handoff_at: None,
+                    channel_id: Some(1), session_id: Some(3), resume_id: None, created_at: 0, autostart: false, sleep_after_min: None, asleep_at: None, self_handoff: false, self_handoff_at: None, tools_up_front: false,
                 }).unwrap();
             }
         });
@@ -6910,7 +6966,7 @@ mod tests {
             kind: SessionKind::Codex, model: None, effort: None, persona: String::new(),
             home_dir: "/x".into(), working_location: Default::default(), reset_on_next_start: false, handoff: None, permissions: Permissions::default(),
             accepts_origins: crate::agents::default_accepts(SessionKind::Codex),
-            channel_id: None, session_id: None, resume_id: resume.map(Into::into), created_at: 0, autostart: false, sleep_after_min: None, asleep_at: None, self_handoff: false, self_handoff_at: None,
+            channel_id: None, session_id: None, resume_id: resume.map(Into::into), created_at: 0, autostart: false, sleep_after_min: None, asleep_at: None, self_handoff: false, self_handoff_at: None, tools_up_front: false,
         };
         let legacy = store.insert_agent(&agent("old", Some("th-title"))).unwrap();
         let confirmed = store.insert_agent(&agent("new", Some("th-1"))).unwrap();
@@ -6999,7 +7055,7 @@ mod tests {
         let msg = hub.store.insert_agent_message(&AgentMessage { id: 0, from: "schedule:1".into(),
             from_session: None, to_agent: 1, to_session: Some(2), origin: Origin::Schedule, hop: 0,
             reply_to: None, created_at: 1, reply: None, replied_at: None, text: Some("digest".into()),
-            refused: None, to_name: None, cold_idle_ms: None, answer: None }).unwrap();
+            refused: None, to_name: None, cold_idle_ms: None, answer: None, quiet: false, shown_at: None, expired_at: None }).unwrap();
         let mut events = hub.subscribe();
         let prov = Prov { origin: Origin::Schedule, hop: 0, msg_id: Some(msg) };
         hub.note_cold_send(2, prov, false, &format!("msg:{msg}"), idle);

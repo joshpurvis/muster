@@ -40,8 +40,9 @@ import {
   feedFor,
   firstLine,
   carriesLateReply,
+  quietStatus,
   keepForKind,
-  lateText,
+  lateStatus,
   listedModels,
   memoryPathError,
   nameError,
@@ -255,7 +256,7 @@ function AgentRow({ a, now, selected }: { a: Agent; now: number; selected: boole
           {st.since !== null && ` · ${ago(st.since, now)}`}
           {a.autostart && <span class="ap-auto" data-tip="Starts with the daemon">auto</span>}
           {a.sleep_after_min != null && !st.asleep && (
-            <span class="ap-auto" data-tip={`Sleeps after ${idleText(a.sleep_after_min * 60_000)} idle; the next message wakes it`}>
+            <span class="ap-auto" data-tip={`Sleeps after ${idleText(a.sleep_after_min * 60_000)} idle; the next message sent with wake on wakes it`}>
               sleeps
             </span>
           )}
@@ -391,21 +392,40 @@ export function ColdChip({ ms }: { ms: number }) {
   );
 }
 
-/** The agent answered this message later (`reply`): green once it reached the asker. */
+/** The agent answered this message later (`reply`): green unless it never reached the asker,
+ * judged as the message's overlay judges it (a quiet carrier's own status, `lateStatus`). */
 function LateChip({ a }: { a: LateAnswer }) {
-  const failed = a.status === "refused" || a.status === "undelivered";
+  const carrier = a.msg != null ? agentMessages.value.find((x) => x.id === a.msg) : undefined;
+  const { failed, text } = lateStatus(a, carrier);
   return (
-    <span class={cx("ap-chip", failed ? "ap-chip-warn" : "ap-chip-ok")} data-tip={lateText(a)}>
+    <span class={cx("ap-chip", failed ? "ap-chip-warn" : "ap-chip-ok")} data-tip={text}>
       {failed ? "late reply not delivered" : "late reply"}
     </span>
   );
 }
 
+/** A quiet message (sent with wake=false): waiting, shown at a turn's start, or expired. */
+function QuietChip({ m }: { m: AgentMessage }) {
+  const q = quietStatus(m);
+  if (!q) return null;
+  return (
+    <span class={cx("ap-chip", `ap-chip-quiet-${q.state}`)} data-tip={q.text}>
+      {q.chip}
+    </span>
+  );
+}
+
 function FeedEntry({ m, now }: { m: AgentMessage; now: number }) {
+  // A quiet message's status sentence, on the focusable row itself, as its description and as a
+  // tip that shows when the keyboard reaches the row (the chip's own tip is pointer-only).
+  const quiet = quietStatus(m);
   return (
     <button
       type="button"
       class={cx("ap-msg", m.refused && "refused")}
+      aria-description={quiet?.text}
+      data-tip={quiet?.text}
+      data-tip-focus={quiet ? "" : undefined}
       data-msg={m.id}
       onClick={() => (overlay.value = { kind: "agent_message", id: m.id })}
     >
@@ -420,6 +440,7 @@ function FeedEntry({ m, now }: { m: AgentMessage; now: number }) {
         <OriginChip origin={m.origin} />
         <span class="ap-chip">hop {m.hop}</span>
         {m.reply !== null && <span class="ap-chip ap-chip-ok">replied</span>}
+        <QuietChip m={m} />
         {m.answer && <LateChip a={m.answer} />}
         {m.cold_idle_ms != null && <ColdChip ms={m.cold_idle_ms} />}
       </span>
@@ -710,6 +731,8 @@ interface Draft {
   sleep: boolean;
   /** May start itself fresh (Edit, Claude only; the human's to grant). */
   selfHandoff: boolean;
+  /** Muster's message tools in the prompt from the start (Edit, Claude only). */
+  toolsUpFront: boolean;
 }
 
 function fromTemplate(t: AgentTemplate): Draft {
@@ -728,6 +751,7 @@ function fromTemplate(t: AgentTemplate): Draft {
     sleep: false,
     sleepAfter: String(SLEEP_AFTER_DEFAULT),
     selfHandoff: false,
+    toolsUpFront: false,
   };
 }
 
@@ -747,6 +771,7 @@ function fromAgent(a: Agent): Draft {
     sleep: a.sleep_after_min != null,
     sleepAfter: String(a.sleep_after_min ?? SLEEP_AFTER_DEFAULT),
     selfHandoff: !!a.self_handoff,
+    toolsUpFront: !!a.tools_up_front,
   };
 }
 
@@ -765,6 +790,7 @@ const BLANK: Draft = {
   sleep: false,
   sleepAfter: String(SLEEP_AFTER_DEFAULT),
   selfHandoff: false,
+  toolsUpFront: false,
 };
 
 let templateCache: AgentTemplate[] | null = null;
@@ -922,11 +948,14 @@ export function AgentDialog(
     : "Shares files, branch and uncommitted changes with anyone using this checkout.";
   /** Self handoff: an existing Claude agent on a backend that knows it. */
   const canSelfHandoff = !!agent && agent.kind === "claude" && agent.self_handoff !== undefined;
+  /** Message tools up front: an existing Claude agent on a backend that knows it. */
+  const canToolsUpFront = !!agent && agent.kind === "claude" && agent.tools_up_front !== undefined;
   const moreSummary = [
     or && (d.provider === "openrouter" ? "OpenRouter" : "Subscription"),
     d.autostart ? "Autostart on" : "No autostart",
     d.sleep ? (sleepMin ? `Sleeps after ${sleepMin} min idle` : "Sleep time needs fixing") : "Never sleeps",
     canSelfHandoff && d.selfHandoff && "Can start itself fresh",
+    canToolsUpFront && d.toolsUpFront && "Message tools up front",
   ].filter(Boolean).join(" · ");
   const keyHint = or && !or.key_present && (
     <span class="field-hint or-key-hint" id="agent-provider-hint">
@@ -984,6 +1013,7 @@ export function AgentDialog(
       if (d.autostart !== before.autostart) patch.autostart = d.autostart;
       if ((agent.sleep_after_min ?? 0) !== sleepMin) patch.sleep_after_min = sleepMin;
       if (canSelfHandoff && d.selfHandoff !== before.selfHandoff) patch.self_handoff = d.selfHandoff;
+      if (canToolsUpFront && d.toolsUpFront !== before.toolsUpFront) patch.tools_up_front = d.toolsUpFront;
       if (d.accepts.join() !== before.accepts.join()) patch.accepts = d.accepts;
       if (JSON.stringify(d.permissions) !== JSON.stringify(before.permissions)) {
         patch.permissions = d.permissions;
@@ -1467,7 +1497,7 @@ export function AgentDialog(
                   <span class="toggle-thumb" />
                 </span>
                 <span>
-                  Sleep when idle <span class="muted">(stop its process; the next message wakes it)</span>
+                  Sleep when idle <span class="muted">(stop its process; a message sent with wake on wakes it)</span>
                 </span>
               </label>
               {d.sleep && (
@@ -1514,6 +1544,30 @@ export function AgentDialog(
                   When its conversation has grown long, it writes a handoff file and asks. Once it is idle, Muster
                   clears the conversation (its process and background tasks keep running) and points it at the
                   file. At most once every 30 minutes. Only you can turn this on.
+                </span>
+              </div>
+            )}
+            {canToolsUpFront && (
+              <div class="sleep-field">
+                <label class="toggle">
+                  <input
+                    type="checkbox"
+                    data-field="tools-up-front"
+                    aria-describedby="tools-up-front-hint"
+                    checked={d.toolsUpFront}
+                    onChange={(e) => set({ toolsUpFront: (e.target as HTMLInputElement).checked })}
+                  />
+                  <span class="toggle-track">
+                    <span class="toggle-thumb" />
+                  </span>
+                  <span>
+                    Load message tools up front <span class="muted">(skip the tool search for them)</span>
+                  </span>
+                </label>
+                <span id="tools-up-front-hint" class="field-hint sleep-after">
+                  Puts Muster's message tools (ask_agent, tell_agent, reply and four more) in its prompt from the
+                  start, so it doesn't look each one up first. About 2,200 more tokens on every request, mostly
+                  cached. Applies from its next start.
                 </span>
               </div>
             )}
@@ -2020,6 +2074,10 @@ export function MessageDialog({ id, Modal, close }: { id: number; Modal: ModalT;
   const when = new Date(m.created_at).toLocaleString();
   // This message carried another one's late reply.
   const carried = carriesLateReply(m);
+  const quiet = quietStatus(m);
+  // The message that carried its later reply, when that went quietly: where it stands now.
+  const carrier = m.answer?.msg != null ? agentMessages.value.find((x) => x.id === m.answer!.msg) : undefined;
+  const late = m.answer ? lateStatus(m.answer, carrier) : null;
   return (
     <Modal class="dialog dialog-scroll dlg-calm msg-dlg" label={`Message ${m.id}`}>
       <div class="dlg-head">
@@ -2032,9 +2090,11 @@ export function MessageDialog({ id, Modal, close }: { id: number; Modal: ModalT;
             ? ` · late reply to message ${m.reply_to}`
             : ` · while handling message ${m.reply_to}`)}
           {m.cold_idle_ms != null && <>{" · "}<ColdChip ms={m.cold_idle_ms} /></>}
+          {quiet && <>{" · "}<QuietChip m={m} /></>}
         </span>
       </div>
       <div class="dlg-body">
+        {quiet && <div class="msg-quiet muted">{quiet.text}</div>}
         {m.refused && (
           <div class="form-error msg-refused">
             <IconShieldAlert size={13} /> Refused, never delivered: {m.refused}
@@ -2056,6 +2116,8 @@ export function MessageDialog({ id, Modal, close }: { id: number; Modal: ModalT;
               ? <pre class="msg-pre" tabIndex={0}>{m.reply}</pre>
               : m.answer
               ? <span class="muted">None in that turn; the agent answered later (below).</span>
+              : quiet
+              ? <span class="muted">None: a quiet message gets no reply of its own. The agent can answer it with its reply tool.</span>
               : <span class="muted">No reply yet. Replies arrive when the agent's turn ends.</span>}
           </div>
         )}
@@ -2068,12 +2130,9 @@ export function MessageDialog({ id, Modal, close }: { id: number; Modal: ModalT;
             <span
               role="status"
               aria-live="polite"
-              class={cx(
-                "msg-late-status",
-                m.answer.status === "refused" || m.answer.status === "undelivered" ? "form-error" : "muted",
-              )}
+              class={cx("msg-late-status", late?.failed ? "form-error" : "muted")}
             >
-              {lateText(m.answer)}
+              {late?.text}
             </span>
           </div>
         )}

@@ -184,6 +184,13 @@ export const IconClock = (p: P) => (
     <path d="M12 7.5V12l3 2" />
   </Svg>
 );
+/** An envelope: messages waiting (Lucide "mail"). */
+export const IconMail = (p: P) => (
+  <Svg {...p}>
+    <rect x="3" y="5" width="18" height="14" rx="2" />
+    <path d="m3.5 7 8.5 6 8.5-6" />
+  </Svg>
+);
 /** Two bars: paused. */
 export const IconPause = (p: P) => (
   <Svg {...p}>

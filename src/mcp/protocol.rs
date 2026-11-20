@@ -373,7 +373,7 @@ async fn handle_modern<B: Backend>(
         }),
         "tools/list" => json!({
             "resultType": "complete",
-            "tools": tools::tool_definitions(),
+            "tools": tools::tool_list(st, caller),
             "ttlMs": 300_000,
             "cacheScope": "private",
             "_meta": meta,
@@ -458,7 +458,7 @@ async fn handle_legacy<B: Backend>(
             })
         }
         "ping" => json!({}),
-        "tools/list" => json!({"tools": tools::tool_definitions()}),
+        "tools/list" => json!({"tools": tools::tool_list(st, caller)}),
         "server/discover" => json!({
             "supportedVersions": all_versions(),
             "capabilities": capabilities(),

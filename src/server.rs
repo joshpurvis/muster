@@ -31,6 +31,8 @@ pub fn router(hub: Arc<Hub>) -> anyhow::Result<Router> {
         .route("/api/device/logout", post(device_logout))
         .route("/ws", get(ws_upgrade))
         .route("/hook/{event}", post(hook))
+        // Quiet messages for the turn a session's UserPromptSubmit hook is starting (src/quiet.rs).
+        .route("/quiet/take", post(quiet_take))
         // Status-line usage reports (src/statusline.rs): a few numbers, never a whole payload.
         .route("/usage/{agent}", post(usage_report).layer(axum::extract::DefaultBodyLimit::max(16 * 1024)))
         // Trigger URLs (src/schedules/triggers.rs): this machine only, each with its secret.
@@ -596,6 +598,33 @@ async fn hook(State(hub): State<Arc<Hub>>, Path(event): Path<String>, headers: H
     }
 }
 
+/// `POST /quiet/take` with the run's session token, body `{"msg": <id> | null,
+/// "permission_mode": <mode> | null}` (the message id of the prompt's envelope, and the mode
+/// Claude Code says the process runs in): the quiet messages waiting for the turn its
+/// `UserPromptSubmit` hook is starting, marked offered to that run with the session's provenance
+/// raised to theirs (src/quiet.rs). Only that session's own, and only while the token's run is its
+/// current one.
+async fn quiet_take(State(hub): State<Arc<Hub>>, headers: HeaderMap, body: Bytes) -> Response {
+    let Some((id, run)) = bearer(&headers).and_then(|token| hub.session_run_by_token(token)) else {
+        return unauthorized();
+    };
+    // Anything but a positive message id is a prompt Muster didn't type in: the human's turn.
+    let body = serde_json::from_slice::<serde_json::Value>(&body).unwrap_or_default();
+    let msg = body.get("msg").and_then(serde_json::Value::as_i64).filter(|m| *m > 0);
+    // A missing mode, or one Muster doesn't set (the user's own default), counts as the tab's
+    // (`quiet::mode_width`).
+    let tab = hub.session(id).map_or(crate::quiet::width(crate::model::ClaudeMode::Bypass), |s| crate::quiet::session_width(&hub, &s));
+    let width = crate::quiet::mode_width(body.get("permission_mode").and_then(serde_json::Value::as_str), tab);
+    match crate::quiet::take_run(&hub, id, run, msg, width).await {
+        Ok(v) => axum::Json(v).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(json!({ "error": { "message": format!("{e:#}") } })),
+        )
+            .into_response(),
+    }
+}
+
 /// `POST /usage/claude` with the run's session token: attributed by the token alone (to that
 /// session, run and pinned profile), kept out of hooks, events and agent state.
 async fn usage_report(State(hub): State<Arc<Hub>>, Path(agent): Path<String>, headers: HeaderMap, body: Bytes) -> Response {
@@ -975,7 +1004,11 @@ mod tests {
                 assert_eq!(http(port, "POST", "/usage/claude", auth, "{}").0, 401);
             }
             assert_eq!(http(port, "POST", "/api/rpc", &["Authorization: Bearer tok", FWD], hello).0, 401);
-            for path in ["/api/events", "/", "/mcp", "/api/launch-code", "/hook/x", "/usage/claude"] {
+            // Quiet messages need a session token too.
+            for auth in [&["Authorization: Bearer tok"][..], &[]] {
+                assert_eq!(http(port, "POST", "/quiet/take", auth, "{}").0, 401);
+            }
+            for path in ["/api/events", "/", "/mcp", "/api/launch-code", "/hook/x", "/usage/claude", "/quiet/take"] {
                 assert_eq!(http(port, "GET", path, &[FWD], "").0, 404, "{path}");
             }
             assert_eq!(http(port, "GET", "/m/", &["Tailscale-Funnel-Request: ?1"], "").0, 403);

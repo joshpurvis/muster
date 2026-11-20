@@ -2521,6 +2521,8 @@ pub struct AgentOpts {
     pub sleep_after: Option<String>,
     /// `agent edit --self-handoff on|off`.
     pub self_handoff: Option<bool>,
+    /// `agent edit --tools-up-front on|off`.
+    pub tools_up_front: Option<bool>,
     pub claude_mode: Option<String>,
     pub codex_sandbox: Option<String>,
 }
@@ -2573,12 +2575,18 @@ impl AgentOpts {
         if let Some(a) = &self.sleep_after {
             set("sleep_after_min", json!(parse_sleep_after(a)?));
         }
+        if let Some(on) = self.tools_up_front {
+            set("tools_up_front", json!(on));
+        }
         if let Some(on) = self.self_handoff {
             set("self_handoff", json!(on));
-            // Granting it inside a Muster session is refused: say whose call it is (`agent.update`).
-            if let Some(id) = env_session() {
-                set("from_session", json!(id));
-            }
+        }
+        // Granting self handoff or turning on tools up front inside a Muster session is refused:
+        // say whose call it is (`agent.update`).
+        if (self.self_handoff.is_some() || self.tools_up_front.is_some())
+            && let Some(id) = env_session()
+        {
+            set("from_session", json!(id));
         }
         if self.claude_mode.is_some() || self.codex_sandbox.is_some() {
             set(
@@ -2613,7 +2621,7 @@ fn print_agent(verb: &str, b: &Value, name: &str) {
         );
     }
     if let Some(m) = b["sleep_after_min"].as_u64() {
-        println!("  sleeps after {} idle; the next message wakes it", crate::cache::idle_text(m as i64 * 60_000));
+        println!("  sleeps after {} idle; a message sent with wake on wakes it", crate::cache::idle_text(m as i64 * 60_000));
     }
 }
 
@@ -2746,10 +2754,10 @@ fn queue_wait_line(a: &Value) -> Option<String> {
     })
 }
 
-/// `muster agent sleep`: stop an idle agent's process now; its next message wakes it.
+/// `muster agent sleep`: stop an idle agent's process now; a message sent with wake on wakes it.
 pub fn agent_sleep(d: &Discovery, name: &str) -> anyhow::Result<()> {
     let a = client::rpc_with_timeout(d, "agent.sleep", json!({ "name": name }), Duration::from_secs(30))?;
-    println!("{} is asleep; the next message wakes it", a["name"].as_str().unwrap_or(name));
+    println!("{} is asleep; a message sent with wake on wakes it", a["name"].as_str().unwrap_or(name));
     Ok(())
 }
 
@@ -2859,7 +2867,7 @@ pub fn ask(d: &Discovery, agent: &str, words: &[String], timeout: u64, as_json: 
 /// `muster reply`: inside an agent's session, its MCP `reply` (answer message `msg_id` later),
 /// called with the session's own token: never on another session's behalf. Prints how it
 /// reached the asker; exit 1 when the delivery was refused.
-pub fn reply(d: &Discovery, msg_id: i64, words: &[String], as_json: bool) -> anyhow::Result<()> {
+pub fn reply(d: &Discovery, msg_id: i64, words: &[String], wake: bool, as_json: bool) -> anyhow::Result<()> {
     if env_session().is_none() {
         anyhow::bail!("muster reply runs inside an agent's session (it answers a message Muster delivered to that agent)");
     }
@@ -2874,7 +2882,7 @@ pub fn reply(d: &Discovery, msg_id: i64, words: &[String], as_json: bool) -> any
         std::io::stdin().lock().read_to_string(&mut s)?;
         Ok(s)
     })?;
-    let r = session_tool(d, &token, "reply", json!({"msg_id": msg_id, "text": text}))?;
+    let r = session_tool(d, &token, "reply", json!({"msg_id": msg_id, "text": text, "wake": wake}))?;
     if as_json {
         print_json(&r)?;
     } else {

@@ -998,6 +998,7 @@ button.sl-item:hover {
 .tab.renaming .tab-wt,
 .tab.renaming .tab-perm,
 .tab.renaming .tab-queued,
+.tab.renaming .tab-quiet,
 .tab.renaming .tab-close {
   display: none;
 }
@@ -1042,6 +1043,20 @@ button.sl-item:hover {
   font-weight: 700;
   color: var(--text-muted);
   background: var(--bg-4);
+  border-radius: 7px;
+  padding: 0 5px;
+  line-height: 15px;
+}
+
+/* Quiet messages waiting for the next turn (src/quiet.rs). */
+.tab-quiet {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--accent-strong);
+  background: var(--accent-soft);
   border-radius: 7px;
   padding: 0 5px;
   line-height: 15px;
@@ -3561,6 +3576,16 @@ legend {
   color: var(--error-text);
 }
 
+/* Quiet messages (sent without waking the agent): waiting, shown at a turn's start, expired. */
+.ap-chip-quiet-waiting {
+  color: var(--accent-strong);
+  background: var(--accent-soft);
+}
+
+.ap-chip-quiet-shown {
+  color: var(--ok-text);
+}
+
 .ap-msg-refused {
   display: -webkit-box;
   -webkit-box-orient: vertical;
@@ -4692,6 +4717,11 @@ legend {
 
 .msg-refused .icon {
   margin-top: 2px;
+}
+
+.msg-quiet {
+  font-size: 12px;
+  margin-bottom: 10px;
 }
 
 .msg-late-status {

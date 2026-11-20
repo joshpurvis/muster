@@ -377,7 +377,7 @@ pub(crate) fn test_session(id: SessionId, parent: Option<SessionId>) -> SessionI
         exit_code: None,
         cols: 80,
         rows: 24,
-        queued: 0,
+        queued: 0, quiet_waiting: 0,
         subagents: 0,
         background: 0,
         size_owner: None,

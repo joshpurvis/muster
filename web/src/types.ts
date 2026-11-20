@@ -173,6 +173,9 @@ export interface SessionInfo {
   /** Changes with every state/detail change and answered prompt (stale-approval guard). */
   state_seq?: number;
   queued: number;
+  /** Quiet messages (`tell_agent` with wake=false, src/quiet.rs) waiting for its next turn. Missing
+   * from older daemons. */
+  quiet_waiting?: number;
   /** Built-in subagents the agent is running right now (runtime only). */
   subagents?: number;
   /** Sub-agents and commands it started in the background that haven't reported back; a named
@@ -275,7 +278,7 @@ export interface Agent {
   created_at: number;
   /** Sleeps after this many idle minutes (null: never; older daemons: absent). */
   sleep_after_min?: number | null;
-  /** Its process was stopped while idle; the next message wakes it (src/sleep.rs). */
+  /** Its process was stopped while idle; the next message sent with wake on wakes it (src/sleep.rs). */
   asleep?: boolean;
   /** Asleep since (Unix ms). */
   asleep_at?: number | null;
@@ -284,6 +287,9 @@ export interface Agent {
   self_handoff?: boolean;
   /** When it last did (Unix ms). */
   self_handoff_at?: number | null;
+  /** Its sessions get Muster's message tools in the prompt from the start, instead of through
+   * Claude Code's tool search (src/mcp/tools.rs `UP_FRONT`). Older daemons: absent. */
+  tools_up_front?: boolean;
   /** Why its last wake failed, while it is still asleep (it stays asleep; the next message or
    * typing tries again). */
   wake_error?: string;
@@ -315,6 +321,13 @@ export interface AgentMessage {
   /** The agent's later answer (MCP `reply`), and how it reached the asker. Missing: an older
    * daemon. */
   answer?: LateAnswer | null;
+  /** Sent without waking the agent (`tell_agent` or `reply` with wake=false, src/quiet.rs): it
+   * waits for the agent's next turn and arrives as context then. Missing: an older daemon. */
+  quiet?: boolean;
+  /** When a turn's start showed it (quiet messages only). */
+  shown_at?: number | null;
+  /** When it expired unshown (after 7 days). */
+  expired_at?: number | null;
 }
 
 /** How a late reply stands: `pending`/`delivering` until it reaches the asker. */
@@ -338,7 +351,25 @@ export interface LateAnswer {
   note?: string | null;
   /** The message that carried it to an asking agent. */
   msg?: number | null;
-  /** The session it was typed into. */
+  /** The session it was typed into (or, sent quietly, the one it waits for). */
+  session?: SessionId | null;
+  /** Sent with wake=false: unless a waiting ask takes it, the asker gets it at the start of its
+   * next turn that can take it. */
+  quiet?: boolean;
+  /** Sent quietly and kept for the asker: where the carrying message stands now (src/agents.rs
+   * `quiet_state`), whatever page of the log holds it. Missing from an older daemon. */
+  quiet_state?: QuietState | null;
+}
+
+/** Where the message carrying a quiet late reply stands: an agent's (`msg`, `to`) or a plain
+ * session's (`session`). `at`: when it was shown (or an agent's expired); `reason`: why it was
+ * dropped. */
+export interface QuietState {
+  state: "waiting" | "shown" | "expired" | "dropped";
+  at?: number | null;
+  reason?: string | null;
+  msg?: number | null;
+  to?: string | null;
   session?: SessionId | null;
 }
 

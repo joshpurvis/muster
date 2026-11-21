@@ -352,11 +352,27 @@ pub enum Verdict {
     Fresh { why: String, size_k: Option<u64> },
 }
 
-/// The rule for replacing a resting agent's conversation, shared by answers to its questions and
-/// the idle agent resets (src/auto_reset.rs), so both give the same reasons: cold and at least
-/// `cache::FRESH_ANSWER_MIN_TOKENS`, or warm, resting `cache::FRESH_WARM_AFTER_MS` and at least
-/// `cache::FRESH_WARM_MIN_TOKENS`. `asked`: the human asked for a new conversation.
+/// Who asks `rule_verdict` whether to replace a resting agent's conversation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rule {
+    /// An answer to one of its questions: cold and at least `cache::FRESH_ANSWER_MIN_TOKENS`.
+    Answer,
+    /// An answer the human asked to go into a new conversation: the resting checks only.
+    Asked,
+    /// An idle agent reset (src/auto_reset.rs, a setting the owner turns on): as `Answer`, or
+    /// warm, resting `cache::FRESH_WARM_AFTER_MS` and at least `cache::FRESH_WARM_MIN_TOKENS`.
+    Sweep,
+}
+
+/// The cold-answer rule (`rule_verdict` for an answer). `asked`: the human asked for a new
+/// conversation.
 pub fn fresh_verdict(f: &FreshFacts, asked: bool) -> Verdict {
+    rule_verdict(f, if asked { Rule::Asked } else { Rule::Answer })
+}
+
+/// The rule for replacing a resting agent's conversation, one function for answers to its
+/// questions and idle agent resets, so both give the same reasons.
+pub fn rule_verdict(f: &FreshFacts, rule: Rule) -> Verdict {
     use Verdict::Keep;
     if !f.idle && !f.asleep {
         return Keep("it is in a turn, starting, or not running");
@@ -373,7 +389,7 @@ pub fn fresh_verdict(f: &FreshFacts, asked: bool) -> Verdict {
     if f.reset_due {
         return Keep("its next start is a new conversation already");
     }
-    if asked {
+    if rule == Rule::Asked {
         return Verdict::Fresh { why: "the human asked for a fresh start".into(), size_k: None };
     }
     if !f.claude {
@@ -383,7 +399,8 @@ pub fn fresh_verdict(f: &FreshFacts, asked: bool) -> Verdict {
     match f.cold_for {
         Some(_) if tokens < crate::cache::FRESH_ANSWER_MIN_TOKENS => return Keep("its conversation is small"),
         Some(_) => {}
-        None if tokens < crate::cache::FRESH_WARM_MIN_TOKENS => return Keep("its prompt cache is still warm"),
+        None if rule != Rule::Sweep || tokens < crate::cache::FRESH_WARM_MIN_TOKENS =>
+            return Keep("its prompt cache is still warm"),
         None if f.idle_for.is_none_or(|t| t < crate::cache::FRESH_WARM_AFTER_MS) =>
             return Keep("its last turn ended a few minutes ago"),
         None => {}
@@ -416,8 +433,9 @@ pub fn fresh_facts(hub: &Hub, a: &Agent, session: Option<&SessionInfo>, now: i64
         asleep: !live && a.asleep_at.is_some(),
         // By the cache's lifetime, whether or not the cold warnings are shown.
         cold_for: hub.cache_gone_at(info).filter(|t| now >= *t).map(|_| now - info.last_turn_at.unwrap_or(now)),
-        // Since it last came to rest or talked to its model (the human's keys count as `typing`).
-        idle_for: info.last_turn_at.map(|_| (now - crate::sleep::idle_since(info, None)).max(0)),
+        // Since it last came to rest or talked to its model (the human's keys count as `typing`);
+        // asleep, since its last turn (stopping the process isn't activity).
+        idle_for: info.last_turn_at.map(|t| (now - if live { crate::sleep::idle_since(info, None) } else { t }).max(0)),
         tokens: hub.agents().context_size(a),
         others_waiting: !f.queue_idle || f.deliveries > 0 || f.waking,
         typing: keys || (idle && f.draft),
@@ -446,7 +464,7 @@ fn sized_as(a: &Agent, sized: &Option<String>) -> Agent {
 
 /// A fresh start of agent `a` that stopped before a new run took over: it resumes `f.replaces`
 /// again (unless it has another conversation by now), and the replaced run's hooks count again.
-pub(crate) fn take_back(hub: &Hub, a: &Agent, f: &Fresh) -> anyhow::Result<()> {
+fn take_back(hub: &Hub, a: &Agent, f: &Fresh) -> anyhow::Result<()> {
     let Some(old) = &f.replaces else { return Ok(()) };
     if let Some(back) = hub.agents().restore_conversation(hub.store(), a.id, old)? {
         tracing::info!(agent = a.name, "the fresh start for an answer stopped; it keeps its conversation");
@@ -588,13 +606,13 @@ async fn deliver_to_agent(hub: &Arc<Hub>, l: &Letter<'_>, to: Agent, note: Optio
 }
 
 /// Is a run other than the one fresh start `f` replaces live for agent `a` now?
-pub(crate) fn new_run(hub: &Hub, a: &Agent, f: &Fresh) -> bool {
+fn new_run(hub: &Hub, a: &Agent, f: &Fresh) -> bool {
     a.session_id.is_some_and(|s| hub.live_session_ids().contains(&s)) && !old_run_alive(hub, a, f)
 }
 
 /// An answer whose saved fresh start `f` (from before a backend restart) won't go ahead: unless a
 /// new run took over, agent `a` gets its old conversation back. The caller holds the start lock.
-pub(crate) fn settle_cut_off(hub: &Hub, a: &Agent, f: &Fresh) {
+fn settle_cut_off(hub: &Hub, a: &Agent, f: &Fresh) {
     if !new_run(hub, a, f)
         && let Err(e) = take_back(hub, a, f)
     {
@@ -818,27 +836,43 @@ mod tests {
         assert_eq!(keep(&cold(99_999), false), "its conversation is small");
         assert_eq!(fresh_verdict(&cold(100_000), false), Verdict::Fresh {
             why: "the old one was cold and large, about 100k tokens and idle 3 h".into(), size_k: Some(100) });
-        // Warm: 200k and over, once it has rested the grace time.
-        assert_eq!(keep(&warm(199_999, 20 * MIN), false), "its prompt cache is still warm");
-        assert_eq!(fresh_verdict(&warm(200_000, 20 * MIN), false), Verdict::Fresh {
+        // The same lines for an idle agent reset.
+        assert_eq!(sweep_keep(&cold(99_999)), "its conversation is small");
+        assert!(matches!(rule_verdict(&cold(100_000), Rule::Sweep), Verdict::Fresh { .. }));
+        // Warm: 200k and over, once it has rested the grace time; idle agent resets only (an
+        // answer keeps a warm conversation, as before resets existed).
+        assert_eq!(sweep_keep(&warm(199_999, 20 * MIN)), "its prompt cache is still warm");
+        assert_eq!(rule_verdict(&warm(200_000, 20 * MIN), Rule::Sweep), Verdict::Fresh {
             why: "the old one was very large, about 200k tokens, and idle 20 m".into(), size_k: Some(200) });
+        assert_eq!(keep(&warm(500_000, 3 * HOUR), false), "its prompt cache is still warm");
         assert_eq!(crate::cache::FRESH_WARM_MIN_TOKENS, 200_000);
         let grace = crate::cache::FRESH_WARM_AFTER_MS;
-        assert_eq!(keep(&warm(250_000, grace - 1), false), "its last turn ended a few minutes ago");
-        assert!(matches!(fresh_verdict(&warm(250_000, grace), false), Verdict::Fresh { .. }));
+        assert_eq!(sweep_keep(&warm(250_000, grace - 1)), "its last turn ended a few minutes ago");
+        assert!(matches!(rule_verdict(&warm(250_000, grace), Rule::Sweep), Verdict::Fresh { .. }));
         // When it last came to rest is unknown: it may have just ended a turn.
-        assert_eq!(keep(&FreshFacts { idle_for: None, ..warm(250_000, grace) }, false), "its last turn ended a few minutes ago");
+        assert_eq!(sweep_keep(&FreshFacts { idle_for: None, ..warm(250_000, grace) }), "its last turn ended a few minutes ago");
         // The human's prompt in the last 24 hours keeps a warm one too.
-        assert_eq!(keep(&FreshFacts { human_prompt_at: Some(NOW - 23 * HOUR), ..warm(250_000, grace) }, false),
+        assert_eq!(sweep_keep(&FreshFacts { human_prompt_at: Some(NOW - 23 * HOUR), ..warm(250_000, grace) }),
             "the human worked in this conversation in the last 24 hours");
         // Unknown size: never, warm or cold.
-        assert_eq!(keep(&FreshFacts { tokens: None, ..warm(250_000, grace) }, false), "its conversation's size is unknown");
+        assert_eq!(sweep_keep(&FreshFacts { tokens: None, ..warm(250_000, grace) }), "its conversation's size is unknown");
         // A Codex agent: never.
-        assert_eq!(keep(&FreshFacts { claude: false, ..warm(250_000, grace) }, false),
+        assert_eq!(sweep_keep(&FreshFacts { claude: false, ..warm(250_000, grace) }),
             "only Claude agents report their conversation's size");
-        // Mid-turn and queued: never.
-        assert_eq!(keep(&FreshFacts { idle: false, ..warm(250_000, grace) }, false), "it is in a turn, starting, or not running");
-        assert_eq!(keep(&FreshFacts { others_waiting: true, ..warm(250_000, grace) }, false), "other prompts are waiting for it");
+        // Mid-turn, queued, typing, a reset or move already due: never.
+        let w = || warm(250_000, grace);
+        assert_eq!(sweep_keep(&FreshFacts { idle: false, ..w() }), "it is in a turn, starting, or not running");
+        assert_eq!(sweep_keep(&FreshFacts { working: true, ..w() }), "it has a sub-agent, a background task or a new turn under way");
+        assert_eq!(sweep_keep(&FreshFacts { others_waiting: true, ..w() }), "other prompts are waiting for it");
+        assert_eq!(sweep_keep(&FreshFacts { typing: true, ..w() }), "the human is typing into it");
+        assert_eq!(sweep_keep(&FreshFacts { reset_due: true, ..w() }), "its next start is a new conversation already");
+    }
+
+    fn sweep_keep(f: &FreshFacts) -> &'static str {
+        match rule_verdict(f, Rule::Sweep) {
+            Verdict::Keep(why) => why,
+            v => panic!("{v:?} for {f:?}"),
+        }
     }
 
     #[test]

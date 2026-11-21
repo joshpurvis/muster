@@ -45,6 +45,9 @@ Deno.test("an asleep agent's tab is no exited session: a message wakes it", () =
   equal(sessionAsleep(undefined), false);
   equal(asleepNote({ name: "scout", cache_cold_at: null }, 0), "scout is asleep. Sending a message wakes it into the same conversation.");
   equal(asleepNote({ name: "scout", cache_cold_at: 10 }, 20).includes("full cost"), true, "the cost once its cache expired");
+  // Its conversation forgotten by an idle agent reset: the backend cleared its turn clock.
+  equal(asleepNote({ name: "scout", cache_cold_at: null, last_turn_at: null }, 0),
+    "scout is asleep. Sending a message wakes it into a new conversation.");
 });
 
 Deno.test("pairing codes accept mixed case, spaces and dashes without changing QR tokens", () => {

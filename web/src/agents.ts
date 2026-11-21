@@ -62,10 +62,21 @@ export function parseSleepAfter(v: string): number | null {
 /** The asleep bar's sentence: how long it has slept, that the next message sent with wake on (a
  * quiet one waits instead) or typing wakes it, and when its prompt cache has likely expired, what
  * that wake costs (`cold`). */
-export function asleepText(name: string, asleepAt: number | null | undefined, cold: boolean, now: number): string {
+export function asleepText(
+  name: string,
+  asleepAt: number | null | undefined,
+  cold: boolean,
+  now: number,
+  fresh = false,
+): string {
   const lead = asleepAt != null && now - asleepAt >= 60_000
     ? `${name} has been asleep for ${idleText(now - asleepAt)}`
     : `${name} is asleep`;
+  // Its conversation was forgotten (an idle agent reset, or no saved one): nothing to re-read.
+  if (fresh) {
+    return `${lead}. The next message sent with wake on, or typing here, wakes it into a new conversation, ` +
+      "which reads its memory/ notes first.";
+  }
   return `${lead}. The next message sent with wake on, or typing here, wakes it` +
     (cold
       ? `: it re-reads the whole conversation at full cost, since its prompt cache has likely expired.`

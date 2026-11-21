@@ -1,44 +1,46 @@
-//! Idle agent resets (docs/UI.md "Idle agent resets"): with the setting on (`UiPrefs::auto_reset`,
-//! off by default, changed only by a click in Muster's window), Muster starts a resting named
-//! Claude agent whose conversation is very large in a new conversation by itself. Its memory/
-//! notes stay; the new conversation reads them.
+//! Idle agent resets (docs/PROTOCOL.md "Idle agent resets"): with the setting on
+//! (`UiPrefs::auto_reset`, off by default, changed only by a click in Muster's window), Muster
+//! gives a resting named Claude agent whose conversation is very large a new conversation by
+//! itself. Its memory/ notes stay; the new conversation reads them.
 //!
-//! - The rule is the one answers to questions follow (src/relay.rs `fresh_verdict`, read from the
-//!   hub by `fresh_facts`), so both give the same reasons: resting (idle or asleep, nothing in a
-//!   turn, starting, waiting on the human, queued or on its way, nobody typing), its next start
-//!   not a new conversation already, no prompt of the human's own taken in by it in the last 24
-//!   hours, its size known (Claude's status line), and either cold (past its cache lifetime) and
-//!   at least `cache::FRESH_ANSWER_MIN_TOKENS`, or warm, resting `cache::FRESH_WARM_AFTER_MS` and
-//!   at least `cache::FRESH_WARM_MIN_TOKENS`. Codex agents, agents of unknown size and plain
-//!   sessions (no memory/ to come back to): never.
-//! - `sweep` looks every `SWEEP_EVERY`. Each agent is decided and restarted under the cold-answer
-//!   rule's per-agent lock and the start lock, the order the answer path takes them, so an answer
-//!   and a reset never both restart it, and nothing else starts it in between; the start itself
-//!   checks the rule once more with no await between the check and the restart
-//!   (`agents::start_fresh_if_held`).
-//! - A running agent is restarted the way Start fresh restarts it. An asleep one stays asleep: its
-//!   conversation is forgotten, so whatever wakes it next starts a new one (no wake is spent).
+//! - The rule is the one answers to questions follow (src/relay.rs `rule_verdict`, `Rule::Sweep`,
+//!   read from the hub by `fresh_facts`), so both give the same reasons: resting (idle or asleep,
+//!   nothing in a turn, starting, waiting on the human, queued or on its way, nobody typing), its
+//!   next start not a new conversation already, no prompt of the human's own taken in by it in the
+//!   last 24 hours, its size known (Claude's status line), and either cold (past its cache
+//!   lifetime) and at least `cache::FRESH_ANSWER_MIN_TOKENS`, or (resets only) warm, resting
+//!   `cache::FRESH_WARM_AFTER_MS` and at least `cache::FRESH_WARM_MIN_TOKENS`. Codex agents,
+//!   agents of unknown size and plain sessions (no memory/ to come back to): never.
+//! - `sweep` looks every `SWEEP_EVERY`. Each agent is decided under the cold-answer rule's
+//!   per-agent lock and the start lock, the order the answer path takes them, so an answer and a
+//!   reset never both act on it, and nothing starts it in between.
+//! - A running agent is put to sleep first, the way a sleep stops it (src/sleep.rs): its last
+//!   check and the stop are one step against keys typed, messages and prompts on their way, and a
+//!   restart in between finishes or undoes the stop. Then, asleep (whether it just fell asleep or
+//!   already was), the rule is checked again and its conversation forgotten, while the setting is
+//!   still on (`Hub::while_auto_reset_on`): whatever wakes it next starts a new conversation. No
+//!   start is spent on it now; the stopped run's late hooks can't bring the old one back
+//!   (`Hub::forget_run_conversation`). A restart between the sleep and the forgetting leaves it
+//!   asleep in its old conversation, for the next sweep.
+//! - After a backend restart, text in a running agent's input box that this backend didn't see
+//!   typed (it can't tell a draft from Claude's suggestion) keeps it.
 //! - It leaves the new conversation one quiet message (src/quiet.rs, from `muster`, the human's
 //!   origin): why, and to read memory/ first. It never wakes the agent, arrives as context when
-//!   its next turn starts, and shows in the Agents panel's message log. The agent's daily message
-//!   cap and accepted origins are checked before anything restarts: an agent that couldn't take
-//!   the note keeps its conversation.
-//! - Each reset is a `system` event in the agent's tab (`auto_reset`), saying why.
-//! - A backend restart between forgetting the conversation and the new run is settled at the next
-//!   start (`settle`): the reset is saved first (`PENDING_KEY`), and as for an answer
-//!   (`relay::settle_cut_off`), unless a new run took over, the agent gets its conversation back.
+//!   its next turn starts, and shows in the Agents panel's message log. The agent's accepted
+//!   origins, daily message cap and waiting quiet messages are checked before anything stops: an
+//!   agent that couldn't take the note keeps its conversation.
+//! - Each reset is also a `system` event in the agent's tab (`auto_reset`) and a notice in the
+//!   window, saying why.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::agents::{self, Agent, Origin, Route};
 use crate::hub::Hub;
 use crate::model::*;
-use crate::relay::{self, Fresh, Verdict};
+use crate::relay::{self, Rule, Verdict};
 
 /// How often resting agents are looked at.
 pub const SWEEP_EVERY: Duration = Duration::from_secs(5 * 60);
@@ -47,8 +49,9 @@ pub const BY_WINDOW: &str = "only a click in Muster's window turns idle agent re
     (Settings and more, Idle agent resets…)";
 /// The sender of the note a reset leaves.
 pub const FROM: &str = "muster";
-/// Runtime key: resets started and not finished, by agent id.
-const PENDING_KEY: &str = "auto-reset-pending";
+
+/// When this backend started looking (Unix ms): keys typed before it are unknown to it.
+static WATCHING_SINCE: OnceLock<i64> = OnceLock::new();
 
 /// `SWEEP_EVERY`; a debug build can shorten it for the smoke test.
 fn every() -> Duration {
@@ -60,29 +63,21 @@ fn every() -> Duration {
     SWEEP_EVERY
 }
 
-/// A reset under way, saved before the agent is restarted.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct Pending {
-    created_at: i64,
-    size_k: Option<u64>,
-    fresh: Fresh,
-}
-
 /// What a sweep did to one agent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reset {
     pub agent: String,
     pub why: String,
-    /// It was asleep: its next start is the new conversation.
-    pub asleep: bool,
+    /// It was running, and was put to sleep for it.
+    pub stopped: bool,
     /// The note it left (None: refused, see the log).
     pub note: Option<i64>,
 }
 
-/// At daemon start: settle a reset a restart cut off, then sweep from time to time.
+/// At daemon start: sweep from time to time.
 pub fn spawn(hub: Arc<Hub>) {
+    let _ = WATCHING_SINCE.set(now_ms());
     tokio::spawn(async move {
-        settle(&hub).await;
         let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + every(), every());
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -116,27 +111,27 @@ pub async fn sweep(hub: &Arc<Hub>, now: i64) -> Vec<Reset> {
 /// The rule for agent `a` as it is now.
 fn verdict(hub: &Hub, a: &Agent, now: i64) -> Verdict {
     let session = a.session_id.and_then(|s| hub.session(s));
-    relay::fresh_verdict(&relay::fresh_facts(hub, a, session.as_ref(), now), false)
+    relay::rule_verdict(&relay::fresh_facts(hub, a, session.as_ref(), now), Rule::Sweep)
 }
 
-/// Could agent `a` take the note now (its accepted origins, its daily message cap)?
+/// Could agent `a` take the note now (its accepted origins, its daily message cap, room among its
+/// waiting quiet messages)?
 fn note_allowed(hub: &Hub, a: &Agent, now: i64) -> Result<(), String> {
-    let recent = hub.store().count_agent_messages_since(a.id, now - crate::mcp::guard::AGENT_CAP_WINDOW_MS)
+    let store = hub.store();
+    let recent = store.count_agent_messages_since(a.id, now - crate::mcp::guard::AGENT_CAP_WINDOW_MS)
         .map_err(|e| format!("{e:#}"))?;
-    crate::mcp::guard::check_agent_delivery(&a.name, &a.accepts_origins, Origin::Human, 0, recent)
+    crate::mcp::guard::check_agent_delivery(&a.name, &a.accepts_origins, Origin::Human, 0, recent)?;
+    let waiting = store.quiet_count_agent(a.id, crate::quiet::after(now)).map_err(|e| format!("{e:#}"))?;
+    if waiting >= crate::quiet::WAITING_MAX {
+        return Err(format!("{waiting} quiet messages wait for it already"));
+    }
+    Ok(())
 }
 
-fn pending(hub: &Hub) -> HashMap<i64, Pending> {
-    hub.store().load_runtime(PENDING_KEY).ok().flatten().unwrap_or_default()
-}
-
-fn set_pending(hub: &Hub, id: i64, p: Option<Pending>) -> anyhow::Result<()> {
-    let mut all = pending(hub);
-    match p {
-        Some(p) => all.insert(id, p),
-        None => all.remove(&id),
-    };
-    hub.store().save_runtime(PENDING_KEY, &all)
+/// Text in running session `info`'s input box that this backend didn't see typed: since it came
+/// to rest before this backend started, a draft can't be told from Claude's suggestion.
+fn unseen_text(hub: &Hub, info: &SessionInfo) -> bool {
+    WATCHING_SINCE.get().is_some_and(|since| info.state_since < *since) && crate::inject::has_any_text(hub, info.id)
 }
 
 /// Decide again under the locks and reset agent `id` (made at `created_at`).
@@ -151,98 +146,59 @@ async fn reset_one(hub: &Arc<Hub>, id: i64, created_at: i64, now: i64) -> Option
         return None;
     }
     let Verdict::Fresh { why, size_k } = verdict(hub, &a, at()) else { return None };
+    let (sid, replaces) = (a.session_id?, a.resume_id.clone()?);
     if let Err(no) = note_allowed(hub, &a, at()) {
         tracing::debug!(agent = a.name, "not reset: it couldn't take the note: {no}");
         return None;
     }
-    let live = a.session_id.is_some_and(|s| hub.live_session_ids().contains(&s));
-    let fresh = Fresh { why, replaces: a.resume_id.clone(), run: a.session_id.and_then(|s| hub.pty_generation(s)) };
-    if !live {
-        // Asleep: no run to restart. Forget the conversation; whatever wakes it starts a new one.
-        let replaces = fresh.replaces.clone()?;
-        return match hub.agents().forget_conversation(hub.store(), id, &replaces) {
-            Ok(Some(b)) => {
-                agents::publish(hub, &b);
-                Some(record(hub, &b, &fresh, size_k, true).await)
-            }
-            Ok(None) => None,
-            Err(e) => {
-                tracing::warn!(agent = a.name, "not reset: {e:#}");
-                None
-            }
-        };
+    let running = a.asleep_at.is_none();
+    if running {
+        if hub.session(sid).is_some_and(|i| unseen_text(hub, &i)) {
+            tracing::debug!(agent = a.name, "not reset: text in its input box may be a draft typed before this backend started");
+            return None;
+        }
+        if let Err(e) = crate::sleep::sleep_held(hub, &a.name, crate::sleep::Why::Reset, &held).await {
+            tracing::debug!(agent = a.name, "not reset: {e:#}");
+            return None;
+        }
     }
-    if let Err(e) = set_pending(hub, id, Some(Pending { created_at, size_k, fresh: fresh.clone() })) {
-        tracing::warn!(agent = a.name, "not reset: saving it first failed: {e:#}");
+    // Asleep now: anything that came meanwhile (keys held for a wake, a message on its way)
+    // keeps it, and the setting is checked once more, under its own lock.
+    let b = current()?;
+    if b.asleep_at.is_none() || !matches!(verdict(hub, &b, at()), Verdict::Fresh { .. }) {
+        tracing::debug!(agent = b.name, "not reset: it is no longer resting");
         return None;
     }
-    // Checked again by the start itself, with no await between the check and the restart.
-    let ok = |s: &SessionInfo| current().is_some_and(|c| c.resume_id == fresh.replaces
-        && matches!(relay::fresh_verdict(&relay::fresh_facts(hub, &c, Some(s), at()), false), Verdict::Fresh { .. }));
-    let started = agents::start_fresh_if_held(hub, &a.name, &ok, &held).await;
-    let done = match started {
-        Ok(s) => Some(s.agent),
-        Err(e) => {
-            if e.downcast_ref::<agents::NotIdle>().is_none() {
-                tracing::warn!(agent = a.name, "not reset: {e:#}");
-            }
-            // As for an answer: a new run holding a new conversation stays; otherwise a
-            // conversation the failed start forgot is the agent's again.
-            match current() {
-                Some(c) if relay::new_run(hub, &c, &fresh) && c.resume_id != fresh.replaces => Some(c),
-                Some(c) => {
-                    relay::settle_cut_off(hub, &c, &fresh);
-                    None
-                }
-                None => None,
-            }
+    let forgot = hub.while_auto_reset_on(|| -> anyhow::Result<Option<Agent>> {
+        // The stopped run's late hooks first: one can't save the old conversation back after.
+        hub.forget_run_conversation(sid)?;
+        hub.agents().forget_conversation(hub.store(), id, &replaces)
+    });
+    match forgot {
+        Some(Ok(Some(c))) => {
+            agents::publish(hub, &c);
+            Some(record(hub, &c, &why, size_k, running).await)
         }
-    };
-    if let Err(e) = set_pending(hub, id, None) {
-        tracing::warn!(agent = a.name, "clearing a finished reset: {e:#}");
-    }
-    match done {
-        Some(b) => Some(record(hub, &b, &fresh, size_k, false).await),
-        None => None,
-    }
-}
-
-/// A reset a backend restart cut off: done if a new run took over (recorded now), else the agent
-/// gets its conversation back.
-pub async fn settle(hub: &Arc<Hub>) {
-    for (id, p) in pending(hub) {
-        let _one = relay::rule_lock(hub, id).await;
-        let _held = hub.agents().start_lock.lock().await;
-        if let Some(a) = relay::agent_then(hub, id, Some(p.created_at)) {
-            if relay::new_run(hub, &a, &p.fresh) && a.resume_id != p.fresh.replaces {
-                record(hub, &a, &p.fresh, p.size_k, false).await;
-            } else {
-                relay::settle_cut_off(hub, &a, &p.fresh);
-            }
-        }
-        if let Err(e) = set_pending(hub, id, None) {
-            tracing::warn!(agent = id, "clearing a settled reset: {e:#}");
+        None | Some(Ok(None)) => None,
+        Some(Err(e)) => {
+            tracing::warn!(agent = b.name, "not reset: {e:#}");
+            None
         }
     }
 }
 
 /// The agent's log line for a reset, with `why` as the rule gave it.
-pub fn log_text(name: &str, why: &str, asleep: bool) -> String {
-    if asleep {
-        format!("Idle agent reset: {name}'s next start is a new conversation, because {why}. \
-                 It stays asleep until something wakes it; its memory/ notes are kept.")
-    } else {
-        format!("Idle agent reset: Muster started {name} in a new conversation, because {why}. \
-                 Its memory/ notes are kept.")
-    }
+pub fn log_text(name: &str, why: &str) -> String {
+    format!("Idle agent reset: {name} is asleep, and its next start is a new conversation, because {why}. \
+             Whatever wakes it starts the new one; its memory/ notes are kept.")
 }
 
-/// Leave the note, then say so in the agent's tab.
-async fn record(hub: &Arc<Hub>, a: &Agent, f: &Fresh, size_k: Option<u64>, asleep: bool) -> Reset {
+/// Leave the note, then say so in the agent's tab and the window.
+async fn record(hub: &Arc<Hub>, a: &Agent, why: &str, size_k: Option<u64>, stopped: bool) -> Reset {
     let out = agents::Outgoing {
         agent: a.name.clone(),
         agent_id: Some(a.id),
-        text: relay::reset_line(&f.why),
+        text: relay::reset_line(why),
         from: FROM.into(),
         from_session: None,
         route: Route { origin: Origin::Human, hop: 0, reply_to: None },
@@ -254,18 +210,18 @@ async fn record(hub: &Arc<Hub>, a: &Agent, f: &Fresh, size_k: Option<u64>, aslee
             None
         }
     };
-    let mut text = log_text(&a.name, &f.why, asleep);
+    let mut text = log_text(&a.name, why);
     if note.is_none() {
-        text.push_str(" Muster couldn't leave it a note saying so (see the Agents panel's message log).");
+        text.push_str(" Muster couldn't leave it a note saying so.");
     }
     tracing::info!(agent = a.name, "{text}");
     let channel = a.session_id.and_then(|s| hub.session(s)).map(|s| s.channel_id).or(a.channel_id);
     hub.log_event(channel, a.session_id, EventKind::System, json!({
         "text": text, "level": "info",
-        "auto_reset": {"agent": a.name, "agent_id": a.id, "why": f.why, "size_k": size_k, "asleep": asleep,
-            "replaces": f.replaces, "note_msg": note},
+        "auto_reset": {"agent": a.name, "agent_id": a.id, "why": why, "size_k": size_k, "stopped": stopped, "note_msg": note},
     }));
-    Reset { agent: a.name.clone(), why: f.why.clone(), asleep, note }
+    hub.notice("info", text);
+    Reset { agent: a.name.clone(), why: why.to_string(), stopped, note }
 }
 
 #[cfg(test)]

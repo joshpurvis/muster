@@ -1100,31 +1100,37 @@ of the same delivery (its message, else its panel batch, else its text) is recor
 
 With `prefs.auto_reset` on (off by default; changed only by a click in Muster's window, see
 `prefs.set`), the backend looks at the named agents every 5 minutes (`src/auto_reset.rs`) and
-starts a resting Claude agent with a very large conversation in a new one by itself. The rule is
-the one an answer to a question follows (docs/MCP.md "Questions for the human", one function,
-`relay::fresh_verdict`): resting (idle with an empty input queue and no sub-agent, background
-task or just-typed turn under way, or asleep), nothing else on its way to it, nobody typing into
-it, no reset, account move or self handoff already due, no prompt of the human's own taken in by
-it in the last 24 hours, its size known from its status line, and either cold (past `cache_ttl`)
-and at least 100,000 tokens, or warm, resting at least 15 minutes since its last turn and at
-least 200,000 tokens. Codex agents, agents of unknown size and plain sessions: never. It is
-decided again under the same per-agent lock as an answer and the start lock, and once more by
-the start itself, so an answer and a reset never both restart it.
+gives a resting Claude agent with a very large conversation a new one by itself. The rule is the
+cold-answer rule (docs/MCP.md "Questions for the human"; one function, `relay::rule_verdict`) with
+one more line: resting (idle with an empty input queue and no sub-agent, background task or
+just-typed turn under way, or asleep), nothing else on its way to it, nobody typing into it, no
+reset, account move or self handoff already due, no prompt of the human's own taken in by it in
+the last 24 hours, its size known from its status line, and either cold (past `cache_ttl`) and at
+least 100,000 tokens, or warm, resting at least 15 minutes since its last turn (a follow-up
+within minutes belongs in the conversation that knows the work) and at least 200,000 tokens.
+Answers to questions keep warm conversations. Codex agents, agents of unknown size and plain
+sessions: never. Each agent is decided under the same per-agent lock as an answer and the start lock.
 
-- A running agent is restarted the way `agent.start {fresh}` restarts it. An asleep one stays
-  asleep: its conversation is forgotten (`resume_id` null), so whatever wakes it starts a new one.
+- A running agent is put to sleep first, as `agent.sleep` does ("Sleep and wake"): the last
+  check and the stop are one step against keys typed, messages and prompts on their way, and keys
+  typed in the last two minutes keep it. After a backend restart, text in its input box that the
+  backend didn't see typed (a draft can't be told from Claude's suggestion) keeps it.
+- Asleep (just put to sleep, or asleep already), it is checked again, and while `auto_reset` is
+  still on (checked under the lock `prefs.set` takes) its conversation is forgotten: `resume_id`
+  null, the stopped run's hooks no longer change it, and its session's `last_turn_at` and
+  `cache_cold_at` null (nothing to re-read). Whatever wakes it next starts a new conversation; no
+  start is spent now. A backend restart between the sleep and this step leaves it asleep in its
+  old conversation, for the next sweep.
 - It leaves one quiet message from `muster` (origin `human`, hop 0; docs/MCP.md "Quiet messages"):
   `Muster started you in a new conversation while you were idle, because <why>. Read your memory/
-  notes first, before anything else.` It never wakes the agent and arrives as context when its next
-  turn starts. The agent's accepted origins and daily message cap are checked before anything
-  restarts: an agent that couldn't take it keeps its conversation, and nothing is recorded.
+  notes first, before anything else.` It never wakes the agent, arrives as context when its next
+  turn starts, and expires unshown after 7 days like any quiet message. The agent's accepted
+  origins, daily message cap and waiting quiet messages (fewer than 20) are checked before
+  anything stops: an agent that couldn't take it keeps its conversation, and nothing is recorded.
 - The agent's tab gets a `system` event `{text, level: "info", auto_reset: {agent, agent_id, why,
-  size_k, asleep, replaces, note_msg}}`, text `Idle agent reset: Muster started <name> in a new
-  conversation, because <why>. Its memory/ notes are kept.` (asleep: `<name>'s next start is a new
-  conversation, because <why>. It stays asleep until something wakes it; its memory/ notes are kept.`).
-- A reset under way is saved first (`runtime_state` `auto-reset-pending`). A backend restart that
-  cut it off between forgetting the conversation and the new run is settled at the next start:
-  a new run that took over is recorded as the reset; otherwise the agent gets its conversation back.
+  size_k, stopped, note_msg}}` and the window a notice, text `Idle agent reset: <name> is asleep,
+  and its next start is a new conversation, because <why>. Whatever wakes it starts the new one;
+  its memory/ notes are kept.`
 
 ## Groups layout (v2)
 

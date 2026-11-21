@@ -174,12 +174,12 @@ async fn a_reset_leaves_a_note_and_a_log_line_once() {
     let now = now_ms();
     let hub = fixture();
     turn_on(&hub, true);
-    let a = claude(&hub, Some(182_400), 10 * HOUR, now);
+    claude(&hub, Some(182_400), 10 * HOUR, now);
     let mut rx = hub.subscribe();
     let done = sweep(&hub, now).await;
     let why = "the old one was cold and large, about 182k tokens and idle 10 h";
     assert_eq!(done.len(), 1, "{done:?}");
-    assert_eq!((done[0].why.as_str(), done[0].asleep), (why, true));
+    assert_eq!((done[0].why.as_str(), done[0].stopped), (why, false));
     // The note: a quiet message from Muster, the first thing the new conversation reads.
     let m = hub.store().agent_message(done[0].note.expect("a note")).unwrap().unwrap();
     assert!(m.quiet && m.from == FROM && m.origin == Origin::Human && m.hop == 0, "{m:?}");
@@ -194,26 +194,41 @@ async fn a_reset_leaves_a_note_and_a_log_line_once() {
         }
     };
     assert_eq!(ev.session_id, Some(1));
-    assert_eq!(ev.data["text"], format!("Idle agent reset: alpha's next start is a new conversation, because {why}. \
-        It stays asleep until something wakes it; its memory/ notes are kept."));
+    assert_eq!(ev.data["text"], format!("Idle agent reset: alpha is asleep, and its next start is a new conversation, \
+        because {why}. Whatever wakes it starts the new one; its memory/ notes are kept."));
     assert_eq!(ev.data["auto_reset"]["size_k"], 182);
-    assert_eq!(ev.data["auto_reset"]["replaces"], "conv-old");
+    // The stopped run's clock is gone with its conversation: a wake isn't announced as costly.
+    let info = hub.session(1).unwrap();
+    assert_eq!((info.last_turn_at, info.cache_cold_at), (None, None));
     // Its next sweep finds nothing to do: the new conversation's size is unknown until reported.
     assert!(sweep(&hub, now + HOUR).await.is_empty());
 }
 
 #[tokio::test]
-async fn a_reset_a_restart_cut_off_gives_the_conversation_back() {
+async fn a_full_quiet_inbox_keeps_it() {
     let now = now_ms();
     let hub = fixture();
+    turn_on(&hub, true);
     let a = claude(&hub, Some(216_003), 3 * HOUR, now);
-    // Saved, then the start forgot the conversation, then the backend stopped: no new run.
-    let fresh = Fresh { why: "the old one was cold and large".into(), replaces: Some("conv-old".into()), run: Some(7) };
-    set_pending(&hub, a.id, Some(Pending { created_at: a.created_at, size_k: Some(216), fresh })).unwrap();
-    hub.agents().update(hub.store(), a.id, |b| b.resume_id = None).unwrap();
-    settle(&hub).await;
-    assert_eq!(resume_of(&hub, &a).as_deref(), Some("conv-old"));
-    assert!(pending(&hub).is_empty());
+    let route = Route { origin: Origin::Human, hop: 0, reply_to: None };
+    for _ in 0..crate::quiet::WAITING_MAX {
+        let mut m = agents::message_record(&a, "lead", None, route, "x");
+        m.quiet = true;
+        hub.store().insert_agent_message(&m).unwrap();
+    }
+    assert!(!reset(&hub, &a, now).await);
+}
+
+#[tokio::test]
+async fn a_running_agent_is_kept_in_a_turn_and_when_not_asleep() {
+    let now = now_ms();
+    let hub = fixture();
+    turn_on(&hub, true);
+    let a = claude(&hub, Some(216_003), 3 * HOUR, now);
+    // Awake, in a turn (this fixture has no live run): never touched.
+    hub.agents().set_asleep(hub.store(), a.id, None, None).unwrap();
+    hub.edit_session_for_test(1, |i| i.state = AgentState::Working);
+    assert!(!reset(&hub, &a, now).await);
 }
 
 #[test]

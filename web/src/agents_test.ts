@@ -153,6 +153,11 @@ Deno.test("sleep: the idle time field and the asleep bar's words", () => {
     asleepText("ada", 0, false, 90 * MIN),
     "ada has been asleep for 1 h 30 m. The next message sent with wake on, or typing here, wakes it into the same conversation.",
   );
+  // An idle agent reset forgot its conversation: a wake starts a new one, whatever its old cache.
+  assertEquals(
+    asleepText("ada", null, true, 0, true),
+    "ada is asleep. The next message sent with wake on, or typing here, wakes it into a new conversation, which reads its memory/ notes first.",
+  );
   const cold = asleepText("ada", null, true, 0);
   check(cold.startsWith("ada is asleep. The next message") && cold.includes("full cost"), cold);
   // A wake that failed: still asleep, says why and how to try again.

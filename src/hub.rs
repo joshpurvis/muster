@@ -660,6 +660,28 @@ impl Hub {
         Ok(p)
     }
 
+    /// Run `f` only while idle agent resets are on (src/auto_reset.rs), holding the lock
+    /// `set_ui_prefs` holds from read to broadcast: a window's Off saved first stops it, and once
+    /// Off is saved no reset is under way.
+    pub(crate) fn while_auto_reset_on<T>(&self, f: impl FnOnce() -> T) -> Option<T> {
+        let _one_at_a_time = self.prefs_lock.lock();
+        self.ui_prefs().auto_reset.then(f)
+    }
+
+    /// Session `id`'s stopped run held a conversation its agent has forgotten (an idle agent
+    /// reset, src/auto_reset.rs): that run's late hooks no longer change the agent's conversation,
+    /// and the next run has nothing cached to lose, so no wake is announced as costly.
+    pub(crate) fn forget_run_conversation(&self, id: SessionId) -> anyhow::Result<()> {
+        let mut g = self.inner.lock();
+        let Some(e) = g.sessions.get_mut(&id) else { return Ok(()) };
+        e.fenced_generation = Some(e.generation);
+        e.info.last_turn_at = None;
+        self.cache_rules.lock().refresh(&mut e.info);
+        self.store.update_session(&e.info)?;
+        self.publish_session(&e.info);
+        Ok(())
+    }
+
     /// New cold-cache rules: every session's `cache_cold_at` follows (derived, not stored).
     fn set_cache_rules(&self, rules: crate::cache::CacheRules) {
         let mut g = self.inner.lock();

@@ -1231,8 +1231,7 @@ before it is typed in is refused (as every agent message now is).
 **A cold, large conversation starts fresh.** When the answer goes to a named Claude agent whose
 conversation is cold (its prompt cache has likely expired by its lifetime in `prefs.cache_ttl`,
 whether or not the cold warnings are shown: docs/PROTOCOL.md "Cold prompt cache") and at least
-100,000 tokens, or warm, resting at least 15 minutes since its last turn and at least 200,000
-tokens (its last request's input, as its status line reported it for that conversation;
+100,000 tokens (its last request's input, as its status line reported it for that conversation;
 a report that arrives after a newer one, or without the run's API time to order it by, is
 dropped), Muster starts the agent in a new
 conversation first, the way Start fresh does (persona, memory and the start lock as usual), and
@@ -1246,14 +1245,12 @@ chose already due at its next start, no fresh start the agent asked for itself w
 handoff), and no prompt of the human's own
 taken in by that agent in the last 24 hours, in whichever tab (typed at its input box, or sent as
 the human's from a terminal or the window; messages and answers don't count). Whatever Muster can't tell (no size reported yet for that conversation, a
-Codex agent, a status line Muster doesn't run) keeps the current conversation, as do smaller ones,
-and warm ones under 200,000 tokens or that ended a turn in the last 15 minutes (a lead's follow-up
-often comes within minutes and belongs in the conversation that knows the work). The same rule,
-from the same function, starts idle agents fresh on their own when the owner turns that on
-(docs/PROTOCOL.md "Idle agent resets"). The message then starts with one line: `Muster started you in a new conversation
+Codex agent, a status line Muster doesn't run) keeps the current conversation, as do warm or
+smaller ones. The same function, with one more line for warm conversations of 200,000 tokens and
+over, decides idle agent resets when the owner turns them on (docs/PROTOCOL.md "Idle agent
+resets"). The message then starts with one line: `Muster started you in a new conversation
 for this message, because the old one was cold and large, about 216k tokens and idle 3 h. Read
-your memory/ notes first; the message below has everything it is about.` (warm: `because the old
-one was very large, about 205k tokens, and idle 20 m`), and the answer's
+your memory/ notes first; the message below has everything it is about.`, and the answer's
 delivery says so (`delivery.fresh: {why, replaces, run}`; its note starts `started <agent> in a new
 conversation, because ...`). The decision is saved with the delivery, with the run it replaces, before the agent is
 restarted, so a backend restart in between neither restarts it twice nor types the answer in

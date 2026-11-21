@@ -1180,7 +1180,7 @@ function AutoResetDialog() {
     } else setBusy(false);
   };
   return (
-    <Modal class="dialog dlg-calm auto-reset-dlg" label="Idle agent resets">
+    <Modal class="dialog dialog-scroll dlg-calm auto-reset-dlg" label="Idle agent resets">
       <form
         onSubmit={(e) => {
           e.preventDefault();
@@ -1189,9 +1189,9 @@ function AutoResetDialog() {
       >
         <div class="dlg-head">
           <h2>Idle agent resets</h2>
-          <span class="muted">
-            A resting agent with a very large conversation pays for all of it on its next message. Muster can start it
-            in a new conversation instead; it keeps its memory/ notes and reads them first.
+          <span class="muted" id="auto-reset-why">
+            An agent with a very long conversation re-reads all of it with its next message, which uses a lot of your
+            plan. Muster can give it a new conversation while it rests; it keeps its memory/ notes and reads them first.
           </span>
         </div>
         <div class="dlg-body">
@@ -1202,18 +1202,19 @@ function AutoResetDialog() {
               class="auto-reset-on"
               checked={on}
               disabled={busy}
-              aria-describedby="auto-reset-when"
+              aria-describedby="auto-reset-why auto-reset-when"
               onChange={(e) => setOn((e.target as HTMLInputElement).checked)}
             />
             <span class="toggle-track">
               <span class="toggle-thumb" />
             </span>
-            <span>Start large idle agents in a new conversation</span>
+            <span>Start idle agents with long conversations in a new one</span>
           </label>
           <ul id="auto-reset-when" class="auto-reset-when muted">
             <li>Named Claude agents at rest: 100k tokens once their cache has expired, or 200k after 15 minutes idle.</li>
             <li>Left alone while they work, have messages waiting, or you are typing, and for a day after you prompt them.</li>
-            <li>Each reset shows in the agent's tab and in the Agents panel's messages.</li>
+            <li>The agent is put to sleep, and its next start is the new conversation. Each reset shows in the Agents
+              panel's messages, with why.</li>
           </ul>
         </div>
         <div class="dlg-foot">

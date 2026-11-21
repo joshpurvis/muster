@@ -1053,16 +1053,18 @@ const announcedAsleep = new Set<string>();
 function AsleepBar({ s }: { s: SessionInfo }) {
   const agent = agentBySession.value.get(s.id);
   const now = cacheNow();
-  const cold = wakeCold(s, now);
+  // No saved conversation (an idle agent reset forgot it): a wake starts a new one.
+  const fresh = agent?.resumable === false;
+  const cold = !fresh && wakeCold(s, now);
   const name = agent?.name ?? s.name;
   const failed = agent?.wake_error;
-  const key = `${agent?.id}:${agent?.asleep_at ?? 0}:${cold ? "cold" : "warm"}:${failed ?? ""}`;
+  const key = `${agent?.id}:${agent?.asleep_at ?? 0}:${fresh ? "fresh" : cold ? "cold" : "warm"}:${failed ?? ""}`;
   const [say, setSay] = useState("");
   useEffect(() => {
     if (announcedAsleep.has(key)) return;
     const t = setTimeout(() => {
       announcedAsleep.add(key);
-      setSay(failed ? wakeFailedText(name, failed, cold) : asleepText(name, null, cold, now));
+      setSay(failed ? wakeFailedText(name, failed, cold) : asleepText(name, null, cold, now, fresh));
     }, 150);
     return () => clearTimeout(t);
   }, [key]);
@@ -1072,13 +1074,17 @@ function AsleepBar({ s }: { s: SessionInfo }) {
       <span class="sr-only" role="status" aria-live="polite">{say}</span>
       <span class="asleep-dot" aria-hidden="true" />
       <span class="asleep-text">
-        {failed ? wakeFailedText(name, failed, cold) : asleepText(name, agent?.asleep_at, cold, now)}
+        {failed ? wakeFailedText(name, failed, cold) : asleepText(name, agent?.asleep_at, cold, now, fresh)}
       </span>
       {agent && (
         <button
           type="button"
           class="link-btn"
-          data-tip={cold ? "Restart it into its conversation now (it re-reads all of it)" : "Restart it into its conversation now"}
+          data-tip={fresh
+            ? "Start it in a new conversation now"
+            : cold
+            ? "Restart it into its conversation now (it re-reads all of it)"
+            : "Restart it into its conversation now"}
           onMouseDown={keepFocus}
           onClick={() => A.wakeAgent(agent)}
         >

@@ -384,16 +384,29 @@ function Pictures({ p, stale, onZoom }: { p: Pr; stale: boolean; onZoom: (index:
   const all = pairs(p);
   if (!all.length) return null;
   const out = leftOut(p);
+  // A left-out picture keeps its place in the pair: its label, then a line saying why, so the
+  // picture on the other side shows alone and the other pairs stay as posted.
   const fig = (i: number | null) => {
-    if (i === null || out(i)) return null;
+    if (i === null) return null;
     const x = list[i];
     const got = prPictures.value.get(pictureKey(p, i));
+    const label = (
+      <div class={cx("pm-side", x.side)}>
+        {x.side === "before" ? "Before" : "After"}
+        {stale && <span class="pm-tag warn pm-old">older version</span>}
+      </div>
+    );
+    if (out(i)) {
+      return (
+        <figure class="pm-fig">
+          {label}
+          <p class="pm-left-out">{leftOutText(x.caption, x.too_tall ?? got?.tooTall, p.poster.label, !!x.too_tall)}</p>
+        </figure>
+      );
+    }
     return (
       <figure class="pm-fig">
-        <div class={cx("pm-side", x.side)}>
-          {x.side === "before" ? "Before" : "After"}
-          {stale && <span class="pm-tag warn pm-old">older version</span>}
-        </div>
+        {label}
         {got?.src
           ? (
             <button type="button" class="pm-shot" aria-label={`Show full size: ${x.side}, ${x.caption}`} onClick={() => onZoom(i)}>
@@ -405,25 +418,13 @@ function Pictures({ p, stale, onZoom }: { p: Pr; stale: boolean; onZoom: (index:
       </figure>
     );
   };
-  // A left-out picture's place is a line under its pair: the picture on the other side shows
-  // alone, and the other pairs stay as posted.
-  const note = (i: number | null) => {
-    if (i === null || !out(i)) return null;
-    const x = list[i];
-    const size = x.too_tall ?? prPictures.value.get(pictureKey(p, i))?.tooTall;
-    return <p class="pm-left-out">{leftOutText(x.side, x.caption, size)}</p>;
-  };
   return (
     <div class="pm-pairs">
-      {all.map((pair, k) => {
-        const shown = [pair.before, pair.after].filter((i) => i !== null && !out(i)).length;
-        return (
-          <div key={k} class="pm-pair-group">
-            {shown > 0 && <div class={cx("pm-pair", shown === 1 && "solo")}>{fig(pair.before)}{fig(pair.after)}</div>}
-            {note(pair.before)}{note(pair.after)}
-          </div>
-        );
-      })}
+      {all.map((pair, k) => (
+        <div key={k} class={cx("pm-pair", (pair.before === null || pair.after === null) && "solo")}>
+          {fig(pair.before)}{fig(pair.after)}
+        </div>
+      ))}
     </div>
   );
 }
@@ -782,7 +783,9 @@ function Lightbox({ p, index, onStep, onClose }: { p: Pr; index: number; onStep:
           ? <img src={got.src} alt={x.caption} onClick={stop} />
           : (
             <div class="qv-shot-missing" onClick={stop}>
-              {got?.tooTall || x.too_tall ? leftOutText(x.side, x.caption, got?.tooTall ?? x.too_tall) : got?.error ?? "Loading the picture…"}
+              {got?.tooTall || x.too_tall
+                ? leftOutText(x.caption, x.too_tall ?? got?.tooTall, p.poster.label, !!x.too_tall)
+                : got?.error ?? "Loading the picture…"}
             </div>
           )}
       </div>

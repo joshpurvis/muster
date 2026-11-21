@@ -1044,6 +1044,14 @@ fn a_full_page_phone_picture_is_left_out_and_its_poster_told() {
     std::fs::write(hub.store().pr_dir(1).join("1/0.png"), png_of(390, 8000)).unwrap();
     let old = picture(&hub, 1, 1, 0).unwrap();
     assert!(old.get("src").is_none() && old["too_tall"] == json!({"width": 390, "height": 8000}), "{old}");
+    // A full-page screenshot over 8 MiB is refused, and the problem says what to post instead.
+    let mut big = png_of(1170, 24000);
+    big.resize(9 << 20, 0);
+    let huge = dir.join("huge.png");
+    std::fs::write(&huge, big).unwrap();
+    let e = checked(with(|v| v["pictures"] = json!([{"path": huge.to_str().unwrap(), "caption": "Whole page", "side": "after"}])))
+        .unwrap_err();
+    assert!(e.iter().any(|x| x.contains("larger than 8 MiB") && x.contains("crop of one screen")), "{e:?}");
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(hub.store().prs_root());
 }

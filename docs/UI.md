@@ -473,9 +473,10 @@ merges, never a model.
 - **Too tall to read**: a picture more than 3 times as tall as it is wide (a full-page phone
   screenshot) is never shown, since fitted to the window it is an unreadable sliver. `post_pr` leaves
   it out and tells the poster; a card stored before that rule gets only its size from Muster. Its
-  place shows one line instead ("After picture left out: “<caption>” is 390 × 8000 px, too tall to
-  read here. A crop of one screen would show."), the picture on the other side of its pair shows
-  alone, the other pairs stay as posted, and the large view skips it.
+  place in the pair keeps its Before or After label and shows a line instead ("Left out: “<caption>”
+  is 390 × 8000 px, too tall to read here. <poster> was told to post a crop of one screen
+  instead."; on an older card "Not shown: … Ask <poster> for a crop of one screen."), the picture on
+  the other side shows as it is, the other pairs stay as posted, and the large view skips it.
 - **Narrow** (under 760px): the pictures stay side by side, smaller; the dock stacks, Merge full
   width.
 

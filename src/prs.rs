@@ -648,7 +648,11 @@ pub fn check(c: NewPr) -> Result<Checked, Vec<String>> {
                     }
                 }
             }
-            Err(e) => p.push(format!("picture {}: {e:#}", i + 1)),
+            Err(e) => {
+                // A full-page screenshot is often also over the size limit: say what to post instead.
+                let hint = if format!("{e:#}").contains("larger than") { "; a full-page screenshot? post a crop of one screen" } else { "" };
+                p.push(format!("picture {}: {e:#}{hint}", i + 1))
+            }
         }
     }
     if bytes > MAX_CARD_BYTES {

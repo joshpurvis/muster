@@ -250,11 +250,13 @@ export function pillMark(p: Pr): { glyph: string; cls: "" | "none" | "run" | "wa
 export type LeftOut = (i: number) => boolean;
 export const leftOutOf = (p: Pr, loaded?: LeftOut): LeftOut => (i) => !!p.pictures?.[i]?.too_tall || !!loaded?.(i);
 
-/** The line shown in a left-out picture's place. */
-export function leftOutText(side: "before" | "after", caption: string, size: PrSize | undefined): string {
+/** The words in a left-out picture's place, under its Before or After label. `told`: post_pr left
+ * it out and told the poster; otherwise the card was stored before that rule and nobody was told. */
+export function leftOutText(caption: string, size: PrSize | undefined, poster: string, told: boolean): string {
   const px = size ? `${size.width} × ${size.height} px, ` : "";
-  return `${side === "before" ? "Before" : "After"} picture left out: “${caption}” is ${px}too tall to read here. ` +
-    "A crop of one screen would show.";
+  return told
+    ? `Left out: “${caption}” is ${px}too tall to read here. ${poster} was told to post a crop of one screen instead.`
+    : `Not shown: “${caption}” is ${px}too tall to read here. Ask ${poster} for a crop of one screen.`;
 }
 
 /** Before and after pictures in pairs, in posting order: the nth before beside the nth after (an

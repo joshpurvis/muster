@@ -146,8 +146,10 @@ Deno.test("a picture left out for being too tall keeps its place: its pair's oth
   equal(stepPicture(old, 1, 1, both), 0);
   equal(stepPicture(old, 0, -1, both), 1);
   equal(stepPicture(old, 0, 1, () => true), 0);
-  equal(leftOutText("after", "The whole page", { width: 390, height: 8000 }),
-    "After picture left out: “The whole page” is 390 × 8000 px, too tall to read here. A crop of one screen would show.");
+  equal(leftOutText("The whole page", { width: 390, height: 8000 }, "builder-2", true),
+    "Left out: “The whole page” is 390 × 8000 px, too tall to read here. builder-2 was told to post a crop of one screen instead.");
+  equal(leftOutText("The whole page", { width: 390, height: 8000 }, "builder-2", false),
+    "Not shown: “The whole page” is 390 × 8000 px, too tall to read here. Ask builder-2 for a crop of one screen.");
 });
 
 Deno.test("an unknown result, a restart and GitHub's words are told as they are", () => {

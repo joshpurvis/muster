@@ -1489,6 +1489,19 @@ export async function setCachePrefs(change: { cache_warn?: boolean; cache_ttl?: 
   }
 }
 
+/** Idle agent resets on or off (`prefs.set {auto_reset}`, a click in this window). False if refused. */
+export async function setAutoReset(on: boolean): Promise<boolean> {
+  try {
+    const p = await rpc.call<WindowPrefs>("prefs.set", { auto_reset: on });
+    if (newerPrefs(windowPrefs.value, p)) windowPrefs.value = p;
+    toast("success", on ? "Idle agent resets are on." : "Idle agent resets are off.", 2500);
+    return true;
+  } catch (e) {
+    toast("error", `Couldn't change idle agent resets: ${errText(e)}`);
+    return false;
+  }
+}
+
 /** A backend restart is under way (from the update banner), until the new backend answers. */
 export const restartingBackend = signal(false);
 let restartTimer = 0;

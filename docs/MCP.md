@@ -1241,11 +1241,14 @@ limit, daily and spend caps) runs first, so a refused answer leaves the conversa
 Only while the agent rests (idle with an empty input queue and no sub-agent, background task or
 just-typed turn under way, or asleep), with nothing else on its way to it, nobody typing into it
 (a draft in its input box, or keys in the last two minutes), no reset or account move the owner
-chose already due at its next start, and no prompt of the human's own
+chose already due at its next start, no fresh start the agent asked for itself waiting (Self
+handoff), and no prompt of the human's own
 taken in by that agent in the last 24 hours, in whichever tab (typed at its input box, or sent as
 the human's from a terminal or the window; messages and answers don't count). Whatever Muster can't tell (no size reported yet for that conversation, a
 Codex agent, a status line Muster doesn't run) keeps the current conversation, as do warm or
-smaller ones. The message then starts with one line: `Muster started you in a new conversation
+smaller ones. The same function, with one more line for warm conversations of 200,000 tokens and
+over, decides idle agent resets when the owner turns them on (docs/PROTOCOL.md "Idle agent
+resets"). The message then starts with one line: `Muster started you in a new conversation
 for this message, because the old one was cold and large, about 216k tokens and idle 3 h. Read
 your memory/ notes first; the message below has everything it is about.`, and the answer's
 delivery says so (`delivery.fresh: {why, replaces, run}`; its note starts `started <agent> in a new

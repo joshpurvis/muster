@@ -55,6 +55,14 @@ function moreMenu(): MenuItem[] {
         run: () => (overlay.value = { kind: "cache_settings" }),
       }]
       : []),
+    // Backends with idle agent resets (src/auto_reset.rs).
+    ...(shared?.auto_reset !== undefined
+      ? [{
+        label: "Idle agent resets…",
+        hint: shared.auto_reset ? "on" : "off",
+        run: () => (overlay.value = { kind: "auto_reset" }),
+      }]
+      : []),
     {
       label: "Terminal gets Alt keys",
       checked: p.altToTerminal,

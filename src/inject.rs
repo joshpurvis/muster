@@ -567,6 +567,13 @@ pub(crate) fn has_draft(hub: &Hub, id: SessionId) -> bool {
     hub.session(id).is_some_and(|s| composer(hub, id, adapter_for(s.kind)).is_some_and(|c| !c.trim().is_empty()))
 }
 
+/// Any text in session `id`'s input box, Claude's dim suggestion too: what `has_draft` reads as
+/// empty only by the keys this backend saw typed (src/auto_reset.rs, after a backend restart).
+pub(crate) fn has_any_text(hub: &Hub, id: SessionId) -> bool {
+    hub.session(id).is_some_and(|s| hub.screen(id).and_then(|screen| adapter_for(s.kind).composer_text(&screen))
+        .is_some_and(|c| !c.trim().is_empty()))
+}
+
 pub fn paused(hub: &Hub) -> Vec<SessionId> {
     hub.injection.inner.lock().iter().filter(|(_, queue)| queue.blocked)
         .map(|(id, _)| *id).collect()

@@ -1,0 +1,13 @@
+[
+  {"until": "globalThis.__muster?.windowId?.value != null", "settle": 0.8},
+  {"js": "const M = globalThis.__muster; const w = await M.rpc.call('workspace.add', {path: '/tmp', name: 'demo-app'}); await M.rpc.call('channel.create', {workspace_id: w.id, name: 'demo-app', agent: 'shell', window_id: M.windowId.value}); return 'channel';", "until": "globalThis.__muster.activeChannelId.value != null && document.querySelector('.pane .tab')", "settle": 1.0},
+  {"js": "document.querySelector('[aria-label=\"Settings and more\"]').click();", "until": "[...document.querySelectorAll('[role=menuitem]')].some((b) => b.textContent.includes('Idle agent resets'))", "settle": 0.6, "shot": "menu"},
+  {"js": "[...document.querySelectorAll('[role=menuitem]')].find((b) => b.textContent.includes('Idle agent resets')).click();", "until": "document.querySelector('[role=dialog][aria-label=\"Idle agent resets\"]')", "settle": 0.8},
+  {"shot": "dialog-off", "crop": "[role=dialog][aria-label=\"Idle agent resets\"]", "pad": 24},
+  {"js": "document.querySelector('.auto-reset-on').click();", "until": "document.querySelector('.auto-reset-on').checked", "settle": 0.5, "shot": "dialog-on", "crop": "[role=dialog][aria-label=\"Idle agent resets\"]", "pad": 24},
+  {"js": "document.querySelector('[role=dialog][aria-label=\"Idle agent resets\"] .btn-primary').click();", "until": "globalThis.__muster.prefs && !document.querySelector('[role=dialog][aria-label=\"Idle agent resets\"]')", "settle": 0.6},
+  {"js": "document.querySelectorAll('.toast .toast-x').forEach((b) => b.click()); const M = globalThis.__muster; const v = M.channelLayout.value; M.channelLayout.value = {...v, sidebar: {...v.sidebar, hidden: false, agents: true}};", "until": "[...document.querySelectorAll('.ap-msg')].some((m) => m.textContent.includes('Muster started you'))", "settle": 1.0, "shot": "agents-log"},
+  {"shot": "agents-log-crop", "crop": ".ap-feed-list", "pad": 8},
+  {"js": "[...document.querySelectorAll('.ap-msg')].find((m) => m.textContent.includes('Muster started you')).click();", "until": "[...document.querySelectorAll('[role=dialog]')].some((d) => d.textContent.includes('Read your memory/ notes first'))", "settle": 0.8, "shot": "agents-log-message"},
+  {"js": "return {theme: document.documentElement.dataset.theme, auto_reset: (await globalThis.__muster.rpc.call('prefs.get', {})).auto_reset};"}
+]

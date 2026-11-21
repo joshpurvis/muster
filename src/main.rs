@@ -3,6 +3,7 @@ mod adapters;
 mod agent_reply;
 mod agents;
 mod assets;
+mod auto_reset;
 mod addon;
 mod cache;
 mod cli;
@@ -1977,6 +1978,9 @@ async fn daemon_main(openrouter_key: Option<openrouter::ApiKey>, launch: Option<
     hub.reconcile_failed_resumes();
     // Agents that sleep when idle (src/sleep.rs); asleep ones stay asleep across a restart.
     sleep::spawn(hub.clone());
+    // Resting agents with very large conversations start new ones, when the owner turned it on
+    // (src/auto_reset.rs); first a reset a restart cut off is settled.
+    auto_reset::spawn(hub.clone());
     // Agents with autostart on (their homes were moved above, before anything could start).
     {
         let hub = hub.clone();

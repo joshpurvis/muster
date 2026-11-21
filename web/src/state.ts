@@ -481,6 +481,8 @@ export type Overlay =
   | { kind: "shell" }
   /** "Cache warning…": the cold prompt cache bar and each provider's cache lifetime. */
   | { kind: "cache_settings" }
+  /** "Idle agent resets…": Muster starting large idle agents in a new conversation. */
+  | { kind: "auto_reset" }
   | { kind: "addons" }
   /** "Shut down Muster…": stop the backend and terminal host, ending every session. */
   | { kind: "shutdown" }

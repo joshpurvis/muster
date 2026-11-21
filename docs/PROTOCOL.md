@@ -1096,6 +1096,46 @@ the `agent_message` event and in a schedule run's `message`), and the channel's 
 of the same delivery (its message, else its panel batch, else its text) is recorded once
 (`runtime_state` `cold-send:<session>`).
 
+### Idle agent resets
+
+With `prefs.auto_reset` on (off by default; changed only by a click in Muster's window, see
+`prefs.set`), the backend looks at the named agents every 5 minutes (`src/auto_reset.rs`) and
+gives a resting Claude agent with a very large conversation a new one by itself. The rule is the
+cold-answer rule (docs/MCP.md "Questions for the human"; one function, `relay::rule_verdict`) with
+one more line: resting (idle with an empty input queue and no sub-agent, background task or
+just-typed turn under way, or asleep), nothing else on its way to it, nobody typing into it, no
+reset, account move or self handoff already due, no prompt of the human's own taken in by it in
+the last 24 hours, its size known from its status line, and either cold (past `cache_ttl`) and at
+least 100,000 tokens, or warm, resting at least 15 minutes since its last turn (a follow-up
+within minutes belongs in the conversation that knows the work) and at least 200,000 tokens.
+Answers to questions keep warm conversations. Codex agents, agents of unknown size and plain
+sessions: never. Each agent is decided under the same per-agent lock as an answer and the start lock.
+
+- A running agent is put to sleep first, as `agent.sleep` does ("Sleep and wake"): the last
+  check and the stop are one step against keys typed, messages and prompts on their way, and keys
+  typed in the last two minutes keep it. After a backend restart, text in its input box that the
+  backend didn't see typed (a draft can't be told from Claude's suggestion) keeps it.
+- Asleep (just put to sleep, or asleep already), it is checked again, and while `auto_reset` is
+  still on (checked under the lock `prefs.set` takes, as is the sleep's claim: once Off is saved,
+  no reset claims an agent, and none forgets a conversation; one that claimed it just before keeps
+  it asleep in its conversation) its conversation is forgotten: `resume_id` null, and then its session's
+  `last_turn_at` and `cache_cold_at` null (nothing to re-read). Hooks from the stopped run of an
+  asleep agent with no saved conversation (only a reset leaves one so: a sleep needs one) never
+  change it, also when replayed after a backend restart (and, in memory, the stopped run is fenced
+  before the conversation is forgotten, for a hook handled at that moment or during the wake). Whatever wakes it next starts a new conversation; no
+  start is spent now. A backend restart between the sleep and this step leaves it asleep in its
+  old conversation, for the next sweep.
+- It leaves one quiet message from `muster` (origin `human`, hop 0; docs/MCP.md "Quiet messages"):
+  `Muster started you in a new conversation while you were idle, because <why>. Read your memory/
+  notes first, before anything else.` It never wakes the agent, arrives as context when its next
+  turn starts, and expires unshown after 7 days like any quiet message. The agent's accepted
+  origins, daily message cap and waiting quiet messages (fewer than 20) are checked before
+  anything stops: an agent that couldn't take it keeps its conversation, and nothing is recorded.
+- The agent's tab gets a `system` event `{text, level: "info", auto_reset: {agent, agent_id, why,
+  size_k, stopped, note_msg}}` and the window a notice, text `Idle agent reset: <name> is asleep,
+  and its next start is a new conversation, because <why>. Whatever wakes it starts the new one;
+  its memory/ notes are kept.`
+
 ## Groups layout (v2)
 
 The UI's structure is window → channel → split groups → tabs. A session still belongs to a
@@ -1736,8 +1776,8 @@ watcher and no polling by clients.
 | `daemon.reload` | `{expect}` | `{exe}`. `expect`: the `updates.backend` id the human was offered (at least 12 hex digits of its SHA-256). The backend hashes the file at its launch path `exe` again and refuses unless it is that build (refused: still being written, or replaced since) and not the build already running (refused: a second window's late click after the restart). Then it runs `<exe> reload` detached: the CLI's own safety checks, then it stops this backend and starts the build at `exe`. Terminals keep running; clients reconnect as after any backend restart. A reload the CLI refuses leaves this backend running and sends an error `notice`. Clients never queue it for a later connection. |
 | `daemon.shutdown` | `{}` | `{}`. What `muster stop` does: runs this backend's own `muster stop` detached (it stops the backend and then the terminal host, ending every session), and once that has started emits `daemon_stopping` `{reason: "shutdown"}`. If it can't start, the call fails and nothing is emitted. Clients stop reconnecting only on `daemon_stopping` or this call's reply, never on a dropped connection. |
 | `daemon.restart` | `{backend, host}` | `{exe}`. What `muster stop` then `muster` do, in one step: every session ends, then a new backend and terminal host start from the launch path `exe`, picked as a normal start picks them (so a waiting terminal host update is installed, and a waiting backend build too). `backend`, `host`: the `updates.backend` and `updates.host` ids the window was shown (null: none waiting). The backend hashes the launch file and the host beside it again and refuses unless they are still those builds (refused: still being written, or replaced since). It runs `<exe> restart-all --report-fd 3 --launch <exe> --app <sha256> [--host <sha256>]` detached (the full hashes it just read), with its own environment plus its OpenRouter key (if any), as `daemon.reload` runs `reload`. Before anything stops, that command takes the lifecycle lock (`<runtime>/lifecycle.lock`, which `muster stop` and `muster reload` also take, so one from a shell meanwhile is refused), checks that it can signal the backend and stop the terminal host (one of another protocol version too: identified by its `terminal.json` and the peer credentials of its socket, then sent SIGTERM), and prepares the release the new daemon will run (the snapshot a daemon start makes, under `<data>/application-releases/`), refusing unless its files have exactly those hashes and are executable. It reports on a socket pair (descriptor 3): `refused: <why>` (the call fails with that reason), or `ready`; then this backend emits `daemon_stopping` `{reason: "restart"}` and answers `go`, and only then does the command stop anything: this backend (waiting up to 120 s until it has really exited), then the host (30 s), then it starts the daemon from the release snapshot (`daemon --foreground --launch <exe>`: it runs that release and looks for updates at `exe`), without opening a window, and checks that the backend answering is the one it started (its `hello.build` that release's), on a new host started from the release's host. Before `ready` it also runs the snapshot once: its backend answers `--version` as this build, and its host starts on scratch directories and answers this build's protocol hello holding the fence it was given; a truncated host or one of another protocol version is refused there. If a step doesn't finish, it stops there and nothing is started over it. A command that exits without a word (an older build without `restart-all`) or says nothing for 20 s is ended and the call fails: nothing was stopped. A failure after `go` comes back as an error `notice` if this backend still runs, and is written to `<runtime>/restart-failed` for the next `muster` to print. Clients keep reconnecting after `{reason: "restart"}` and take only a `hello` from a backend with another `pid`, on a terminal host with another `instance`, as the restarted one; one whose `build` isn't the backend build the window was shown (or, with none shown, its previous build) is taken as restarted by something else, and says so. Never queued for a later connection. |
-| `prefs.get` | `{}` | `{decorations, shell?, cache_warn, cache_ttl, revision}`: preferences every window shares (stored in the database, so a new native window reads them before it is built). `decorations`: native windows show the system title bar (default true). `shell`: absolute path of the shell new shell sessions run; absent means the account's login shell (from the password database), else `$SHELL`, else `/bin/bash` (`hello.login_shell`; `hello.default_shell` is the one in use). `revision` rises with every `prefs.set`. |
-| `prefs.set` | `{decorations?, shell?, cache_warn?, cache_ttl?}` | The new preferences; fields left out stay, unknown fields are refused. `cache_warn`, `cache_ttl`: see "Cold prompt cache". `shell` takes a path or a name on the backend's `PATH` and stores the absolute path of an executable file (else an error); `""` goes back to the login shell. Setting it is local only, like `daemon.shutdown`. Running shells keep theirs; new and restarted ones use it. Writes are serialized from read to broadcast; each emits `prefs_changed` with the result. A client ignores a reply or event with a lower `revision` than one it has already applied (a reply can arrive after a later change's event). |
+| `prefs.get` | `{}` | `{decorations, shell?, cache_warn, cache_ttl, auto_reset, revision}`: preferences every window shares (stored in the database, so a new native window reads them before it is built). `decorations`: native windows show the system title bar (default true). `shell`: absolute path of the shell new shell sessions run; absent means the account's login shell (from the password database), else `$SHELL`, else `/bin/bash` (`hello.login_shell`; `hello.default_shell` is the one in use). `revision` rises with every `prefs.set`. |
+| `prefs.set` | `{decorations?, shell?, cache_warn?, cache_ttl?, auto_reset?}` | The new preferences; fields left out stay, unknown fields are refused. `cache_warn`, `cache_ttl`: see "Cold prompt cache". `auto_reset` (default false): see "Idle agent resets"; only from a click in Muster's window (the check `schedule.approve` makes), on or off: from anywhere else the whole call is refused. `shell` takes a path or a name on the backend's `PATH` and stores the absolute path of an executable file (else an error); `""` goes back to the login shell. Setting it is local only, like `daemon.shutdown`. Running shells keep theirs; new and restarted ones use it. Writes are serialized from read to broadcast; each emits `prefs_changed` with the result. A client ignores a reply or event with a lower `revision` than one it has already applied (a reply can arrive after a later change's event). |
 
 `daemon.reload`, `daemon.reload_handoff`, `daemon.restart` and `daemon.shutdown` run one at a time: while one
 this backend started may still happen (until it fails, or this backend stops), the others are refused with

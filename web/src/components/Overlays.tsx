@@ -169,6 +169,8 @@ export function Overlays() {
       return <AddonSettingsDialog />;
     case "cache_settings":
       return <CacheSettingsDialog />;
+    case "auto_reset":
+      return <AutoResetDialog />;
     case "shutdown":
       return <Lifecycle restart={false} />;
     case "restart":
@@ -1156,6 +1158,68 @@ function CacheSettingsDialog() {
         <div class="dlg-foot">
           <button type="button" class="btn" onClick={close}>Cancel</button>
           <button type="submit" class="btn btn-primary" disabled={!ok}>Save</button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
+/** Idle agent resets (src/auto_reset.rs): one switch, saved by this click in the window. */
+function AutoResetDialog() {
+  const [opened] = useState(() => windowPrefs.value?.auto_reset ?? false);
+  const [on, setOn] = useState(opened);
+  const [busy, setBusy] = useState(false);
+  const first = useRef<HTMLInputElement>(null);
+  useLayoutEffect(() => first.current?.focus(), []);
+  const save = async () => {
+    if (busy) return;
+    if (on === opened) return close();
+    setBusy(true);
+    if (await A.setAutoReset(on)) {
+      if (overlay.value?.kind === "auto_reset") close();
+    } else setBusy(false);
+  };
+  return (
+    <Modal class="dialog dialog-scroll dlg-calm auto-reset-dlg" label="Idle agent resets">
+      <form
+        onSubmit={(e) => {
+          e.preventDefault();
+          save();
+        }}
+      >
+        <div class="dlg-head">
+          <h2>Idle agent resets</h2>
+          <span class="muted" id="auto-reset-why">
+            An agent with a very long conversation re-reads all of it with its next message, which uses a lot of your
+            plan. Muster can give it a new conversation while it rests; it keeps its memory/ notes and reads them first.
+          </span>
+        </div>
+        <div class="dlg-body">
+          <label class="toggle">
+            <input
+              ref={first}
+              type="checkbox"
+              class="auto-reset-on"
+              checked={on}
+              disabled={busy}
+              aria-describedby="auto-reset-why auto-reset-when"
+              onChange={(e) => setOn((e.target as HTMLInputElement).checked)}
+            />
+            <span class="toggle-track">
+              <span class="toggle-thumb" />
+            </span>
+            <span>Start idle agents with long conversations in a new one</span>
+          </label>
+          <ul id="auto-reset-when" class="auto-reset-when muted">
+            <li>Named Claude agents at rest: 100k tokens once their cache has expired, or 200k after 15 minutes idle.</li>
+            <li>Left alone while they work, have messages waiting, or you are typing, and for a day after you prompt them.</li>
+            <li>The agent is put to sleep, and its next start is the new conversation. Each reset shows in the Agents
+              panel's messages, with why.</li>
+          </ul>
+        </div>
+        <div class="dlg-foot">
+          <button type="button" class="btn" onClick={close}>Cancel</button>
+          <button type="submit" class="btn btn-primary" disabled={busy}>Save</button>
         </div>
       </form>
     </Modal>

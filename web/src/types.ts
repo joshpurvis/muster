@@ -897,6 +897,9 @@ export interface WindowPrefs {
   cache_warn?: boolean;
   /** Each CLI/provider pair's prompt-cache lifetime, in minutes. */
   cache_ttl?: CacheTtl;
+  /** Muster starts resting agents with very large conversations in new ones (src/auto_reset.rs).
+   * Changed only from the window. Missing from older backends. */
+  auto_reset?: boolean;
   /** Raised by every `prefs.set` (missing from the first builds that had prefs). */
   revision?: number;
 }

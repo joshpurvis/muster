@@ -635,6 +635,9 @@ pub enum Why {
     Manual,
     /// Its idle time ran out (`sleep_after_min`).
     Idle,
+    /// An idle agent reset (src/auto_reset.rs) stops it before forgetting its conversation; it
+    /// says so in its own words, so this sleep logs nothing of its own.
+    Reset,
 }
 
 /// The agent can't sleep now; the text says why.
@@ -653,7 +656,13 @@ impl std::error::Error for NotNow {}
 /// the start lock, which every wake also takes, then `State::claim`), keeping its record, tab
 /// and conversation. Already asleep: nothing to do.
 pub async fn sleep(hub: &Arc<Hub>, name: &str, why: Why) -> anyhow::Result<Agent> {
-    let _one = hub.agents().start_lock.lock().await;
+    let held = hub.agents().start_lock.lock().await;
+    sleep_held(hub, name, why, &held).await
+}
+
+/// `sleep` for a caller holding the start lock (`_held`).
+pub(crate) async fn sleep_held(hub: &Arc<Hub>, name: &str, why: Why, _held: &crate::agents::StartHeld<'_>)
+    -> anyhow::Result<Agent> {
     let a = hub.agents().get(name).ok_or_else(|| crate::agents::no_agent(hub, name))?;
     if a.asleep_at.is_some() {
         return Ok(a);
@@ -679,12 +688,22 @@ pub async fn sleep(hub: &Arc<Hub>, name: &str, why: Why) -> anyhow::Result<Agent
     if why == Why::Idle && !due(&a, &info, human_at(hub, info.id, now), now) {
         return Err(NotNow(format!("{} was busy again", a.name)).into());
     }
+    if why == Why::Reset && human_at(hub, info.id, now).is_some_and(|t| now - t < HUMAN_QUIET_MS) {
+        return Err(NotNow(format!("{} can't sleep now: you typed into it just now", a.name)).into());
+    }
     // The run that was checked: only it is stopped.
     let Some(generation) = hub.pty_generation(info.id) else {
         return Err(NotNow(format!("{} can't sleep now: it isn't running", a.name)).into());
     };
     let state = &hub.agents().sleep;
-    if let Err(no) = state.claim(hub, a.id, info.id, seen) {
+    // An idle agent reset claims it only while resets are on, under the lock the setting is
+    // saved under: once Off is saved, no reset stops an agent.
+    let claimed = if why == Why::Reset {
+        hub.while_auto_reset_on(|| state.claim(hub, a.id, info.id, seen)).unwrap_or(Err("idle agent resets were turned off"))
+    } else {
+        state.claim(hub, a.id, info.id, seen)
+    };
+    if let Err(no) = claimed {
         return Err(NotNow(format!("{} can't sleep now: {no}", a.name)).into());
     }
     if let Err(e) = hub.agents().set_asleep(hub.store(), a.id, Some(now), Some(generation)) {
@@ -707,9 +726,12 @@ pub async fn sleep(hub: &Arc<Hub>, name: &str, why: Why) -> anyhow::Result<Agent
     }
     let a = hub.agents().by_id(a.id).ok_or_else(|| anyhow::anyhow!("{name} was removed"))?;
     crate::agents::publish(hub, &a);
+    if why == Why::Reset {
+        return Ok(a);
+    }
     let idle = now - idle_since(&info, human_at(hub, info.id, now));
     let text = match why {
-        Why::Manual => format!("{} is asleep. A message sent with wake on wakes it.", a.name),
+        Why::Manual | Why::Reset => format!("{} is asleep. A message sent with wake on wakes it.", a.name),
         Why::Idle => format!(
             "{} fell asleep after {} idle. A message sent with wake on wakes it.",
             a.name,

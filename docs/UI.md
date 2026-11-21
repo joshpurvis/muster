@@ -633,6 +633,28 @@ it opened with, so another window's change to a field left alone stays); every w
 once. Off hides the bar and every marker. Its body scrolls in a short window; Save stays on
 screen.
 
+**Idle agent resets…** (`⋯` "Settings and more", with on or off as the hint; palette "Idle agent
+resets…"; backends with `prefs.auto_reset` only): one switch, "Start idle agents with long
+conversations in a new one", off by default, under a line saying why (an agent with a very long
+conversation re-reads all of it with its next message, which uses a lot of the plan; a new one
+keeps its memory/ notes and reads them first; the switch's description) and three short lines on
+when: named Claude agents at rest, 100k tokens once their cache has expired or 200k after 15
+minutes idle; left alone while they work, have messages waiting or you are typing, and for a day
+after you prompt them; the agent is put to sleep and its next start is the new conversation, each
+reset shown in the Agents panel's messages with why. Save sends it only when it changed; only a
+click in Muster's window changes it (the backend refuses it from the command line, a script or an
+agent, docs/PROTOCOL.md "Idle agent resets"). Its body scrolls in a short window. Each reset
+leaves the agent a quiet message from `muster` in the Agents panel's message log ("Muster started
+you in a new conversation while you were idle, because the old one was cold and large, about 182k
+tokens and idle 10 h. Read your memory/ notes first, before anything else.", with its `waits for
+a turn` chip, then `shown`), and a notice in the window ("Idle agent reset: alpha is asleep, and
+its next start is a new conversation, because …"). Its asleep bar then reads "… wakes it into a
+new conversation, which reads its memory/ notes first." (no cold tint: nothing is re-read), and
+Wake's tooltip "Start it in a new conversation now"; the phone's composer line, which can't tell,
+says only "Sending a message wakes it."
+
+![Idle agent resets](screenshots/auto-reset-dialog.webp)
+
 Muster's own sends are noted too: an agent message, a scheduled run's message or panel events
 typed into a cold agent are still delivered, and recorded as a **cold start**: a `cold start`
 chip on the message in the Agents panel's message log, in its message overlay, and on the

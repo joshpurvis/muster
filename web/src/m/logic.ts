@@ -115,7 +115,13 @@ export function sessionAsleep(s: { state: string; state_detail: string | null } 
 
 /** The composer's line for an asleep agent: sending wakes it, at full cost once its prompt cache
  * has likely expired (`cache_cold_at`). */
-export function asleepNote(s: { name: string; cache_cold_at?: number | null }, now: number): string {
+export function asleepNote(
+  s: { name: string; cache_cold_at?: number | null; last_turn_at?: number | null },
+  now: number,
+): string {
+  // No turn clock (an idle agent reset forgot its conversation, or none was seen): no claim
+  // about which conversation it wakes into.
+  if (s.last_turn_at === null) return `${s.name} is asleep. Sending a message wakes it.`;
   const cold = s.cache_cold_at != null && now >= s.cache_cold_at;
   return `${s.name} is asleep. Sending a message wakes it` +
     (cold ? ": it re-reads the whole conversation at full cost, since its prompt cache has likely expired." : " into the same conversation.");

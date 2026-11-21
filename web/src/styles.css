@@ -5967,6 +5967,21 @@ fieldset.sch-then > legend {
   max-width: 52ch;
 }
 
+/* Idle agent resets (AutoResetDialog). */
+.auto-reset-dlg .dlg-head .muted {
+  max-width: 52ch;
+}
+
+.auto-reset-when {
+  display: grid;
+  gap: 6px;
+  max-width: 56ch;
+  margin: 14px 0 0;
+  padding-left: 18px;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 .cache-ttls {
   display: grid;
   gap: 10px;

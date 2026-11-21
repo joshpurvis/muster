@@ -172,7 +172,14 @@ async fn reset_one(hub: &Arc<Hub>, id: i64, created_at: i64, now: i64) -> Option
             tracing::debug!(agent = b.name, "not reset: it is no longer resting");
             return Ok(None);
         }
-        hub.agents().forget_conversation(hub.store(), id, &replaces)
+        // Fenced first, in memory, so a hook of the stopped run being handled right now, or one
+        // arriving while a wake replaces the run, can't save it back either.
+        let run = hub.fence_stopped_run(sid);
+        let r = hub.agents().forget_conversation(hub.store(), id, &replaces);
+        if !matches!(r, Ok(Some(_))) {
+            hub.unfence_conversation(sid, run);
+        }
+        r
     });
     let c = match forgot {
         Some(Ok(Some(c))) => c,

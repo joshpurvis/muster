@@ -668,6 +668,15 @@ impl Hub {
         self.ui_prefs().auto_reset.then(f)
     }
 
+    /// Fence session `id`'s current (stopped) run, as `fence_conversation` does: its run, to
+    /// take the fence back with `unfence_conversation` (None: no such session).
+    pub(crate) fn fence_stopped_run(&self, id: SessionId) -> Option<u64> {
+        let mut g = self.inner.lock();
+        let e = g.sessions.get_mut(&id)?;
+        e.fenced_generation = Some(e.generation);
+        Some(e.generation)
+    }
+
     /// Session `id`'s stopped run held a conversation its asleep agent has forgotten (an idle
     /// agent reset, src/auto_reset.rs; that run's late hooks no longer change it, see `on_hook`):
     /// the next run has nothing cached to lose, so no wake is announced as costly.

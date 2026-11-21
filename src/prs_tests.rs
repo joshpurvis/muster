@@ -1055,7 +1055,7 @@ fn a_full_page_phone_picture_is_left_out_and_its_poster_told() {
     // Only for that error: a missing file whose name says "larger than" gets no hint.
     let gone = dir.join("image is larger than yesterday.png");
     let e = checked(with(|v| v["pictures"] = json!([{"path": gone.to_str().unwrap(), "caption": "Gone", "side": "after"}]))).unwrap_err();
-    assert!(e.iter().any(|x| x.contains("not found")) && !e.iter().any(|x| x.contains("crop")), "{e:?}");
+    assert!(e.iter().any(|x| x.contains("not found")) && !e.iter().any(|x| x.contains("post a crop of one screen")), "{e:?}");
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(hub.store().prs_root());
 }

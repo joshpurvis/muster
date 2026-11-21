@@ -2,7 +2,7 @@
 // order of the list, the four rules and the words on the page, with no signals, RPC or DOM, so
 // tests import it alone. prs.ts re-exports it.
 
-import type { Pr, PrMark } from "./types.ts";
+import type { Pr, PrMark, PrSize } from "./types.ts";
 
 /** Seconds between the click on Merge and `pr.merge` (Cancel takes Merge's place meanwhile). */
 export const COUNTDOWN_S = 5;
@@ -245,6 +245,20 @@ export function pillMark(p: Pr): { glyph: string; cls: "" | "none" | "run" | "wa
   return { glyph, cls, status: p.later != null && cardState(p) !== "merged" ? `not now, ${tagText(p).text}` : tagText(p).text };
 }
 
+/** Whether picture `i` is left out for being too tall to read: post_pr marked it (`too_tall`), or
+ * `loaded` (what `pr.picture` sent, for a card stored before that rule) says so. */
+export type LeftOut = (i: number) => boolean;
+export const leftOutOf = (p: Pr, loaded?: LeftOut): LeftOut => (i) => !!p.pictures?.[i]?.too_tall || !!loaded?.(i);
+
+/** The words in a left-out picture's place, under its Before or After label. `told`: post_pr left
+ * it out and told the poster; otherwise the card was stored before that rule and nobody was told. */
+export function leftOutText(caption: string, size: PrSize | undefined, poster: string, told: boolean): string {
+  const px = size ? `${size.width} × ${size.height} px, ` : "";
+  return told
+    ? `Left out: “${caption}” is ${px}too tall to read here. ${poster} was told to post a crop of one screen instead.`
+    : `Not shown: “${caption}” is ${px}too tall to read here. Ask ${poster} for a crop of one screen.`;
+}
+
 /** Before and after pictures in pairs, in posting order: the nth before beside the nth after (an
  * index into `p.pictures`, or null where one side has none). */
 export function pairs(p: Pr): { before: number | null; after: number | null }[] {
@@ -255,23 +269,30 @@ export function pairs(p: Pr): { before: number | null; after: number | null }[] 
 }
 
 /** The large view's order: before 1, after 1, before 2, after 2… */
-export function viewOrder(p: Pr): number[] {
-  return pairs(p).flatMap((x) => [x.before, x.after].filter((i): i is number => i !== null));
+export function viewOrder(p: Pr, out: LeftOut = leftOutOf(p)): number[] {
+  return pairs(p).flatMap((x) => [x.before, x.after].filter((i): i is number => i !== null && !out(i)));
 }
 
-/** The picture the large view steps to from picture `at` (`dir` 1 or -1, wrapping). */
-export function stepPicture(p: Pr, at: number, dir: 1 | -1): number {
-  const order = viewOrder(p);
-  const i = order.indexOf(at);
-  if (i < 0 || !order.length) return at;
-  return order[(i + dir + order.length) % order.length];
+/** The picture the large view steps to from picture `at` (`dir` 1 or -1, wrapping), skipping
+ * left-out ones. `at` may be left out itself: an old card's picture that turned out too tall once
+ * the large view had stepped onto it. */
+export function stepPicture(p: Pr, at: number, dir: 1 | -1, out: LeftOut = leftOutOf(p)): number {
+  const all = pairs(p).flatMap((x) => [x.before, x.after].filter((i): i is number => i !== null));
+  const i = all.indexOf(at);
+  if (i < 0) return at;
+  for (let k = 1; k <= all.length; k++) {
+    const next = all[(i + dir * k + all.length * k) % all.length];
+    if (!out(next)) return next;
+  }
+  return at;
 }
 
-/** The other side of picture `at`'s pair (null: it stands alone). */
-export function otherSide(p: Pr, at: number): number | null {
+/** The other side of picture `at`'s pair (null: it stands alone, or the other side is left out). */
+export function otherSide(p: Pr, at: number, out: LeftOut = leftOutOf(p)): number | null {
   const pair = pairs(p).find((x) => x.before === at || x.after === at);
   if (!pair) return null;
-  return pair.before === at ? pair.after : pair.before;
+  const other = pair.before === at ? pair.after : pair.before;
+  return other === null || out(other) ? null : other;
 }
 
 /** "pair 1 of 2". */

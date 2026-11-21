@@ -1,5 +1,5 @@
 import {
-  banner, canMerge, cardState, dotClass, firstLine, pillMark, toldText, groupOf, nextReady, offReason, otherSide, pairs, pairText, rules, sortMerged,
+  banner, canMerge, leftOutOf, leftOutText, cardState, dotClass, firstLine, pillMark, toldText, groupOf, nextReady, offReason, otherSide, pairs, pairText, rules, sortMerged,
   sortWaiting, stepPicture, tagText, viewOrder, worthShowing,
 } from "./prs_model.ts";
 import type { Pr, PrRead, PrVerdict } from "./types.ts";
@@ -118,6 +118,38 @@ Deno.test("pictures pair in posting order; the large view steps before 1, after 
   equal(otherSide(p, 4), null);
   equal(pairText(p, 3), "pair 2 of 3");
   equal(pairs(pr(1)), []);
+});
+
+Deno.test("a picture left out for being too tall keeps its place: its pair's other side shows alone, the large view skips it", () => {
+  const pic = (side: "before" | "after", tall = false) =>
+    ({ path: "/x.png", caption: side, side, file: tall ? "" : "1/0.png", ...(tall ? { too_tall: { width: 390, height: 8000 } } : {}) });
+  // Before 1 (one phone screen), after 1 (the whole page: left out), before 2, after 2 (a laptop).
+  const p = pr(1, { pictures: [pic("before"), pic("after", true), pic("before"), pic("after")] });
+  equal(pairs(p), [{ before: 0, after: 1 }, { before: 2, after: 3 }]);
+  equal(viewOrder(p), [0, 2, 3]);
+  equal(stepPicture(p, 0, 1), 2);
+  equal(stepPicture(p, 0, -1), 3);
+  equal(otherSide(p, 0), null);
+  equal(otherSide(p, 2), 3);
+  equal(pairText(p, 2), "pair 2 of 2");
+  // A card stored before the rule: Muster sends only the size of picture 3, so it is left out too.
+  const old = pr(2, { pictures: [pic("before"), pic("after"), pic("before"), pic("after")] });
+  const out = leftOutOf(old, (i) => i === 3);
+  equal(viewOrder(old, out), [0, 1, 2]);
+  equal(otherSide(old, 2, out), null);
+  equal(stepPicture(old, 2, 1, out), 0);
+  // The large view stood on picture 3 before it turned out too tall: it still steps on.
+  equal(stepPicture(old, 3, 1, out), 0);
+  equal(stepPicture(old, 3, -1, out), 2);
+  // Both sides of a pair left out: stepping goes past the pair.
+  const both = leftOutOf(old, (i) => i === 2 || i === 3);
+  equal(stepPicture(old, 1, 1, both), 0);
+  equal(stepPicture(old, 0, -1, both), 1);
+  equal(stepPicture(old, 0, 1, () => true), 0);
+  equal(leftOutText("The whole page", { width: 390, height: 8000 }, "builder-2", true),
+    "Left out: “The whole page” is 390 × 8000 px, too tall to read here. builder-2 was told to post a crop of one screen instead.");
+  equal(leftOutText("The whole page", { width: 390, height: 8000 }, "builder-2", false),
+    "Not shown: “The whole page” is 390 × 8000 px, too tall to read here. Ask builder-2 for a crop of one screen.");
 });
 
 Deno.test("an unknown result, a restart and GitHub's words are told as they are", () => {

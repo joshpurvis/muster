@@ -15,6 +15,7 @@ mod gui;
 mod hookcmd;
 mod hook_inbox;
 mod hub;
+mod image_size;
 mod inject;
 mod links;
 mod mcp;

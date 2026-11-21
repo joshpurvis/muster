@@ -6634,6 +6634,9 @@ fieldset.sch-then > legend {
 .pm-row .qv-top .pm-tag { margin-left: auto; flex: none; align-self: center; }
 
 .pm-pairs { display: grid; gap: 18px; margin: 2px 0 18px; }
+/* In a left-out picture's place (too tall to read): a few words, never the picture. */
+.pm-left-out { margin: 0; padding: 9px 12px; overflow-wrap: anywhere; border: 1px dashed var(--border-strong); border-radius: 8px;
+  font-size: 12.5px; line-height: 1.45; color: var(--text-muted); }
 .pm-pair { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; align-items: start; }
 .pm-pair.solo { grid-template-columns: minmax(0, calc(50% - 8px)); }
 .pm-fig { margin: 0; min-width: 0; }

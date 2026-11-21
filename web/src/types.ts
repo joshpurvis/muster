@@ -702,6 +702,12 @@ export interface PrVerdict {
 }
 
 /** A pull request card as `pr.list`, `pr.get` and `pr_upserted` give it. */
+/** A picture's size in pixels. */
+export interface PrSize {
+  width: number;
+  height: number;
+}
+
 export interface Pr {
   id: number;
   /** "P3". */
@@ -716,7 +722,8 @@ export interface Pr {
   head_sha: string;
   summary: string;
   who_notices: string;
-  pictures?: { path: string; caption: string; side: "before" | "after"; file: string }[];
+  /** `too_tall`: left out by post_pr for being too tall to read (its size); `file` is empty then. */
+  pictures?: { path: string; caption: string; side: "before" | "after"; file: string; too_tall?: PrSize }[];
   tests: string;
   undo: string;
   after_merge: string;

@@ -9,8 +9,8 @@
 
 import { computed, signal } from "@preact/signals";
 import { rpc } from "./rpc.ts";
-import type { Pr } from "./types.ts";
-import { sortMerged, sortWaiting } from "./prs_model.ts";
+import type { Pr, PrSize } from "./types.ts";
+import { type LeftOut, leftOutOf, sortMerged, sortWaiting } from "./prs_model.ts";
 import type { Seen } from "./prs_merge_queue.ts";
 
 export * from "./prs_model.ts";
@@ -108,7 +108,9 @@ export async function setLater(p: Pr, later: boolean): Promise<Pr> {
 /** A card's pictures, read through `pr.picture` when first shown. Key `<id>:<post>:<index>`. At
  * most `PICTURES_KEPT` are kept (the oldest go first), a card's earlier posts go when a newer one
  * is shown, and a picture that failed is asked for again after a few seconds. */
-export const prPictures = signal<Map<string, { src?: string; error?: string; at?: number }>>(new Map());
+export const prPictures = signal<Map<string, Loaded>>(new Map());
+/** `tooTall`: Muster sent no picture, only its size: too tall to read (docs/UI.md "PRs to merge"). */
+type Loaded = { src?: string; tooTall?: PrSize; error?: string; at?: number };
 const PICTURES_KEPT = 24;
 const RETRY_MS = 5000;
 
@@ -118,7 +120,7 @@ export function loadPrPicture(p: Pr, index: number) {
   const key = pictureKey(p, index);
   const have = prPictures.value.get(key);
   if (have && !(have.error && Date.now() - (have.at ?? 0) > RETRY_MS)) return;
-  const set = (v: { src?: string; error?: string; at?: number }) => {
+  const set = (v: Loaded) => {
     const next = new Map(prPictures.value);
     next.delete(key);
     for (const k of next.keys()) {
@@ -130,10 +132,13 @@ export function loadPrPicture(p: Pr, index: number) {
     prPictures.value = next;
   };
   set({});
-  rpc.call<{ src: string }>("pr.picture", { id: p.id, post: p.post, index })
-    .then((r) => set({ src: r.src }))
+  rpc.call<{ src?: string; too_tall?: PrSize }>("pr.picture", { id: p.id, post: p.post, index })
+    .then((r) => set(r.too_tall ? { tooTall: r.too_tall } : r.src ? { src: r.src } : { error: "Muster sent no picture", at: Date.now() }))
     .catch((e) => set({ error: e instanceof Error ? e.message : String(e), at: Date.now() }));
 }
+
+/** The pictures of `p` left out for being too tall: marked on the card, or so sent by `pr.picture`. */
+export const leftOut = (p: Pr): LeftOut => leftOutOf(p, (i) => !!prPictures.value.get(pictureKey(p, i))?.tooTall);
 
 /** A clock for the tab's "shown for a day after a merge" (minutes are enough). */
 export const minuteClock = signal(Date.now());

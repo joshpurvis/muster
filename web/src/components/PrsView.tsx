@@ -17,7 +17,7 @@
 import { signal } from "@preact/signals";
 import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
 import {
-  askChanges, banner, baseName, canMerge, cardState, CLICK_GUARD_MS, COUNTDOWN_S, GROUPS, groupOf, loadPrPicture,
+  askChanges, banner, baseName, canMerge, cardState, CLICK_GUARD_MS, COUNTDOWN_S, GROUPS, groupOf, leftOut, leftOutText, loadPrPicture,
   mergeCommand, mergedPrs, nb, nextReady, offReason, otherSide, pairs, pairText, pictureKey, pillMark, prPictures,
   prs, prsFilter, refreshPrs, REFRESH_EVERY_MS, repoName, type Rule, rules, selectedPr, setLater, shortSha, sizeOf,
   sortWaiting, stepPicture, tagText, target, titleOf, toldText, waitingPrs,
@@ -378,19 +378,36 @@ function MergedBlock({ p, now }: { p: Pr; now: number }) {
 
 function Pictures({ p, stale, onZoom }: { p: Pr; stale: boolean; onZoom: (index: number) => void }) {
   const list = p.pictures ?? [];
-  useEffect(() => list.forEach((_, i) => loadPrPicture(p, i)), [p.id, p.post, list.length]);
+  // A picture left out by post_pr is never asked for; one Muster sends only the size of (a card
+  // stored before that rule) is left out once it arrives.
+  useEffect(() => list.forEach((x, i) => !x.too_tall && loadPrPicture(p, i)), [p.id, p.post, list.length]);
   const all = pairs(p);
   if (!all.length) return null;
+  const out = leftOut(p);
+  // A left-out picture keeps its place in the pair: its label, then a line saying why, so the
+  // picture on the other side shows alone and the other pairs stay as posted.
   const fig = (i: number | null) => {
     if (i === null) return null;
     const x = list[i];
     const got = prPictures.value.get(pictureKey(p, i));
+    // "older version" marks a picture shown; a left-out one has only its line.
+    const label = (
+      <div class={cx("pm-side", x.side)}>
+        {x.side === "before" ? "Before" : "After"}
+        {stale && !out(i) && <span class="pm-tag warn pm-old">older version</span>}
+      </div>
+    );
+    if (out(i)) {
+      return (
+        <figure class="pm-fig">
+          {label}
+          <p class="pm-left-out">{leftOutText(x.caption, x.too_tall ?? got?.tooTall, p.poster.label, !!x.too_tall)}</p>
+        </figure>
+      );
+    }
     return (
       <figure class="pm-fig">
-        <div class={cx("pm-side", x.side)}>
-          {x.side === "before" ? "Before" : "After"}
-          {stale && <span class="pm-tag warn pm-old">older version</span>}
-        </div>
+        {label}
         {got?.src
           ? (
             <button type="button" class="pm-shot" aria-label={`Show full size: ${x.side}, ${x.caption}`} onClick={() => onZoom(i)}>
@@ -729,7 +746,8 @@ function Lightbox({ p, index, onStep, onClose }: { p: Pr; index: number; onStep:
   const x = (p.pictures ?? [])[index];
   if (!x) return null;
   const got = prPictures.value.get(pictureKey(p, index));
-  const other = otherSide(p, index);
+  const out = leftOut(p);
+  const other = otherSide(p, index, out);
   const seg = (side: "before" | "after") => {
     const on = x.side === side;
     return (
@@ -743,7 +761,7 @@ function Lightbox({ p, index, onStep, onClose }: { p: Pr; index: number; onStep:
     if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); onClose(); }
     else if (e.key === "ArrowRight" || e.key === "ArrowLeft") {
       e.preventDefault();
-      onStep(stepPicture(p, index, e.key === "ArrowRight" ? 1 : -1));
+      onStep(stepPicture(p, index, e.key === "ArrowRight" ? 1 : -1, out));
     } else if (e.key === "Tab") {
       // The keyboard stays inside the dialog.
       const all = [...(box.current?.querySelectorAll<HTMLElement>("button:not(:disabled)") ?? [])];
@@ -762,14 +780,22 @@ function Lightbox({ p, index, onStep, onClose }: { p: Pr; index: number; onStep:
         <span class="pm-box-text">{target(p)} · {pairText(p, index)} · ← → switch</span>
       </div>
       <div class="pm-zoomed">
-        {got?.src ? <img src={got.src} alt={x.caption} onClick={stop} /> : <div class="qv-shot-missing">{got?.error ?? "Loading the picture…"}</div>}
+        {got?.src
+          ? <img src={got.src} alt={x.caption} onClick={stop} />
+          : (
+            <div class="qv-shot-missing" onClick={stop}>
+              {got?.tooTall || x.too_tall
+                ? leftOutText(x.caption, x.too_tall ?? got?.tooTall, p.poster.label, !!x.too_tall)
+                : got?.error ?? "Loading the picture…"}
+            </div>
+          )}
       </div>
       <div class="pm-box-bar" onClick={stop}>
         <span class="pm-box-text pm-cap">{x.caption}</span>
       </div>
       <div class="pm-box-bar" onClick={stop}>
-        <button type="button" class="qv-btn" onClick={() => onStep(stepPicture(p, index, -1))}>‹ Previous</button>
-        <button type="button" class="qv-btn" onClick={() => onStep(stepPicture(p, index, 1))}>Next ›</button>
+        <button type="button" class="qv-btn" onClick={() => onStep(stepPicture(p, index, -1, out))}>‹ Previous</button>
+        <button type="button" class="qv-btn" onClick={() => onStep(stepPicture(p, index, 1, out))}>Next ›</button>
         <button type="button" class="qv-btn qv-lightbox-close" onClick={onClose}>Close (Esc)</button>
       </div>
     </div>

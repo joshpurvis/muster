@@ -50,6 +50,10 @@ const PARALLEL_READS: usize = 4;
 /// Reads of a merge's result before Muster takes GitHub's word that it didn't merge.
 const RESULT_READS: u32 = 3;
 const PICTURE_EXT: [&str; 6] = ["png", "jpg", "jpeg", "gif", "webp", "svg"];
+/// A picture more than this many times as tall as it is wide is left out of a card: fitted to the
+/// window it is a sliver too narrow to read (a full-page phone screenshot, 390 x 8000). One phone
+/// screen (390 x 844, about 2.2) and anything wider are shown.
+pub const MAX_TALL: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -99,8 +103,26 @@ pub struct Picture {
     pub path: String,
     pub caption: String,
     pub side: Side,
-    /// Muster's copy, inside the card's directory (`<post>/<index>.<ext>`).
+    /// Muster's copy, inside the card's directory (`<post>/<index>.<ext>`); empty when it was
+    /// left out.
     pub file: String,
+    /// Left out for being too tall to read (`MAX_TALL`): its size. Muster keeps no copy, and the
+    /// window shows a line in its place, so the other pictures keep their pairs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub too_tall: Option<Size>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Size {
+    pub width: u32,
+    pub height: u32,
+}
+
+/// The picture's size when it is too tall to read in the window (`MAX_TALL`); `None` for one that
+/// is shown, or whose header doesn't give a size.
+pub fn too_tall(mime: &str, bytes: &[u8]) -> Option<Size> {
+    let (width, height) = crate::image_size::size(mime, bytes)?;
+    (height as u64 > MAX_TALL as u64 * width as u64).then_some(Size { width, height })
 }
 
 /// One check's verdict.
@@ -494,7 +516,7 @@ pub struct NewPr {
     pub details: Option<String>,
 }
 
-/// A card that passed the check, its pictures read (mime and bytes), not yet stored.
+/// A card that passed the check, its pictures read, not yet stored.
 #[derive(Debug, Clone)]
 pub struct Checked {
     pub repo: String,
@@ -502,11 +524,20 @@ pub struct Checked {
     pub head_sha: String,
     pub summary: String,
     pub who_notices: String,
-    pub pictures: Vec<(PictureIn, &'static str, Vec<u8>)>,
+    pub pictures: Vec<CheckedPicture>,
     pub tests: String,
     pub undo: String,
     pub after_merge: String,
     pub details: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CheckedPicture {
+    pub pic: PictureIn,
+    pub mime: &'static str,
+    /// Empty when it is left out (`too_tall`).
+    pub data: Vec<u8>,
+    pub too_tall: Option<Size>,
 }
 
 /// Plain text from an agent or GitHub: control characters cleaned (`clean_text`), and Unicode's
@@ -607,10 +638,21 @@ pub fn check(c: NewPr) -> Result<Checked, Vec<String>> {
         }
         match crate::panel_apps::read_image(std::path::Path::new("/"), path.trim_start_matches('/')) {
             Ok((mime, data)) => {
-                bytes += data.len();
-                pictures.push((PictureIn { path, caption, side: pic.side }, mime, data));
+                let pic = PictureIn { path, caption, side: pic.side };
+                // Too tall to read: left out, its place kept (the poster is told; `post`).
+                match too_tall(mime, &data) {
+                    Some(size) => pictures.push(CheckedPicture { pic, mime, data: Vec::new(), too_tall: Some(size) }),
+                    None => {
+                        bytes += data.len();
+                        pictures.push(CheckedPicture { pic, mime, data, too_tall: None });
+                    }
+                }
             }
-            Err(e) => p.push(format!("picture {}: {e:#}", i + 1)),
+            Err(e) => {
+                // A full-page screenshot is often also over the size limit: say what to post instead.
+                let hint = if format!("{e:#}").starts_with("image is larger than") { "; a full-page screenshot? post a crop of one screen" } else { "" };
+                p.push(format!("picture {}: {e:#}{hint}", i + 1))
+            }
         }
     }
     if bytes > MAX_CARD_BYTES {
@@ -631,8 +673,9 @@ pub fn post(hub: &Hub, caller: SessionId, args: Value) -> anyhow::Result<Value> 
         "Muster refused the card. Fix all of these and post it again:\n- {}", problems.join("\n- ")))?;
     let route = agents::outgoing(hub.agents().prov(caller));
     let now = now_ms();
-    let pictures_of = |post: u32| c.pictures.iter().enumerate().map(|(i, (pic, mime, _))| Picture {
-        path: pic.path.clone(), caption: pic.caption.clone(), side: pic.side, file: format!("{post}/{i}.{}", ext_of(mime)),
+    let pictures_of = |post: u32| c.pictures.iter().enumerate().map(|(i, x)| Picture {
+        path: x.pic.path.clone(), caption: x.pic.caption.clone(), side: x.pic.side, too_tall: x.too_tall,
+        file: if x.too_tall.is_some() { String::new() } else { format!("{post}/{i}.{}", ext_of(x.mime)) },
     }).collect::<Vec<_>>();
     let card = Pr {
         id: 0, status: Status::Waiting, created_at: now, updated_at: now, poster: poster.clone(), origin: route.origin.clone(),
@@ -687,7 +730,11 @@ pub fn post(hub: &Hub, caller: SessionId, args: Value) -> anyhow::Result<Value> 
             None => format!("this session ({caller})"),
         },
     };
-    Ok(json!({
+    let left_out = c.pictures.iter().enumerate().filter_map(|(i, x)| x.too_tall.map(|s| format!(
+        "picture {} ({}): {} × {} px, too tall to read in the human's window (more than {MAX_TALL} times as tall as wide), \
+        so it is left out of the card. Post again with a crop of one screen (a phone: about 390 × 844) or a few such crops.",
+        i + 1, x.pic.path, s.width, s.height))).collect::<Vec<_>>();
+    let mut out = json!({
         "card": format!("P{}", pr.id),
         "repo": pr.repo,
         "number": pr.number,
@@ -701,7 +748,13 @@ pub fn post(hub: &Hub, caller: SessionId, args: Value) -> anyhow::Result<Value> 
             words. If you push new commits, the card goes stale and Merge is off: post it again with post_pr (new commit, new \
             pictures); withdraw_pr takes it back.",
             if replaced { "Posted again" } else { "Posted" }, pr.id, &pr.head_sha[..7], pr.repo, pr.number),
-    }))
+    });
+    if !left_out.is_empty() {
+        out["note"] = json!(format!("{} {} of your pictures left out (see left_out): the human sees a line saying so in \
+            its place.", out["note"].as_str().unwrap_or_default(), left_out.len()));
+        out["left_out"] = json!(left_out);
+    }
+    Ok(out)
 }
 
 /// Write post `pr.post`'s pictures into its own directory (a later post never overwrites them).
@@ -713,7 +766,8 @@ fn store_pictures(hub: &Hub, pr: &Pr, c: &Checked) -> anyhow::Result<()> {
     let dir = hub.store().pr_dir(pr.id).join(pr.post.to_string());
     let written = (|| {
         crate::paths::ensure_private_dir(&dir).with_context(|| format!("creating {}", dir.display()))?;
-        for (pic, (_, _, data)) in pr.pictures.iter().zip(&c.pictures) {
+        for (pic, x) in pr.pictures.iter().zip(&c.pictures).filter(|(p, _)| p.too_tall.is_none()) {
+            let data = &x.data;
             let file = hub.store().pr_dir(pr.id).join(&pic.file);
             crate::paths::write_private(&file, data).with_context(|| format!("writing {}", file.display()))?;
         }
@@ -841,7 +895,16 @@ pub fn picture(hub: &Hub, id: i64, post: u32, index: usize) -> anyhow::Result<Va
     let pr = hub.store().pr(id)?.with_context(|| format!("no pull request card P{id}"))?;
     anyhow::ensure!(pr.post == post, "card P{id} was posted again since: look at it again");
     let p = pr.pictures.get(index).with_context(|| format!("card P{id} has no picture {}", index + 1))?;
+    // Too tall to read: never sent, whether post_pr left it out or the card was stored before that
+    // rule (its copy is measured here).
+    let tall = |size: Size| json!({"too_tall": size, "caption": p.caption});
+    if let Some(size) = p.too_tall {
+        return Ok(tall(size));
+    }
     let (mime, bytes) = crate::panel_apps::read_image(&hub.store().pr_dir(id), &p.file)?;
+    if let Some(size) = too_tall(mime, &bytes) {
+        return Ok(tall(size));
+    }
     Ok(json!({
         "src": format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(&bytes)),
         "caption": p.caption,

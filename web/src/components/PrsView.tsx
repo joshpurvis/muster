@@ -390,10 +390,11 @@ function Pictures({ p, stale, onZoom }: { p: Pr; stale: boolean; onZoom: (index:
     if (i === null) return null;
     const x = list[i];
     const got = prPictures.value.get(pictureKey(p, i));
+    // "older version" marks a picture shown; a left-out one has only its line.
     const label = (
       <div class={cx("pm-side", x.side)}>
         {x.side === "before" ? "Before" : "After"}
-        {stale && <span class="pm-tag warn pm-old">older version</span>}
+        {stale && !out(i) && <span class="pm-tag warn pm-old">older version</span>}
       </div>
     );
     if (out(i)) {

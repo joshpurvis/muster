@@ -650,7 +650,7 @@ pub fn check(c: NewPr) -> Result<Checked, Vec<String>> {
             }
             Err(e) => {
                 // A full-page screenshot is often also over the size limit: say what to post instead.
-                let hint = if format!("{e:#}").contains("larger than") { "; a full-page screenshot? post a crop of one screen" } else { "" };
+                let hint = if format!("{e:#}").starts_with("image is larger than") { "; a full-page screenshot? post a crop of one screen" } else { "" };
                 p.push(format!("picture {}: {e:#}{hint}", i + 1))
             }
         }

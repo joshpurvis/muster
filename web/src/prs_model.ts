@@ -271,12 +271,18 @@ export function viewOrder(p: Pr, out: LeftOut = leftOutOf(p)): number[] {
   return pairs(p).flatMap((x) => [x.before, x.after].filter((i): i is number => i !== null && !out(i)));
 }
 
-/** The picture the large view steps to from picture `at` (`dir` 1 or -1, wrapping). */
+/** The picture the large view steps to from picture `at` (`dir` 1 or -1, wrapping), skipping
+ * left-out ones. `at` may be left out itself: an old card's picture that turned out too tall once
+ * the large view had stepped onto it. */
 export function stepPicture(p: Pr, at: number, dir: 1 | -1, out: LeftOut = leftOutOf(p)): number {
-  const order = viewOrder(p, out);
-  const i = order.indexOf(at);
-  if (i < 0 || !order.length) return at;
-  return order[(i + dir + order.length) % order.length];
+  const all = pairs(p).flatMap((x) => [x.before, x.after].filter((i): i is number => i !== null));
+  const i = all.indexOf(at);
+  if (i < 0) return at;
+  for (let k = 1; k <= all.length; k++) {
+    const next = all[(i + dir * k + all.length * k) % all.length];
+    if (!out(next)) return next;
+  }
+  return at;
 }
 
 /** The other side of picture `at`'s pair (null: it stands alone, or the other side is left out). */

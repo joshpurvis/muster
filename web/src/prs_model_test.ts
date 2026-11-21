@@ -138,6 +138,14 @@ Deno.test("a picture left out for being too tall keeps its place: its pair's oth
   equal(viewOrder(old, out), [0, 1, 2]);
   equal(otherSide(old, 2, out), null);
   equal(stepPicture(old, 2, 1, out), 0);
+  // The large view stood on picture 3 before it turned out too tall: it still steps on.
+  equal(stepPicture(old, 3, 1, out), 0);
+  equal(stepPicture(old, 3, -1, out), 2);
+  // Both sides of a pair left out: stepping goes past the pair.
+  const both = leftOutOf(old, (i) => i === 2 || i === 3);
+  equal(stepPicture(old, 1, 1, both), 0);
+  equal(stepPicture(old, 0, -1, both), 1);
+  equal(stepPicture(old, 0, 1, () => true), 0);
   equal(leftOutText("after", "The whole page", { width: 390, height: 8000 }),
     "After picture left out: “The whole page” is 390 × 8000 px, too tall to read here. A crop of one screen would show.");
 });

@@ -193,6 +193,7 @@ const windowPrefs = {
   decorations: true,
   cache_warn: true,
   cache_ttl: { claude: 60, claude_openrouter: 5, codex_chatgpt: 0, codex_openrouter: 30 } as Record<string, number>,
+  auto_reset: false,
   revision: 0,
 };
 
@@ -1047,6 +1048,27 @@ const sched = scheduleMock({
       refused:
         "orchestrator accepts only human-started messages, and this one started from a schedule (origin=schedule)",
     },
+    // The note an idle agent reset leaves (src/auto_reset.rs), waiting for its next turn.
+    {
+      id: seq++,
+      from: "muster",
+      from_session: null,
+      to: orch.name,
+      to_agent: orch.id,
+      to_session: null,
+      origin: "human",
+      hop: 0,
+      reply_to: null,
+      created_at: now() - 60_000,
+      text: "Muster started you in a new conversation while you were idle, because the old one was cold and large, " +
+        "about 182k tokens and idle 10 h. Read your memory/ notes first, before anything else.",
+      reply: null,
+      replied_at: null,
+      refused: null,
+      quiet: true,
+      shown_at: null,
+      expired_at: null,
+    },
     // A quiet message shown at the start of the agent's next turn.
     {
       id: seq++,
@@ -1731,6 +1753,7 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
       }
       if (typeof p.decorations === "boolean") windowPrefs.decorations = p.decorations;
       if (typeof p.cache_warn === "boolean") windowPrefs.cache_warn = p.cache_warn;
+      if (typeof p.auto_reset === "boolean") windowPrefs.auto_reset = p.auto_reset;
       Object.assign(windowPrefs.cache_ttl, p.cache_ttl ?? {});
       for (const s of sessions.values()) {
         const ttlBefore = s.cache_ttl_min ?? null;

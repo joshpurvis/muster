@@ -365,8 +365,8 @@ human"); the **Questions** tab is where the human sees and answers them (`web/sr
   the asker's pick is marked "<asker>'s pick" and starts out chosen), a box for the human's own
   words (every question; the only box for an "own words" question), then **If you don't answer**,
   **Holding up** and **After you answer** (where the asker is now: working, idle, cold, asleep or
-  not running, and so how the answer reaches it; when its conversation is cold and large, that the
-  answer starts it in a new conversation: "builder-2 is idle and its conversation has gone cold and
+  not running, and so how the answer reaches it; when its conversation is cold and large (or warm
+  and very large, docs/MCP.md "Questions for the human"), that the answer starts it in a new conversation: "builder-2 is idle and its conversation has gone cold and
   is large (about 216k): your answer starts it in a new conversation, which reads its notes
   first.", read from the backend's `asker_now.new_conversation` again whenever the asker's state
   or cold mark changes, so it matches what the delivery then does), **Send answer**, the question's links and
@@ -632,6 +632,23 @@ the lifetime that applies. Save sends only the fields edited in this dialog (com
 it opened with, so another window's change to a field left alone stays); every window follows at
 once. Off hides the bar and every marker. Its body scrolls in a short window; Save stays on
 screen.
+
+**Idle agent resets…** (`⋯` "Settings and more", with on or off as the hint; palette "Idle agent
+resets…"; backends with `prefs.auto_reset` only): one switch, "Start large idle agents in a new
+conversation", off by default, under a line saying why (a resting agent with a very large
+conversation pays for all of it on its next message; a new one keeps its memory/ notes and reads
+them first) and three short lines on when: named Claude agents at rest, 100k tokens once their
+cache has expired or 200k after 15 minutes idle; left alone while they work, have messages
+waiting or you are typing, and for a day after you prompt them; each reset shows in the agent's
+tab and in the Agents panel's messages. Save sends it only when it changed; only a click in
+Muster's window changes it (the backend refuses it from the command line, a script or an agent,
+docs/PROTOCOL.md "Idle agent resets"). Each reset leaves the agent a quiet message from `muster`
+in the Agents panel's message log ("Muster started you in a new conversation while you were idle,
+because the old one was cold and large, about 182k tokens and idle 10 h. Read your memory/ notes
+first, before anything else.", with its `waits for a turn` chip, then `shown`), and a line in its
+tab's timeline ("Idle agent reset: Muster started alpha in a new conversation, because …").
+
+![Idle agent resets](screenshots/auto-reset-dialog.webp)
 
 Muster's own sends are noted too: an agent message, a scheduled run's message or panel events
 typed into a cold agent are still delivered, and recorded as a **cold start**: a `cold start`

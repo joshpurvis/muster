@@ -523,6 +523,10 @@ async fn dispatch_inner(hub: &Arc<Hub>, who: &Principal, method: &str, params: V
                 human_only(who, "prefs.set shell", &params)?;
             }
             let p: UiPrefsChange = parse(params)?;
+            // Muster restarting agents on its own: the owner's click in the window, either way.
+            if p.auto_reset.is_some() && via != Via::Window {
+                return Err(RpcError(crate::auto_reset::BY_WINDOW.into()));
+            }
             to_value(hub.set_ui_prefs(p)?)
         }
 
@@ -2556,7 +2560,7 @@ async fn handle_request(
         }
         // Making or widening unattended work: as asked only from a click in the owner's
         // window (`from_window`); anywhere else it is held for one, or refused.
-        m if widening(m) => {
+        m if widening(m) || (m == "prefs.set" && req.params.get("auto_reset").is_some()) => {
             let (hub, who, resp, link) = (hub.clone(), who.clone(), resp.clone(), link.clone());
             tokio::spawn(async move {
                 let from = req.params.get("from_session").and_then(|v| v.as_u64()).map(|v| v as SessionId);
@@ -3381,11 +3385,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn idle_agent_resets_change_only_by_a_click_in_the_window() {
+        let (hub, _st) = fixture();
+        assert_eq!(call(&hub, "prefs.get", json!({})).await.unwrap()["auto_reset"], false);
+        // The command line, a script, an agent: refused, either way.
+        for on in [true, false] {
+            let e = call(&hub, "prefs.set", json!({"auto_reset": on})).await.unwrap_err();
+            assert!(e.contains("only a click in Muster's window"), "{e}");
+        }
+        assert!(!hub.ui_prefs().auto_reset);
+        let r = dispatch_via(&hub, &Principal::Local, "prefs.set", json!({"auto_reset": true}), Via::Window).await.map_err(|e| e.0).unwrap();
+        assert_eq!(r["auto_reset"], true);
+        // Other settings still change from anywhere, and leave it as it is.
+        assert_eq!(call(&hub, "prefs.set", json!({"cache_warn": false})).await.unwrap()["auto_reset"], true);
+    }
+
+    #[tokio::test]
     async fn window_prefs_persist_and_broadcast() {
         let (hub, _st) = fixture();
         let mut rx = hub.subscribe();
         let ttl = json!({"claude": 60, "claude_openrouter": 5, "codex_chatgpt": 0, "codex_openrouter": 30});
-        let prefs = |d: bool, r: u64| json!({"decorations": d, "cache_warn": true, "cache_ttl": ttl, "revision": r});
+        let prefs = |d: bool, r: u64| json!({"decorations": d, "cache_warn": true, "cache_ttl": ttl, "auto_reset": false, "revision": r});
         assert_eq!(call(&hub, "prefs.get", json!({})).await.unwrap(), prefs(true, 0));
         let set = prefs(false, 1);
         assert_eq!(call(&hub, "prefs.set", json!({"decorations": false})).await.unwrap(), set);

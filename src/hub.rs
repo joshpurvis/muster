@@ -649,6 +649,9 @@ impl Hub {
         if let Some(ttl) = change.cache_ttl {
             p.cache_ttl.apply(ttl)?;
         }
+        if let Some(on) = change.auto_reset {
+            p.auto_reset = on;
+        }
         p.revision += 1;
         self.store.save_runtime(UI_PREFS_KEY, &p)?;
         crate::adapters::shell::set_configured_shell(p.shell.clone());

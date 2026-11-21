@@ -21,11 +21,19 @@ use crate::openrouter::Provider;
 /// Longest cache lifetime one can set, in minutes (a day). 0 means it never goes cold.
 pub const TTL_MAX_MIN: u32 = 24 * 60;
 
-/// An answer to a named agent's question starts it in a new conversation when its old one is
-/// cold and at least this large (tokens of its last request): resuming would re-read all of it
-/// uncached, to act on one message that repeats the whole question (src/relay.rs
-/// `fresh_verdict`).
+/// An answer to a named agent's question (and an idle agent reset, src/auto_reset.rs) starts it
+/// in a new conversation when its old one is cold and at least this large (tokens of its last
+/// request): resuming would re-read all of it uncached, to act on one message that repeats the
+/// whole question (src/relay.rs `fresh_verdict`).
 pub const FRESH_ANSWER_MIN_TOKENS: u64 = 100_000;
+/// While its cache is still warm, a conversation at least this large is replaced too (by the same
+/// rule, for answers and for idle agent resets, src/auto_reset.rs): every request rereads all of
+/// it, and a new conversation that reads its notes is about 70k.
+pub const FRESH_WARM_MIN_TOKENS: u64 = 200_000;
+/// A warm conversation is replaced only once it has rested this long since its last turn: a lead
+/// often sends a follow-up within minutes of an answer, and that one should land in the
+/// conversation that knows the work.
+pub const FRESH_WARM_AFTER_MS: i64 = 15 * 60_000;
 
 /// How long each CLI/provider pair keeps a conversation cached, in minutes.
 ///

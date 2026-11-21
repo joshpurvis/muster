@@ -1274,6 +1274,21 @@ impl Registry {
         Ok(a.clone())
     }
 
+    /// An idle agent reset of asleep agent `id` (src/auto_reset.rs): it forgets conversation
+    /// `expect`, if that is still the one it would resume, so its next start is a new one. The
+    /// record, when it forgot it.
+    pub(crate) fn forget_conversation(&self, store: &Store, id: i64, expect: &str) -> anyhow::Result<Option<Agent>> {
+        let mut g = self.inner.lock();
+        let a = g.agents.get_mut(&id).ok_or_else(|| anyhow::anyhow!("agent {id} was removed"))?;
+        if a.resume_id.as_deref() != Some(expect) {
+            return Ok(None);
+        }
+        store.reset_agent_conversation(id)?;
+        a.resume_id = None;
+        a.reset_on_next_start = false;
+        Ok(Some(a.clone()))
+    }
+
     /// A fresh start of agent `id` stopped before a new run took over (src/relay.rs): it resumes
     /// `conversation` again, unless something set another conversation meanwhile. The record, when
     /// it is set back.

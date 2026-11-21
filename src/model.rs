@@ -542,13 +542,16 @@ pub struct UiPrefs {
     pub cache_warn: bool,
     /// Each CLI/provider pair's prompt-cache lifetime, in minutes.
     pub cache_ttl: crate::cache::CacheTtl,
+    /// Muster starts a resting named agent with a very large conversation in a new one by itself
+    /// (src/auto_reset.rs). Off by default; changed only by a click in Muster's window.
+    pub auto_reset: bool,
     /// Raised by every `prefs.set`, so a client can tell a stale reply from a newer change.
     pub revision: u64,
 }
 
 impl Default for UiPrefs {
     fn default() -> Self {
-        Self { decorations: true, shell: None, cache_warn: true, cache_ttl: Default::default(), revision: 0 }
+        Self { decorations: true, shell: None, cache_warn: true, cache_ttl: Default::default(), auto_reset: false, revision: 0 }
     }
 }
 
@@ -561,6 +564,8 @@ pub struct UiPrefsChange {
     pub shell: Option<String>,
     pub cache_warn: Option<bool>,
     pub cache_ttl: Option<crate::cache::CacheTtlChange>,
+    /// Only from a click in Muster's window (`rpc::dispatch_via`, `Via::Window`).
+    pub auto_reset: Option<bool>,
 }
 
 pub fn now_ms() -> i64 {

@@ -105,6 +105,12 @@ fn typed(hub: &Hub, id: SessionId) -> Typed {
     hub.agents().self_handoff.typed.lock().get(&id).copied().unwrap_or_default()
 }
 
+/// Has agent `agent` asked to start itself fresh, waiting for it to rest? (Muster leaves its
+/// conversation to that: src/relay.rs `fresh_facts`.)
+pub(crate) fn pending(hub: &Hub, agent: i64) -> bool {
+    hub.agents().self_handoff.pending.lock().contains_key(&agent)
+}
+
 /// Does session `id` still belong to an agent allowed to start itself fresh? The injector asks
 /// right before it types a handoff's `/clear`.
 pub(crate) fn still_allowed(hub: &Hub, id: SessionId) -> bool {

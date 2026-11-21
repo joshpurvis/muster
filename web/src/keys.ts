@@ -416,6 +416,13 @@ export const commands: Command[] = [
     run: () => (overlay.value = { kind: "cache_settings" }),
   },
   {
+    id: "auto_reset",
+    title: "Idle agent resets…",
+    group: "Window",
+    enabled: () => windowPrefs.value?.auto_reset !== undefined,
+    run: () => (overlay.value = { kind: "auto_reset" }),
+  },
+  {
     id: "shell",
     title: "Shell for new terminals…",
     group: "Window",

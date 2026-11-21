@@ -2118,13 +2118,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn warm_small_unknown_or_another_conversations_size_keeps_the_conversation() {
-        // Warm: idle 30 minutes of a 60-minute cache.
+    async fn warm_under_200k_small_unknown_or_another_conversations_size_keeps_the_conversation() {
+        // Warm (idle 30 minutes of a 60-minute cache) and under the warm line.
         let hub = fixture();
-        let a = resting_claude(&hub, "builder-2", 2, Some(216_003), 30 * MIN);
+        let a = resting_claude(&hub, "builder-2", 2, Some(199_999), 30 * MIN);
         let n = ask_n(&hub, 2, 1);
         assert_eq!(answered(&hub, n).await.fresh, None);
         assert_eq!(resume_of(&hub, &a).as_deref(), Some("conv-old"));
+        // Warm and at least the warm line, resting past its grace: the same rule as idle agent
+        // resets (src/auto_reset.rs) starts it fresh.
+        let hub = fixture();
+        let a = resting_claude(&hub, "builder-2", 2, Some(216_003), 30 * MIN);
+        let n = ask_n(&hub, 2, 1);
+        assert_eq!(answered(&hub, n).await.fresh.map(|f| f.why).as_deref(),
+            Some("the old one was very large, about 216k tokens, and idle 30 m"));
+        assert_eq!(resume_of(&hub, &a), None);
         // Small.
         let hub = fixture();
         let a = resting_claude(&hub, "builder-2", 2, Some(40_000), 3 * 60 * MIN);

@@ -163,10 +163,10 @@ fn root_tag(text: &str) -> Option<&str> {
     loop {
         i += text[i..].find('<')?;
         let rest = &text[i..];
-        if rest.starts_with("<!--") {
-            i += 4 + rest[4..].find("-->")? + 3;
-        } else if rest.starts_with("<?") {
-            i += 2 + rest[2..].find("?>")? + 2;
+        if let Some(r) = rest.strip_prefix("<!--") {
+            i += 4 + r.find("-->")? + 3;
+        } else if let Some(r) = rest.strip_prefix("<?") {
+            i += 2 + r.find("?>")? + 2;
         } else if rest.starts_with("<!") {
             i = doctype_end(b, i + 2)?;
         } else {

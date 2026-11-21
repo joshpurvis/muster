@@ -130,12 +130,11 @@ fn exif_orientation(seg: &[u8]) -> Option<u16> {
 /// scaled up before rounding.
 fn svg(b: &[u8]) -> Option<(u32, u32)> {
     let text = std::str::from_utf8(b).ok()?;
-    let attrs = attributes(root_tag(text)?);
-    let get = |name: &str| attrs.iter().find(|(k, _)| *k == name).map(|(_, v)| *v);
-    let (w, h) = match (get("width").and_then(length), get("height").and_then(length)) {
+    let [width, height, view_box] = attributes(root_tag(text)?, ["width", "height", "viewBox"]);
+    let (w, h) = match (width.and_then(length), height.and_then(length)) {
         (Some(w), Some(h)) => (w, h),
         _ => {
-            let mut vb = get("viewBox")?.split(|c: char| c.is_whitespace() || c == ',').filter(|s| !s.is_empty());
+            let mut vb = view_box?.split(|c: char| c.is_whitespace() || c == ',').filter(|s| !s.is_empty());
             let mut next = || vb.next().and_then(|s| s.parse::<f64>().ok());
             let (_, _, w, h) = (next()?, next()?, next()?, next()?);
             if vb.next().is_some() || !(w.is_finite() && h.is_finite() && w > 0.0 && h > 0.0) {
@@ -148,40 +147,28 @@ fn svg(b: &[u8]) -> Option<(u32, u32)> {
     Some(((w * k).round().min(u32::MAX as f64) as u32, (h * k).round().min(u32::MAX as f64) as u32))
 }
 
-/// An absolute length in CSS pixels ("390", "390px", "4in"); `None` for relative ones (%, em).
+/// An absolute length in CSS pixels ("390", "3.9e2px", "4in"); `None` for relative ones (%, em).
 fn length(v: &str) -> Option<f64> {
     let v = v.trim();
-    let split = v.find(|c: char| c.is_ascii_alphabetic() || c == '%').unwrap_or(v.len());
-    let per = match &v[split..] {
-        "" | "px" => 1.0,
-        "in" => 96.0,
-        "cm" => 96.0 / 2.54,
-        "mm" => 96.0 / 25.4,
-        "pt" => 96.0 / 72.0,
-        "pc" => 16.0,
-        _ => return None,
-    };
-    v[..split].trim().parse::<f64>().ok().map(|x| x * per).filter(|x| x.is_finite() && *x > 0.0)
+    let (num, per) = [("px", 1.0), ("in", 96.0), ("cm", 96.0 / 2.54), ("mm", 96.0 / 25.4), ("pt", 96.0 / 72.0), ("pc", 16.0)]
+        .into_iter().find_map(|(unit, per)| v.strip_suffix(unit).map(|n| (n, per))).unwrap_or((v, 1.0));
+    num.trim().parse::<f64>().ok().map(|x| x * per).filter(|x| x.is_finite() && *x > 0.0)
 }
 
-/// The root element's attribute text, after comments, processing instructions and a doctype; `None`
-/// when the root isn't `<svg>`.
+/// The root element's attribute text, after comments, processing instructions and a doctype, in
+/// one pass from the start; `None` when the root isn't `<svg>`.
 fn root_tag(text: &str) -> Option<&str> {
-    let mut rest = text;
+    let b = text.as_bytes();
+    let mut i = 0;
     loop {
-        rest = &rest[rest.find('<')?..];
-        if let Some(r) = rest.strip_prefix("<!--") {
-            rest = &r[r.find("-->")? + 3..];
-        } else if let Some(r) = rest.strip_prefix("<?") {
-            rest = &r[r.find("?>")? + 2..];
-        } else if let Some(r) = rest.strip_prefix("<!") {
-            // A doctype, maybe with an internal subset in [...] that holds '>' of its own.
-            let gt = r.find('>')?;
-            let end = match r.find('[') {
-                Some(open) if open < gt => { let close = open + r[open..].find(']')?; close + r[close..].find('>')? }
-                _ => gt,
-            };
-            rest = &r[end + 1..];
+        i += text[i..].find('<')?;
+        let rest = &text[i..];
+        if rest.starts_with("<!--") {
+            i += 4 + rest[4..].find("-->")? + 3;
+        } else if rest.starts_with("<?") {
+            i += 2 + rest[2..].find("?>")? + 2;
+        } else if rest.starts_with("<!") {
+            i = doctype_end(b, i + 2)?;
         } else {
             let r = &rest[1..];
             let name_end = r.find(|c: char| c.is_whitespace() || c == '>' || c == '/').unwrap_or(r.len());
@@ -191,10 +178,30 @@ fn root_tag(text: &str) -> Option<&str> {
     }
 }
 
-/// The attributes of a tag's text, in order: `name="value"` or `name='value'` (at most 256).
-fn attributes(mut s: &str) -> Vec<(&str, &str)> {
-    let mut out = Vec::new();
-    while out.len() < 256 {
+/// Just past the `>` that closes a doctype whose text starts at `i`: one forward pass that skips
+/// quoted literals, and comments and nested declarations inside an internal subset `[...]`.
+fn doctype_end(b: &[u8], mut i: usize) -> Option<usize> {
+    let mut subset = false;
+    while i < b.len() {
+        match b[i] {
+            q @ (b'"' | b'\'') => i += 1 + b.get(i + 1..)?.iter().position(|&c| c == q)? + 1,
+            b'[' if !subset => { subset = true; i += 1; }
+            b']' if subset => { subset = false; i += 1; }
+            b'<' if subset && b[i..].starts_with(b"<!--") => {
+                i += 4 + b[i + 4..].windows(3).position(|w| w == b"-->")? + 3;
+            }
+            b'>' if !subset => return Some(i + 1),
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// The values of `names` among a tag's attributes (`name="value"` or `name='value'`), the first of
+/// each; the whole tag is read, however many other attributes come first.
+fn attributes<'a, const N: usize>(mut s: &'a str, names: [&str; N]) -> [Option<&'a str>; N] {
+    let mut out = [None; N];
+    loop {
         s = s.trim_start();
         let n = s.find(|c: char| c == '=' || c == '/' || c.is_whitespace()).unwrap_or(s.len());
         if n == 0 {
@@ -206,7 +213,9 @@ fn attributes(mut s: &str) -> Vec<(&str, &str)> {
         let r = r.trim_start();
         let Some(q) = r.chars().next().filter(|c| *c == '"' || *c == '\'') else { break };
         let Some(end) = r[1..].find(q) else { break };
-        out.push((name, &r[1..1 + end]));
+        if let Some(k) = names.iter().position(|x| *x == name) {
+            out[k].get_or_insert(&r[1..1 + end]);
+        }
         s = &r[2 + end..];
     }
     out
@@ -309,6 +318,18 @@ mod tests {
         // Absolute units become pixels; the ratio is what counts.
         assert_eq!(svg(r#"<svg width="1in" height="4in">"#), Some((100, 400)));
         assert_eq!(svg(r#"<svg width="10cm" height="10mm">"#), Some((1000, 100)));
+        assert_eq!(svg(r#"<svg width="3.9e2px" height="8e3">"#), Some((390, 8000)));
+        // A comment inside a doctype's internal subset, and any number of other attributes first.
+        assert_eq!(svg(r#"<!DOCTYPE svg [<!-- ]> <svg width="1600" height="1000"/> --><!ENTITY x "]>">]><svg width="390" height="8000">"#),
+            Some((390, 8000)));
+        let many: String = (0..400).map(|i| format!(r#" data-a{i}="1""#)).collect();
+        assert_eq!(svg(&format!(r#"<svg{many} width="390" height="8000">"#)), Some((390, 8000)));
+        // A prolog of many empty declarations is read in one pass (this took minutes when each
+        // searched the rest of the file).
+        let slow = format!("{}<svg width=\"390\" height=\"8000\"/>", "<!>".repeat(2_000_000));
+        let t = std::time::Instant::now();
+        assert_eq!(svg(&slow), Some((390, 8000)));
+        assert!(t.elapsed() < std::time::Duration::from_secs(5), "{:?}", t.elapsed());
         // A JPEG's EXIF segment after its frame header still turns it.
         let mut late = jpeg_of(8000, 390, None, false);
         let exif = jpeg_of(1, 1, Some(6), false);

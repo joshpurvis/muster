@@ -668,13 +668,12 @@ impl Hub {
         self.ui_prefs().auto_reset.then(f)
     }
 
-    /// Session `id`'s stopped run held a conversation its agent has forgotten (an idle agent
-    /// reset, src/auto_reset.rs): that run's late hooks no longer change the agent's conversation,
-    /// and the next run has nothing cached to lose, so no wake is announced as costly.
+    /// Session `id`'s stopped run held a conversation its asleep agent has forgotten (an idle
+    /// agent reset, src/auto_reset.rs; that run's late hooks no longer change it, see `on_hook`):
+    /// the next run has nothing cached to lose, so no wake is announced as costly.
     pub(crate) fn forget_run_conversation(&self, id: SessionId) -> anyhow::Result<()> {
         let mut g = self.inner.lock();
         let Some(e) = g.sessions.get_mut(&id) else { return Ok(()) };
-        e.fenced_generation = Some(e.generation);
         e.info.last_turn_at = None;
         self.cache_rules.lock().refresh(&mut e.info);
         self.store.update_session(&e.info)?;
@@ -4492,8 +4491,12 @@ impl Hub {
                 info.background = 0;
                 background = Default::default();
             }
-            // Start fresh is replacing this run: it changes no conversation anything resumes.
-            let fenced = entry.fenced_generation == Some(entry.generation);
+            // Start fresh is replacing this run: it changes no conversation anything resumes. Nor
+            // does the stopped run of an agent asleep with no conversation saved (an idle agent
+            // reset forgot it, src/auto_reset.rs; a sleep needs one), from the record, so a hook
+            // replayed after a backend restart can't bring the old one back either.
+            let forgotten = self.agents.by_session(entry.info.id).is_some_and(|a| a.asleep_at.is_some() && a.resume_id.is_none());
+            let fenced = entry.fenced_generation == Some(entry.generation) || forgotten;
             let mut runtime = crate::store::HookSession { generation: entry.generation,
                 subagents: info.subagents, last_hook_at, conversation: change.conversation.clone(),
                 background: background.clone(),
@@ -6683,6 +6686,18 @@ mod tests {
         hub.agents.update(&hub.store, hub.agents.by_session(2).unwrap().id, |a| a.resume_id = None).unwrap();
         hook(&hub, "agent-token", "Stop", serde_json::json!({"session_id": "conv-2"}));
         assert_eq!(hub.agents.by_session(2).unwrap().resume_id, None, "fenced");
+        // An idle agent reset forgot an asleep agent's conversation, then the backend restarted
+        // (no fence in memory): the stopped run's late hook still can't bring it back.
+        let hub = agent_fixture();
+        hub.inner.lock().tokens.insert("agent-token".into(), 2);
+        hub.set_state_for_test(2, AgentState::Idle);
+        hook(&hub, "agent-token", "SessionStart", serde_json::json!({"session_id": "conv-1"}));
+        hook(&hub, "agent-token", "UserPromptSubmit", serde_json::json!({"prompt": "hi"}));
+        let id = hub.agents.by_session(2).unwrap().id;
+        hub.agents.set_asleep(&hub.store, id, Some(now_ms()), None).unwrap();
+        assert!(hub.agents.forget_conversation(&hub.store, id, "conv-1").unwrap().is_some());
+        hook(&hub, "agent-token", "Stop", serde_json::json!({"session_id": "conv-1"}));
+        assert_eq!(hub.agents.by_session(2).unwrap().resume_id, None, "forgotten while asleep");
     }
 
     /// `fixture_with` plus session 3, a Codex tab in channel 1, with `extra` stored arguments

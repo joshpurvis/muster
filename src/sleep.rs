@@ -696,7 +696,14 @@ pub(crate) async fn sleep_held(hub: &Arc<Hub>, name: &str, why: Why, _held: &cra
         return Err(NotNow(format!("{} can't sleep now: it isn't running", a.name)).into());
     };
     let state = &hub.agents().sleep;
-    if let Err(no) = state.claim(hub, a.id, info.id, seen) {
+    // An idle agent reset claims it only while resets are on, under the lock the setting is
+    // saved under: once Off is saved, no reset stops an agent.
+    let claimed = if why == Why::Reset {
+        hub.while_auto_reset_on(|| state.claim(hub, a.id, info.id, seen)).unwrap_or(Err("idle agent resets were turned off"))
+    } else {
+        state.claim(hub, a.id, info.id, seen)
+    };
+    if let Err(no) = claimed {
         return Err(NotNow(format!("{} can't sleep now: {no}", a.name)).into());
     }
     if let Err(e) = hub.agents().set_asleep(hub.store(), a.id, Some(now), Some(generation)) {

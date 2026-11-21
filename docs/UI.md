@@ -650,8 +650,8 @@ tokens and idle 10 h. Read your memory/ notes first, before anything else.", wit
 a turn` chip, then `shown`), and a notice in the window ("Idle agent reset: alpha is asleep, and
 its next start is a new conversation, because …"). Its asleep bar then reads "… wakes it into a
 new conversation, which reads its memory/ notes first." (no cold tint: nothing is re-read), and
-Wake's tooltip "Start it in a new conversation now"; the phone's composer line says "Sending a
-message wakes it into a new conversation.
+Wake's tooltip "Start it in a new conversation now"; the phone's composer line, which can't tell,
+says only "Sending a message wakes it."
 
 ![Idle agent resets](screenshots/auto-reset-dialog.webp)
 

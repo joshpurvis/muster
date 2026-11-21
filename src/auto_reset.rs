@@ -18,10 +18,11 @@
 //!   check and the stop are one step against keys typed, messages and prompts on their way, and a
 //!   restart in between finishes or undoes the stop. Then, asleep (whether it just fell asleep or
 //!   already was), the rule is checked again and its conversation forgotten, while the setting is
-//!   still on (`Hub::while_auto_reset_on`): whatever wakes it next starts a new conversation. No
-//!   start is spent on it now; the stopped run's late hooks can't bring the old one back
-//!   (`Hub::forget_run_conversation`). A restart between the sleep and the forgetting leaves it
-//!   asleep in its old conversation, for the next sweep.
+//!   still on (`Hub::while_auto_reset_on`, which the sleep's claim also holds): whatever wakes it
+//!   next starts a new conversation. No start is spent on it now; the stopped run's late hooks
+//!   can't bring the old one back, also after a backend restart (`Hub::on_hook` ignores them for
+//!   an asleep agent with no conversation saved). A restart between the sleep and the forgetting
+//!   leaves it asleep in its old conversation, for the next sweep.
 //! - After a backend restart, text in a running agent's input box that this backend didn't see
 //!   typed (it can't tell a draft from Claude's suggestion) keeps it.
 //! - It leaves the new conversation one quiet message (src/quiet.rs, from `muster`, the human's
@@ -162,29 +163,32 @@ async fn reset_one(hub: &Arc<Hub>, id: i64, created_at: i64, now: i64) -> Option
             return None;
         }
     }
-    // Asleep now: anything that came meanwhile (keys held for a wake, a message on its way)
-    // keeps it, and the setting is checked once more, under its own lock.
-    let b = current()?;
-    if b.asleep_at.is_none() || !matches!(verdict(hub, &b, at()), Verdict::Fresh { .. }) {
-        tracing::debug!(agent = b.name, "not reset: it is no longer resting");
-        return None;
-    }
+    // Asleep now. Under the lock the setting is saved under: anything that came meanwhile (keys
+    // held for a wake, a message on its way) keeps it, then the conversation is forgotten (once
+    // forgotten, the stopped run's late hooks can't save it back: `Hub::on_hook`).
     let forgot = hub.while_auto_reset_on(|| -> anyhow::Result<Option<Agent>> {
-        // The stopped run's late hooks first: one can't save the old conversation back after.
-        hub.forget_run_conversation(sid)?;
+        let Some(b) = current().filter(|b| b.asleep_at.is_some()) else { return Ok(None) };
+        if !matches!(verdict(hub, &b, at()), Verdict::Fresh { .. }) {
+            tracing::debug!(agent = b.name, "not reset: it is no longer resting");
+            return Ok(None);
+        }
         hub.agents().forget_conversation(hub.store(), id, &replaces)
     });
-    match forgot {
-        Some(Ok(Some(c))) => {
-            agents::publish(hub, &c);
-            Some(record(hub, &c, &why, size_k, running).await)
-        }
-        None | Some(Ok(None)) => None,
+    let c = match forgot {
+        Some(Ok(Some(c))) => c,
+        None | Some(Ok(None)) => return None,
         Some(Err(e)) => {
-            tracing::warn!(agent = b.name, "not reset: {e:#}");
-            None
+            tracing::warn!(agent = a.name, "not reset: {e:#}");
+            return None;
         }
+    };
+    // Its old conversation's cache clock goes with it (after: a restart in between leaves a
+    // stale clock, never a saved conversation without one).
+    if let Err(e) = hub.forget_run_conversation(sid) {
+        tracing::warn!(agent = c.name, "clearing the old conversation's cache clock: {e:#}");
     }
+    agents::publish(hub, &c);
+    Some(record(hub, &c, &why, size_k, running).await)
 }
 
 /// The agent's log line for a reset, with `why` as the rule gave it.

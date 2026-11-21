@@ -1116,9 +1116,11 @@ sessions: never. Each agent is decided under the same per-agent lock as an answe
   typed in the last two minutes keep it. After a backend restart, text in its input box that the
   backend didn't see typed (a draft can't be told from Claude's suggestion) keeps it.
 - Asleep (just put to sleep, or asleep already), it is checked again, and while `auto_reset` is
-  still on (checked under the lock `prefs.set` takes) its conversation is forgotten: `resume_id`
-  null, the stopped run's hooks no longer change it, and its session's `last_turn_at` and
-  `cache_cold_at` null (nothing to re-read). Whatever wakes it next starts a new conversation; no
+  still on (checked under the lock `prefs.set` takes, as is the sleep's claim: once Off is saved,
+  no reset stops an agent) its conversation is forgotten: `resume_id` null, and then its session's
+  `last_turn_at` and `cache_cold_at` null (nothing to re-read). Hooks from the stopped run of an
+  asleep agent with no saved conversation (only a reset leaves one so: a sleep needs one) never
+  change it, also when replayed after a backend restart. Whatever wakes it next starts a new conversation; no
   start is spent now. A backend restart between the sleep and this step leaves it asleep in its
   old conversation, for the next sweep.
 - It leaves one quiet message from `muster` (origin `human`, hop 0; docs/MCP.md "Quiet messages"):

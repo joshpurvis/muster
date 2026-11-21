@@ -470,6 +470,12 @@ merges, never a model.
   large view, on a solid ground with the rest of the tab out of reach: **Before | After** flips the
   pair in place, ← and → step through before 1, after 1, before 2…, Esc or a click outside the
   picture closes.
+- **Too tall to read**: a picture more than 3 times as tall as it is wide (a full-page phone
+  screenshot) is never shown, since fitted to the window it is an unreadable sliver. `post_pr` leaves
+  it out and tells the poster; a card stored before that rule gets only its size from Muster. Its
+  place shows one line instead ("After picture left out: “<caption>” is 390 × 8000 px, too tall to
+  read here. A crop of one screen would show."), the picture on the other side of its pair shows
+  alone, the other pairs stay as posted, and the large view skips it.
 - **Narrow** (under 760px): the pictures stay side by side, smaller; the dock stacks, Merge full
   width.
 

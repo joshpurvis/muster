@@ -1,8 +1,9 @@
 // Dev-only: the mock daemon's pull request cards for the PRs to merge tab (docs/PROTOCOL.md "Pull
 // requests to merge"), in memory. Nothing here calls GitHub: each card carries a made-up read, and
 // `pr.merge` "merges" a ready card after a moment (any other is refused with its reason).
-// `mock.pr_seed` puts in the sample cards (every state the tab shows); dev/mock.ts routes `pr.*`
-// and `mock.pr_*` here. Every repo, name, commit and picture is invented: this repo is public.
+// `mock.pr_seed` puts in the sample cards (every state the tab shows), `mock.pr_seed_tall` two
+// cards with a full-page phone picture (too tall to read: one posted after post_pr left such pictures
+// out, one stored before); dev/mock.ts routes `pr.*` and `mock.pr_*` here. Every repo, name, commit and picture is invented: this repo is public.
 
 import type { Pr, PrRead, PrVerdict } from "../src/types.ts";
 
@@ -27,7 +28,22 @@ const notesFrame = (body: string) =>
     <text x="22" y="104" font-size="12" fill="#5b6279">Reading list</text><text x="22" y="134" font-size="12" fill="#5b6279">Garden</text>
     <text x="22" y="164" font-size="12" fill="#5b6279">Recipes</text><text x="22" y="194" font-size="12" fill="#5b6279">Ideas</text>${body}`);
 
+/** A made-up site on one phone screen (390 × 844), or the whole page (390 × 8000). */
+const phone = (whole: boolean) => {
+  const h = whole ? 8000 : 844;
+  const blocks = Array.from({ length: Math.floor((h - 120) / 150) }, (_, i) => {
+    const y = 110 + i * 150;
+    return `<text x="20" y="${y}" font-size="17" font-weight="700" fill="#1e2a21">Section ${i + 1}</text>
+      ${bars(20, y + 18, [330, 350, 300, 340, 220], 16, "#cfd3c8")}`;
+  }).join("");
+  return `<svg viewBox="0 0 390 ${h}" width="390" height="${h}" xmlns="http://www.w3.org/2000/svg" font-family="system-ui, sans-serif"><rect width="390" height="${h}" fill="#fbfaf7"/><rect width="390" height="56" fill="#fff"/>
+    <rect y="56" width="390" height="1" fill="#e6e2d8"/><text x="20" y="36" font-size="18" font-weight="700" fill="#27412f">Fernleaf</text>
+    <rect x="300" y="18" width="70" height="22" rx="11" fill="#27412f"/>${blocks}</svg>`;
+};
+
 const SHOTS: Record<string, (after: boolean) => string> = {
+  phone: () => phone(false),
+  phonepage: () => phone(true),
   editor: (after) =>
     notesFrame(`<text x="186" y="80" font-size="22" font-weight="700" fill="#1f2640">Trip plan</text>
     ${bars(186, 104, [410, 380, 424, 300])}${bars(186, 186, [396, 420, 250])}${bars(186, 252, [410, 340])}
@@ -105,6 +121,8 @@ interface Sample {
   undo: string;
   after: string;
   pics: ["before" | "after", string, string][];
+  /** Posted after post_pr left out too-tall pictures: these are marked, and kept no copy of. */
+  leftOut?: { index: number; width: number; height: number }[];
   base?: string;
   newSha?: string;
   merged_as?: string;
@@ -176,6 +194,26 @@ const SAMPLES: Sample[] = [
   },
 ];
 
+/** Pull requests with a full-page phone picture: #231 was posted after post_pr left such pictures
+ * out (its card marks it), #232 before (its stored copy is measured when the window asks). */
+const TALL_SAMPLES: Sample[] = [231, 232].map((n): Sample => ({
+  n, repo: "acme/site-kit", title: n === 231 ? "Shorter sign-up page on phones" : "Sign-up page in two steps", agent: "web-fixer",
+  age_min: n === 231 ? 12 : 30, sha: n === 231 ? "5e1d0aa" : "7c2b9f4", files: 3, add: 40, del: 61, kind: "ready", checks: [2, 2, 0, 0],
+  summary: "The sign-up page on phones drops the long feature list, so the form is on the first screen.",
+  who: "Visitors who sign up from a phone.", tests: "deno test: 51 passed. Looked at the page at 390 and 1280 px wide.",
+  undo: "Revert the merge commit.", after: "Deploy the site.",
+  pics: [["before", "One phone screen: the form is below the fold", "phone"], ["after", "The whole page on a phone", "phonepage"],
+    ["before", "On a laptop, before", "docs"], ["after", "On a laptop, after", "docs"]],
+  ...(n === 231 ? { leftOut: [{ index: 1, width: 390, height: 8000 }] } : {}),
+}));
+
+/** The width and height attributes of an `<svg>` (the mock's pictures all have them). */
+function svgSize(body: string): { width: number; height: number } | null {
+  const tag = body.slice(0, body.indexOf(">"));
+  const w = Number(/\swidth="(\d+)"/.exec(tag)?.[1]), h = Number(/\sheight="(\d+)"/.exec(tag)?.[1]);
+  return w > 0 && h > 0 ? { width: w, height: h } : null;
+}
+
 export function prMock(d: PrDeps) {
   const all = new Map<number, Pr>();
   /** Picture SVGs by `<id>:<index>`. */
@@ -216,9 +254,9 @@ export function prMock(d: PrDeps) {
     return { ok: !reason, state, commit, base, checks, ...(reason ? { reason } : {}) };
   }
 
-  function seed(): Pr[] {
+  function seed(samples = SAMPLES): Pr[] {
     const out: Pr[] = [];
-    for (const s of SAMPLES) {
+    for (const s of samples) {
       const id = next++;
       const at = d.now() - s.age_min * 60_000;
       const read = readOf(s, d.now() - 2 * 60_000);
@@ -226,7 +264,11 @@ export function prMock(d: PrDeps) {
         id, card: `P${id}`, status: s.kind === "merged" ? "merged" : s.kind === "stale" ? "stale" : s.kind === "closed" ? "closed" : "waiting",
         created_at: at, updated_at: at + 1, poster: { label: s.agent, session_id: 0, kind: "codex", agent_id: 2000 + id },
         repo: s.repo, number: s.n, head_sha: sha(s.sha), summary: s.summary, who_notices: s.who,
-        pictures: s.pics.map(([side, caption], i) => ({ path: `/home/user/shots/${s.n}-${side}-${i + 1}.svg`, caption, side, file: `1/${i}.svg` })),
+        pictures: s.pics.map(([side, caption], i) => {
+          const tall = s.leftOut?.find((x) => x.index === i);
+          return { path: `/home/user/shots/${s.n}-${side}-${i + 1}.svg`, caption, side, file: tall ? "" : `1/${i}.svg`,
+            ...(tall ? { too_tall: { width: tall.width, height: tall.height } } : {}) };
+        }),
         tests: s.tests, undo: s.undo, after_merge: s.after, post: 1, github: read, verdict: verdictOf(read, sha(s.sha)),
         ...(s.kind === "later" ? { later: d.now() - 3600_000 } : {}),
         ...(s.kind === "stale" ? { stale_told: true } : {}),
@@ -247,7 +289,7 @@ export function prMock(d: PrDeps) {
         details: s.kind === "ready" ? "Files: src/editor/count.ts, src/list/row.tsx. Reviewed twice; both found nothing." : undefined,
       };
       if (!p.details) delete p.details;
-      s.pics.forEach(([side, , shot], i) => svgs.set(`${id}:${i}`, SHOTS[shot](side === "after")));
+      s.pics.forEach(([side, , shot], i) => !s.leftOut?.some((x) => x.index === i) && svgs.set(`${id}:${i}`, SHOTS[shot](side === "after")));
       all.set(id, p);
       publish(p);
       out.push(p);
@@ -284,8 +326,12 @@ export function prMock(d: PrDeps) {
         case "pr.picture": {
           const card = get(p.id);
           const pic = card.pictures?.[p.index];
+          // Too tall to read: only its size, as the daemon sends it (left out, or measured).
+          if (pic?.too_tall) return { too_tall: pic.too_tall, caption: pic.caption };
           const body = svgs.get(`${card.id}:${p.index}`);
           if (!pic || !body) throw new Error(`card P${card.id} has no picture ${Number(p.index) + 1}`);
+          const size = svgSize(body);
+          if (size && size.height > 3 * size.width) return { too_tall: size, caption: pic.caption };
           return { src: `data:image/svg+xml;charset=utf-8,${encodeURIComponent(body)}`, caption: pic.caption };
         }
         case "pr.refresh": {
@@ -331,6 +377,8 @@ export function prMock(d: PrDeps) {
         }
         case "mock.pr_seed":
           return { prs: seed() };
+        case "mock.pr_seed_tall":
+          return { prs: seed(TALL_SAMPLES) };
       }
       throw new Error(`unknown method: ${method}`);
     },

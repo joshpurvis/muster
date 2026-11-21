@@ -2,7 +2,7 @@
 // order of the list, the four rules and the words on the page, with no signals, RPC or DOM, so
 // tests import it alone. prs.ts re-exports it.
 
-import type { Pr, PrMark } from "./types.ts";
+import type { Pr, PrMark, PrSize } from "./types.ts";
 
 /** Seconds between the click on Merge and `pr.merge` (Cancel takes Merge's place meanwhile). */
 export const COUNTDOWN_S = 5;
@@ -245,6 +245,18 @@ export function pillMark(p: Pr): { glyph: string; cls: "" | "none" | "run" | "wa
   return { glyph, cls, status: p.later != null && cardState(p) !== "merged" ? `not now, ${tagText(p).text}` : tagText(p).text };
 }
 
+/** Whether picture `i` is left out for being too tall to read: post_pr marked it (`too_tall`), or
+ * `loaded` (what `pr.picture` sent, for a card stored before that rule) says so. */
+export type LeftOut = (i: number) => boolean;
+export const leftOutOf = (p: Pr, loaded?: LeftOut): LeftOut => (i) => !!p.pictures?.[i]?.too_tall || !!loaded?.(i);
+
+/** The line shown in a left-out picture's place. */
+export function leftOutText(side: "before" | "after", caption: string, size: PrSize | undefined): string {
+  const px = size ? `${size.width} × ${size.height} px, ` : "";
+  return `${side === "before" ? "Before" : "After"} picture left out: “${caption}” is ${px}too tall to read here. ` +
+    "A crop of one screen would show.";
+}
+
 /** Before and after pictures in pairs, in posting order: the nth before beside the nth after (an
  * index into `p.pictures`, or null where one side has none). */
 export function pairs(p: Pr): { before: number | null; after: number | null }[] {
@@ -255,23 +267,24 @@ export function pairs(p: Pr): { before: number | null; after: number | null }[] 
 }
 
 /** The large view's order: before 1, after 1, before 2, after 2… */
-export function viewOrder(p: Pr): number[] {
-  return pairs(p).flatMap((x) => [x.before, x.after].filter((i): i is number => i !== null));
+export function viewOrder(p: Pr, out: LeftOut = leftOutOf(p)): number[] {
+  return pairs(p).flatMap((x) => [x.before, x.after].filter((i): i is number => i !== null && !out(i)));
 }
 
 /** The picture the large view steps to from picture `at` (`dir` 1 or -1, wrapping). */
-export function stepPicture(p: Pr, at: number, dir: 1 | -1): number {
-  const order = viewOrder(p);
+export function stepPicture(p: Pr, at: number, dir: 1 | -1, out: LeftOut = leftOutOf(p)): number {
+  const order = viewOrder(p, out);
   const i = order.indexOf(at);
   if (i < 0 || !order.length) return at;
   return order[(i + dir + order.length) % order.length];
 }
 
-/** The other side of picture `at`'s pair (null: it stands alone). */
-export function otherSide(p: Pr, at: number): number | null {
+/** The other side of picture `at`'s pair (null: it stands alone, or the other side is left out). */
+export function otherSide(p: Pr, at: number, out: LeftOut = leftOutOf(p)): number | null {
   const pair = pairs(p).find((x) => x.before === at || x.after === at);
   if (!pair) return null;
-  return pair.before === at ? pair.after : pair.before;
+  const other = pair.before === at ? pair.after : pair.before;
+  return other === null || out(other) ? null : other;
 }
 
 /** "pair 1 of 2". */

@@ -1,0 +1,15 @@
+[
+  {"until": "globalThis.__muster?.windowId?.value != null", "settle": 0.8},
+  {"js": "const M = globalThis.__muster; const w = await M.rpc.call('workspace.add', {path: '/tmp', name: 'notes-app'}); await M.rpc.call('channel.create', {workspace_id: w.id, name: 'notes-app', agent: 'shell', window_id: M.windowId.value}); return 'channel';", "until": "globalThis.__muster.activeChannelId.value != null && document.querySelector('.pane .tab')", "settle": 1.0},
+  {"js": "const M = globalThis.__muster; const v = M.channelLayout.value; M.channelLayout.value = {...v, sidebar: {...v.sidebar, hidden: true}};", "until": "globalThis.__muster.channelLayout.value?.sidebar.hidden === true", "settle": 0.6},
+  {"js": "await globalThis.__muster.rpc.call('mock.pr_seed_tall', {}); return 'seeded';", "until": "document.querySelector('.prs-tab')"},
+  {"js": "document.querySelector('.prs-tab').click();", "until": "document.querySelector('.prs-view .pb-dock .pm-merge')", "settle": 0.8},
+  {"js": "[...document.querySelectorAll('.pb-pill')].find((b) => b.textContent.includes('#232')).click();", "until": "document.querySelector('.prs-view .qv-q')?.textContent.includes('two steps') && document.querySelectorAll('.pm-shot img').length + document.querySelectorAll('.pm-left-out').length === 4", "settle": 1.0},
+  {"js": "document.querySelector('.pm-pairs').scrollIntoView({block: 'start'});", "settle": 0.6, "shot": "stored-before-the-rule", "crop": ".pm-pairs", "pad": 12},
+  {"js": "[...document.querySelectorAll('.pb-pill')].find((b) => b.textContent.includes('#231')).click();", "until": "document.querySelector('.prs-view .qv-q')?.textContent.includes('Shorter') && document.querySelectorAll('.pm-shot img').length + document.querySelectorAll('.pm-left-out').length === 4", "settle": 1.0},
+  {"js": "document.querySelector('.pm-pairs').scrollIntoView({block: 'start'});", "settle": 0.6, "shot": "posted-after-the-rule", "crop": ".pm-pairs", "pad": 12},
+  {"js": "document.querySelector('.pm-shot').click();", "until": "document.querySelector('.pm-lightbox img')", "settle": 0.8, "shot": "large-view"},
+  {"js": "return {before: document.querySelector('.pm-seg button:first-child').disabled, after: document.querySelector('.pm-seg button:last-child').disabled, text: document.querySelector('.pm-box-text').textContent, notes: [...document.querySelectorAll('.pm-left-out')].map((x) => x.textContent)};"},
+  {"js": "document.querySelector('.pm-lightbox').dispatchEvent(new KeyboardEvent('keydown', {key: 'ArrowRight', bubbles: true}));", "settle": 0.6},
+  {"js": "return document.querySelector('.pm-box-text').textContent + ' | ' + document.querySelector('.pm-cap').textContent;"}
+]

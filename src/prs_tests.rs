@@ -988,3 +988,62 @@ fn cards_and_their_messages_survive_a_restart() {
     assert_eq!(store.unfinished_prs().unwrap(), vec![1]);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A PNG's first 33 bytes: the signature and the IHDR chunk (`width` x `height`), all that
+/// `post_pr` reads of it.
+fn png_of(width: u32, height: u32) -> Vec<u8> {
+    let mut b = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+    b.extend(width.to_be_bytes());
+    b.extend(height.to_be_bytes());
+    b.extend([8, 6, 0, 0, 0, 0, 0, 0, 0]);
+    b
+}
+
+#[test]
+fn a_full_page_phone_picture_is_left_out_and_its_poster_told() {
+    let hub = fixture();
+    agent(&hub, "builder-2", SessionKind::Codex, 3);
+    let dir = temp_dir("tall");
+    let file = |name: &str, w: u32, h: u32| {
+        let f = dir.join(name);
+        std::fs::write(&f, png_of(w, h)).unwrap();
+        f.to_str().unwrap().to_string()
+    };
+    let (desktop, page, phone, wide) =
+        (file("desktop.png", 1600, 1000), file("page.png", 390, 8000), file("phone.png", 390, 844), file("wide.png", 2400, 600));
+    let pics = json!([
+        {"path": desktop, "caption": "Sign-up page on a laptop", "side": "before"},
+        {"path": page, "caption": "Sign-up page on a phone", "side": "after"},
+        {"path": phone, "caption": "One phone screen", "side": "before"},
+        {"path": wide, "caption": "The wide banner", "side": "after"},
+    ]);
+    let out = post(&hub, 3, with(|v| v["pictures"] = pics)).unwrap();
+    // The card is posted with the rest, and the poster is told which picture stayed out and why.
+    assert_eq!(out["card"].as_str(), Some("P1"), "{out}");
+    let left = out["left_out"].as_array().unwrap_or_else(|| panic!("no left_out in {out}"));
+    assert_eq!(left.len(), 1, "{out}");
+    let said = left[0].as_str().unwrap();
+    assert!(said.contains(&page) && said.contains("390 × 8000") && said.contains("too tall") && said.contains("crop"), "{said}");
+    assert!(out["note"].as_str().unwrap().contains("left out"), "{out}");
+    // Its place is kept, so the pairs stay as posted (before 1 with after 1, before 2 with after 2),
+    // but Muster keeps no copy of it and never sends it to the window.
+    let v = get(&hub, 1).unwrap();
+    let stored = v["pictures"].as_array().unwrap();
+    assert_eq!(stored.len(), 4, "{v}");
+    assert_eq!(stored[1]["too_tall"], json!({"width": 390, "height": 8000}), "{v}");
+    assert!(stored.iter().enumerate().all(|(i, x)| (i == 1) == x.get("too_tall").is_some()), "{v}");
+    assert!(!hub.store().pr_dir(1).join("1/1.png").exists());
+    let tall = picture(&hub, 1, 1, 1).unwrap();
+    assert!(tall.get("src").is_none(), "{tall}");
+    assert_eq!(tall["too_tall"], json!({"width": 390, "height": 8000}), "{tall}");
+    // A laptop picture, one phone screen and a wide picture are shown as before.
+    for i in [0, 2, 3] {
+        assert!(picture(&hub, 1, 1, i).unwrap()["src"].as_str().unwrap().starts_with("data:image/png;base64,"), "picture {i}");
+    }
+    // A card stored before this rule, with a tall picture in Muster's copy, never sends it either.
+    std::fs::write(hub.store().pr_dir(1).join("1/0.png"), png_of(390, 8000)).unwrap();
+    let old = picture(&hub, 1, 1, 0).unwrap();
+    assert!(old.get("src").is_none() && old["too_tall"] == json!({"width": 390, "height": 8000}), "{old}");
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(hub.store().prs_root());
+}

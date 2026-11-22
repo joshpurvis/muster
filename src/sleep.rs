@@ -628,6 +628,12 @@ fn typed_just_now(why: Why, human_at: Option<i64>, now: i64) -> bool {
     human_at.is_some_and(|t| now - t < quiet)
 }
 
+/// Why input refused this sleep, in words: a move also counts an agent's keys, so it doesn't
+/// say the owner typed.
+fn typed_reason(why: Why) -> &'static str {
+    if why == Why::Move { "keys were typed into it just now" } else { "you typed into it just now" }
+}
+
 /// When raw input that isn't the human's was last admitted to session `id` (Unix ms).
 fn raw_at(hub: &Hub, id: SessionId, now: i64) -> Option<i64> {
     hub.agents().sleep.inner.lock().raw_at.get(&id).map(|at| now - at.elapsed().as_millis() as i64)
@@ -712,7 +718,7 @@ pub(crate) async fn sleep_held(hub: &Arc<Hub>, name: &str, why: Why, _held: &cra
     // could miss it.
     let (seen, on_way) = a.session_id.map_or((0, 0), |s| hub.agents().sleep.input_seq(s));
     if on_way > 0 {
-        return Err(NotNow(format!("{} can't sleep now: you typed into it just now", a.name)).into());
+        return Err(NotNow(format!("{} can't sleep now: {}", a.name, typed_reason(why))).into());
     }
     let (info, f) = facts(hub, &a);
     // A move applied now begins a new conversation anyway: no saved one is needed (only then).
@@ -735,8 +741,8 @@ pub(crate) async fn sleep_held(hub: &Arc<Hub>, name: &str, why: Why, _held: &cra
     };
     if typed_just_now(why, typed, now) {
         // A move also counts an agent's keys: say it neutrally.
-        let (what, typed) = if why == Why::Move { ("restart", "keys were typed into it just now") } else { ("sleep", "you typed into it just now") };
-        return Err(NotNow(format!("{} can't {what} now: {typed}", a.name)).into());
+        let what = if why == Why::Move { "restart" } else { "sleep" };
+        return Err(NotNow(format!("{} can't {what} now: {}", a.name, typed_reason(why))).into());
     }
     // The run that was checked: only it is stopped.
     let Some(generation) = hub.pty_generation(info.id) else {
@@ -751,6 +757,7 @@ pub(crate) async fn sleep_held(hub: &Arc<Hub>, name: &str, why: Why, _held: &cra
         state.claim(hub, a.id, info.id, seen)
     };
     if let Err(no) = claimed {
+        let no = if no == "you typed into it just now" { typed_reason(why) } else { no };
         return Err(NotNow(format!("{} can't sleep now: {no}", a.name)).into());
     }
     if let Err(e) = hub.agents().set_asleep(hub.store(), a.id, Some(now), Some(generation)) {

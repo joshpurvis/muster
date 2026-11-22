@@ -2983,9 +2983,11 @@ fn move_preflight(hub: &Hub, a: &Agent) -> anyhow::Result<()> {
     hub.check_account_profile(a.account_profile_id)?;
     check_provider(hub, a.kind, a.provider, a.model.as_deref(), true)?;
     check_location(hub, &a.working_location)?;
+    // Its home, as the start prepares it (made again when missing; a link or a file refused).
+    ensure_home(Path::new(&a.home_dir))?;
     // The folder it will run in, as `prepare_channel` picks it (its own channel's checkout, or its
     // home): a worktree removed on disk would stop it and then fail to start.
-    // Home: the start makes it again if it is missing (`ensure_home`), so only a checkout counts.
+    // Home: checked just above.
     let cwd = if a.working_location == WorkingLocation::Home {
         None
     } else {
@@ -5057,6 +5059,16 @@ mod tests {
         hub.update_account_profile(work, None, Some(false)).unwrap();
         let e = format!("{:#}", move_preflight(&hub, &hub.agents().get("preflight").unwrap()).unwrap_err());
         assert!(e.contains("disabled"), "{e}");
+        // A home that became a file is refused before anything stops; a missing one is made again.
+        hub.update_account_profile(work, None, Some(true)).unwrap();
+        let home = std::path::PathBuf::from(&moved.home_dir);
+        std::fs::remove_dir_all(&home).unwrap();
+        assert!(move_preflight(&hub, &moved).is_ok() && home.is_dir(), "a missing home is made again");
+        std::fs::remove_dir_all(&home).unwrap();
+        std::fs::write(&home, "x").unwrap();
+        assert!(format!("{:#}", move_preflight(&hub, &moved).unwrap_err()).contains("is not a folder"));
+        std::fs::remove_file(&home).unwrap();
+        hub.update_account_profile(work, None, Some(false)).unwrap();
         let kept = hub.agents().by_id(a.id).unwrap();
         assert_eq!((kept.account_profile_id, kept.handoff.as_ref().map(|h| h.from)), (Some(work), Some(Some(personal))),
             "the move still waits");

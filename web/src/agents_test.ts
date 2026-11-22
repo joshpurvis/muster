@@ -522,8 +522,8 @@ Deno.test("the message after a move says when it takes effect", () => {
   assertEquals(switchMessage("ada", { ...sw, now: true, outcome: "restarted" }).text,
     "ada moved to Work: a new conversation started there.");
   assertEquals(switchMessage("ada", { ...sw, now: true, outcome: "busy", notes_skipped: "busy" }).level, "warn");
-  assertEquals(switchMessage("ada", { ...sw, now: true, outcome: "busy", why: "you typed into it just now" }).text,
-    "ada can't restart now (you typed into it just now), so it moves to Work at its next start.");
+  assertEquals(switchMessage("ada", { ...sw, now: true, outcome: "busy", why: "keys were typed into it just now" }).text,
+    "ada can't restart now (keys were typed into it just now), so it moves to Work at its next start.");
   assertEquals(switchMessage("ada", { ...sw, outcome: "next_start", notes_skipped: "at_limit" }).text.includes("at its limit"), true);
   assertEquals(switchMessage("ada", { ...sw, now: true, notes: "asked", outcome: "after_notes" }).text.includes("waits up to 10 minutes for its reply, then restarts it on Work if it is idle; otherwise it moves at its next start"), true);
 });

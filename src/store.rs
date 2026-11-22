@@ -344,7 +344,7 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE bots ADD COLUMN channel_id INTEGER;
     "#,
     // v9: bots are now "agents" (tables, columns and index renamed), with an autostart flag;
-    // messages keep their text and, for a refused one, the reason (the agents panel's log).
+    // messages keep their text and, for a refused one, the reason (the sidebar's message log).
     // Home dirs and the agents workspace move from `<data>/bots` to `<data>/agents` at daemon
     // start, together with the folders (`agents::relocate_homes`), so a record never points at a
     // folder that didn't move.
@@ -1747,7 +1747,7 @@ impl Store {
     }
 
     /// A message an agent's policy refused (origin, hop limit, daily cap, permissions): kept for
-    /// the agents panel's log, never counted toward the cap.
+    /// the sidebar's message log, never counted toward the cap.
     pub fn insert_refused_agent_message(&self, m: &crate::agents::AgentMessage, why: &str) -> anyhow::Result<i64> {
         let conn = self.conn.lock();
         Self::insert_agent_message_on(&conn, m, Some(why))?;

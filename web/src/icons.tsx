@@ -197,7 +197,7 @@ export const IconPause = (p: P) => (
     <path d="M9 6v12M15 6v12" />
   </Svg>
 );
-/** Two heads: named agents (the agents panel). */
+/** Two heads: named agents. */
 export const IconAgents = (p: P) => (
   <Svg {...p}>
     <circle cx="9" cy="8" r="3.2" />

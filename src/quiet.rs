@@ -29,7 +29,7 @@
 //! prompt's `permission_mode` says, doesn't take it; `mode_width`). The
 //! rest keep waiting for a turn that can take them, or until they expire. Only Claude sessions
 //! take quiet messages: their hook is the way in. Agent messages live in `agent_messages`
-//! (`quiet` = 1, so the daily caps, the agents panel's log and `reply` all see them); an ordinary
+//! (`quiet` = 1, so the daily caps, the sidebar's message log and `reply` all see them); an ordinary
 //! session's in `quiet_messages`, for the run the send was checked against, dropped when that
 //! run's process ends. Unshown ones expire after `EXPIRE_MS` (`expire`, at start and hourly).
 

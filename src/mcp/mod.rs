@@ -125,7 +125,7 @@ pub fn router(hub: Arc<Hub>) -> anyhow::Result<Router> {
     }
     if limits.cross_workspace {
         tracing::warn!(
-            "{} is retired: use directional sharing rules in the Agents panel",
+            "{} is retired: use directional sharing rules in Muster's sidebar (Channels ⋯ → Session communication)",
             guard::ENV_CROSS_WORKSPACE
         );
     }

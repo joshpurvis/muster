@@ -56,7 +56,7 @@ export interface LayoutState {
   root: Layout;
   focus: string;
   zoom: string | null;
-  /** The window shows the agents panel (docs/UI.md "Agents panel"). Missing: closed. */
+  /** Legacy layouts only: the window showed the old agents panel (docs/UI.md "Agents in the sidebar"). Missing: closed. */
   agents?: boolean;
 }
 

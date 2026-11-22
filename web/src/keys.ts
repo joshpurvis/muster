@@ -454,14 +454,8 @@ export const commands: Command[] = [
     id: "channels-panel",
     title: "Toggle channels panel",
     group: "Window",
-    run: () => A.toggleChannelsPanel(),
-  },
-  {
-    id: "agents-panel",
-    title: "Toggle agents panel",
-    group: "Agents",
     keys: ["Alt+Shift+G"],
-    run: () => A.toggleAgentsPanel(),
+    run: () => A.toggleChannelsPanel(),
   },
   {
     id: "new-agent",
@@ -703,7 +697,7 @@ function pendingHere(sid: number): boolean {
 // starts, approves, interrupts or types into anything. Close closes that panel itself.
 const PANEL_COMMANDS = new Set([
   "jump", "palette", "next-needs-you", "next-tab", "prev-tab", "move-tab-left", "move-tab-right",
-  "close-tab", "sidebar", "agents-panel", "zoom", "fullscreen", "shortcuts", ...Array.from({ length: 9 }, (_, i) => `tab-${i + 1}`),
+  "close-tab", "sidebar", "channels-panel", "zoom", "fullscreen", "shortcuts", ...Array.from({ length: 9 }, (_, i) => `tab-${i + 1}`),
   ...["left", "right", "up", "down"].map((d) => `focus-${d}`),
 ]);
 const panelBindings = () => bindings.filter((b) => PANEL_COMMANDS.has(b.cmd.id));

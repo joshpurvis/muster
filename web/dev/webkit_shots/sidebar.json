@@ -1,0 +1,71 @@
+[
+ {
+  "until": "globalThis.__muster?.windowId?.value != null && globalThis.__muster.agents.value.some((a) => a.name === 'orchestrator')",
+  "settle": 0.5
+ },
+ {
+  "js": "const m = globalThis.__muster; const w = m.windowId.value;\nawait m.rpc.call('agent.start', {name: 'orchestrator', window_id: w});\nawait m.rpc.call('agent.start', {name: 'reviewer', window_id: w});\nfor (let i = 0; i < 50 && !m.agents.value.find((x) => x.name === 'orchestrator')?.channel_id; i++) await new Promise((r) => setTimeout(r, 100));\nconst a = m.agents.value.find((x) => x.name === 'orchestrator');\nawait m.rpc.call('channel.rename', {id: a.channel_id, name: 'planning'});\nawait m.rpc.call('mock.propose', {agent: 'worker', by: 'orchestrator', name: 'Weekly dependency check', prompt: 'List the dependency updates waiting in the open pull requests and say which are safe to merge.', reason: 'Dependency updates pile up; one look a week is enough.'});\nconst first = m.windowChannels.value[0]; if (first) m.channelLayout.value = {...m.channelLayout.value, active: first.id};",
+  "timeout": 20
+ },
+ {
+  "until": "document.querySelector('.needs-you .ny-prop') && document.querySelector('.channel-row[data-agent=orchestrator] .channel-agent') && document.querySelector('.channel-row[data-agent=reviewer]')",
+  "settle": 0.8,
+  "shot": "after-240",
+  "crop": ".sidebar",
+  "pad": 0
+ },
+ {
+  "shot": "needs-you",
+  "crop": ".needs-you",
+  "pad": 8
+ },
+ {
+  "js": "document.querySelector('.channel-row[data-agent=orchestrator]').dispatchEvent(new MouseEvent('mouseenter', {bubbles: false}));",
+  "until": "document.querySelector('.agent-card')",
+  "settle": 0.5,
+  "shot": "card-hover-240"
+ },
+ {
+  "js": "document.querySelector('.channel-row[data-agent=orchestrator]').dispatchEvent(new MouseEvent('mouseleave', {bubbles: false}));",
+  "until": "!document.querySelector('.agent-card')",
+  "settle": 0.2
+ },
+ {
+  "js": "const b = document.querySelector('.channel-row[data-agent=reviewer] .channel-select'); b.focus(); b.dispatchEvent(new KeyboardEvent('keydown', {key: 'ArrowRight', bubbles: true}));",
+  "until": "document.activeElement?.closest('.agent-card')",
+  "settle": 0.4,
+  "shot": "card-keyboard"
+ },
+ {
+  "js": "document.activeElement.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', bubbles: true})); return document.activeElement?.closest('.channel-row')?.dataset.agent;",
+  "until": "!document.querySelector('.agent-card') && document.activeElement?.matches('.channel-row[data-agent=reviewer] .channel-select')"
+ },
+ {
+  "js": "const b = document.querySelector('.channel-row[data-agent=orchestrator] .channel-select'); const r = b.getBoundingClientRect(); b.dispatchEvent(new MouseEvent('contextmenu', {bubbles: true, cancelable: true, clientX: r.left + 60, clientY: r.top + 12}));",
+  "until": "document.querySelector('.menu')",
+  "settle": 0.4,
+  "shot": "menu",
+  "crop": ".menu",
+  "pad": 16
+ },
+ {
+  "js": "document.querySelector('.menu').dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', bubbles: true}));",
+  "until": "!document.querySelector('.menu')"
+ },
+ {
+  "js": "const m = globalThis.__muster; m.channelLayout.value = {...m.channelLayout.value, sidebar: {...m.channelLayout.value.sidebar, width: 340}};",
+  "settle": 0.6,
+  "shot": "after-340",
+  "crop": ".sidebar",
+  "pad": 0
+ },
+ {
+  "js": "document.querySelector('.channel-row[data-agent=worker]').dispatchEvent(new MouseEvent('mouseenter', {bubbles: false}));",
+  "until": "document.querySelector('.agent-card')",
+  "settle": 0.5,
+  "shot": "card-hover-340"
+ },
+ {
+  "js": "return {title: document.title, theme: document.documentElement.dataset.theme};"
+ }
+]

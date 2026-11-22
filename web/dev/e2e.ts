@@ -1,6 +1,6 @@
 // End-to-end UI walkthrough against the MOCK daemon (dev only). Two headless browsers act as two
 // client windows. Covers the v2 layout: a window split into groups, each with its own tab strip;
-// a tab is one session. Also the agents panel (Alt+G, start-and-pull, the message log, New
+// a tab is one session. Also agents in the sidebar (their rows, start-and-pull, the message log, New
 // agent from a template, Edit ▸ Memory), agent panels and the built-in panel apps.
 //
 //   deno task build:dev && MOCK_PORT=17761 deno task mock &
@@ -595,29 +595,27 @@ try {
     ok("Jump pulled one tab of a two-tab task into window 2 (session.set_window); its sibling stayed");
   }
 
-  // ---- the agents panel (mock only: clicking an agent starts it)
+  // ---- agents in the sidebar (mock only: clicking an agent's row starts it)
   if (!real) {
     const menuItem = (b: Browser, label: string) =>
       b.eval(`(() => { const it = [...document.querySelectorAll('.menu .menu-item')]
         .find((e) => e.querySelector('.menu-label')?.textContent === ${JSON.stringify(label)});
         if (!it) return false; it.click(); return true; })()`);
     await a.click(`[data-tab-sid="${t2}"]`);
-    await a.key("Alt+G");
-    await a.wait(`!!document.querySelector('.agents-panel') && ${M}.layout.value.agents === true`, 3000);
-    await a.wait(`document.querySelectorAll('.ap-row').length === ${M}.agents.value.length`, 3000);
+    if (await a.eval(`document.querySelector('.sidebar')?.style.display === 'none'`)) await a.key("Alt+G");
+    await a.wait(`document.querySelectorAll('.channel-row.agent-row').length === ${M}.agents.value.length`, 3000);
     check(await a.eval(`${M}.agents.value.length`) >= 2, "the mock's agents are listed");
     check(
-      await a.eval(`document.querySelector('[data-agent="orchestrator"] .ap-kind')?.textContent`) ===
-        "Claude",
-      "rows show the kind badge",
+      await a.eval(`document.querySelector('.channel-row[data-agent="orchestrator"] .channel-select')?.getAttribute('aria-label')?.startsWith('orchestrator, agent')`),
+      "an agent's row names it as an agent",
     );
     check(
       await a.eval(
-        `document.querySelector('[data-agent="reviewer"] .ap-row-sub')?.textContent.startsWith('stopped')`,
+        `(document.querySelector('.channel-row[data-agent="reviewer"] .channel-select')?.getAttribute('aria-label') ?? '').includes(', stopped')`,
       ),
       "a stopped agent says so",
     );
-    ok("Alt+G opened the agents panel (kept in the window's layout); rows show dot, name, kind, state");
+    ok("every agent has a row in the channel list (no channel yet: after the channels), with its state");
 
     // The message log: from → to, first line, origin and hop chips, refusals in red.
     const entries = await a.eval(`document.querySelectorAll('.ap-msg').length`);
@@ -651,7 +649,7 @@ try {
         "orchestrator → reviewer",
       "newest first, from → to",
     );
-    await shot(a, "09-agents-panel");
+    await shot(a, "09-agents-in-sidebar");
     await a.click(`.ap-msg[data-msg]:not(.refused)`);
     await a.wait(`!!document.querySelector('.msg-dlg .msg-pre')`, 2000);
     check(
@@ -668,29 +666,32 @@ try {
 
     // Click a stopped agent: it starts, and its tab opens in this window's focused group.
     const before = await here(a);
-    await a.click(`[data-agent="reviewer"]`);
+    await a.click(`.channel-row[data-agent="reviewer"] .channel-select`);
     await a.wait(`${M}.focusedSession.value?.name === 'reviewer'`, 6000);
     const rev: number = await a.eval(`${M}.focusedSession.value.id`);
     check(!before.includes(rev) && (await here(a)).includes(rev), "a new tab for the agent, here");
     await a.wait(
-      `!document.querySelector('[data-agent="reviewer"] .ap-row-sub')?.textContent.startsWith('stopped')`,
+      `!(document.querySelector('.channel-row[data-agent="reviewer"] .channel-select')?.getAttribute('aria-label') ?? ', stopped').includes(', stopped')`,
       4000,
     );
     check(
       await a.eval(
         `[...document.querySelectorAll('.ap-msg')].every((m) => m.querySelector('.ap-msg-route').textContent.includes('reviewer'))`,
       ),
-      "selecting the agent filters the log to it",
+      "opening the agent's channel filters the log to it",
     );
     check(!!(await a.eval(`document.querySelector('.ap-filter')`)), "the filter chip shows");
+    check(
+      await a.eval(`!!document.querySelector('.channel-row[data-agent="reviewer"][data-channel-id]')`),
+      "its row is now its channel's row",
+    );
     ok("clicking a stopped agent started it in a tab of the focused group and filtered the log");
     await shot(a, "09b-agents-running");
 
     // From window 2: clicking it pulls its tab over, as Jump does.
-    await b2.key("Alt+G");
-    await b2.wait(`!!document.querySelector('.agents-panel')`, 3000);
-    check(await a.eval(`!!document.querySelector('.agents-panel')`), "window 1 keeps its own panel");
-    await b2.click(`[data-agent="reviewer"]`);
+    if (await b2.eval(`document.querySelector('.sidebar')?.style.display === 'none'`)) await b2.key("Alt+G");
+    await b2.wait(`!!document.querySelector('.channel-row[data-agent="reviewer"]')`, 3000);
+    await b2.click(`.channel-row[data-agent="reviewer"] .channel-select`);
     await b2.wait(
       `${M}.windowSessions.value.some((s) => s.id === ${rev}) && ${M}.focusedSession.value?.id === ${rev}`,
       5000,
@@ -711,10 +712,10 @@ try {
     check(!(await here(a)).includes(rev) && !(await here(b2)).includes(rev), "a tab in no window");
     check(await b2.eval(`!document.querySelector('.confirm-dlg') && !document.querySelector('.confirm-close')`), "no confirm");
     check(
-      !(await b2.eval(`document.querySelector('[data-agent="reviewer"] .ap-row-sub')?.textContent.startsWith('stopped')`)),
+      !(await b2.eval(`(document.querySelector('.channel-row[data-agent="reviewer"] .channel-select')?.getAttribute('aria-label') ?? '').includes(', stopped')`)),
       "its row still shows it running",
     );
-    await b2.click(`[data-agent="reviewer"]`);
+    await b2.click(`.channel-row[data-agent="reviewer"] .channel-select`);
     await b2.wait(
       `${M}.focusedSession.value?.id === ${rev} && !${M}.sessions.value.get(${rev}).hidden`,
       5000,
@@ -747,18 +748,18 @@ try {
     ok("closing before the agent list loaded still only hid it; the toast's Show brought it back");
 
     // Stop (the row's menu) is what stops it; the tab stays, showing it stopped.
-    await b2.click(`[data-agent="reviewer"]`, { button: "right" });
+    await b2.click(`.channel-row[data-agent="reviewer"] .channel-select`, { button: "right" });
     await b2.wait(`!!document.querySelector('.menu')`);
     check(await menuItem(b2, "Stop"), "the row's menu has Stop");
     await b2.wait(`${M}.sessions.value.get(${rev}).state === 'exited'`, 5000);
     await b2.wait(
-      `document.querySelector('[data-agent="reviewer"] .ap-row-sub')?.textContent.startsWith('stopped')`,
+      `(document.querySelector('.channel-row[data-agent="reviewer"] .channel-select')?.getAttribute('aria-label') ?? '').includes(', stopped')`,
       3000,
     );
     check((await here(b2)).includes(rev), "its tab stays");
     ok("Stop in the agent's menu stopped it");
     await b2.key("Alt+G");
-    await b2.wait(`!document.querySelector('.agents-panel')`, 2000);
+    await b2.wait(`document.querySelector('.sidebar')?.style.display === 'none'`, 2000);
 
     // Jump lists every agent; choosing a stopped one starts it.
     await a.key("Ctrl+Space");
@@ -1162,8 +1163,8 @@ try {
   }
   ok(`reload reclaimed the same window${v2 ? " and its groups" : ""} (${await layoutSig(a)})`);
   if (!real && v2) {
-    await a.wait(`!!document.querySelector('.agents-panel')`, 3000);
-    ok("the agents panel came back open with the window (per-window, in its layout)");
+    await a.wait(`!!document.querySelector('.sidebar .channels-panel') && document.querySelector('.sidebar').style.display !== 'none'`, 3000);
+    ok("the sidebar came back shown with the window (per-window, in its layout)");
   }
 
   // ---- schedules (dev/e2e_schedules.ts)

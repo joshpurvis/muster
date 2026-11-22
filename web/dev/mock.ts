@@ -1486,6 +1486,15 @@ async function agentMethod(method: string, p: any): Promise<unknown> {
       files.set(path, p.text);
       return { path, size: p.text.length };
     }
+    // Dev only: an agent proposes a schedule that waits for the human's Approve (the sidebar's
+    // Needs you box; src/schedules/agent.rs `propose_schedule`).
+    case "mock.propose":
+      return sched.propose(
+        { agent: p.agent, name: p.name, prompt: p.prompt ?? "Check the open pull requests.", when: p.when ?? { kind: "cron", cron: "0 9 * * 1" } },
+        p.by ?? p.agent,
+        p.reason ?? "",
+        p.age_ms ?? 40 * 60_000,
+      );
     // Dev only: a message arriving from an agent (e2e checks the log updates live).
     case "mock.agent_message": {
       const a = agentNamed(p.to);

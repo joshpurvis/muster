@@ -420,7 +420,7 @@ pub struct SessionInfo {
     pub window_id: Option<WindowId>,
     /// A named agent's tab the human closed (`session.hide`): the session runs on with no
     /// window (`window_id` None) and no `window.claim` adopts it, until `session.set_window`
-    /// shows it again (the agents panel does).
+    /// shows it again (its row in the sidebar does).
     #[serde(default)]
     pub hidden: bool,
     /// What its current (or last) run bills to: set at each start from its named agent's

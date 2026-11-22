@@ -4188,7 +4188,7 @@ impl Hub {
             }
             let mut next = e.info.clone();
             next.window_id = Some(window_id);
-            // Showing a hidden agent tab again (the agents panel, Jump, Alt+J pull it here).
+            // Showing a hidden agent tab again (its row in the sidebar, Jump, Alt+J pull it here).
             next.hidden = false;
             self.store.update_session(&next)?;
             e.info = next.clone();
@@ -4207,7 +4207,7 @@ impl Hub {
         Ok(info)
     }
 
-    /// `session.hide`: close a named agent's tab without stopping it (docs/UI.md "Agents panel").
+    /// `session.hide`: close a named agent's tab without stopping it (docs/UI.md "Agents in the sidebar").
     /// The session keeps its process, scrollback and channel; it leaves its window
     /// (`window_id` None, `hidden`), and so does its task when none of its tabs is left in a
     /// window, so neither keeps a window alive nor is adopted by `window.claim`. Messages still
@@ -6407,7 +6407,7 @@ mod tests {
         let w = hub.claim_window(5, Some(3)).unwrap();
         assert!(!w.channel_ids.contains(&1));
         assert!(hub.session(2).unwrap().hidden && hub.channel(1).unwrap().window_id.is_none());
-        // Shown again (the agents panel pulls it into its window): the task follows.
+        // Shown again (its sidebar row pulls it into its window): the task follows.
         let s = hub.set_session_window(2, 3, None).unwrap();
         assert!(!s.hidden && s.window_id == Some(3));
         assert_eq!(hub.channel(1).unwrap().window_id, Some(3));

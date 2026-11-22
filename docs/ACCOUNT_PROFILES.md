@@ -402,7 +402,7 @@ What the owner sees:
   without Now it still moves at its next start. It is skipped when the old account is at its
   limit. Only the human asks for it (it types a prompt as the human's): the window, or the CLI
   in a terminal outside Muster; it is refused inside any Muster tab and from agents.
-- **Agents panel / tab menu:** "Switch account…" opens the same choice.
+- **An agent's row menu in the sidebar / tab menu:** "Switch account…" opens the same choice.
 - **CLI:** `muster agent edit NAME --profile PROFILE [--now] [--save-notes]` (until 21 Nov 2026
   notes were asked by default and `--no-save-notes` turned it off; that flag is still accepted).
   Without `--now` a running agent keeps its current account until its next start;
@@ -476,7 +476,7 @@ As built (2026-11-13), where it adds to the plan above:
   "finished its turn on the request to save notes and moved to Work", or that it can't restart now
   and why (it moves at its next start).
 - `agent.update` replies with `switch` (docs/PROTOCOL.md). The CLI also takes `--reason TEXT`.
-- Also from a Claude agent's tab menu ("Switch account…"), not only the Agents panel row.
+- Also from a Claude agent's tab menu ("Switch account…"), not only its row in the sidebar.
 
 Changes on 21 Nov 2026 (the owner: "allow you to edit accounts in the future. i hate all these
 random rules i didnt ask for blocking us", and "its waking up idle agents to tell them to prepare
@@ -489,7 +489,7 @@ being moved, let's make a way to avoid that in the future"):
   and "Wake it first to save notes" (the dialog, unticked) keep it as an opt-in. A busy agent is
   never asked either way, as before.
 - A move without Now waits for the agent's next start, and the window now says so wherever the
-  agent shows: "Moves to Work at its next start" under its row in the Agents panel, at the top of
+  agent shows: "Moves to Work at its next start" in its card in the sidebar, at the top of
   its row and tab menus with **Restart now on Work** (enabled only while it is running, idle and
   has nothing queued, the same check as Now), and as a panel in Edit agent with a **Restart now**
   button. `agent.update` with `now` alone (`muster agent edit NAME --now`) applies the move that

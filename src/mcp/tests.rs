@@ -1767,7 +1767,7 @@ async fn ask_agent_origin_rule_hops_and_cap() {
     m.d.lock().agent_counts.insert(3, crate::mcp::guard::AGENT_DAILY_PROMPT_CAP);
     let (t, err) = call(&st, "ask_agent", json!({"agent": "ada", "text": "x"})).await;
     assert!(err && t.contains("last 24 hours"), "{t}");
-    // Each policy refusal was kept for the agents panel's log (origin x2, hops, cap).
+    // Each policy refusal was kept for the sidebar's message log (origin x2, hops, cap).
     let refused = m.d.lock().refused.clone();
     assert_eq!(refused.len(), 4, "{refused:?}");
     assert!(refused[0].1.contains("accepts only human") && refused[3].1.contains("last 24 hours"));

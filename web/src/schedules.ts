@@ -1,4 +1,4 @@
-// Pure logic for schedules (docs/UI.md "Agents panel", docs/PROTOCOL.md "Schedules"): the New /
+// Pure logic for schedules (docs/UI.md "Agents in the sidebar", docs/PROTOCOL.md "Schedules"): the New /
 // Edit schedule dialog's timing presets and agent order, and how rows and run history read. No
 // signals, no DOM: unit tested (schedules_test.ts). Cron lines are read by the backend
 // (`schedule.preview`); here they are only matched against the presets' shapes.
@@ -667,24 +667,9 @@ function waitingSince(s: Schedule): number {
   return s.made_by && s.made_by.approved_at === null ? s.made_by.at : s.held?.at ?? s.updated_at;
 }
 
-/** Every schedule waiting for your approval, oldest first (the panel's notice, and its count). */
+/** Every schedule waiting for your approval, oldest first (the sidebar's Needs you box). */
 export function waitingProposals(list: Schedule[]): Schedule[] {
   return list.filter(isProposal).sort((a, b) => waitingSince(a) - waitingSince(b) || a.id - b.id);
-}
-
-/** The panel's notice: "2 schedules proposed by reviewer wait for your approval", "1 schedule
- * made outside Muster's window waits for your approval", or both kinds together. */
-export function waitingNotice(waiting: Schedule[]): string {
-  const proposed = waiting.filter((s) => !isHeld(s) || (s.made_by && s.made_by.approved_at === null));
-  const held = waiting.length - proposed.length;
-  const n = (k: number) => (k === 1 ? "1 schedule" : `${k} schedules`);
-  const verb = waiting.length === 1 ? "waits" : "wait";
-  if (!held) {
-    const by = [...new Set(proposed.map((s) => s.made_by?.agent ?? "an agent"))].join(", ");
-    return `${n(proposed.length)} proposed by ${by} ${verb} for your approval`;
-  }
-  if (!proposed.length) return `${n(held)} made or changed outside Muster's window ${verb} for your approval`;
-  return `${n(waiting.length)} ${verb} for your approval (${proposed.length} proposed by agents, ${held} from the command line)`;
 }
 
 /** What a held schedule's card says was done outside the window: "Made from the command line",

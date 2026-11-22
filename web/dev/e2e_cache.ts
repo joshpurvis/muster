@@ -32,9 +32,9 @@ export async function cacheChecks(a: Browser, { shots, ok, check }: CacheCtx) {
   check(prefs.cache_warn === true && prefs.cache_ttl?.claude === 60, "the backend's defaults: on, Claude 1 h");
 
   // A Claude agent with a tab here, idle.
-  if (!(await a.eval(`${M}.agentsPanelOpen.value`))) await a.key("Alt+G");
-  await a.wait(`!!document.querySelector('[data-agent="digest"]')`, 5000);
-  await a.click(`[data-agent="digest"]`);
+  if (await a.eval(`document.querySelector('.sidebar')?.style.display === 'none'`)) await a.key("Alt+G");
+  await a.wait(`!!document.querySelector('.channel-row[data-agent="digest"]')`, 5000);
+  await a.click(`.channel-row[data-agent="digest"] .channel-select`);
   await a.wait(`(() => { const ag = ${M}.agents.value.find((x) => x.name === "digest");
     const s = ag && ${M}.sessions.value.get(ag.session_id); return !!s && s.state !== "starting" && s.state !== "exited"; })()`, 8000);
   const sid: number = await a.eval(`${M}.agents.value.find((x) => x.name === "digest").session_id`);

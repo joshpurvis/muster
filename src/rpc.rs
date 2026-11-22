@@ -1551,7 +1551,7 @@ async fn dispatch_inner(hub: &Arc<Hub>, who: &Principal, method: &str, params: V
                     if p.on && via == Via::Outside {
                         return Err(RpcError(
                             "allowing triggers on a note lets its changes start runs, so it takes a click in Muster's window \
-                             (the note's status line, or the trigger's ⋯ menu in the Agents panel). From here you can only switch them off"
+                             (the note's status line, or the trigger's ⋯ menu in its agent's card in the sidebar). From here you can only switch them off"
                                 .into(),
                         ));
                     }
@@ -1626,7 +1626,7 @@ async fn agent_schedule_call(hub: &Arc<Hub>, method: &str, params: &Value, from:
 
 /// Why `schedule.approve` was refused from anything but a click in Muster's window.
 pub const APPROVE_BY_CLICK: &str = "a schedule waiting for approval (an agent's proposal, or one made or changed outside Muster's \
-     window) is approved only with a click on Approve in Muster's window (the Agents panel): not from the command line, a script \
+     window) is approved only with a click on Approve in Muster's window (Needs you, in the sidebar): not from the command line, a script \
      or an agent, so an agent can't approve its own";
 
 /// How a WebSocket connection came in (`server::ws_upgrade`).

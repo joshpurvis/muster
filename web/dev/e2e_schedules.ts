@@ -1,5 +1,5 @@
-// Schedules checks for the mock e2e walkthrough (dev/e2e.ts calls `scheduleChecks`): the agents
-// panel's Schedules sections with their history, the New / Edit schedule dialog, Run now, pause,
+// Schedules checks for the mock e2e walkthrough (dev/e2e.ts calls `scheduleChecks`): each agent's
+// schedules in its sidebar card with their history, the Needs you box, the New / Edit schedule dialog, Run now, pause,
 // Pause all and Scheduling settings. Also runs alone against the mock, for quick iteration:
 //
 //   deno task build:dev && MOCK_PORT=17761 deno task mock &
@@ -39,8 +39,19 @@ export async function scheduleChecks(a: Browser, { shots, ok, check }: ScheduleC
     await a.sleep(150);
     await a.key("Enter");
   };
-  const row = (name: string) => `[...document.querySelectorAll('.sch-row')].find((r) => r.querySelector('.sch-name')?.textContent === ${js(name)})`;
-  const rowSel = async (name: string) => `.sch-row[data-schedule="${await a.eval(`${row(name)}?.dataset.schedule`)}"]`;
+  // A schedule's row is in its agent's card: the lookup opens that card first (as → on the agent's
+  // row does; it stays open until Esc or focus leaves it), so a poll finds the row on its next try.
+  const row = (name: string) => `(() => {
+    const s = ${M}.schedules.value.find((x) => x.name === ${js(name)});
+    if (s && ${M}.agentCard.value?.agent !== s.agent_id) ${M}.agentCard.value = { agent: s.agent_id, byKey: true };
+    return [...document.querySelectorAll('.agent-card .sch-row')].find((r) => r.querySelector('.sch-name')?.textContent === ${js(name)});
+  })()`;
+  /** Open the card that holds a schedule and wait for its row. */
+  const card = (name: string) => a.wait(`!!${row(name)}`, 3000);
+  const rowSel = async (name: string) => {
+    await card(name);
+    return `.sch-row[data-schedule="${await a.eval(`${row(name)}?.dataset.schedule`)}"]`;
+  };
   const openMenu = async (name: string) => {
     await a.click(`${await rowSel(name)} .sch-more`);
     await a.wait(`!!document.querySelector('.menu')`, 2000);
@@ -51,25 +62,36 @@ export async function scheduleChecks(a: Browser, { shots, ok, check }: ScheduleC
       Object.getOwnPropertyDescriptor(proto.prototype, 'value').set.call(i, ${js(v)});
       i.dispatchEvent(new Event(${js(ev)}, { bubbles: true })); })()`);
 
-  if (!(await a.eval(`${M}.agentsPanelOpen.value`))) await a.key("Alt+G");
-  await a.wait(`!!document.querySelector('.agents-panel') && document.querySelectorAll('.sch-row').length >= 3`, 5000);
+  if (await a.eval(`document.querySelector('.sidebar')?.style.display === 'none'`)) await a.key("Alt+G");
+  await a.wait(`!!document.querySelector('.channel-row[data-agent="worker"]')`, 5000);
 
-  // ---- the panel: each agent's schedules under its row
+  // ---- the sidebar: each agent's schedules in its card; a failed run in Needs you, flagged on its row
+  check(await a.eval(`!document.querySelector('.sch-row')`), "no schedule rows until a card opens");
   check(
-    await a.eval(`document.querySelector('[data-agent="worker"]').nextElementSibling?.matches('.sch-list')`),
-    "the worker's schedules sit right under its row",
+    await a.eval(`document.querySelector('.needs-you .ny-run .ny-name')?.textContent === 'CI check'`),
+    "the blocked run is in Needs you",
+  );
+  check(
+    await a.eval(`!!document.querySelector('.channel-row[data-agent="worker"] .row-chip-bad')`),
+    "the worker's row has the red chip",
+  );
+  await card("Daily PR summary");
+  check(
+    await a.eval(`document.querySelector('.agent-card .sch-list')?.getAttribute('aria-label') === 'Schedules of worker'`),
+    "the worker's schedules are in its card",
   );
   const daily = row("Daily PR summary");
   check(/^next: /.test(await a.eval(`${daily}.querySelector('.sch-next').textContent`)), "the next run shows");
   check(await a.eval(`${daily}.querySelector('.sch-chip').textContent`) === "replied", "the last run's outcome");
   check(await a.eval(`${row("CI check")}.querySelector('.sch-badge')?.textContent`) === "paused", "a paused badge");
   check(await a.eval(`${row("CI check")}.querySelector('.sch-chip.sch-bad')?.textContent`) === "blocked", "a failure in red");
+  await card("Morning digest");
   check(
     /^expires (today|tomorrow)/.test(await a.eval(`${row("Morning digest")}.querySelector('.sch-expires')?.textContent ?? ''`)),
     "a Claude subscription agent's schedule says when it expires, with Renew",
   );
-  await shot("agents-panel-schedules", ".agents-panel");
-  ok("the agents panel lists each agent's schedules: next run, last outcome, paused badge, expiry");
+  await shot("agent-card-schedules", ".agent-card");
+  ok("each agent's card lists its schedules: next run, last outcome, paused badge, expiry; a blocked run is in Needs you");
 
   // ---- history: click a schedule; failures red, skips grey, a catch-up chip; a run opens its message
   await a.click(await rowSel("Daily PR summary"));
@@ -79,7 +101,7 @@ export async function scheduleChecks(a: Browser, { shots, ok, check }: ScheduleC
   check(lines.some((l) => l.includes("sch-run-skip") && l.includes("busy")), "a skipped run is grey, with why");
   check(lines.some((l) => l.includes("sch-run-bad") && l.includes("refused")), "a refused run is red, with why");
   check(lines.some((l) => l.includes("catch-up")), "a catch-up run has its chip");
-  await shot("schedule-history", ".agents-panel");
+  await shot("schedule-history", ".agent-card");
   await a.click(`.sch-runs .sch-run.has-msg`);
   await a.wait(`!!document.querySelector('.msg-dlg')`, 2000);
   check(
@@ -101,7 +123,7 @@ export async function scheduleChecks(a: Browser, { shots, ok, check }: ScheduleC
   ok("clicking a schedule shows its runs (failures red, skips grey, catch-up chip); a run opens its message and reply");
 
   // ---- New schedule from an agent's menu preselects that agent
-  await a.click(`[data-agent="digest"]`, { button: "right" });
+  await a.click(`.channel-row[data-agent="digest"] .channel-select`, { button: "right" });
   await a.wait(`!!document.querySelector('.menu')`, 2000);
   check(await menuItem("New schedule…"), "an agent's menu has New schedule…");
   await a.wait(`!!document.querySelector('.sch-dlg .sch-agent')`, 2000);
@@ -207,11 +229,12 @@ export async function scheduleChecks(a: Browser, { shots, ok, check }: ScheduleC
   // ---- Pause all: a banner with Resume; the palette offers the opposite
   await a.click(".ap-head-more");
   await a.wait(`!!document.querySelector('.menu')`, 2000);
-  check(await menuItem("Pause all schedules"), "Pause all in the panel header's menu");
+  check(await menuItem("Pause all schedules"), "Pause all in the Channels header's menu");
   await a.wait(`!!document.querySelector('.sch-paused-note')`, 2000);
   check((await R("schedule.settings.get", {})).paused === true, "the backend has it");
+  await card("Daily PR summary");
   check(await a.eval(`!!document.querySelector('.sch-next.held')`), "next runs show as held");
-  await shot("agents-panel-paused", ".agents-panel");
+  await shot("sidebar-paused", ".sidebar");
   await a.click(".sch-paused-note .sch-link");
   await a.wait(`!document.querySelector('.sch-paused-note')`, 2000);
   await palette("pause all schedules");

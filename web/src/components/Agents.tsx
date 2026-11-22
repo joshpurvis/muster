@@ -1,23 +1,16 @@
-// Named agents (docs/UI.md "Agents panel"): the left dock (rows, message log), the New / Edit
+// Named agents (docs/UI.md "Agents in the sidebar"): the sidebar's message log, the New / Edit
 // agent dialog with its Memory tab, and the message overlay. Talking to an agent happens in its
-// own terminal tab; the panel only starts, finds and configures agents.
-import { type ComponentChildren, Fragment } from "preact";
+// own terminal tab; its row and card in the sidebar (AgentCard.tsx) start, find and configure it.
+import type { ComponentChildren } from "preact";
 import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "preact/hooks";
-import { Communication } from "./Communication.tsx";
 import { rpc } from "../rpc.ts";
-import { AgentSchedules, agentsHeaderItems, agentsHeaderMenu, moveRow, ProposalsNotice, SchedulesPausedNotice } from "./Schedules.tsx";
 import {
   workspaces,
   accountProfiles,
   accountUsage,
-  schedulesSupported,
-  scheduleSettings,
   agentFilter,
-  cacheNow,
   agentMessages,
   agents,
-  agentsPanelOpen,
-  agentsSupported,
   knowAgent,
   openRouter,
   overlay,
@@ -25,12 +18,9 @@ import {
   sessions,
   setPref,
   toast,
-  windowPrefs,
 } from "../state.ts";
 import * as A from "../actions.ts";
 import {
-  agentBilling,
-  agentStatus,
   ago,
   choiceOf,
   contextLabel,
@@ -79,14 +69,13 @@ import type {
   Provider,
 } from "../types.ts";
 import { DEFAULT_PERMISSIONS, KIND_LABEL } from "../types.ts";
-import { Kbd, SessionDot, Spinner, StateDot } from "./common.tsx";
-import { contextMenu, openMenu } from "./Menu.tsx";
+import { Kbd, Spinner } from "./common.tsx";
+import { contextMenu } from "./Menu.tsx";
 import { PermissionsPanel, PermissionsPill } from "./Permissions.tsx";
 import { ProfilePill, ProfileUsage } from "./AccountProfiles.tsx";
 import { atLimit, profileName, sameChoice } from "../account_profiles.ts";
 import { MoreOptions, PillSelect } from "./DialogKit.tsx";
 import {
-  IconAgents,
   IconBranch,
   IconChevron,
   IconChevronDown,
@@ -94,17 +83,16 @@ import {
   IconCpu,
   IconFolder,
   IconGauge,
-  IconMore,
   IconPlus,
   IconShieldAlert,
   IconSpark,
   IconX,
 } from "../icons.tsx";
 import { cx } from "../util.ts";
-import { CACHE_DOT_LABEL, cacheDot, idleText, isCold, wakeCold } from "../cache.ts";
+import { idleText } from "../cache.ts";
 
 /** Re-render every `ms` (the "time in state" column). */
-function useNow(ms = 30_000): number {
+export function useNow(ms = 30_000): number {
   const [now, setNow] = useState(Date.now());
   useEffect(() => {
     const t = setInterval(() => setNow(Date.now()), ms);
@@ -113,220 +101,13 @@ function useNow(ms = 30_000): number {
   return now;
 }
 
-// ---------------- the panel ----------------
-
-export function AgentsPanel() {
-  const now = useNow();
-  const list = agents.value;
-  const sel = agentFilter.value;
-  return (
-    <aside class="agents-panel" aria-label="Agents">
-      <div class="ap-head" {...contextMenu(agentsHeaderItems)}>
-        <button type="button" class="sidebar-heading" aria-expanded="true" onClick={A.toggleAgentsPanel}>
-          <IconChevron size={12} class="open" /><IconAgents size={14} />
-          <span>Agents</span><span class="ap-count">{list.length}</span>
-        </button>
-        {agentsSupported.value && (
-          <button
-            type="button"
-            class="ap-icon-btn ap-head-more"
-            aria-label="Agents and schedules menu"
-            aria-haspopup="menu"
-            data-tip={schedulesSupported.value ? "New agent or schedule, pause all, settings" : "New agent"}
-            onClick={(e) => agentsHeaderMenu(e.currentTarget)}
-          >
-            <IconMore size={13} />
-          </button>
-        )}
-      </div>
-      {agentsSupported.value && <Communication />}
-      {agentsSupported.value && <SchedulesPausedNotice />}
-      {agentsSupported.value && <ProposalsNotice />}
-      {!agentsSupported.value
-        ? <div class="ap-empty">This daemon has no agents. Update muster to use them.</div>
-        : (
-          <div class="ap-list" role="list">
-            {list.length === 0 && (
-              <div class="ap-empty">
-                Persistent agents with their own folder and memory, which you and other agents can ask things.
-              </div>
-            )}
-            {list.map((a) => (
-              <Fragment key={a.id}>
-                <AgentRow a={a} now={now} selected={sel === a.id} />
-                <AgentSchedules agent={a} now={now} />
-              </Fragment>
-            ))}
-            <button type="button" class="ap-new" onClick={() => A.newAgentDialog()}>
-              <IconPlus size={12} /> New agent
-            </button>
-          </div>
-        )}
-      {agentsSupported.value && <Feed now={now} />}
-    </aside>
-  );
-}
-
-function agentMenu(a: Agent, x: number, y: number) {
-  const live = A.agentLive(a);
-  const s = a.session_id !== null ? sessions.value.get(a.session_id) : undefined;
-  const asleep = agentStatus(a, s).asleep;
-  const cold = asleep && wakeCold(s, cacheNow());
-  openMenu({
-    x,
-    y,
-    minWidth: 190,
-    items: [
-      { header: a.name },
-      { label: "Edit…", run: () => A.editAgent(a.name) },
-      { label: "Memory…", run: () => A.editAgent(a.name, "memory") },
-      ...(A.canSwitchAccount(a) ? [{ label: "Switch account…", run: () => A.switchAgentAccount(a.name) }] : []),
-      ...(schedulesSupported.value ? [{ label: "New schedule…", run: () => A.newScheduleDialog(a.name) }] : []),
-      ...A.pendingMoveItems(a),
-      "sep",
-      ...(asleep
-        ? [
-          { label: "Show", run: () => A.openAgent(a.name) },
-          { label: "Wake", hint: cold ? "re-reads it all" : undefined, run: () => A.wakeAgent(a) },
-        ]
-        : [{ label: live ? "Show" : "Start", run: () => A.openAgent(a.name) }]),
-      {
-        label: "Start fresh",
-        hint: a.kind === "claude" ? "new conversation" : undefined,
-        run: () => A.openAgent(a.name, true),
-      },
-      // Sleep needs a saved conversation to wake into; the daemon says why otherwise.
-      ...(asleep ? [] : [{ label: "Sleep", disabled: !live || !a.resumable, run: () => A.sleepAgent(a) }]),
-      { label: "Stop", disabled: !live, run: () => A.stopAgent(a) },
-      { label: "Autostart", checked: a.autostart, run: () => A.setAgentAutostart(a, !a.autostart) },
-      "sep",
-      { label: "Remove…", danger: true, run: () => A.removeAgent(a) },
-    ],
-  });
-}
-
-/** The row's explanation of a waiting move (its tooltip, and its screen-reader description). */
-function moveTip(move: NonNullable<ReturnType<typeof pendingMove>>): string {
-  if (!move.running) return move.off ? `${move.text}. ${move.why}` : `${move.text}: a new conversation there.`;
-  const why = move.restart ? "Restart now is in its menu." : move.why;
-  return `${move.text}. Until then it keeps running on ${move.from}. ${why}`;
-}
-
-function AgentRow({ a, now, selected }: { a: Agent; now: number; selected: boolean }) {
-  const s = a.session_id !== null ? sessions.value.get(a.session_id) : undefined;
-  const st = agentStatus(a, s);
-  const billing = agentBilling(a, s);
-  // What it billed to OpenRouter today (UTC day), once read (src/spend.rs).
-  const spent = billing.badge ? scheduleSettings.value?.spend?.agents.find((x) => x.id === a.id)?.spent : undefined;
-  // Asleep: its next message re-reads the conversation uncached once the cache has expired.
-  const cold = !!s && (st.asleep ? wakeCold(s, cacheNow()) : isCold(s, cacheNow()));
-  const dot = s && st.live ? cacheDot(s, cacheNow(), windowPrefs.value?.cache_warn !== false) : null;
-  const persona = firstLine(a.persona);
-  // A move to another account waiting for its next start (docs/ACCOUNT_PROFILES.md).
-  const move = pendingMove(a, s, accountProfiles.value);
-  const open = () => {
-    agentFilter.value = a.id;
-    A.openAgent(a.name);
-  };
-  return (
-    <div
-      role="listitem"
-      class={cx("ap-row", selected && "sel", !st.live && "stopped", st.asleep && "asleep")}
-      data-agent={a.name}
-      data-tip={persona || undefined}
-      tabIndex={0}
-      aria-label={`${a.name}, ${KIND_LABEL[a.kind]}${billing.badge ? `, ${billing.note ?? OPENROUTER_BADGE}` : ""}, ${st.label}${move ? `; ${move.text}` : ""}${
-        cold ? ", prompt cache likely expired" : dot ? `, ${CACHE_DOT_LABEL[dot]}` : ""
-      }`}
-      aria-describedby={move ? `ap-move-${a.id}` : undefined}
-      onClick={open}
-      onKeyDown={(e) => {
-        // Enter or Space on the row's own ⋯ button is the button's, not the row's.
-        if ((e.key === "Enter" || e.key === " ") && e.target !== e.currentTarget) return;
-        if (e.key === "Enter" || e.key === " ") {
-          e.preventDefault();
-          open();
-        } else if (e.key === "ArrowDown" || e.key === "ArrowUp") {
-          moveRow(e);
-        } else if (e.key === "ContextMenu" || (e.key === "F10" && e.shiftKey)) {
-          e.preventDefault();
-          const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
-          agentMenu(a, r.left + 24, r.bottom - 4);
-        }
-      }}
-      onContextMenu={(e) => {
-        e.preventDefault();
-        agentMenu(a, e.clientX, e.clientY);
-      }}
-    >
-      {s && st.live ? <SessionDot s={s} /> : <StateDot state={st.state} class={st.asleep ? "dot-asleep" : undefined} />}
-      <span class="ap-row-text">
-        <span class="ap-row-top">
-          <span class="ap-name">{a.name}</span>
-          <span class={cx("ap-kind", "ap-kind-" + a.kind)}>{KIND_LABEL[a.kind]}</span>
-        </span>
-        <span class="ap-row-sub">
-          {st.label}
-          {st.since !== null && ` · ${ago(st.since, now)}`}
-          {a.lead && (
-            <span class="ap-auto" data-tip="Lead agent: what it sends from a reminder or a schedule counts as yours">lead</span>
-          )}
-          {a.autostart && <span class="ap-auto" data-tip="Starts with the daemon">auto</span>}
-          {a.sleep_after_min != null && !st.asleep && (
-            <span class="ap-auto" data-tip={`Sleeps after ${idleText(a.sleep_after_min * 60_000)} idle; the next message sent with wake on wakes it`}>
-              sleeps
-            </span>
-          )}
-          {cold && (
-            <span
-              class="ap-cold"
-              data-tip={st.asleep
-                ? "Its prompt cache has likely expired: waking it re-reads the whole conversation at full cost"
-                : "Its prompt cache has likely expired: the next message re-reads the whole conversation"}
-            >
-              cold
-            </span>
-          )}
-        </span>
-        {move && (
-          <span
-            class="ap-move"
-            data-tip={moveTip(move)}
-          >
-            {move.text}
-            <span class="sr-only" id={`ap-move-${a.id}`}>{moveTip(move)}</span>
-          </span>
-        )}
-        {billing.badge && (
-          <span
-            class={cx("or-badge", billing.note && "or-badge-pending")}
-            data-tip={billing.note ?? "Billed per token to your OpenRouter key, not a subscription"}
-          >
-            {billing.label}
-            {spent !== undefined && <span class="or-spent" data-tip="Estimated from the key's spend while it worked (OpenRouter's UTC day)"> · ~${spent.toFixed(2)} today (est.)</span>}
-          </span>
-        )}
-      </span>
-      <button
-        type="button"
-        class="ap-more"
-        aria-label={`${a.name} menu`}
-        onClick={(e) => {
-          e.stopPropagation();
-          const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
-          agentMenu(a, r.left, r.bottom + 4);
-        }}
-      >
-        <IconMore size={13} />
-      </button>
-    </div>
-  );
-}
+// ---------------- the message log ----------------
 
 /** Older messages are fetched on demand (`agent.messages` pages, newest first). */
 const olderState = { busy: false, done: new Set<string>() };
 
-function Feed({ now }: { now: number }) {
+/** The sidebar's Messages section: the log, filtered to the open channel's agent. */
+export function Feed({ now }: { now: number }) {
   const open = prefs.value.agentFeed;
   const sel = agentFilter.value;
   const selName = sel !== null ? agents.value.find((a) => a.id === sel)?.name : undefined;
@@ -1037,8 +818,8 @@ export function AgentDialog(
         });
         knowAgent(a);
         overlay.value = null;
-        if (!agentsPanelOpen.value) A.toggleAgentsPanel();
-        toast("success", `Created ${a.name}. Click it in the agents panel to start it.`);
+        A.revealSidebar();
+        toast("success", `Created ${a.name}. Click its row in the sidebar to start it.`);
         A.focusActiveTerminalSoon();
         return;
       }

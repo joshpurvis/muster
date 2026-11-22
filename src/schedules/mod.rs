@@ -616,7 +616,7 @@ impl Run {
     }
 }
 
-/// The scheduling settings (Agents panel → Scheduling settings).
+/// The scheduling settings (the sidebar's Channels ⋯ → Scheduling settings).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -1313,7 +1313,7 @@ fn check_agent(hub: &Hub, agent: &Agent, origin: Origin) -> anyhow::Result<()> {
         };
         anyhow::bail!(
             "agent {} doesn't take {what} work: tick {tick} under \"Takes messages started by\" in Edit agent, \
-             in Muster's window (the Agents panel).{extra}",
+             in Muster's window (Needs you, at the top of the sidebar).{extra}",
             agent.name,
         );
     }
@@ -1364,7 +1364,7 @@ fn held_room<'a>(list: impl Iterator<Item = &'a Schedule>) -> anyhow::Result<()>
     ensure!(
         waiting < HELD_NEW_MAX,
         "{waiting} schedules made outside Muster's window already wait for your approval (at most {HELD_NEW_MAX}): \
-         approve or dismiss them in the Agents panel first"
+         approve or dismiss them in Muster's sidebar (Needs you) first"
     );
     Ok(())
 }
@@ -1970,7 +1970,7 @@ pub fn set_settings(hub: &Hub, c: SettingsChange, window: bool) -> anyhow::Resul
         let wider = settings_widened(&base, &next);
         ensure!(
             window || wider.is_empty(),
-            "{} would let more run unattended, so it takes a click in Muster's window (Agents panel → ⋯ → \
+            "{} would let more run unattended, so it takes a click in Muster's window (the sidebar's Channels ⋯ → \
              Scheduling settings). From the command line or a script these settings only tighten: pause all, lower spend \
              caps, fewer watched folders. The unattended cap and the quiet hours change from there either way",
             capitalize(&wider.join(", "))

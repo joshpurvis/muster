@@ -1,14 +1,13 @@
-// Schedules in the agents panel (docs/UI.md "Agents panel"): each agent's schedules under its
-// row with their run history, the "All schedules paused" notice, the panel header menu, and the
-// New / Edit schedule and Scheduling settings dialogs. Runs are ordinary agent messages, so a
-// run's message opens in the panel's message overlay.
+// Schedules in the sidebar (docs/UI.md "Agents in the sidebar"): each agent's schedules in its
+// card with their run history, the "Needs you" box, the "All schedules paused" notice, the
+// Channels header's schedule items, and the New / Edit schedule and Scheduling settings dialogs.
+// Runs are ordinary agent messages, so a run's message opens in the message overlay.
 import type { ComponentChildren } from "preact";
 import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "preact/hooks";
 import { rpc } from "../rpc.ts";
 import {
   agentMessages,
   agents,
-  agentsPanelOpen,
   knowSchedule,
   overlay,
   scheduleHistoryOpen,
@@ -17,8 +16,11 @@ import {
   schedules,
   scheduleSettings,
   schedulesSupported,
+  prefs,
+  setPref,
   toast,
 } from "../state.ts";
+import { hideRun, needsYouItems } from "../sidebar.ts";
 import * as A from "../actions.ts";
 import { notes } from "../notes.ts";
 import { UNATTENDED_WARNING } from "../agents.ts";
@@ -48,7 +50,6 @@ import {
   scheduleAgents,
   type ScheduleFields,
   schedulePatch,
-  sortSchedules,
   type WhenDraft,
   whenOfDraft,
   whenToSend,
@@ -72,19 +73,17 @@ import {
   isProposal,
   isHeld,
   heldHeadline,
-  waitingNotice,
   madeByLabel,
   proposalFacts,
   promptIsLong,
   readingWithZone,
   FILES_DEPTH,
-  waitingProposals,
   thenSteps,
 } from "../schedules.ts";
-import type { Agent, Schedule, SchedulePreview, ScheduleRun, ScheduleSettings, WhenInput } from "../types.ts";
+import type { Schedule, SchedulePreview, ScheduleRun, ScheduleSettings, WhenInput } from "../types.ts";
 import { KIND_LABEL } from "../types.ts";
 import { Kbd, Spinner } from "./common.tsx";
-import { openMenu, openMenuAt, type MenuItem } from "./Menu.tsx";
+import { openMenu, type MenuItem } from "./Menu.tsx";
 import { IconAgents, IconChevronDown, IconClock, IconMore, IconPause, IconShieldAlert, IconSpark, IconZap } from "../icons.tsx";
 import { MoreOptions, PillSelect } from "./DialogKit.tsx";
 import { cx } from "../util.ts";
@@ -99,33 +98,21 @@ type ModalT = (
   p: { children: ComponentChildren; class?: string; label: string; onClose?: () => void },
 ) => ComponentChildren;
 
-// ---------------- the panel ----------------
+// ---------------- in the sidebar ----------------
 
-/** The panel header's ⋯: new agent or schedule, pause all, scheduling settings. */
-export function agentsHeaderItems(): MenuItem[] {
-  const sup = schedulesSupported.value;
+/** The Channels header's schedule items: new schedule, pause all, scheduling settings. */
+export function scheduleHeaderItems(): MenuItem[] {
+  if (!schedulesSupported.value) return [];
   const paused = !!scheduleSettings.value?.paused;
   return [
-    { label: "New agent…", run: () => A.newAgentDialog() },
-    ...(sup
-      ? [
-        { label: "New schedule…", run: () => A.newScheduleDialog() },
-        "sep" as const,
-        { label: "Pause all schedules", checked: paused, run: () => A.setAllSchedulesPaused(!paused) },
-        { label: "Scheduling settings…", run: () => A.scheduleSettingsDialog() },
-      ]
-      : []),
+    { label: "New schedule…", run: () => A.newScheduleDialog() },
     "sep",
-    { label: agentsPanelOpen.value ? "Hide agents" : "Show agents", keys: "Alt+Shift+G", run: A.toggleAgentsPanel },
-    { label: "Hide sidebar", keys: "Alt+G", run: A.toggleSidebar },
+    { label: "Pause all schedules", checked: paused, run: () => A.setAllSchedulesPaused(!paused) },
+    { label: "Scheduling settings…", run: () => A.scheduleSettingsDialog() },
   ];
 }
 
-export function agentsHeaderMenu(el: Element) {
-  openMenuAt(el, agentsHeaderItems(), { minWidth: 200, alignRight: false });
-}
-
-/** "All schedules paused · Resume", under the panel header while Pause all is on. */
+/** "All schedules paused · Resume", under the Channels header while Pause all is on. */
 export function SchedulesPausedNotice() {
   if (!schedulesSupported.value || !scheduleSettings.value?.paused) return null;
   return (
@@ -137,24 +124,174 @@ export function SchedulesPausedNotice() {
   );
 }
 
-/** "2 schedules proposed by reviewer wait for your approval · Show" (or made outside Muster's
- * window), under the panel header while any wait. */
-export function ProposalsNotice() {
+/** "Needs you", at the top of the sidebar while anything waits for the human: schedules waiting
+ * for approval (Approve / Edit… / Dismiss), then schedules whose last run failed (its history on
+ * click, the schedule's menu, Hide). Gone when empty. `openAgent` opens the agent's card. */
+export function NeedsYou({ now, openAgent }: { now: number; openAgent: (agent: number) => void }) {
   if (!schedulesSupported.value) return null;
-  const waiting = waitingProposals(schedules.value);
-  if (!waiting.length) return null;
-  const show = () => {
-    const el = document.querySelector<HTMLElement>(`.sch-prop[data-schedule="${waiting[0].id}"]`);
-    el?.scrollIntoView({ block: "nearest" });
-    el?.focus();
-  };
+  const items = needsYouItems(schedules.value, prefs.value.hiddenRuns);
+  if (!items.length) return null;
   return (
-    <div class="sch-paused-note sch-prop-note" role="status">
-      <IconSpark size={12} />
-      <span>{waitingNotice(waiting)}</span>
-      <button type="button" class="sch-link" onClick={show}>Show</button>
+    <section class="needs-you" aria-label={`Needs you: ${items.length}`}>
+      <div class="ny-head" aria-hidden="true">
+        <IconSpark size={12} /><span>Needs you</span><span class="ap-count">{items.length}</span>
+      </div>
+      <div role="list">
+        {items.map((i) =>
+          i.kind === "proposal"
+            ? <NeedsProposal key={`p${i.schedule.id}`} s={i.schedule} now={now} openAgent={openAgent} />
+            : <NeedsRun key={`r${i.schedule.id}`} s={i.schedule} now={now} />
+        )}
+      </div>
+    </section>
+  );
+}
+
+/** A waiting schedule in Needs you: its name (opens its agent's card, which shows the whole
+ * proposal), who proposed it and when, and Approve / Edit… / Dismiss. */
+function NeedsProposal({ s, now, openAgent }: { s: Schedule; now: number; openAgent: (agent: number) => void }) {
+  const m = s.made_by && s.made_by.approved_at === null ? s.made_by : null;
+  const held = !m ? s.held ?? null : null;
+  const fresh = !!m || (held?.what ?? ["made"]).includes("made");
+  const since = m?.at ?? held?.at ?? s.updated_at;
+  const by = m ? `Proposed by ${m.agent}` : heldHeadline(s);
+  const on = s.agent && s.agent !== m?.agent ? ` for ${s.agent}` : "";
+  return (
+    <div
+      role="listitem"
+      class="ny-item ny-prop"
+      data-schedule={s.id}
+      aria-label={`${s.name}. ${by}${on}, ${nextWhenPast(since, now)}. Waits for your approval.`}
+      onContextMenu={(e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        proposalMenu(s, e.clientX, e.clientY);
+      }}
+    >
+      <IconSpark size={12} class="ny-icon" />
+      <div class="ny-text">
+        <button
+          type="button"
+          class="ny-name"
+          data-tip={`Read it in ${s.agent ?? "its agent"}'s card`}
+          aria-haspopup="dialog"
+          onClick={() => openAgent(s.agent_id)}
+          onKeyDown={(e) => {
+            if (e.key === "ContextMenu" || (e.key === "F10" && e.shiftKey)) {
+              e.preventDefault();
+              const r = e.currentTarget.getBoundingClientRect();
+              proposalMenu(s, r.left + 24, r.bottom - 4);
+            }
+          }}
+        >
+          {s.name}
+        </button>
+        <span class="ny-sub">
+          {by}{on} · <span data-tip={new Date(since).toLocaleString()}>{nextWhenPast(since, now)}</span>
+        </span>
+        <span class="ny-actions">
+          <button type="button" class="btn btn-sm btn-primary sch-approve" onClick={() => A.approveSchedule(s)}>Approve</button>
+          <button type="button" class="btn btn-sm" onClick={() => A.editSchedule(s.id)}>Edit…</button>
+          {fresh
+            ? <button type="button" class="btn btn-sm sch-dismiss" onClick={() => A.dismissProposal(s)}>Dismiss</button>
+            : <button type="button" class="btn btn-sm sch-dismiss" onClick={() => A.removeSchedule(s)}>Remove…</button>}
+        </span>
+      </div>
     </div>
   );
+}
+
+/** A schedule whose last run failed, in Needs you: name, agent and next run, the outcome; click
+ * (or Enter) shows its runs under it; ⋯ is the schedule's menu; Hide takes it out of the box
+ * until a run fails again. */
+function NeedsRun({ s, now }: { s: Schedule; now: number }) {
+  const open = scheduleHistoryOpen.value.has(s.id);
+  const last = s.last_run!;
+  const next = nextLabel(s, now);
+  const reason = runReason(last);
+  const toggle = () => A.toggleScheduleHistory(s.id);
+  return (
+    <>
+      <div
+        role="listitem"
+        class={cx("ny-item ny-run", open && "open")}
+        data-schedule={s.id}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          scheduleMenu(s, e.clientX, e.clientY);
+        }}
+      >
+        {s.trigger ? <IconZap size={12} class="ny-icon sch-icon-trig" /> : <IconClock size={12} class="ny-icon" />}
+        <div class="ny-text">
+          <span class="ny-top">
+            <button
+              type="button"
+              class="ny-name"
+              aria-expanded={open}
+              aria-label={`${s.name}, on ${s.agent ?? "a removed agent"}: last run ${OUTCOME_LABEL[last.outcome]}${reason ? ` (${reason})` : ""}. ${next.text}. Show its runs`}
+              onClick={toggle}
+              onKeyDown={(e) => {
+                if (e.key === "ContextMenu" || (e.key === "F10" && e.shiftKey)) {
+                  e.preventDefault();
+                  const r = e.currentTarget.getBoundingClientRect();
+                  scheduleMenu(s, r.left + 24, r.bottom - 4);
+                }
+              }}
+            >
+              {s.name}
+            </button>
+            <button
+              type="button"
+              class="sch-link ny-hide"
+              data-tip="Take it out of Needs you until a run fails again"
+              aria-label={`Hide ${s.name} until a run fails again`}
+              onClick={() => setPref("hiddenRuns", hideRun(prefs.value.hiddenRuns, last.id))}
+            >
+              Hide
+            </button>
+            <button
+              type="button"
+              class="ap-icon-btn ny-more"
+              aria-label={`${s.name} menu`}
+              aria-haspopup="menu"
+              onClick={(e) => {
+                const r = e.currentTarget.getBoundingClientRect();
+                scheduleMenu(s, r.left, r.bottom + 4);
+              }}
+            >
+              <IconMore size={12} />
+            </button>
+          </span>
+          <span class="ny-sub">
+            <span class="ny-agent">{s.agent ?? "removed agent"} · {next.text}</span>
+            <span class={cx("sch-chip", "sch-bad")} data-outcome={last.outcome} data-tip={reason ?? undefined}>
+              {OUTCOME_LABEL[last.outcome]}
+            </span>
+          </span>
+        </div>
+      </div>
+      {open && <RunHistory s={s} now={now} />}
+    </>
+  );
+}
+
+/** An agent's schedules, in its card: proposals as cards, the others with their run history. */
+export function ScheduleList({ list, now, label }: { list: Schedule[]; now: number; label: string }) {
+  return (
+    <div role="list" class="sch-list" aria-label={label}>
+      {list.map((s) => <ScheduleRow key={s.id} s={s} now={now} />)}
+    </div>
+  );
+}
+
+/** Up / Down move through the schedule rows of one card or box. */
+export function moveRow(e: KeyboardEvent) {
+  e.preventDefault();
+  const box = (e.currentTarget as HTMLElement).closest(".agent-card, .needs-you") ?? document;
+  const rows = [...box.querySelectorAll<HTMLElement>(".sch-row, .sch-prop")];
+  const i = rows.indexOf(e.currentTarget as HTMLElement);
+  rows[i + (e.key === "ArrowDown" ? 1 : -1)]?.focus();
 }
 
 /** A waiting schedule's ⋯ menu: approve, edit first, or dismiss (a held change of one of yours:
@@ -213,28 +350,6 @@ function scheduleMenu(s: Schedule, x: number, y: number) {
       { label: "Remove…", danger: true, run: () => A.removeSchedule(s) },
     ],
   });
-}
-
-/** An agent's schedules, under its row: name, next run, last outcome, and the history when open. */
-export function AgentSchedules({ agent, now }: { agent: Agent; now: number }) {
-  if (!schedulesSupported.value) return null;
-  const list = sortSchedules(schedules.value.filter((s) => s.agent_id === agent.id));
-  if (!list.length) return null;
-  return (
-    <div role="listitem" class="sch-list" aria-label={`Schedules of ${agent.name}`}>
-      <div role="list">
-        {list.map((s) => <ScheduleRow key={s.id} s={s} now={now} />)}
-      </div>
-    </div>
-  );
-}
-
-/** Up / Down move through agent and schedule rows alike. */
-export function moveRow(e: KeyboardEvent) {
-  e.preventDefault();
-  const rows = [...document.querySelectorAll<HTMLElement>(".ap-row, .sch-row, .sch-prop")];
-  const i = rows.indexOf(e.currentTarget as HTMLElement);
-  rows[i + (e.key === "ArrowDown" ? 1 : -1)]?.focus();
 }
 
 /** A schedule waiting for you: an agent's proposal, or one made or changed outside Muster's
@@ -865,7 +980,7 @@ export function ScheduleDialog(
         });
         knowSchedule(s);
         overlay.value = null;
-        if (!agentsPanelOpen.value) A.toggleAgentsPanel();
+        A.revealSidebar();
         if (!A.heldToast(s)) toast(
           "success",
           s.trigger

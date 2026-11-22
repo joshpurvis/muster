@@ -860,7 +860,7 @@ long job finishes: it says so in that turn's reply, then calls `reply {msg_id, t
   | An ask still waiting for that message (`ask_agent`, `muster ask`, `agent.ask`) | It returns the text as its `reply` (it re-checks every second; after 30 s untaken, e.g. the ask was cancelled, the next row applies: `WAITER_MAX`). Only a reply that brings no origin the question's chain didn't have, and is no deeper in the chain than an answer in the question's own turn (one hop past it); any other goes as the next row says. | `returned` |
   | A named agent | A new agent message: `[muster msg <new id> from <replier> origin=<o> hop=<n>]`, then `Late reply to your message <id> ("<first line of the question>"):` and the text, with `reply_to` = the message answered. Through `agents::send_checked`: the asker's accepted origins, the hop limit, the daily and unattended caps, the OpenRouter spend caps, the injection queue; a stopped agent is started as for any message. A refusal is logged like any refused message. | `delivered` (`delivered_as`), else `refused` |
   | Another Claude or Codex session (live) | Typed in through its injection queue after `[muster reply to msg <id> from <replier> origin=<o> hop=<n>]` (no message row of its own, so not an envelope the agents' attribution acts on); the session takes the reply's origin and hop. A Claude session takes only `human`-origin replies (`send_message`'s rule). | `delivered` (`session_id`), else `refused` |
-  | The human (a client, `muster ask` outside a session or in a shell tab), or a schedule | Shown in the agents panel's message log (the message's entry gets a `late reply` chip; its overlay shows the text and how it was delivered); a desktop notification when the human asked. | `shown` |
+  | The human (a client, `muster ask` outside a session or in a shell tab), or a schedule | Shown in the sidebar's message log (the message's entry gets a `late reply` chip; its overlay shows the text and how it was delivered); a desktop notification when the human asked. | `shown` |
   | An agent since removed, a session that ended | Kept in the log only. | `undelivered` |
 
   With `wake: false` (`reply {msg_id, text, wake: false}`, `muster reply --no-wake`), the two
@@ -1006,7 +1006,7 @@ for what can wait. Code: `src/quiet.rs`.
   them.
 - *Seen in:* the receiver's tab (an envelope badge with the count, `quiet_waiting` on the
   session; an asleep agent's tab shows it too, and messages sent before an agent's first start
-  count once its tab opens), the agents panel's message log for named agents' messages ("waits
+  count once its tab opens), the sidebar's message log for named agents' messages ("waits
   for a turn", "shown", "expired"; `agent.messages` fields `quiet`, `shown_at`, `expired_at`),
   and the overlay of a message whose late reply went quietly, which shows where the carrying
   message stands from `answer.quiet_state` (`{state: "waiting"|"shown"|"expired"|"dropped", at?,
@@ -1029,7 +1029,7 @@ about 14,500. Applies from the agent's next start (Claude Code reads the list wh
 
 **Refusals are logged.** A message refused by the agent's policy (`ask_agent`'s permission
 check, origin rule, hop limit, daily cap or unattended cap, and the same checks behind `muster ask`) is kept in
-`agent_messages` with the reason and shown in the agents panel's log (`agent.messages`,
+`agent_messages` with the reason and shown in the sidebar's message log (`agent.messages`,
 `agent_message` events). It is never delivered and never counts toward the cap. Bounded: per
 sender at most 10 refusals per 10 minutes are stored (more are only counted, and the next stored
 one says how many), the text is cut to 2 KB, and refused rows are pruned to the last 30 days and
@@ -1106,7 +1106,7 @@ the human adds a directional sharing rule), and project agents don't drive an ag
 ### Schedules
 
 A named agent can schedule work for itself (docs/SCHEDULING_PLAN.md, Phase 3). The owner's rule:
-an agent **proposes** and the human **approves** each proposal with a click in the Agents panel
+an agent **proposes** and the human **approves** each proposal with a click in Needs you, at the top of Muster's sidebar
 (only there: no command, tool or script approves); the one exception is a **one-off reminder for the agent itself,
 5 minutes to 24 hours ahead**, which runs without approval. Code: `src/schedules/agent.rs`.
 
@@ -1447,7 +1447,7 @@ server refuses:
 - any target outside the caller's workspace: `send_message`, `read_screen`,
   `get_recent_output`, `wait_for_state` (by session), `post_to_channel`, `get_diff`,
   `spawn_session` (by `channel_id`). `list_channels` and `list_sessions` only show the caller's
-  workspace plus explicitly shared targets. The human grants access in the Agents panel under
+  workspace plus explicitly shared targets. The human grants access in Muster's sidebar (Channels ⋯) under
   Session communication, with separate messaging and output-reading permissions.
 
 Text from agents (`send_message` text, `spawn_session` prompt) is typed into a terminal, so it
@@ -1498,7 +1498,7 @@ message); named agents still use `ask_agent`, `tell_agent` and `reply`.
 `list_sessions` includes `reachability` with `can_message`, `can_read_output`,
 `message_reason` and `read_output_reason`. Discovering a session does not authorize
 reading its output. Same-workspace access remains the default. The old
-`MUSTER_MCP_CROSS_WORKSPACE` switch is retired; it no longer grants access. In the Agents panel,
+`MUSTER_MCP_CROSS_WORKSPACE` switch is retired; it no longer grants access. In Muster's sidebar (Channels ⋯ → Session communication),
 **Session communication** lets the human add directional workspace grants,
 optionally limited to one caller session, with separate messaging and reading
 permissions. Only a verified local window can change grants. Named agents remain
@@ -1513,7 +1513,7 @@ so posts cannot automatically produce reply loops. Each session can subscribe to
 32 channels. The feed retains 1000 posts globally and exposes
 `oldest_available_id` so consumers can detect a retention gap. Own posts are omitted.
 
-The Agents panel shows session conversation threads and their progress. Human RPC:
+Session communication (Channels ⋯ in the sidebar) shows session conversation threads and their progress. Human RPC:
 `communication.get` returns grants, messages and subscriptions; `communication.set`
 accepts `{grants, expected_grants}` and rejects stale edits. Each grant contains
 `from_workspace`, `to_workspace`, optional `from_session`, `message`, `read_output`.

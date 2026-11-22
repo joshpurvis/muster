@@ -46,6 +46,7 @@ import { DEFAULT_PERMISSIONS, KIND_LABEL, needsHuman, STATE_LABEL, STATE_PRIORIT
 import { PermissionsDialog, PermissionsPanel, PermissionsPill } from "./Permissions.tsx";
 import { PillToggle } from "./DialogKit.tsx";
 import { AgentDialog, MessageDialog } from "./Agents.tsx";
+import { CommunicationDialog } from "./Communication.tsx";
 import { ScheduleDialog, ScheduleSettingsDialog } from "./Schedules.tsx";
 import { AccountProfilesDialog, ProfilePill, ProfileUsage } from "./AccountProfiles.tsx";
 import { UpdateBanner } from "./UpdateBanner.tsx";
@@ -195,6 +196,8 @@ export function Overlays() {
       );
     case "agent_message":
       return <MessageDialog key={o.id} id={o.id} Modal={Modal} close={close} />;
+    case "communication":
+      return <CommunicationDialog Modal={Modal} close={close} />;
     case "schedule":
       return <ScheduleDialog key={o.id ?? "new"} id={o.id} agent={o.agent} keep={o.draft} Modal={Modal} close={close} />;
     case "schedule_settings": {

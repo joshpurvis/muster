@@ -36,9 +36,17 @@ export async function triggerChecks(a: Browser, { shots, ok, check }: TriggerCtx
       const proto = i instanceof HTMLSelectElement ? HTMLSelectElement : i instanceof HTMLTextAreaElement ? HTMLTextAreaElement : HTMLInputElement;
       Object.getOwnPropertyDescriptor(proto.prototype, 'value').set.call(i, ${js(v)});
       i.dispatchEvent(new Event(${js(ev)}, { bubbles: true })); })()`);
-  const row = (name: string) =>
-    `[...document.querySelectorAll('.sch-row')].find((r) => r.querySelector('.sch-name')?.textContent === ${js(name)})`;
-  const rowSel = async (name: string) => `.sch-row[data-schedule="${await a.eval(`${row(name)}?.dataset.schedule`)}"]`;
+  // A schedule's row is in its agent's card: the lookup opens that card (see e2e_schedules.ts).
+  const row = (name: string) => `(() => {
+    const s = ${M}.schedules.value.find((x) => x.name === ${js(name)});
+    if (s && ${M}.agentCard.value?.agent !== s.agent_id) ${M}.agentCard.value = { agent: s.agent_id, byKey: true };
+    return [...document.querySelectorAll('.agent-card .sch-row')].find((r) => r.querySelector('.sch-name')?.textContent === ${js(name)});
+  })()`;
+  const card = (name: string) => a.wait(`!!${row(name)}`, 3000);
+  const rowSel = async (name: string) => {
+    await card(name);
+    return `.sch-row[data-schedule="${await a.eval(`${row(name)}?.dataset.schedule`)}"]`;
+  };
   const menuItem = (label: string) =>
     a.eval(`(() => { const it = [...document.querySelectorAll('.menu .menu-item')]
       .find((e) => e.querySelector('.menu-label')?.textContent === ${js(label)});
@@ -107,6 +115,7 @@ export async function triggerChecks(a: Browser, { shots, ok, check }: TriggerCtx
   check(made.trigger && made.when.kind === "note" && made.when.note_id === noteId && made.daily_cap === 10, `a note trigger: ${js(made.when)}`);
   check(made.then?.on_success?.agent === "triage" && made.then.on_failure?.notify, `its steps: ${js(made.then)}`);
   await a.wait(`!!${row(made.name)}?.querySelector('.sch-icon-trig')`, 2000);
+  await card(made.name);
   check(await a.eval(`${row(made.name)}.querySelector('.sch-next').textContent`) === "waiting", "the row waits for a change");
   ok("New schedule → When something happens → A note changes: the note's switch is offered, Then… steps saved");
 
@@ -132,7 +141,7 @@ export async function triggerChecks(a: Browser, { shots, ok, check }: TriggerCtx
   await R("schedule.run", { id: made.id });
   await a.wait(`!!document.querySelector('.sch-run.sch-run-step')`, 6000);
   await a.wait(`document.querySelector('.sch-run.sch-run-step')?.textContent.includes('then: triage')`, 4000);
-  await shot("trigger-history-chain", ".agents-panel");
+  await shot("trigger-history-chain", ".agent-card");
   await a.click(await rowSel(made.name));
   await a.wait(`!document.querySelector('.sch-runs')`, 2000);
   ok("Run now on a trigger: the run, and its Then… step on triage, shown under it");
@@ -158,6 +167,7 @@ export async function triggerChecks(a: Browser, { shots, ok, check }: TriggerCtx
   // A URL trigger: its menu copies the command (with the secret); Skip next isn't offered.
   const url: any = await R("schedule.create", { agent: "worker", prompt: "The deploy finished: check the site.", when: { kind: "url", name: "deploy-done" } });
   await a.wait(`!!${row(url.name)}`, 2000);
+  await card(url.name);
   await a.eval(`${row(url.name)}.scrollIntoView({ block: 'center' })`);
   await a.click(`${await rowSel(url.name)} .sch-more`);
   await a.wait(`!!document.querySelector('.menu')`, 2000);
@@ -165,7 +175,7 @@ export async function triggerChecks(a: Browser, { shots, ok, check }: TriggerCtx
   check(labels.includes("Copy trigger command") && labels.includes("New secret…") && !labels.includes("Skip next run"), `the URL trigger's menu: ${labels}`);
   check(await menuItem("Copy trigger command"), "Copy trigger command");
   await a.wait(`[...document.querySelectorAll('.toast')].some((t) => t.textContent.includes('keep it private') || t.textContent.includes('muster trigger --url deploy-done'))`, 3000);
-  await shot("agents-panel-triggers", ".agents-panel");
+  await shot("agent-card-triggers", ".agent-card");
   ok("a GitHub trigger reads in the dialog and its row says gh isn't signed in; a URL trigger's menu copies its command");
 
   // ---- Scheduling settings: today's OpenRouter spend and the caps

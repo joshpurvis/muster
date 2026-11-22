@@ -225,6 +225,8 @@ interface Sched {
   window_from: number;
   created_at: number;
   updated_at: number;
+  /** An agent's proposal (src/schedules/agent.rs, loosely): waits for Approve, never runs before. */
+  made_by?: { agent_id: number; agent: string; kind: "proposal"; reason: string; at: number; approved_at: number | null } | null;
 }
 
 // The mock's own time zone is pinned to UTC, so its data and screenshots never carry the zone of
@@ -353,7 +355,7 @@ export function scheduleMock(deps: ScheduleDeps) {
       skip_next: s.skip_next,
       next_run: s.next_run,
       last_slot: s.last_slot,
-      status: expired ? "expired" : s.next_run === null && !isTrig(s.when) ? "done" : s.paused ? "paused" : "active",
+      status: waiting(s) ? "proposed" : expired ? "expired" : s.next_run === null && !isTrig(s.when) ? "done" : s.paused ? "paused" : "active",
       expires_at: exp,
       expires_soon: exp !== null && !expired && exp - now() <= DAY,
       created_at: s.created_at,
@@ -368,8 +370,13 @@ export function scheduleMock(deps: ScheduleDeps) {
         ? { id: s.when.note_id, title: deps.noteTitle(s.when.note_id) ?? "", triggers: !!deps.noteTriggers(s.when.note_id) }
         : null,
       url: s.when.kind === "url" ? `http://127.0.0.1:7433/api/trigger/${s.when.name}` : null,
+      made_by: s.made_by ?? null,
+      estimate: waiting(s)
+        ? { runs_per_week: 1, max_per_day: 1, billing: "codex", text: "1 run in the coming week, at most 1 a day.", lines: null }
+        : null,
     };
   }
+  const waiting = (s: Sched) => !!s.made_by && s.made_by.approved_at === null;
 
   const agentName = (id: number | null) => deps.agents().find((a) => a.id === id)?.name ?? null;
   function thenJson(t: ThenSteps | null) {
@@ -663,6 +670,16 @@ export function scheduleMock(deps: ScheduleDeps) {
       }
       case "schedule.create":
         return create(p);
+      // An agent's proposal waiting for the human (the mock seeds one; `propose_schedule`).
+      case "schedule.approve": {
+        const s = get(p.id);
+        if (!waiting(s)) throw new Error("it doesn't wait for approval");
+        if (p.seen !== undefined && p.seen !== s.updated_at) throw new Error("it changed since you looked; look again");
+        s.made_by!.approved_at = now();
+        s.next_run = firstSlot(s.when, now());
+        s.updated_at = now();
+        return publish(s);
+      }
       case "schedule.update":
         return update(p);
       case "schedule.remove": {
@@ -862,5 +879,19 @@ export function scheduleMock(deps: ScheduleDeps) {
     }
   }
 
-  return { handle, seed, weekdayAt, noteChanged, noteTriggersChanged, hold: (id: number, text: string) => hold(get(id), text, false) };
+  /** Seed: an agent's proposal waiting for approval, made `ageMs` ago. */
+  function propose(p: any, by: string, reason: string, ageMs: number) {
+    const j = create(p) as { id: number };
+    const s = get(j.id);
+    const a = agentNamed(by);
+    s.created_at = s.updated_at = s.window_from = now() - ageMs;
+    s.made_by = { agent_id: a.id, agent: a.name, kind: "proposal", reason, at: now() - ageMs, approved_at: null };
+    s.next_run = null;
+    return publish(s);
+  }
+
+  return {
+    handle, seed, propose, weekdayAt, noteChanged, noteTriggersChanged,
+    hold: (id: number, text: string) => hold(get(id), text, false),
+  };
 }

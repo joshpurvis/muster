@@ -221,7 +221,7 @@ pub fn check_reach(hub: &Hub, recorder: SessionId, t: &Target) -> Result<(), Str
             if !shared {
                 return Err(format!(
                     "session {} is in another workspace and messaging it isn't shared with yours, so an answer can't reach it. \
-                     The human can add a sharing rule in the Agents panel under Session communication", s.id));
+                     The human can add a sharing rule in Muster's sidebar: Channels ⋯ → Session communication", s.id));
             }
             (Some(c.id), c.permissions, s.kind, format!("session {}'s channel", s.id))
         }

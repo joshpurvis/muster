@@ -292,7 +292,7 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "reply",
             "Reply to a message later",
-            "Answer a message you received (its first line is [muster msg <id> from ...]) after the turn that received it ended, e.g. once a long job finishes: say so in that turn's reply, then call this with the result. Only for messages delivered to you, once per message. If the sender's ask_agent is still waiting, it returns this text, but only when your answer brings no scheduled or webhook origin the question didn't have and is at most one hop past the question (not, say, when you answer from deeper work in another chain); otherwise it is delivered to the sender as a new message (\"Late reply to your message <id>\") with the same origin rule, hop limit, caps and input queue as ask_agent, or, if the human asked, shown in the agents panel. With wake=false, unless a waiting ask takes it, the sender gets it at the start of its next turn that can take it instead of a new turn; like tell_agent's, it can wait several turns, so choose it only when the sender needn't act now (Claude senders only; at most 6,000 characters (an emoji such as 😀 counts as two) and 150 lines; a reply rooted in both scheduled and webhook work goes with wake=true; so does one on scheduled work a lead agent passes on (origin=lead) when an existing agent or a live session asked, even if its ask is still waiting). It is stored first: a refused delivery is reported, never lost. Rate limited with send_message (20 per minute).",
+            "Answer a message you received (its first line is [muster msg <id> from ...]) after the turn that received it ended, e.g. once a long job finishes: say so in that turn's reply, then call this with the result. Only for messages delivered to you, once per message. If the sender's ask_agent is still waiting, it returns this text, but only when your answer brings no scheduled or webhook origin the question didn't have and is at most one hop past the question (not, say, when you answer from deeper work in another chain); otherwise it is delivered to the sender as a new message (\"Late reply to your message <id>\") with the same origin rule, hop limit, caps and input queue as ask_agent, or, if the human asked, shown in the sidebar's message log. With wake=false, unless a waiting ask takes it, the sender gets it at the start of its next turn that can take it instead of a new turn; like tell_agent's, it can wait several turns, so choose it only when the sender needn't act now (Claude senders only; at most 6,000 characters (an emoji such as 😀 counts as two) and 150 lines; a reply rooted in both scheduled and webhook work goes with wake=true; so does one on scheduled work a lead agent passes on (origin=lead) when an existing agent or a live session asked, even if its ask is still waiting). It is stored first: a refused delivery is reported, never lost. Rate limited with send_message (20 per minute).",
             json!({
                 "type": "object",
                 "properties": {
@@ -381,7 +381,7 @@ pub fn tool_definitions() -> Vec<Value> {
     tools.extend([
         tool("list_schedules", "List schedules", "List the schedules that run on you or that you made (proposals, reminders): id, agent, name, prompt, when, status (proposed: waiting for the human's approval; active, paused, expired, done), next run, who made it, and the last run's outcome. Also whether you take scheduled work at all (the human sets that).",
             empty_schema(), true),
-        tool("propose_schedule", "Propose schedule", "Propose a schedule (recurring with cron, or a one-off with at or in_minutes) for you or another agent that takes scheduled work. It does NOT run until the human approves it with a click in Muster's Agents panel, where they see the prompt, the timing, the agent, your reason and the estimated use; they may edit or dismiss it. Each run is a message marked as scheduled, under every limit the human set (per-agent daily caps, spend caps, quiet hours, a Claude subscription agent's 7-day expiry). Refused while you handle scheduled or triggered work. Limits: 3 proposals waiting, 10 a day, 5 live schedules you made. Triggers and \"Then\" steps are the human's to set up.",
+        tool("propose_schedule", "Propose schedule", "Propose a schedule (recurring with cron, or a one-off with at or in_minutes) for you or another agent that takes scheduled work. It does NOT run until the human approves it with a click in Muster's sidebar, where they see the prompt, the timing, the agent, your reason and the estimated use; they may edit or dismiss it. Each run is a message marked as scheduled, under every limit the human set (per-agent daily caps, spend caps, quiet hours, a Claude subscription agent's 7-day expiry). Refused while you handle scheduled or triggered work. Limits: 3 proposals waiting, 10 a day, 5 live schedules you made. Triggers and \"Then\" steps are the human's to set up.",
             json!({"type":"object","properties":Value::Object(propose),"required":["prompt","reason"],"additionalProperties":false}), false),
         tool("set_reminder", "Set reminder", "Have Muster send you a prompt once, 5 minutes to 24 hours from now (\"check CI again in 20 minutes\"), without asking the human: a one-off for yourself only, delivered as scheduled work into your current conversation. You must take scheduled work (the human sets that). Refused while you handle scheduled or triggered work, so a reminder can't set the next one. At most 3 waiting, 15 minutes apart, 10 a day. For anything recurring, later or for another agent, use propose_schedule.",
             json!({"type":"object","properties":Value::Object(remind),"required":["prompt"],"additionalProperties":false}), false),
@@ -786,7 +786,7 @@ fn open_channel<B: Backend>(st: &McpState<B>, id: ChannelId) -> Result<Channel, 
 const HOW_SHELL: &str =
     "The human can allow it by starting the muster daemon with MUSTER_MCP_ALLOW_SHELL=1.";
 const HOW_CROSS: &str =
-    "The human can add a sharing rule in the Agents panel under Session communication.";
+    "The human can add a sharing rule in Muster's sidebar: Channels ⋯ → Session communication.";
 
 /// Text an agent sends to another session is typed into its terminal, so it must stay text:
 /// escape sequences could end the bracketed paste (`ESC [ 201 ~`) and turn the rest into raw
@@ -1522,7 +1522,7 @@ struct AgentSend {
 
 /// The checks before any message to a named agent: the name, size and text rules, the
 /// permission width over the agent's tabs, the origin rule, hop limit and daily cap, then the
-/// rate limit. Policy refusals are kept for the agents panel's log.
+/// rate limit. Policy refusals are kept for the sidebar's message log.
 fn agent_send<B: Backend>(st: &McpState<B>, caller: SessionId, name: &str, text: &str, wake: bool) -> Result<AgentSend, String> {
     let agent = st
         .backend
@@ -1553,7 +1553,7 @@ fn agent_send<B: Backend>(st: &McpState<B>, caller: SessionId, name: &str, text:
     let me = caller_session(st, caller)?;
     let from = crate::agents::sender_label(st.backend.agents().iter().find(|b| b.session_id == Some(caller)), caller);
     let prov = caller_prov(st, caller);
-    // Policy refusals (permissions, origin, hops, cap) are kept for the agents panel's log.
+    // Policy refusals (permissions, origin, hops, cap) are kept for the sidebar's message log.
     let refused = |why: String| {
         let proposed = crate::agents::proposed_route(prov, None);
         st.backend

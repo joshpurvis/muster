@@ -2569,6 +2569,10 @@ legend {
   pointer-events: auto;
   min-width: 180px;
   max-width: 320px;
+  /* A long menu (an agent's row: its own items, then its channel's) scrolls in a short window. */
+  max-height: calc(100vh - 24px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
   padding: 4px;
   background: var(--bg-overlay);
   border: 1px solid var(--border-strong);
@@ -3049,7 +3053,7 @@ legend {
   flex: none;
 }
 
-/* ---------------- agents panel (docs/UI.md "Agents panel") ---------------- */
+/* ---------------- agents in the sidebar (docs/UI.md "Agents in the sidebar") ---------------- */
 
 .app-body {
   flex: 1;
@@ -3062,30 +3066,27 @@ legend {
 }
 
 .sidebar {
-  width: 240px;
+  position: relative;
+  width: var(--sidebar-w, 240px);
   flex: none;
-  display: grid;
+  display: flex;
+  flex-direction: column;
   min-height: 0;
   background: var(--bg-1);
   border-right: 1px solid var(--border);
   user-select: none;
 }
 
-.channels-panel { display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
+.channels-panel { flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
 .channels-scroll { flex: 1; min-height: 0; overflow-y: auto; padding: 5px 6px 12px; }
-.sidebar-heading, .sidebar-collapsed {
+.sidebar-heading {
   display: flex; align-items: center; gap: 7px; min-width: 0; color: var(--text);
   font-size: 12px; font-weight: 650; text-align: left;
 }
 .sidebar-heading { flex: 1; height: 100%; }
-.sidebar-collapsed { padding: 0 10px; border-bottom: 1px solid var(--border); }
-.sidebar-heading:hover, .sidebar-collapsed:hover { color: var(--accent-strong); }
+.sidebar-heading:hover { color: var(--accent-strong); }
 .sidebar-heading .open { transform: rotate(90deg); }
 .sidebar .ap-head { padding-left: 10px; }
-.sidebar-divider { background: var(--border); position: relative; }
-.sidebar-divider.resizable { cursor: row-resize; background: var(--bg-1); border-block: 1px solid var(--border); }
-.sidebar-divider.resizable:hover, .sidebar-divider:focus-visible { background: var(--accent); }
-.sidebar-divider:focus-visible { outline: 1px solid var(--accent); outline-offset: 0; }
 .channel-row { display: flex; align-items: center; border-radius: var(--r); margin: 1px 0; }
 .channel-label { display: flex; flex-direction: column; flex: 1; min-width: 0; gap: 1px; }
 .channel-context { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; color: var(--text-faint); }
@@ -3111,20 +3112,135 @@ legend {
 .empty-channel-path { color: var(--text-faint); font-size: 12px; overflow-wrap: anywhere; margin-bottom: 20px; }
 .empty-channel-actions { display: flex; justify-content: center; gap: 8px; margin-top: 18px; }
 @media (max-width: 760px) { .sidebar { width: 190px; } }
+/* Drag (or focus and ←/→) the dock's right edge to widen it (docs/UI.md "Channels sidebar"). */
+.sidebar-edge {
+  position: absolute; top: 0; right: -3px; bottom: 0; width: 6px; z-index: 5; cursor: col-resize;
+  outline: none;
+}
+.sidebar-edge:hover, .sidebar-edge:focus-visible { background: var(--accent); opacity: 0.6; }
+@media (max-width: 760px) { .sidebar-edge { display: none; } }
+
+/* An agent's row (docs/UI.md "Agents in the sidebar"): its channel's name, the agent's faint
+   beside it when they differ; wide, its state and time, cold and its schedules' chip. */
+.channel-agent { font-weight: 400; color: var(--text-faint); font-size: 11px; }
+.channel-row.unread .channel-agent { font-weight: 400; }
+.channel-select .row-wide { display: none; }
+.sidebar.wide .channel-select .row-wide { display: inline-flex; }
+@media (max-width: 760px) { .sidebar.wide .channel-select .row-wide { display: none; } }
+.row-state {
+  flex: none; margin-left: auto; margin-right: 2px; font-size: 10.5px; color: var(--text-faint); white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.row-state + .row-cold { margin-left: 0; }
+.channel-select > .row-state ~ .row-chip,
+.channel-select > .row-state ~ .channel-count,
+.channel-select > .row-state ~ .channel-attention { margin-left: 0; }
+.row-chip {
+  flex: none; margin-left: auto; display: inline-flex; align-items: center; gap: 3px;
+  height: 16px; padding: 0 5px; border-radius: 8px; font-size: 10px; font-weight: 600;
+  font-variant-numeric: tabular-nums; border: 1px solid var(--border-strong); color: var(--text-faint);
+}
+.row-chip:hover { color: var(--text); border-color: var(--text-faint); }
+.row-chip-wait { color: var(--warn-text); background: var(--attn-bg); border-color: var(--attn-border); }
+.row-chip-bad {
+  color: var(--error-text); background: var(--del-bg);
+  border-color: color-mix(in srgb, var(--st-error) 40%, transparent);
+}
+.row-chip + .channel-count, .row-chip + .channel-attention { margin-left: 0; }
+.agent-row .channel-select { gap: 7px; }
+.channel-row.card-open:not(.active) { background: var(--hover); }
+
+/* The card beside an agent's row: opens on hover, or → on the focused row. */
+.agent-card {
+  position: fixed; z-index: 90; width: 360px; max-width: calc(100vw - 24px);
+  max-height: calc(100vh - 16px); overflow-y: auto; overscroll-behavior: contain;
+  display: flex; flex-direction: column;
+  background: var(--bg-overlay); border: 1px solid var(--border-strong); border-radius: 8px;
+  box-shadow: var(--shadow); color: var(--text); font-size: 12px; user-select: text;
+  animation: pop 110ms var(--ease);
+}
+.ac-head { display: flex; align-items: center; gap: 8px; padding: 10px 12px 2px; min-width: 0; }
+.ac-name { font-size: 14px; font-weight: 650; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ac-agent { color: var(--text-faint); font-size: 11.5px; white-space: nowrap; }
+.ac-head .ap-kind { margin-left: auto; }
+.ac-status {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 4px 0; padding: 2px 12px 0 28px;
+  color: var(--text-faint); font-size: 11.5px; font-variant-numeric: tabular-nums;
+}
+.ac-line { padding: 4px 12px 0 28px; }
+.ac-persona {
+  padding: 4px 12px 0 28px; color: var(--text-muted); font-size: 11.5px; line-height: 1.4;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+.ac-actions { display: flex; flex-wrap: wrap; gap: 5px; padding: 10px 12px 12px; }
+.ac-actions .btn { padding: 0 8px; }
+.ac-actions .ac-more { padding: 0 6px; }
+.ac-section { border-top: 1px solid var(--border); padding: 8px 8px 8px; }
+.ac-section-head {
+  display: flex; align-items: center; gap: 6px; padding: 0 4px 6px;
+  font-size: 10.5px; font-weight: 650; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-faint);
+}
+.ac-section-head .ap-count { text-transform: none; letter-spacing: 0; }
+.ac-folder .ac-path {
+  padding: 0 4px; font-family: var(--font-mono); font-size: 11px; color: var(--text-muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* Session communication (the Channels header's ⋯): one field per line. */
+.communication .dlg-body { font-size: 12px; overflow-wrap: anywhere; }
+.communication label { display: block; margin: 8px 0; }
+.communication select, .communication input[type=number] { display: block; width: 100%; margin-top: 4px; }
+.communication details { margin: 8px 0; }
+
+/* "Needs you": proposals and failed runs, at the top of the list while any wait. */
+.needs-you {
+  margin: 4px 0 8px; padding: 6px 5px 4px 6px; border-radius: 8px;
+  background: var(--attn-bg); border: 1px solid var(--attn-border);
+}
+.ny-head {
+  display: flex; align-items: center; gap: 6px; padding: 0 2px 6px;
+  font-size: 10.5px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: var(--warn-text);
+}
+.ny-head .ap-count { text-transform: none; letter-spacing: 0; }
+.ny-item { display: flex; align-items: flex-start; gap: 6px; padding: 5px 2px 6px; min-width: 0; }
+.ny-item + .ny-item, .sch-runs + .ny-item { border-top: 1px solid var(--attn-border); }
+.ny-icon { flex: none; margin-top: 2px; color: var(--warn-text); }
+.needs-you .sch-chip.sch-bad { color: var(--error-text); }
+.needs-you .sch-approve { background: var(--accent-fill); }
+.needs-you .sch-approve:hover:not(:disabled) { background: var(--accent-fill-hover); }
+.ny-when { white-space: nowrap; }
+.ny-run .ny-name { display: flex; align-items: center; }
+.ny-run .ny-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.ny-chev { flex: none; margin-right: 3px; color: var(--text-faint); transition: transform var(--t) var(--ease); }
+.ny-chev.open { transform: rotate(90deg); }
+.ny-run .ny-icon { color: var(--text-faint); }
+.ny-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.ny-top { display: flex; align-items: center; gap: 4px; min-width: 0; }
+.ny-top .ny-name { flex: 1; }
+.ny-name {
+  text-align: left; font-size: 12px; font-weight: 600; color: var(--text); min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; border-radius: 3px;
+}
+.ny-name:hover { text-decoration: underline; }
+.ny-sub { font-size: 11px; line-height: 1.4; color: var(--text-faint); min-width: 0; }
+.ny-run .ny-sub { display: flex; align-items: center; gap: 6px; }
+.ny-sub .ny-agent { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ny-sub .sch-chip { margin-left: auto; }
+.ny-actions { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+.ny-actions .btn { padding: 0 8px; }
+.ny-top .ap-icon-btn { flex: none; margin-left: 0; width: 20px; height: 20px; }
+.needs-you .ny-hide { flex: none; font-size: 11px; font-weight: 500; color: var(--text-faint); }
+.needs-you .ny-hide:hover { color: var(--text); text-decoration: none; }
+.needs-you .sch-runs { margin: 0 0 4px 18px; }
 @media (max-height: 440px) { .sidebar .ap-feed { max-height: 35%; } }
-/* The Messages heading never shrinks away: in a short sidebar the agents list gives way first
-   (it was clipped once the Usage section took its share of the height). */
+/* The Messages heading never shrinks away: in a short sidebar the channel list gives way first. */
 .sidebar .ap-feed { min-height: 31px; }
-/* With Agents dragged small, its list gives way before the Messages heading does. */
-.sidebar .ap-list { min-height: 0; }
 
 /* Usage: the sidebar's bottom-left section, a small table of every account's usage windows. */
-/* Content-height and pinned to the bottom (with Channels and Agents both collapsed its grid row
-   is the one that stretches); min-width lets long names ellipsize instead of widening it. */
-.us { --us-col: 62px; display: flex; flex-direction: column; min-height: 0; min-width: 0; align-self: end; }
-/* One hairline above it; collapsed Agents brings its own, so the two overlap there. */
+/* Content-height at the bottom; min-width lets long names ellipsize instead of widening it. */
+.us { --us-col: 62px; flex: none; display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+/* One hairline above it. */
 .sidebar > .us { border-top: 1px solid var(--border); }
-.sidebar > .sidebar-collapsed + .us { margin-top: -1px; }
 .us.open .ap-chev { transform: rotate(90deg); }
 .us-list {
   display: flex; flex-direction: column; gap: 1px; padding: 0 6px 8px;
@@ -3180,17 +3296,6 @@ legend {
 
 .us.open .us-peak { display: none; }
 
-.agents-panel {
-  width: auto;
-  flex: none;
-  display: flex;
-  flex-direction: column;
-  min-height: 0;
-  background: var(--bg-1);
-  overflow: hidden;
-  user-select: none;
-}
-
 @keyframes ap-in {
   from {
     opacity: 0;
@@ -3207,13 +3312,6 @@ legend {
   padding: 0 6px 0 12px;
   border-bottom: 1px solid var(--border);
   color: var(--text-muted);
-}
-
-.ap-title {
-  font-size: 12px;
-  font-weight: 650;
-  letter-spacing: 0.02em;
-  color: var(--text);
 }
 
 .ap-count {
@@ -3242,79 +3340,11 @@ legend {
   background: var(--hover-strong);
 }
 
-.ap-list {
-  flex: 1 1 auto;
-  min-height: 72px;
-  overflow-y: auto;
-  padding: 6px;
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-}
-
 .ap-empty {
   padding: 8px 8px 10px;
   font-size: 11.5px;
   line-height: 1.5;
   color: var(--text-faint);
-}
-
-.ap-row {
-  position: relative;
-  display: flex;
-  align-items: flex-start;
-  gap: 9px;
-  padding: 6px 8px 6px 9px;
-  border-radius: var(--r);
-  cursor: pointer;
-  outline: none;
-  transition: background var(--t) var(--ease);
-}
-
-.ap-row > .dot {
-  margin-top: 5px;
-}
-
-.ap-row:hover {
-  background: var(--hover);
-}
-
-.ap-row:focus-visible {
-  box-shadow: inset 0 0 0 1.5px var(--pane-focus-ring);
-}
-
-.ap-row.sel {
-  background: var(--accent-soft);
-}
-
-.ap-row-text {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-}
-
-.ap-row-top {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  min-width: 0;
-  padding-right: 18px;
-}
-
-.ap-name {
-  font-size: 13px;
-  font-weight: 550;
-  color: var(--text);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  min-width: 0;
-}
-
-.ap-row.stopped .ap-name {
-  color: var(--text-muted);
 }
 
 .ap-kind {
@@ -3345,15 +3375,6 @@ legend {
   color: #2d6fd0;
 }
 
-.ap-row-sub {
-  font-size: 11.5px;
-  color: var(--text-faint);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  font-variant-numeric: tabular-nums;
-}
-
 .ap-auto {
   margin-left: 6px;
   font-size: 10px;
@@ -3363,7 +3384,7 @@ legend {
   color: var(--text-faint);
 }
 
-/* A move to another account waiting for the agent's next start (docs/UI.md "Agents panel"). */
+/* A move to another account waiting for the agent's next start (docs/UI.md "Agents in the sidebar"). */
 .ap-move {
   font-size: 11px;
   line-height: 1.35;
@@ -3387,31 +3408,9 @@ legend {
   transition: opacity var(--t) var(--ease);
 }
 
-.ap-row:hover .ap-more,
-.ap-row:focus-within .ap-more,
-.ap-row.sel .ap-more {
-  opacity: 1;
-}
-
 .ap-more:hover {
   color: var(--text);
   background: var(--hover-strong);
-}
-
-.ap-new {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-top: 4px;
-  padding: 6px 9px;
-  border-radius: var(--r);
-  font-size: 12.5px;
-  color: var(--text-faint);
-}
-
-.ap-new:hover {
-  color: var(--text);
-  background: var(--hover);
 }
 
 /* The message log: collapsible, at the bottom. */
@@ -3424,6 +3423,8 @@ legend {
 }
 
 .ap-feed.open {
+  /* A fixed share: sized to its messages, it would change height with each channel opened (it
+     follows the channel's agent) and move the list under the pointer. */
   flex: 0 1 46%;
 }
 
@@ -4888,7 +4889,7 @@ legend {
 .panel-strip .ps-lock { display: inline-flex; align-items: center; gap: 4px; }
 @container (max-width: 460px) { .panel-strip .ps-who, .panel-strip .ps-sep, .panel-strip .ps-lock { display: none; } }
 /* Fullscreen (Alt+Shift+Z): one group's visible tab fills the window. Its tab strip is not
-   drawn; the agents panel and the status line stay mounted but hidden. A panel keeps its strip,
+   drawn; the sidebar and the status line stay mounted but hidden. A panel keeps its strip,
    whose last button goes back; a terminal gets a small button in its top-right corner. */
 .panel-strip .ps-full, .preview-bar .ps-full {
   flex: none; display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 22px;
@@ -5297,14 +5298,10 @@ body.dragging .panel-view { pointer-events: none; }
   .notes-list .note-del { opacity: 1; }
 }
 
-/* ---------------- schedules (docs/UI.md "Agents panel") ---------------- */
+/* ---------------- schedules (docs/UI.md "Agents in the sidebar") ---------------- */
 
 .ap-head .ap-head-more {
   margin-left: auto;
-}
-
-.ap-head .ap-head-more + .ap-head-x {
-  margin-left: 0;
 }
 
 /* "All schedules paused · Resume", under the header. */
@@ -5339,11 +5336,11 @@ body.dragging .panel-view { pointer-events: none; }
   text-decoration: underline;
 }
 
-/* An agent's schedules hang under its row, on a thin guide line. */
+/* An agent's schedules, in its card. */
 .sch-list {
-  margin: 0 0 4px 12px;
-  padding-left: 2px;
-  border-left: 1px solid var(--border-strong);
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
 }
 
 .sch-row {
@@ -6237,10 +6234,6 @@ fieldset.sch-then > legend {
   margin-top: 2px;
 }
 
-.sch-prop-note {
-  color: var(--st-attn);
-}
-
 /* A channel's utility shell sits beneath its tiled workspace. */
 .sl-terminal { flex: none; justify-content: center; min-width: 28px; }
 .sl-terminal.active { color: var(--accent); background: var(--hover-strong); }
@@ -6282,12 +6275,6 @@ fieldset.sch-then > legend {
 .drawer-resize:hover, .drawer-resize:focus-visible { background: var(--accent); opacity: 0.6; }
 .drawer-empty { flex: 1; display: flex; align-items: center; justify-content: center; gap: 12px; padding: 16px; color: var(--text-muted); overflow: auto; }
 .drawer-notice { padding: 4px 12px; font-size: 11.5px; color: var(--text-muted); background: var(--bg-1); }
-
-.communication { padding: 8px 12px; font-size: 12px; overflow-wrap: anywhere; }
-.communication section { max-height: 65vh; overflow: auto; }
-.communication label { display: block; margin: 8px 0; }
-.communication select, .communication input[type=number] { display: block; width: 100%; }
-.communication details { margin: 8px 0; }
 
 /* ---------------- The pinned Questions tab (docs/UI.md "Questions") ---------------- */
 

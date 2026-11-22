@@ -14,7 +14,7 @@ key press away, and the terminals keep running when the window closes.
 
 ## What you get
 
-- **Channels for projects.** Channels sit above Agents in a split sidebar. Each has its own
+- **Channels for projects.** The sidebar lists your channels, each named agent in its own channel's row. Each has its own
   tiles and tabs, so switching projects restores your arrangement. New tabs join the selected
   channel; Alt+Shift+N creates another channel, optionally in its own worktree. Drag tabs
   between tiles, channels and windows. Empty channels stay ready for your next session.
@@ -42,8 +42,9 @@ key press away, and the terminals keep running when the window closes.
   ![An agent's terminal on the left; on the right a PR decision panel for "Rate-limit failed logins per IP" with the verdict "Safe to merge: it slows down people guessing passwords, and the tests pass", a note that an approving review is still required, cards for the risk, the passing checks and the reviews, a plain summary of what changed, and Merge, Request changes, Ask, Skip and Hold buttons](docs/screenshots/pr-decision.png)
 
 - **Named agents that remember.** Give an agent a name, a persona and a folder of memory files,
-  and it resumes its conversation each time you start it. The agents panel (Alt+Shift+G) starts them,
-  edits their persona and memory, and shows the messages agents send each other.
+  and it resumes its conversation each time you start it. Each agent lives in its channel's row in
+  the sidebar: a click starts it, hovering (or →) shows its state, schedules and actions, and
+  Messages shows what agents send each other.
 
   ![The agents panel on the left listing four named agents with their states and the messages between them, a Claude agent's terminal in the middle, and a panel on the right with a bar chart of CI minutes per day, master builds against PR builds, under the agent's one-line finding and three headline numbers](docs/screenshots/agents-chart.png)
 
@@ -128,7 +129,7 @@ From there:
 | Alt+J | Go to the next agent that needs you |
 | Alt+A / Alt+Shift+A | Approve / deny the focused agent's prompt |
 | Ctrl+Space | Jump to any tab, agent or folder |
-| Alt+Shift+G | Agents panel |
+| Alt+Shift+G | Collapse or expand the channel list |
 | Alt+G | Hide or show the entire sidebar |
 | Alt+/ or F1 | Every shortcut |
 
@@ -176,8 +177,9 @@ tools agents get.
 Named agents are persistent agent sessions with their own folder, memory and resumed
 conversation (PLAN.md §10): `muster agent new reviewer --persona "Reviews diffs"`, then
 `muster ask reviewer "is fix-auth safe to merge?"` (or the `ask_agent` MCP tool from an agent).
-In the UI, Alt+Shift+G opens the agents panel: start an agent with a click, create one from a
-template, edit its persona and memory, and watch the messages agents send each other. You can
+In the UI, each agent lives in its channel's row in the sidebar: start it with a click, hover the
+row (or press →) for its card, create one from a template (New agent… in the Channels `⋯`), edit
+its persona and memory from its menu, and watch the messages agents send each other. You can
 also let a Claude agent start itself fresh from a handoff file it writes once its conversation
 grows long (docs/MCP.md, "Self handoff").
 

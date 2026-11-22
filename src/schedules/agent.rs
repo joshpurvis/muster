@@ -4,7 +4,7 @@
 //! session run the same tools).
 //!
 //! The owner's rule (docs/SCHEDULING_PLAN.md "Decisions", question 3, answer b): an agent
-//! proposes, and the human approves each proposal with a click in the Agents panel. The one
+//! proposes, and the human approves each proposal with a click in Muster's sidebar (Needs you). The one
 //! exception is a one-off reminder for the agent itself, at most 24 hours ahead, which runs
 //! without approval. Recurring schedules are where runaway use comes from, so:
 //!
@@ -103,7 +103,7 @@ fn made_today(hub: &Hub, agent: i64, kind: MadeKind, now: i64) -> usize {
 /// The calling agent: a named agent's own session.
 fn me(hub: &Hub, caller: SessionId) -> anyhow::Result<Agent> {
     hub.agents().by_session(caller).context(
-        "only named agents (the ones in Muster's Agents panel) can have schedules: this session isn't one",
+        "only named agents (the ones in Muster's sidebar) can have schedules: this session isn't one",
     )
 }
 
@@ -222,7 +222,7 @@ pub fn tool(hub: &Hub, caller: SessionId, name: &str, args: Value) -> anyhow::Re
                 "takes_scheduled_work": me.accepts_origins.contains(&Origin::Schedule),
                 "limits": {
                     "reminder": "a one-off for yourself, 5 minutes to 24 hours ahead, no approval",
-                    "proposals": "the human approves each one in the Agents panel",
+                    "proposals": "the human approves each one in Muster's sidebar (Needs you)",
                     "reminders_waiting_max": REMINDERS_WAITING_MAX,
                     "proposals_waiting_max": PROPOSALS_WAITING_MAX,
                     "live_schedules_you_made_max": AGENT_MADE_MAX,
@@ -373,7 +373,7 @@ pub fn tool(hub: &Hub, caller: SessionId, name: &str, args: Value) -> anyhow::Re
                 hub,
                 "info",
                 &format!("{} proposes a schedule: \"{}\"", me.name, s.name),
-                &format!("{reading}{on}. Approve or dismiss it in the Agents panel."),
+                &format!("{reading}{on}. Approve or dismiss it in Needs you at the top of Muster's sidebar."),
             );
             Ok(json!({
                 "schedule_id": s.id,
@@ -381,7 +381,7 @@ pub fn tool(hub: &Hub, caller: SessionId, name: &str, args: Value) -> anyhow::Re
                 "agent": target.name,
                 "when": reading,
                 "estimate": j["estimate"]["text"],
-                "note": "It doesn't run until the human approves it in the Agents panel (they may edit it first). \
+                "note": "It doesn't run until the human approves it in Muster's sidebar (they may edit it first). \
                          list_schedules shows whether it was approved; dismissed proposals disappear.",
             }))
         }

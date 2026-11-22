@@ -212,7 +212,7 @@ pub fn resolve_file(given: &str, home: &Path, cwd: &Path) -> Result<PathBuf, Str
 pub fn check_request(agent: Option<&Agent>, session: &SessionInfo, file: &str, now: i64, pending: bool)
     -> Result<PathBuf, String> {
     let Some(a) = agent else {
-        return Err("only named agents (the ones in Muster's Agents panel) can start themselves fresh, and only when \
+        return Err("only named agents (the ones in Muster's sidebar) can start themselves fresh, and only when \
             the human allows it: this session isn't one. Ask the human to /clear it instead"
             .into());
     };

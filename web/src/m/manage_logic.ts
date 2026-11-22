@@ -114,7 +114,7 @@ export function closeConfirm(
       title: `Close ${agent}'s tab?`,
       body: [
         `${agent} is a named agent, so closing its tab only hides it. It keeps running and still gets messages.`,
-        "Show it again from the agents panel on your computer. To end it, use Stop.",
+        "Show it again from its row in the sidebar on your computer. To end it, use Stop.",
       ],
       action: "Close tab",
       danger: false,

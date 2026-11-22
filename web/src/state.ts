@@ -38,6 +38,7 @@ import { applyPr, loadPrs, minuteClock, prs, prsSupported, worthShowing } from "
 import { debounce, load, save } from "./util.ts";
 import { upsertMessage } from "./agents.ts";
 import { newerRun, upsertRun } from "./schedules.ts";
+import { ownerOf } from "./sidebar.ts";
 import { type Dismissed, releaseOfScript, type RestartWait, restartWait, type UpdateStatus } from "./updates.ts";
 import {
   allSessions,
@@ -184,7 +185,7 @@ export const lastBackend = signal<RestartWait>({ pid: null, host: null, build: n
  * refused or Muster is restarting or stopped. */
 export const lifecycleChecking = signal<"restart" | "shutdown" | null>(null);
 
-// ---------------- named agents (docs/UI.md "Agents panel") ----------------
+// ---------------- named agents (docs/UI.md "Agents in the sidebar") ----------------
 
 /** Every named agent, by name. Loaded after each hello (`agent.list`), then kept by events. */
 export const agents = signal<Agent[]>([]);
@@ -194,7 +195,8 @@ export const agentsSupported = signal(true);
 export const agentsLoaded = signal(false);
 /** The message log, newest first (`agent.messages`, then `agent_message` events). */
 export const agentMessages = signal<AgentMessage[]>([]);
-/** The panel's selected agent: the log shows only messages to it. */
+/** The agent whose messages the log shows: the open channel's agent (`to <name> ×` clears it
+ * until another channel opens). */
 export const agentFilter = signal<number | null>(null);
 
 export const agentBySession = computed(() => {
@@ -223,7 +225,7 @@ async function loadAgents() {
   }
 }
 
-// ---------------- schedules (docs/UI.md "Agents panel", docs/PROTOCOL.md "Schedules") ----------------
+// ---------------- schedules (docs/UI.md "Agents in the sidebar", docs/PROTOCOL.md "Schedules") ----------------
 
 /** Every schedule (`schedule.list` after each hello, then `schedule_*` events). */
 export const schedules = signal<Schedule[]>([]);
@@ -410,8 +412,10 @@ export interface Prefs {
   altToTerminal: boolean;
   /** Jump / Alt+J focus the other window (window.raise) instead of pulling its tab here. */
   jumpRaises: boolean;
-  /** The agents panel's message log is expanded. */
+  /** The sidebar's message log is expanded. */
   agentFeed: boolean;
+  /** Failed schedule runs hidden from the sidebar's Needs you box: schedule id → the run hidden. */
+  hiddenRuns: Record<string, number>;
   /** The sidebar's Usage card shows each account's bars. */
   usageCard: boolean;
 }
@@ -426,6 +430,7 @@ const defaultPrefs: Prefs = {
   altToTerminal: false,
   jumpRaises: false,
   agentFeed: true,
+  hiddenRuns: {},
   usageCard: true,
 };
 
@@ -491,6 +496,8 @@ export type Overlay =
   /** New agent (no `name`) or Edit agent, on its Settings or Memory tab. */
   | { kind: "agent"; name?: string; tab?: "settings" | "memory"; template?: string; focus?: "profile" }
   | { kind: "agent_message"; id: number }
+  /** Session communication: sharing rules between workspaces (the Channels header's ⋯). */
+  | { kind: "communication" }
   /** New schedule (no `id`; `agent` preselects one) or Edit schedule. `draft`: the fields as
    * typed before Scheduling settings opened over it (the dialog's own shape). */
   | ScheduleOverlay
@@ -563,6 +570,15 @@ export const renaming = signal<
 /** Every channel's layout in this window. Only the active one is rendered. */
 export const channelLayout = signal<WindowLayoutState | null>(null);
 export const activeChannelId = computed(() => channelLayout.value?.active ?? null);
+
+/** The open channel's agent (none for a task channel): the message log follows it. */
+const openChannelAgent = computed(() => {
+  const id = activeChannelId.value;
+  return id === null ? null : ownerOf(agents.value).get(id)?.id ?? null;
+});
+effect(() => {
+  agentFilter.value = openChannelAgent.value;
+});
 export const drawerFocused = signal(false);
 export const activeDrawer = computed(() => channelLayout.value?.drawers?.[activeChannelId.value ?? -1] ?? null);
 export const activeChannel = computed(() => channelById.value.get(activeChannelId.value ?? -1) ?? null);
@@ -608,7 +624,6 @@ effect(() => {
   if (f !== null && (!l || l.focus !== f || !findPane(l.root, f))) fullscreen.value = null;
 });
 
-export const agentsPanelOpen = computed(() => !!channelLayout.value?.sidebar.agents);
 export const sidebarHidden = computed(() => !!channelLayout.value?.sidebar.hidden);
 export const channelsPanelOpen = computed(() => !!channelLayout.value?.sidebar.channels);
 

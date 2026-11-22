@@ -139,7 +139,7 @@ Deno.test("followLink: a link to something gone says so in a short message", () 
     [{ kind: "panel", id: 9 }, "says: Panel 9 is closed."],
     [{ kind: "tab", id: 77 }, "says: Tab 77 no longer exists."],
     [{ kind: "agent", name: "nobody" }, "says: There is no agent named nobody."],
-    [{ kind: "agent", name: "idle" }, "says: idle has no tab yet: start it from the Agents panel."],
+    [{ kind: "agent", name: "idle" }, "says: idle has no tab yet: start it from its row in the sidebar."],
   ];
   for (const [link, want] of cases) {
     const { deps, calls } = world();

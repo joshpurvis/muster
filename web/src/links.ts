@@ -122,7 +122,7 @@ export function followLink(link: MusterLink, d: LinkDeps): boolean {
       const a = d.agent(link.name);
       if (!a) return gone(d, `There is no agent named ${link.name}.`);
       if (a.session === null || !d.hasSession(a.session)) {
-        return gone(d, `${a.name} has no tab yet: start it from the Agents panel.`);
+        return gone(d, `${a.name} has no tab yet: start it from its row in the sidebar.`);
       }
       d.gotoSession(a.session);
       return true;

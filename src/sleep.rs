@@ -1,4 +1,4 @@
-//! Sleep and wake for named agents (PLAN.md §10, docs/UI.md "Agents panel").
+//! Sleep and wake for named agents (PLAN.md §10, docs/UI.md "Agents in the sidebar").
 //!
 //! An asleep agent's CLI process is stopped while it is idle; its record, tab and conversation
 //! stay, shown as asleep (`Agent::asleep_at`, saved, so it survives a backend reload and a full
@@ -11,7 +11,7 @@
 //! What wakes it: a message (`ask_agent`, `muster ask`, a schedule run, after every guard rail
 //! of those paths), the human's `muster send` (or a phone's message), the human typing into its
 //! tab (the keys are held here and typed once it is ready, `keys`), a real click in one of its
-//! panels, and Start (Wake) in the agents panel. Nothing that doesn't need the agent wakes it: a
+//! panels, and Start (Wake) in an agent's row menu. Nothing that doesn't need the agent wakes it: a
 //! panel closing (or any other notice `panels::wakes` turns down), status checks, list and read
 //! tools, reading its screen, the terminal's own reports (focus, mouse, cursor position),
 //! showing its tab.
@@ -662,7 +662,7 @@ pub(crate) fn facts(hub: &Hub, a: &Agent) -> (Option<SessionInfo>, Facts) {
 /// Why a sleep was asked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Why {
-    /// The human (Sleep in the agents panel, `muster agent sleep`).
+    /// The human (Sleep in its row menu, `muster agent sleep`).
     Manual,
     /// Its idle time ran out (`sleep_after_min`).
     Idle,

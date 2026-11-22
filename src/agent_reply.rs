@@ -12,7 +12,7 @@
 //!   message;
 //! - another Claude or Codex session gets it typed in through its injection queue after a
 //!   `[muster reply to msg <id> …]` header, under `send_message`'s Claude origin rule;
-//! - the human (also through a shell tab) or a schedule sees it in the agents panel's message
+//! - the human (also through a shell tab) or a schedule sees it in the sidebar's message
 //!   log, with a desktop notification when the human asked.
 //!
 //! Its route is the stricter of the message's chain and the replier's current one (a non-human
@@ -43,7 +43,7 @@ pub enum AnswerStatus {
     Returned,
     /// Delivered to the asker (`msg` for an agent, `session` for where it was typed).
     Delivered,
-    /// In the agents panel's log only: the human, a shell or a schedule asked.
+    /// In the sidebar's message log only: the human, a shell or a schedule asked.
     Shown,
     /// A guard refused the delivery (`note` says which). Still kept here.
     Refused,
@@ -91,7 +91,7 @@ pub const WAITER_MAX: Duration = Duration::from_secs(30);
 const QUOTE_MAX: usize = 80;
 
 /// What a timed-out ask says about late replies.
-pub const TIMED_OUT_NOTE: &str = "no reply yet; the message stays delivered. If the agent answers later with its reply tool, the answer comes to you as a new message (\"Late reply to your message <msg_id>\"; if it sends it with wake=false, at the start of your next turn that can take it instead), or, if the human asked, in the agents panel's message log";
+pub const TIMED_OUT_NOTE: &str = "no reply yet; the message stays delivered. If the agent answers later with its reply tool, the answer comes to you as a new message (\"Late reply to your message <msg_id>\"; if it sends it with wake=false, at the start of your next turn that can take it instead), or, if the human asked, in the sidebar's message log";
 
 /// The asks in progress (in memory: no ask survives a restart): those waiting for a message's
 /// turn, and those still delivering theirs (the message id isn't theirs to know yet).
@@ -432,7 +432,7 @@ async fn deliver(hub: &Arc<Hub>, m: &AgentMessage, mut a: Answer) -> Answer {
     match asker(hub, m) {
         Asker::Log { human } => {
             let who = if human { "the human".to_string() } else { m.from.clone() };
-            set(&mut a, AnswerStatus::Shown, format!("{who} asked: shown in the agents panel's message log"));
+            set(&mut a, AnswerStatus::Shown, format!("{who} asked: shown in the sidebar's message log"));
             if human {
                 let first = a.text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
                 crate::notify::alert(&format!("{from} replied to message {}", m.id), first);

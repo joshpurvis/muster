@@ -1,6 +1,6 @@
 import {
   changeChannelLayout, folderChannel, followingChannel, loadChannelLayout, reconcileChannels, rememberPlace,
-  savedChannel, sidebarRatio, type TabHome, type WindowLayoutState,
+  savedChannel, sidebarWidth, type TabHome, type WindowLayoutState,
 } from "./channels.ts";
 import {
   addTab, allPanes, allSessions, emptyLayout, findPane, noteTab, panelTab,
@@ -116,15 +116,23 @@ Deno.test("a notes-only legacy window has a stable fallback, with no invented pr
 });
 
 Deno.test("sidebar preferences are window-wide, validated and survive channel reloads", () => {
-  // Older saves carry the removed grouping fields; they are dropped, not kept.
+  // Older saves carry the removed grouping fields and the Agents section's split; they are dropped.
   const s = loadChannelLayout({ v: 2, layouts: {}, active: 999,
     sidebar: { split: 4, agents: false, channels: true, collapsedProjects: [1, "bad"],
       groupBy: "account", collapsedAccounts: ["claude:7", 42] } }, [10], []);
   equal(s.active, 10);
-  equal(s.sidebar, { hidden: false, channels: true, agents: false, split: 0.8 });
+  equal(s.sidebar, { hidden: false, channels: true, width: 240 });
   equal(loadChannelLayout(s, [10], []).sidebar, s.sidebar);
-  equal(sidebarRatio(NaN), 0.45);
-  equal(sidebarRatio(-1), 0.2);
+  const wide = loadChannelLayout({ v: 2, layouts: {}, active: 10, sidebar: { width: 9999 } }, [10], []);
+  equal(wide.sidebar.width, 420);
+  equal(sidebarWidth(NaN), 240);
+  equal(sidebarWidth(-1), 200);
+  equal(sidebarWidth(333.4), 333);
+  // A window that showed the old Agents section with Channels collapsed shows the merged list.
+  const agentsOnly = loadChannelLayout({ v: 2, layouts: {}, active: 10, sidebar: { channels: false, agents: true } }, [10], []);
+  equal(agentsOnly.sidebar.channels, true);
+  const neither = loadChannelLayout({ v: 2, layouts: {}, active: 10, sidebar: { channels: false, agents: false } }, [10], []);
+  equal(neither.sidebar.channels, false);
 });
 
 Deno.test("a new channel in an open folder joins it, across accounts", () => {

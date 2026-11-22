@@ -35,9 +35,8 @@ async function closeDialog() {
   }
 }
 async function editAgent() {
-  if (!(await b.eval(`${M}.agentsPanelOpen.value`))) await b.eval(`${M}.agentsPanelOpen.value = true`);
-  await b.wait(`!!document.querySelector('.ap-row')`, 5000);
-  await b.click(".ap-row", { button: "right" });
+  await b.wait(`!!document.querySelector('.channel-row.agent-row')`, 5000);
+  await b.click(".channel-row.agent-row .channel-select", { button: "right" });
   const item = `Array.from(document.querySelectorAll('[role="menuitem"]')).find(e => e.querySelector('.menu-label')?.textContent.trim() === 'Edit…')`;
   await b.wait(`!!${item}`);
   await b.eval(`${item}.click()`);

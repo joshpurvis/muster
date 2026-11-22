@@ -38,6 +38,7 @@ const KEYS: Record<string, { key: string; code: string; vk: number }> = {
   Home: { key: "Home", code: "Home", vk: 36 },
   End: { key: "End", code: "End", vk: 35 },
   F1: { key: "F1", code: "F1", vk: 112 },
+  F10: { key: "F10", code: "F10", vk: 121 },
   F2: { key: "F2", code: "F2", vk: 113 },
   "`": { key: "`", code: "Backquote", vk: 192 },
   "/": { key: "/", code: "Slash", vk: 191 },

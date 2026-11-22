@@ -99,7 +99,7 @@ pub fn tick(hub: &Arc<Hub>, now: i64) -> Vec<Run> {
                 Ok(x) => {
                     let when = plan::expires_at(&x, &f).map(fmt_local).unwrap_or_default();
                     alert(hub, "warn", &format!("{}: schedule \"{}\" expires {when}", agent.name, x.name),
-                        "Claude subscription agents' schedules stop after 7 days. Renew it in the Agents panel to keep it running.");
+                        "Claude subscription agents' schedules stop after 7 days. Renew it from its menu in its agent's card in Muster's sidebar to keep it running.");
                     publish(hub, &x);
                 }
                 Err(e) => tracing::warn!(schedule = s.id, "{e:#}"),
@@ -766,7 +766,7 @@ fn notify_outcome(hub: &Hub, s: &Schedule, agent: &str, run: &Run, force: bool) 
     }
     let summary = format!("{agent}: \"{}\" {}", s.name, run.outcome.label());
     let body = run.reason.clone().unwrap_or_else(|| match run.outcome {
-        Outcome::Replied => "Open the Agents panel for the reply.".into(),
+        Outcome::Replied => "Open its agent's card in Muster's sidebar for the reply.".into(),
         _ => String::new(),
     });
     let level = if run.outcome.is_failure() || force { "warn" } else { "info" };

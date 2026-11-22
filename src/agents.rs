@@ -410,7 +410,7 @@ pub fn persona_text(name: &str, kind: SessionKind, persona: &str) -> String {
          ## Schedules\n\n\
          To follow something up later yourself (\"check CI again in 20 minutes\"), use `set_reminder`: a \
          one-off for you, up to 24 hours ahead, no approval needed. For anything recurring or later, use \
-         `propose_schedule`: the human approves it in the Agents panel before it runs. `list_schedules` \
+         `propose_schedule`: the human approves it in Muster's sidebar before it runs. `list_schedules` \
          shows yours. Neither works while you handle scheduled or triggered work.\n",
         kind = kind.as_str(),
         resume = " resumes your conversation when you restart",
@@ -2198,7 +2198,7 @@ pub fn widens_unattended(hub: &Hub, cur: &Agent, next: &Agent) -> Option<String>
     if next.accepts_origins.iter().any(|o| unattended(o) && !cur.accepts_origins.contains(o)) {
         return Some(format!(
             "letting {} take scheduled or triggered work takes a click in Muster's window: tick it under \
-             \"Takes messages started by\" in Edit agent (Agents panel). From here an agent's accepted work can only shrink",
+             \"Takes messages started by\" in Edit agent (the agent's menu in Muster's sidebar). From here an agent's accepted work can only shrink",
             cur.name
         ));
     }
@@ -2208,7 +2208,7 @@ pub fn widens_unattended(hub: &Hub, cur: &Agent, next: &Agent) -> Option<String>
     {
         return Some(format!(
             "changing the provider of {}, which takes scheduled or triggered work or is named in a schedule, takes a click in \
-             Muster's window (Edit agent, in the Agents panel): it changes whether its schedules stop after 7 days and what \
+             Muster's window (Edit agent, in the agent's menu in the sidebar): it changes whether its schedules stop after 7 days and what \
              pays for them. From here, first take away its Schedule and Webhook and remove the schedules that name it",
             cur.name
         ));

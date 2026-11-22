@@ -27,7 +27,7 @@
 //!   typed (it can't tell a draft from Claude's suggestion) keeps it.
 //! - It leaves the new conversation one quiet message (src/quiet.rs, from `muster`, the human's
 //!   origin): why, and to read memory/ first. It never wakes the agent, arrives as context when
-//!   its next turn starts, and shows in the Agents panel's message log. The agent's accepted
+//!   its next turn starts, and shows in the sidebar's message log. The agent's accepted
 //!   origins, daily message cap and waiting quiet messages are checked before anything stops: an
 //!   agent that couldn't take the note keeps its conversation.
 //! - Each reset is also a `system` event in the agent's tab (`auto_reset`) and a notice in the

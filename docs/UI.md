@@ -1,7 +1,7 @@
 # Muster UI spec: channel workspaces
 
-A window has a sidebar with Channels above global Agents, and a tiled workspace for the
-selected channel. Each channel has independent split groups and tab strips. A tab is a terminal,
+A window has a sidebar with one list of channels (each named agent lives in its channel's row),
+and a tiled workspace for the selected channel. Each channel has independent split groups and tab strips. A tab is a terminal,
 an agent panel or a note. Background terminals keep running when another channel is selected.
 Jump and “next that needs me” select the destination channel before showing its tab.
 
@@ -27,16 +27,23 @@ kills it, and reopening restores the window's channel selection, layouts and sid
 
 ## Channels sidebar
 
-Channels sit above Agents in a 240px dock. Both sections scroll independently and can collapse.
-**Alt+G** hides or shows the entire sidebar, preserving the section states and divider.
-The window's ⋯ menu has Show/Hide sidebar, and the palette has Toggle sidebar. Visibility is
-saved per window. Alt+Shift+G or Toggle channels panel also reveals the sidebar when it is hidden.
-Drag their divider, or focus it and use Up/Down/Home/End, to resize the sections. Channel rows
-show a tab count, unread activity and an attention count when a session needs you. The
-channels form one flat list in their saved order, with no project or account headings (older
-saved grouping and collapse settings are ignored). Right-click the Channels heading, a row, or
-empty space for Hide channels (collapse this section) or Hide sidebar (hide the entire dock).
-Channels that share a name show their branch, or else their folder, under it.
+The sidebar is one list of channels in a 240px dock, with Messages and Usage under it. A named
+agent has no section of its own: it lives in its channel's row (see "Agents in the sidebar"), and
+agents whose channel isn't in this window (never started yet, or shown in another window) get a
+row after the channels, before Notes. **Alt+G** hides or shows the entire sidebar. The window's ⋯
+menu has Show/Hide sidebar, and the palette has Toggle sidebar. Visibility is saved per window.
+Alt+Shift+G or Toggle channels panel collapses or expands the list, and also reveals the sidebar
+when it is hidden. Drag the dock's right edge to widen it (200 to 420px, saved per window;
+double-click puts it back to 240), or focus the edge and use Left/Right/Home/End; from 300px an
+agent's row also shows its state and time, `cold`, and a clock chip with its schedule count.
+Channel rows show a tab count, unread activity and an attention count when a session needs you.
+The channels form one flat list in their saved order, with no project or account headings (older
+saved grouping and collapse settings, and the old Agents section's split, are ignored).
+Right-click empty space or the Channels heading, or its `⋯`, for New channel…, New agent…, New
+schedule…, Pause all schedules (checked while on), Scheduling settings…, Session communication…
+(sharing rules between workspaces, in a dialog), Hide channels and Hide sidebar. While Pause all
+is on, an amber **All schedules paused · Resume** line stays under the heading. Channels that
+share a name show their branch, or else their folder, under it.
 Below the channels, a **Notes** row (with the number of notes) opens the notes list described
 under "Notes": every note, type to filter, Enter opens it. Its menu has New note and, when the
 window still has the old Notes workspace (tabs of notes that had no channel when channels came
@@ -58,7 +65,7 @@ Unchanged from v0. Dark by default with a light theme (`prefers-color-scheme` pl
 toggle). All colors are CSS custom properties on `:root`. State colors: starting gray
 (pulsing), working `#4ea1ff`, needs_approval / asking_question `#f0a020`, error `#f85149`,
 stuck `#e0823d`, exited `#6a6a76` (hollow dot). Idle follows the agent's prompt cache
-(`web/src/cache.ts` `cacheDot`, on tabs, channel rows, the switcher and the Agents panel): green
+(`web/src/cache.ts` `cacheDot`, on tabs, channel rows, the switcher and agents' rows): green
 `#3fb950` while warm (the next message is cheap; also an agent that never goes cold or has had no
 turn yet, and every idle agent with the cache warning off), faded green `#55935e` (`#4a8656`
 light) in its last 5 minutes, grey `#72727e` (`#7f7f8b` light) once cold or when its launch
@@ -148,8 +155,8 @@ launch offers Try again. Archiving the channel stops its drawer shell along with
   terminal in this task, Split right ▸ / Split down ▸ (Move this tab, or a new Claude / Codex /
   Shell in this task there), Move to channel ▸, Move to window ▸ (existing windows plus
   "New window"), Switch account… (a Claude named agent's tab, once Claude profiles exist: see
-  "Agents panel"; while a move waits for its next start, "Moves to Work at its next start" and
-  Restart now on Work follow it, as in the agent's row menu), Restart, Interrupt, Close tab (a named agent's tab only hides: see "Agents panel"), and when it is the task's last session with a
+  "Agents in the sidebar"; while a move waits for its next start, "Moves to Work at its next start" and
+  Restart now on Work follow it, as in the agent's row menu), Restart, Interrupt, Close tab (a named agent's tab only hides: see "Agents in the sidebar"), and when it is the task's last session with a
   worktree, Close + remove worktree (confirmed in a dialog). Restart and Interrupt, here and in
   the terminal menu, ask first while an agent is mid-turn (working, stuck, needs approval or asking):
   "Claude is working" / "Codex is working", "Stop its current turn?" or "Restart it? Its
@@ -561,7 +568,7 @@ Pointer-based (not HTML5 DnD), with the v1 drop-zone overlay:
   window body, whatever its share of the split was.
 - **Fullscreen** (Alt+Shift+Z, the `⤢` button at the right end of a panel's strip or of the web
   preview's bar, Fullscreen in the tab and terminal menus, and "Fullscreen tab" in the
-  palette): one tab fills the whole window, with no tab strips, agents panel or status line. A
+  palette): one tab fills the whole window, with no tab strips, sidebar or status line. A
   panel keeps its strip, whose button turns into Exit fullscreen; a terminal gets a small
   Exit fullscreen button in its top-right corner. It acts on the group: switching tabs in it
   (Alt+1..9, Ctrl+Tab) stays fullscreen. Per window and in memory only: the saved layout never
@@ -620,7 +627,7 @@ a light blue tint):
   re-reads the whole conversation at full cost." It sits above the terminal's canvases, which can
   overhang it until xterm refits.
 - The tab gets a small **cold** marker (after the OpenRouter badge), a tooltip line and ", prompt
-  cache likely expired" in its accessible name; the agent's row in the Agents panel gets one
+  cache likely expired" in its accessible name; the agent's row in the sidebar (and its card) gets one
   beside its state (also in its accessible name). The markers stay while the bar is dismissed.
 
 **Cache warning…** (`⋯` "Settings and more", with its state as the hint; palette "Cache warning
@@ -642,10 +649,10 @@ keeps its memory/ notes and reads them first; the switch's description) and thre
 when: named Claude agents at rest, 100k tokens once their cache has expired or 200k after 15
 minutes idle; left alone while they work, have messages waiting or you are typing, and for a day
 after you prompt them; the agent is put to sleep and its next start is the new conversation, each
-reset shown in the Agents panel's messages with why. Save sends it only when it changed; only a
+reset shown in the sidebar's Messages with why. Save sends it only when it changed; only a
 click in Muster's window changes it (the backend refuses it from the command line, a script or an
 agent, docs/PROTOCOL.md "Idle agent resets"). Its body scrolls in a short window. Each reset
-leaves the agent a quiet message from `muster` in the Agents panel's message log ("Muster started
+leaves the agent a quiet message from `muster` in the sidebar's message log ("Muster started
 you in a new conversation while you were idle, because the old one was cold and large, about 182k
 tokens and idle 10 h. Read your memory/ notes first, before anything else.", with its `waits for
 a turn` chip, then `shown`), and a notice in the window ("Idle agent reset: alpha is asleep, and
@@ -658,7 +665,7 @@ says only "Sending a message wakes it."
 
 Muster's own sends are noted too: an agent message, a scheduled run's message or panel events
 typed into a cold agent are still delivered, and recorded as a **cold start**: a `cold start`
-chip on the message in the Agents panel's message log, in its message overlay, and on the
+chip on the message in the sidebar's message log, in its message overlay, and on the
 schedule run that sent it (tooltip: how long it had been idle, and that it likely re-read the
 conversation uncached: an estimate).
 
@@ -790,7 +797,7 @@ dialog has it, then Cancel and one primary button.
   no provider choice either: running on OpenRouter is a named agent's setting (below).
 - **Rename window…** (palette, `⋯`, the window chip): a small dialog; the title follows.
 - **Permissions** dialog: unchanged from v0 (tab context menu, the tab's shield icon, palette).
-- **New agent / Edit agent** and the **message** overlay: see "Agents panel".
+- **New agent / Edit agent** and the **message** overlay: see "Agents in the sidebar".
 - **Shortcuts sheet** (Alt+/ or F1). Context menus are custom and keyboard navigable. Toasts sit
   bottom-right. Modals trap focus. Never use `alert/confirm/prompt`.
 
@@ -816,27 +823,31 @@ disabled, without allowing it to change (a line under the pills says why), so it
 The account itself is verified with `/status` in Claude Code. Backend versions without
 profile support do not show these controls.
 
-## Agents panel
+## Agents in the sidebar
 
-Named agents (PLAN.md §10) appear below Channels in the shared sidebar. **Alt+Shift+G** (or
-"Toggle agents panel" in Jump and the palette) expands or collapses the section; each window
-remembers it in `Window.layout.sidebar.agents`. You talk to an agent in its own
-terminal tab; there is no chat view.
+Named agents (PLAN.md §10) have no section of their own: each one lives in its channel's row in
+the Channels list (an agent owns one channel, `agent.channel_id`), with one right-click menu for
+both. An agent whose channel isn't in this window (one that hasn't started yet, or whose channel
+is shown in another window) gets a row of its own after the channels, before Notes, so every agent
+stays reachable. You talk to an agent in its own terminal tab; there is no chat view. The old
+Agents section, its divider and its notice line are gone (`web/src/sidebar.ts` builds the list;
+`components/AgentCard.tsx` draws the rows' agent parts and the card).
 
 | Part | What |
 |---|---|
-| Header | "Agents", the count, `⋯` (New agent…, and with a backend that has schedules: New schedule…, Pause all schedules (checked while on), Scheduling settings…), `×` hides the panel. While Pause all is on, an amber line under it reads **All schedules paused · Resume**. While agents' proposals wait, another amber line reads **2 schedules proposed by reviewer wait for your approval · Show** (Show scrolls to and focuses the oldest); schedules made or changed outside the window wait the same way (**1 schedule made or changed outside Muster's window waits for your approval**, or both kinds counted together). |
-| Proposal | An agent's proposed schedule (Phase 3) is an amber card under the agent it would run on, above its other schedules: **Proposed by reviewer · today 10:02**, the name, WHEN (the reading with its time zone, always: "At 08:30, Monday to Friday (America/Los Angeles time)", and for a one-off in another zone when that is here: "; 16:30 your time"), AGENT, ALSO (fresh conversation, quiet hours, a daily cap, a reply note, when set), the PROMPT (monospace, scrolls past 9 lines; the box takes the keyboard focus, so arrow keys scroll it, and a prompt over 8 lines or 600 characters has **Show all (N lines)** / **Show less** under it), THEN (every "Then…" step, nested ones indented under the step they follow: "When it replies: ask **deployer**", "When that step replies: …", "If it fails: notify you", each with its prompt in the same monospace box; **Show all** unfolds these too), WHY (the agent's reason, in italics: its words), and USE (the estimate, one sentence each: runs in the coming week and at most per day; what pays, amber with a shield for a Claude subscription agent, with its 7-day expiry and quiet hours; the agent's unattended cap and its last 7 days). Buttons **Approve** (`schedule.approve`; a toast with its next run), **Edit…** (the schedule dialog, its head saying it stays waiting until approved) and **Dismiss** (`schedule.remove`, no confirm: it never ran). Right-click, Shift+F10 or the menu key: the same three. It never shows a next run or a history: it hasn't run. A schedule made or widened outside Muster's window (the command line, a script: `held`) gets the same card, headed **Made from the command line or a script** (or **Resumed …**, **Changed and resumed …**, **Renewed for 7 days …**) with when, and WHY reading "Waits for your approval: it came from the command line or a script, not from a click in Muster's window. Until you approve it, it doesn't run."; a held change of one of yours has **Remove…** (with the usual question) instead of Dismiss. Approve sends the `updated_at` the card showed, so a schedule changed since is refused. If a change made in the window itself comes back held (Muster couldn't tell its program), a toast says so and points at the card. |
-| Row | State dot (same colours as tabs; hollow when stopped), name, kind badge (CLAUDE / CODEX), and below it the state plus time in state (`idle · 3m`, `stopped`), with an `auto` marker for autostart agents, a `sleeps` marker for one that sleeps when idle, and a blue `cold` marker while its prompt cache has likely expired (see "Cold cache bar"). An asleep agent reads `asleep · 2h` with a half-filled dot, and `cold` when waking it would re-read the whole conversation at full cost. An agent on OpenRouter gets a third line, an amber **OpenRouter · pay per use** badge (it bills per token), followed by an estimate of what it spent today once read (`· ~$0.42 today (est.)`, OpenRouter's UTC day; see Scheduling settings). The badge follows what the running process bills to: switched to Subscription while running on OpenRouter it reads **OpenRouter · until restart**, switched the other way **OpenRouter · from restart** (tooltip and accessible name say which); clicking such a running agent shows its tab and a toast that the new provider applies when it restarts (Start fresh, or Stop and start it). A move to another account that waits for its next start adds an amber line, **Moves to Work at its next start** (tooltip: until then it keeps running on its old account, and Restart now is in its menu; also in its accessible name). Hover: the persona's first line. |
-| Click | Starts the agent when no process runs (`agent.start` with this window, so a new tab opens here), except an asleep one, whose tab is only shown (looking never wakes it), then shows its tab exactly as Jump does: pulled into this window's focused group when it is elsewhere or hidden (its tab was closed). Also selects the row, which filters the log. Enter does the same; ↑/↓ move between rows. |
-| Closing its tab | Hides it, never stops it. Every way to close the tab does this: the tab's ×, Alt+W, middle-click, Close tab in the tab menu and in the terminal's right-click menu, and the Close button on the "Exited · Restart · Close" bar. No "Close?" confirm; a toast says it keeps running, with a **Show** button that brings it back (the toast names Alt+Shift+G only while Alt keys reach the app, not with "Terminal gets Alt keys" on). The daemon decides, not the window: `session.remove` of an agent's session hides it too, so closing before the agent list has loaded can't stop it. The session goes on in no window (messages still reach it; its row shows its live state), survives a backend reload or restart, and comes back with its scrollback on the toast's Show, a row click, Start / Show, Jump or Alt+J. Only Stop (and Start fresh, Remove…) stop it; Kill process in the terminal's right-click menu and `muster kill` still kill the process. Closing a window leaves its tabs as always. |
-| Context menu (right-click, `⋯`, Shift+F10) | Edit…, Memory…, Switch account… (Claude agents, once Claude profiles exist: Edit agent with its profile picker focused), New schedule… (preselects this agent), while a move to another account waits for its next start a heading "Moves to Work at its next start" and **Restart now on Work** (only while it runs; disabled with a `when idle` hint until it is idle with nothing queued, the same check as the move's Now; it calls `agent.update` with `now` alone and the toast says what happened), Start / Show (asleep: Show, and Wake with a `re-reads it all` hint when its cache has likely expired), Start fresh (a new conversation, restarting a running one), Sleep (`agent.sleep`; disabled until it runs and has a saved conversation; a toast says why the daemon refused), Stop (`session.kill`), Autostart (checked when on), Remove… (the app's confirm dialog: it stops, its tab closes; its folder stays; its schedules go too). |
-| Schedules | Under the row of an agent that has any, on a thin guide line, soonest next run first. Each schedule: a clock, its name (its tooltip and spoken label give the reading, with the time zone when it isn't this browser's), then `next: Mon 09:00` (`today 14:00`, `tomorrow 09:00`, `3 Nov 09:00` beyond a week), `skips next: …` with Skip next on, a **PAUSED** badge when paused, `expired · Renew`, or `done` (a one-off that ran); on the right, the last run's outcome as a chip (replied green, failures red, skips grey, running blue). An amber `expires tomorrow · Renew` line the day before a Claude subscription agent's schedule expires; once `expires_at` passes the row reads `expired · Renew` by the panel's own clock, without waiting for the backend. While Pause all is on, next times are struck through (tooltip says why). Hover: its reading ("At 09:00, Monday to Friday"). ↑/↓ move through agent and schedule rows alike. A trigger has an amber lightning instead of the clock and reads `waiting`, `runs: today 14:02` (an event is held: after a note's quiet minutes, or the 15-minute floor), or `triggers off for its note`; a git, GitHub or files watcher that can't check adds a red chip (`gh not signed in`, `gh not installed`, `can't check`) and, under the row, a line saying what to do (also in the row's accessible name). A schedule an agent made has a violet chip: `reminder` (a one-off it set for itself) or `from reviewer` (its proposal you approved); the tooltip says which and when. |
+| Needs you | An amber box at the top of the list while anything waits for you; gone when empty. First the schedules waiting for approval, oldest first: an agent's proposal (its name, **Proposed by reviewer · today 10:02**, "for worker" when it would run on another agent) and schedules made or changed outside the window (headed as their card is, below), each with **Approve**, **Edit…** and **Dismiss** (Remove… for a held change of one of yours); clicking its name opens its agent's card, which shows the whole proposal; right-click, Shift+F10 or the menu key give the same three. Then the schedules whose last run failed (blocked, refused, no reply, timed out, agent ended, failed), newest failure first: name, `worker · next: …` and the outcome in red; click (or Enter) shows its runs under it (an arrow turns when they show), `⋯` is the schedule's menu, and **Hide** takes it out of the box, and its red chip off the row, until a run fails again (per viewer, remembered per schedule; the card still shows the run's outcome). Approve, Dismiss and Hide leave keyboard focus on the next item (else the agent's row, else the Channels heading). A Dismiss that arrives after the schedule was approved (in another window, or from a menu opened before) leaves it alone and says so (`schedule.remove` with `waiting`). The menu key on any of an item's controls opens that item's menu. |
+| Row | An agent's channel row: the agent's state dot (its session's colours, half filled asleep, hollow stopped), the channel's name, the agent's own name faint beside it when the two differ (nothing is renamed), then the tab count or the need-you count, and `⋯`. A schedule waiting for approval puts an amber chip with a count on the row, a failed run a red one (the count of both); otherwise, with the sidebar widened past 300px, a clock chip with its schedule count, its state and time (`idle · 37m`, `asleep · 2h`, `stopped`) and `cold`. Clicking a chip opens the card. The row's spoken name says both names, its state, the tab or need-you count and what the chip says (also the plain schedule count). Channels that share a name keep the agent's name beside theirs, with the branch or folder under it. |
+| Card | Hover a row for a moment, or focus it and press →, and a card opens beside the sidebar: the channel's name, "agent <name>" when it differs, the kind badge (CLAUDE / CODEX), the state and time with `lead`, `auto`, `sleeps` and `cold` tags, a move to another account that waits for its next start (amber, **Moves to Work at its next start**; tooltip: until then it keeps running on its old account, and Restart now is in its menu), the OpenRouter badge with today's estimate (`OpenRouter · pay per use · ~$0.42 today (est.)`; **OpenRouter · until restart** / **from restart** while the running process bills otherwise), the persona's first line, buttons **Show** (Start when it isn't running), **New tab**, **Memory…**, **Start fresh** and `⋯` (the row's whole menu), its schedules with their run history and menus, and the channel's tab count and folder (or the agent's home folder). Opened by the keyboard, focus goes to its first button (→ again moves it back in while it is open); Tab walks its buttons and schedules and, past the last one, leaves it (it closes once focus leaves the row and the card; there is no focus trap); Esc, or ← on one of its buttons, closes it and puts focus back on the row. Opened by hover, it stays while the pointer is on the row, the card or one of its menus, closes shortly after it leaves (not while a menu or dialog it opened is up, or focus is in it), and Esc closes it while focus is outside the sidebar (before a terminal sees the key; an open menu or dialog takes Esc first); scrolling the list closes it. A dialog opened from it (Memory…, a run's message, Edit…) keeps it open behind, and closing the dialog gives focus back to the button that opened it. It narrows to the room beside the dock (down to 300px); in a window narrower than that it lies over the dock's right part. Opened by the keyboard, a click anywhere outside its row, menus and dialogs closes it. The menu key on its buttons opens the row's menu; on a schedule or its `⋯`, the schedule's. |
+| Proposal | An agent's proposed schedule (Phase 3) is an amber card in its agent's card, above its other schedules (and a line in Needs you): **Proposed by reviewer · today 10:02**, the name, WHEN (the reading with its time zone, always: "At 08:30, Monday to Friday (America/Los Angeles time)", and for a one-off in another zone when that is here: "; 16:30 your time"), AGENT, ALSO (fresh conversation, quiet hours, a daily cap, a reply note, when set), the PROMPT (monospace, scrolls past 9 lines; the box takes the keyboard focus, so arrow keys scroll it, and a prompt over 8 lines or 600 characters has **Show all (N lines)** / **Show less** under it), THEN (every "Then…" step, nested ones indented under the step they follow: "When it replies: ask **deployer**", "When that step replies: …", "If it fails: notify you", each with its prompt in the same monospace box; **Show all** unfolds these too), WHY (the agent's reason, in italics: its words), and USE (the estimate, one sentence each: runs in the coming week and at most per day; what pays, amber with a shield for a Claude subscription agent, with its 7-day expiry and quiet hours; the agent's unattended cap and its last 7 days). Buttons **Approve** (`schedule.approve`; a toast with its next run), **Edit…** (the schedule dialog, its head saying it stays waiting until approved) and **Dismiss** (`schedule.remove`, no confirm: it never ran). Right-click, Shift+F10 or the menu key: the same three. It never shows a next run or a history: it hasn't run. A schedule made or widened outside Muster's window (the command line, a script: `held`) gets the same card, headed **Made from the command line or a script** (or **Resumed …**, **Changed and resumed …**, **Renewed for 7 days …**) with when, and WHY reading "Waits for your approval: it came from the command line or a script, not from a click in Muster's window. Until you approve it, it doesn't run."; a held change of one of yours has **Remove…** (with the usual question) instead of Dismiss. Approve sends the `updated_at` the card showed, so a schedule changed since is refused. If a change made in the window itself comes back held (Muster couldn't tell its program), a toast says so and points at the card. |
+| Click | Opens the channel at once, as any channel row. Then (after 450 ms, longer than the desktop's double-click time, so a double-click only renames the channel; nothing happens if the channel or agent went meanwhile) an agent that isn't running starts (`agent.start` with this window, so a new tab opens here), and one whose tab was closed or is in another window is shown exactly as Jump does: pulled into this window's focused group. An asleep agent's tab is only shown (looking never wakes it). Clicking a running agent whose provider changed shows a toast that the new provider applies when it restarts. Enter does the same; ↑/↓, Home and End move between rows; → opens the card. |
+| Closing its tab | Hides it, never stops it. Every way to close the tab does this: the tab's ×, Alt+W, middle-click, Close tab in the tab menu and in the terminal's right-click menu, and the Close button on the "Exited · Restart · Close" bar. No "Close?" confirm; a toast says it keeps running, with a **Show** button that brings it back ("Click its row in the sidebar to show it again"). The daemon decides, not the window: `session.remove` of an agent's session hides it too, so closing before the agent list has loaded can't stop it. The session goes on in no window (messages still reach it; its row shows its live state), survives a backend reload or restart, and comes back with its scrollback on the toast's Show, a row click, Start / Show, Jump or Alt+J. Only Stop (and Start fresh, Remove…) stop it; Kill process in the terminal's right-click menu and `muster kill` still kill the process. Closing a window leaves its tabs as always. |
+| Context menu (right-click, `⋯`, Shift+F10) | One menu for the row, headed with both names ("planning · agent orchestrator"): the agent's items, then under a "Channel" heading the channel's own (Rename, New tab, New note, Permissions…, Copy folder path, New channel in this project…, Move up / down, Archive channel…), then Hide channels and Hide sidebar. In a short window the menu scrolls (any long menu does); Shift+F10 or the menu key choose its first action, and the chosen item and checked items (Autostart, Pause all schedules) are told to screen readers. New tab or New note for a channel archived meanwhile says it is gone instead of opening elsewhere. The agent's items: Edit…, Memory…, Switch account… (Claude agents, once Claude profiles exist: Edit agent with its profile picker focused), New schedule… (preselects this agent), while a move to another account waits for its next start a heading "Moves to Work at its next start" and **Restart now on Work** (only while it runs; disabled with a `when idle` hint until it is idle with nothing queued, the same check as the move's Now; it calls `agent.update` with `now` alone and the toast says what happened), Start / Show (asleep: Show, and Wake with a `re-reads it all` hint when its cache has likely expired), Start fresh (a new conversation, restarting a running one), Sleep (`agent.sleep`; disabled until it runs and has a saved conversation; a toast says why the daemon refused), Stop (`session.kill`), Autostart (checked when on), Remove… (the app's confirm dialog: it stops, its tab closes; its folder stays; its schedules go too). |
+| Schedules | In the agent's card, soonest next run first (waiting ones on top). Each schedule: a clock, its name (its tooltip and spoken label give the reading, with the time zone when it isn't this browser's), then `next: Mon 09:00` (`today 14:00`, `tomorrow 09:00`, `3 Nov 09:00` beyond a week), `skips next: …` with Skip next on, a **PAUSED** badge when paused, `expired · Renew`, or `done` (a one-off that ran); on the right, the last run's outcome as a chip (replied green, failures red, skips grey, running blue). An amber `expires tomorrow · Renew` line the day before a Claude subscription agent's schedule expires; once `expires_at` passes the row reads `expired · Renew` by the panel's own clock, without waiting for the backend. While Pause all is on, next times are struck through (tooltip says why). Hover: its reading ("At 09:00, Monday to Friday"). ↑/↓ move through the card's schedule rows. A trigger has an amber lightning instead of the clock and reads `waiting`, `runs: today 14:02` (an event is held: after a note's quiet minutes, or the 15-minute floor), or `triggers off for its note`; a git, GitHub or files watcher that can't check adds a red chip (`gh not signed in`, `gh not installed`, `can't check`) and, under the row, a line saying what to do (also in the row's accessible name). A schedule an agent made has a violet chip: `reminder` (a one-off it set for itself) or `from reviewer` (its proposal you approved); the tooltip says which and when. |
 | Schedule menu (right-click, `⋯`, Shift+F10) | Edit…, Run now (outside its timing, quiet hours and daily cap; the agent's own caps still apply; opens the history), Pause / Resume, Skip next run (its time as the hint) / Don't skip next run, Renew (only for schedules that expire: 7 more days), History (checked when shown), Remove… (the app's confirm dialog; its run history goes, the messages it sent stay in the log). A trigger has no Skip next; Run now runs it without an event. A URL trigger adds **Copy trigger command** (a `curl` line with its URL and secret, `trigger.secret`; the toast says to keep it private) and **New secret…** (confirm; the old secret stops working). A note trigger whose note has triggers off adds **Allow triggers on <note>**. |
 | Run history | Click a schedule (or Enter, or History) to show its runs under it, newest first, 20 at a time ("Older runs" pages `schedule.runs` with `before`). Each line: a dot in the outcome's colour, `Mon 09:00 · replied · 4m` (the planned time, the outcome, how long it took; skips and refusals have no duration); under it a `catch-up` or `run now` chip and the reason for a skip, refusal, block or failure (`busy: the agent was busy for an hour`, `quiet hours (23:00–07:00)`). Failures red, skips grey. A run that sent a message opens it in the message overlay (its text and reply). Live from `schedule_run` (also while a page loads; pages merge in). After a reconnect, histories are thrown away and the open ones load again; a failed load says so with Try again. A triggered run has a `triggered` chip and the first line of what happened (`+N more` for merged events). A "Then…" step reads right under the run it follows, indented on a guide line, with a `then: <agent>` chip; it never becomes the row's last outcome. |
 | Asleep agent's tab | An `asleep` chip on the tab, and instead of the "Exited · Restart" bar a calm bar: "<name> is asleep for 2 h 10 m. The next message sent with wake on, or typing here, wakes it into the same conversation." (a message sent with wake off waits for its next turn instead; the chip's tooltip: "Asleep: a message sent with wake on, or typing here, wakes it") Once its prompt cache has likely expired the bar is tinted like the cold-cache bar and reads "…wakes it: it re-reads the whole conversation at full cost, since its prompt cache has likely expired.", with **Wake** and **Start fresh**. Its buttons never take focus, so typing goes on into the terminal: the daemon holds the keys, wakes the agent and types them once it is ready (Enter alone wakes it too). Focus changes and mouse clicks in the terminal don't wake it. If a wake fails (say its account profile is disabled), it stays asleep and the bar says so: "Waking <name> failed: <why>. It is still asleep: the next message sent with wake on, or typing here, tries again." Screen readers hear the bar once per sleep, again when its prompt cache expires while it sleeps (the wake then costs more), and when a wake fails. |
-| + New agent | Under the list: the New agent dialog. |
-| Message log | Collapsible (the expanded state is a per-viewer pref), newest first: `from → to`, time, the message's first line, origin and hop chips (non-human origins in amber), a `replied` chip, a `late reply` chip once the agent answered it later with `reply` (`late reply not delivered`, red, when a guard refused the delivery or the asker was gone), a `cold start` chip when it was typed into an agent whose cache had likely expired, for a quiet message (sent with wake=false) a `waits for a turn` chip (accent; "Waits for <name>'s next turn that can take it…"), then `shown` (green) once a turn's start showed it, or `expired` after 7 days unshown, each with a sentence as its tooltip (and as the entry's accessible description and its tooltip on keyboard focus, so keyboard users read it too), and for a refused message a red row with the reason. A selected agent filters it (a `to <name> ×` chip clears the filter). "Older messages" pages `agent.messages`. Clicking an entry opens an overlay with the full message, its reply (or "no reply yet"), its later reply with how it reached the asker, and its route (a message that carried a late reply says "late reply to message N"). A quiet message's overlay adds its chip and a line under the title ("Waits for beta's next turn that can take it and arrives as context when that turn starts. Sending it didn't wake beta.", "Shown to beta at the start of a turn, 13:52.", or "Expired after 7 days without being shown to beta."), and its reply reads "None: a quiet message gets no reply of its own. The agent can answer it with its reply tool." A message whose later reply went quietly to an asker says where the carrying message stands now, under the reply, from the daemon's `answer.quiet_state` (so it is right whichever page of the log holds the carrier, and for a plain session's, which has no entry here): "Waits for alpha's next turn that can take it (message 812); it arrives as context when that turn starts.", "Shown to alpha at the start of a turn, 14:05 (message 812).", "Expired after 7 days without being shown to alpha (message 812).", "Waits for session 5's next turn that can take it; …", or "Not delivered: the session ended before its next turn." |
+| New agent | The Channels heading's `⋯` (and its right-click), and the palette: the New agent dialog. |
+| Message log | **Messages**, under the channel list. Collapsible (the expanded state is a per-viewer pref), newest first: `from → to`, time, the message's first line, origin and hop chips (non-human origins in amber), a `replied` chip, a `late reply` chip once the agent answered it later with `reply` (`late reply not delivered`, red, when a guard refused the delivery or the asker was gone), a `cold start` chip when it was typed into an agent whose cache had likely expired, for a quiet message (sent with wake=false) a `waits for a turn` chip (accent; "Waits for <name>'s next turn that can take it…"), then `shown` (green) once a turn's start showed it, or `expired` after 7 days unshown, each with a sentence as its tooltip (and as the entry's accessible description and its tooltip on keyboard focus, so keyboard users read it too), and for a refused message a red row with the reason. It follows the open channel's agent: opening an agent's channel filters it to messages to that agent (a `to <name> ×` chip shows all until another channel opens); a task channel shows all. "Older messages" pages `agent.messages`. Clicking an entry opens an overlay with the full message, its reply (or "no reply yet"), its later reply with how it reached the asker, and its route (a message that carried a late reply says "late reply to message N"). A quiet message's overlay adds its chip and a line under the title ("Waits for beta's next turn that can take it and arrives as context when that turn starts. Sending it didn't wake beta.", "Shown to beta at the start of a turn, 13:52.", or "Expired after 7 days without being shown to beta."), and its reply reads "None: a quiet message gets no reply of its own. The agent can answer it with its reply tool." A message whose later reply went quietly to an asker says where the carrying message stands now, under the reply, from the daemon's `answer.quiet_state` (so it is right whichever page of the log holds the carrier, and for a plain session's, which has no entry here): "Waits for alpha's next turn that can take it (message 812); it arrives as context when that turn starts.", "Shown to alpha at the start of a turn, 14:05 (message 812).", "Expired after 7 days without being shown to alpha (message 812).", "Waits for session 5's next turn that can take it; …", or "Not delivered: the session ended before its next turn." |
 
 Live updates come from `agent_upserted`, `agent_removed` and `agent_message` (the agent list and
 the last 100 messages are loaded after each `hello`); states come from the agents' sessions.
@@ -847,7 +858,7 @@ them (`schedule.list` is an unknown method) shows no schedule UI at all (no sect
 palette commands or banner). The palette has New schedule…, Pause all schedules / Resume all
 schedules (whichever applies) and Scheduling settings….
 
-**Scheduling settings** (header `⋯`, palette): Pause all schedules (a switch; each schedule skips
+**Scheduling settings** (the Channels heading's `⋯`, palette): Pause all schedules (a switch; each schedule skips
 its runs, recorded once, until resumed), quiet hours from / to (`HH:MM`, this computer's time zone,
 named in the hint; they apply to schedules with quiet hours on, the default for Claude
 subscription agents), and "Unattended messages per agent per day" (1–200, default 24: scheduled
@@ -860,7 +871,7 @@ with an estimate of what it spent today (`~$0.60 today (estimated)`) and its own
 again (it re-reads the key when its reading is over a minute old; the numbers update live). Save
 sends only what changed (`schedule.settings.set`). The dialog scrolls in a short window.
 
-**New / Edit schedule dialog** (header `⋯`, an agent's menu, the palette, a schedule's Edit…):
+**New / Edit schedule dialog** (the Channels heading's `⋯`, an agent's row menu, the palette, a schedule's Edit…):
 
 - Layout: the Agent pill with the optional Name beside it, the prompt, When, then pills for If
   missed, Conversation and Notify me and check chips for "Save replies to a note" and "Skip quiet
@@ -901,8 +912,8 @@ sends only what changed (`schedule.settings.set`). The dialog scrolls in a short
   step shows its error under it while closed): Then… (below), at most N runs a day (empty: no cap; Run now
   doesn't count) and the time zone (this browser's by default; 09:00 stays 09:00 across clock
   changes).
-- Ctrl+Enter creates or saves; Esc closes. Create (`schedule.create`) opens the panel if it was
-  closed and toasts the next run; Save sends only changed fields (`schedule.update`). The
+- Ctrl+Enter creates or saves; Esc closes. Create (`schedule.create`) shows the sidebar's list if it was
+  hidden and toasts the next run; Save sends only changed fields (`schedule.update`). The
   backend's refusals (an agent that doesn't take scheduled work, a bad cron line) show in the
   dialog.
 
@@ -939,7 +950,7 @@ sends only what changed (`schedule.settings.set`). The dialog scrolls in a short
   default, "Stops after 7 days").
 - More options: a trigger's daily cap shows "10 (a trigger's default)" when empty.
 
-**New / Edit agent dialog** (+ New agent, the palette's "New agent…", a row's Edit…):
+**New / Edit agent dialog** (New agent… in the Channels heading's `⋯`, the palette's "New agent…", a row's Edit…):
 
 - Layout: New shows the template chips, then Name (large) beside the kind switch, then the
   persona; Edit shows the kind badge, name and home folder over Settings · Memory tabs. Then
@@ -993,7 +1004,7 @@ sends only what changed (`schedule.settings.set`). The dialog scrolls in a short
   replaced from elsewhere meanwhile is refused). The picker follows the agent's account until
   you change it, so a move made from the CLI while the dialog is open isn't undone by Save. A
   restart of a busy agent's tab with a move waiting says it moves there (a new conversation). The
-  agent's row in the Agents panel shows the same "Moves to Work at its next start" line in amber
+  agent's card in the sidebar shows the same "Moves to Work at its next start" line in amber
   under its state. A Claude agent's tab menu has Switch account… as well.
 - Model and Effort pills for the agent's kind (`agent.models`): Default (the CLI's
   choice; the pill reads "Default"), the CLI's models (Claude's aliases such as `opus`; Codex's model ids) or levels, and
@@ -1064,7 +1075,7 @@ sends only what changed (`schedule.settings.set`). The dialog scrolls in a short
 - Edit saves only changed fields (`agent.update`); provider, model, effort and permissions apply
   from the agent's next start, which the toast says when it runs. Edit's title shows the
   OpenRouter badge for an agent on it.
-- Ctrl+Enter creates or saves. Creating opens the panel if it was closed.
+- Ctrl+Enter creates or saves. Creating shows the sidebar's list if it was hidden.
 
 ## Naming (no names up front)
 
@@ -1129,7 +1140,7 @@ Chromium `--app` mode, so there Alt+T and Alt+Shift+N are the reliable fallbacks
 | Alt+Shift+←↑→↓ | Resize the focused group |
 | Alt+Z | Zoom the focused group |
 | Alt+Shift+Z | Fullscreen: the focused tab fills the window (again, or Esc outside terminals and text fields, goes back) |
-| Alt+Shift+G | Show / hide the agents panel (per window) |
+| Alt+Shift+G | Collapse / expand the channel list, showing the sidebar if hidden (per window) |
 | F2 (in a focused strip) | Rename what the tab shows (as double-click) |
 | Alt+A / Alt+Shift+A | Approve / deny focused session's prompt |
 | Ctrl+Shift+F | Find in terminal |
@@ -1163,7 +1174,7 @@ Chromium `--app` mode, so there Alt+T and Alt+Shift+N are the reliable fallbacks
 - Desktop notifications (daemon, `notify.rs`) are unchanged.
 - Per-viewer prefs in `localStorage` (try/catch): font size, theme, last agent kind, recent
   folders, Jump recency, status line on/off, "Terminal gets Alt keys", "Jump focuses the other
-  window", the agents panel's message log expanded or not, the active tab per window, and the
+  window", the sidebar's message log expanded or not, the failed runs hidden from Needs you, the active tab per window, and the
   dismissed updates. The system title bar is shared by every window and kept by the backend.
 - `window.focused` is called on window focus and right after a claim when the page has focus.
 - Performance: batch output per animation frame per terminal. Never re-render the Preact tree on

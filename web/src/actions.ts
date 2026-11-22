@@ -17,7 +17,6 @@ import {
   agentBySession,
   agentMessages,
   agents,
-  agentsPanelOpen,
   sidebarHidden,
   knowRun,
   knowSchedule,
@@ -93,7 +92,7 @@ import type { HelloResult, Note } from "./types.ts";
 import { inheritedProfile } from "./account_profiles.ts";
 import { isAsleep, pendingMove, providerPendingNote, restartShown, restartShownChanged, switchMessage, upsertMessage } from "./agents.ts";
 import type { MenuItem } from "./components/Menu.tsx";
-import { nextWhen } from "./schedules.ts";
+import { isProposal, nextWhen } from "./schedules.ts";
 import { restartExpect, restartOutcome, restartWait } from "./updates.ts";
 import type {
   Agent,
@@ -951,7 +950,7 @@ export function splitFocused(side: Side, kind: SessionKind = "shell") {
 /**
  * Close a tab: removes its session (the daemon closes a task left without sessions; older
  * daemons are asked to). A busy session gets an inline "Close? ⏎ / Esc" first. A named agent's
- * tab is only hidden: the agent keeps running, and its row in the agents panel shows it again
+ * tab is only hidden: the agent keeps running, and its row in the sidebar shows it again
  * (only the panel's Stop stops it). The daemon decides that too (`session.remove` hides an
  * agent's session), so closing before the agent list has loaded can't stop one.
  */
@@ -1011,14 +1010,12 @@ function removeTab(s: SessionInfo) {
     .catch(fail("Close failed")).catch(() => {});
 }
 
-/** An agent's tab was closed (hidden): say it keeps running, with a Show that brings it back
- * (works whatever "Terminal gets Alt keys" says; Alt+Shift+G is named only when it reaches the app). */
+/** An agent's tab was closed (hidden): say it keeps running, with a Show that brings it back. */
 function agentHidden(s: SessionInfo) {
   focusActiveTerminalSoon();
   if (s.state === "exited") return;
   const name = agentBySession.value.get(s.id)?.name ?? s.name;
-  const where = prefs.value.altToTerminal ? "the agents panel" : "the agents panel (Alt+Shift+G)";
-  toast("info", `${name} keeps running in the background. Show it again from ${where}.`, 7000, undefined, {
+  toast("info", `${name} keeps running in the background. Click its row in the sidebar to show it again.`, 7000, undefined, {
     label: "Show",
     run: () => openAgent(name),
   });
@@ -1666,7 +1663,7 @@ export function restartTimedOut() {
   daemonStopped.value = true;
 }
 
-// ---------- named agents (docs/UI.md "Agents panel") ----------
+// ---------- named agents (docs/UI.md "Agents in the sidebar") ----------
 
 /** Alt+G: hide the whole dock while preserving its sections and divider. */
 export function toggleSidebar() {
@@ -1675,15 +1672,17 @@ export function toggleSidebar() {
   if (hidden) focusActiveTerminalSoon();
 }
 
-/** Alt+Shift+G: expand or collapse Agents; reveal the sidebar if it was hidden. */
-export function toggleAgentsPanel() {
-  const open = sidebarHidden.value || !agentsPanelOpen.value;
-  updateSidebar({ agents: open, hidden: false });
+/** Alt+Shift+G: expand or collapse Channels (agents live in their rows); reveal the sidebar if
+ * it was hidden. */
+export function toggleChannelsPanel() {
+  const open = sidebarHidden.value || !channelsPanelOpen.value;
+  updateSidebar({ channels: open, hidden: false });
   if (!open) focusActiveTerminalSoon();
 }
 
-export function toggleChannelsPanel() {
-  updateSidebar({ channels: sidebarHidden.value || !channelsPanelOpen.value, hidden: false });
+/** Show the sidebar with its channel list (a new agent or schedule was made: it is there). */
+export function revealSidebar() {
+  updateSidebar({ channels: true, hidden: false });
 }
 
 export function openChannel(id: number, focus = true) {
@@ -1836,7 +1835,7 @@ export function newAgentDialog(template?: string) {
   overlay.value = { kind: "agent", template };
 }
 
-// ---------- schedules (docs/UI.md "Agents panel", docs/PROTOCOL.md "Schedules") ----------
+// ---------- schedules (docs/UI.md "Agents in the sidebar", docs/PROTOCOL.md "Schedules") ----------
 
 /** New schedule; `agent` preselects that agent when it takes scheduled work. */
 export function newScheduleDialog(agent?: string) {
@@ -1942,7 +1941,14 @@ export function approveSchedule(s: Schedule) {
 /** Dismiss an agent's proposal, or a schedule made outside the window: it is removed (it never
  * ran). */
 export function dismissProposal(s: Schedule) {
-  rpc.call("schedule.remove", { id: s.id }).then(() => {
+  // A menu opened earlier holds the schedule as it was: approved since (here or in another
+  // window), it is no longer a proposal, and Dismiss must not remove it.
+  const live = schedules.peek().find((x) => x.id === s.id);
+  if (!live || !isProposal(live)) {
+    return toast("info", `${s.name} isn't waiting for approval any more, so it stays.`, 4000);
+  }
+  // `waiting`: the backend removes it only while it still waits (another window may have approved it).
+  rpc.call("schedule.remove", { id: s.id, waiting: true }).then(() => {
     schedules.value = schedules.value.filter((x) => x.id !== s.id);
     const whose = s.made_by && s.made_by.approved_at === null ? `${s.made_by.agent}'s proposal` : "the schedule";
     toast("info", `Dismissed ${whose} ${s.name}.`, 3000);
@@ -2031,7 +2037,7 @@ export async function restartToMove(a: Agent): Promise<boolean> {
   }
 }
 
-/** The menu items for a move waiting for `a`'s next start (Agents panel row, its tab): what
+/** The menu items for a move waiting for `a`'s next start (its row in the sidebar, its tab): what
  * waits, and Restart now while it is running (enabled once it is idle). None without one. */
 export function pendingMoveItems(a: Agent | undefined): MenuItem[] {
   const s = a?.session_id != null ? sessions.value.get(a.session_id) : undefined;

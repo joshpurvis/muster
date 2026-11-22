@@ -12,8 +12,8 @@ import {
   activeChannelId,
   channelLayout,
   agents,
+  agentFilter,
   openRouter,
-  agentsPanelOpen,
   schedules,
   scheduleRuns,
   scheduleSettings,
@@ -56,6 +56,7 @@ import { StatusLine } from "./components/StatusLine.tsx";
 import { Overlays, Toasts } from "./components/Overlays.tsx";
 import { MenuHost } from "./components/Menu.tsx";
 import { Sidebar } from "./components/Sidebar.tsx";
+import { agentCard } from "./components/AgentCard.tsx";
 import { Kbd, TooltipHost } from "./components/common.tsx";
 import { FolderInput } from "./components/FolderInput.tsx";
 import { SplitView } from "./layout/SplitView.tsx";
@@ -188,9 +189,10 @@ rpc.start();
   agents,
   openRouter,
   agentMessages,
-  agentsPanelOpen,
   activeChannelId,
   channelLayout,
+  agentCard,
+  agentFilter,
   schedules,
   scheduleRuns,
   scheduleSettings,

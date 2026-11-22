@@ -1,4 +1,4 @@
-// Pure logic for the agents panel (docs/UI.md "Agents panel"): an agent's status from its
+// Pure logic for named agents in the sidebar (docs/UI.md "Agents in the sidebar"): an agent's status from its
 // session, the message log, and the New / Edit dialog's rules. No signals, no DOM: unit tested
 // (agents_test.ts).
 

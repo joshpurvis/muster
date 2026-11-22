@@ -46,6 +46,8 @@ import { DEFAULT_PERMISSIONS, KIND_LABEL, needsHuman, STATE_LABEL, STATE_PRIORIT
 import { PermissionsDialog, PermissionsPanel, PermissionsPill } from "./Permissions.tsx";
 import { PillToggle } from "./DialogKit.tsx";
 import { AgentDialog, MessageDialog } from "./Agents.tsx";
+import { menuClosedAt, menuOpener } from "./Menu.tsx";
+import { CommunicationDialog } from "./Communication.tsx";
 import { ScheduleDialog, ScheduleSettingsDialog } from "./Schedules.tsx";
 import { AccountProfilesDialog, ProfilePill, ProfileUsage } from "./AccountProfiles.tsx";
 import { UpdateBanner } from "./UpdateBanner.tsx";
@@ -57,11 +59,22 @@ import { basename, type JumpCandidate, jumpOrder, rankJump, tabText, windowLabel
 import { cx, fuzzy, isMac, tildify } from "../util.ts";
 
 const FOCUSABLE =
-  'button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [href], [tabindex]:not([tabindex="-1"])';
+  'button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [href], summary, [tabindex]:not([tabindex="-1"])';
 
+/** The control that opened the dialog on screen now (see Modal). */
+let opener: HTMLElement | null = null;
+
+/** Close the dialog. One opened from an agent's card or the Needs you box gives focus back to the
+ * button that opened it (the dialog does that as it goes); any other goes back to the terminal. */
 function close() {
+  const el = opener;
   overlay.value = null;
-  A.focusActiveTerminalSoon();
+  if (!el?.isConnected || !el.closest(".agent-card, .needs-you")) return A.focusActiveTerminalSoon();
+  // After the dialog has left the page (focus fell out of it).
+  requestAnimationFrame(() => {
+    const at = document.activeElement;
+    if (el.isConnected && !overlay.value && (!at || at === document.body)) el.focus();
+  });
 }
 
 function Modal(
@@ -75,8 +88,17 @@ function Modal(
   },
 ) {
   const ref = useRef<HTMLDivElement>(null);
+  // Who opened it, taken at its first render (by its first effect a field inside it may have
+  // taken focus already): `close` gives focus back to a button of an agent's card or Needs you.
+  const [first] = useState(() => {
+    const at = document.activeElement as HTMLElement | null;
+    // Opened from a menu item: the menu is going (or just went), so whoever opened the menu.
+    const fromMenu = at?.closest(".menu") || ((!at || at === document.body) && Date.now() - menuClosedAt < 1000);
+    return fromMenu ? menuOpener : at;
+  });
   useEffect(() => {
     const prev = document.activeElement as HTMLElement | null;
+    opener = first;
     // Tab stops only: an element taken out of the Tab order (tabindex="-1", like the options of
     // a roving listbox) is skipped, unless focus is on it now (Tab then moves on from there).
     const focusables = () =>
@@ -120,6 +142,7 @@ function Modal(
     return () => {
       removeEventListener("keydown", key);
       document.removeEventListener("focusin", focusIn);
+      if (opener === first) opener = null;
       if (document.activeElement === document.body && prev?.isConnected && !overlay.value) prev.focus();
     };
   }, []);
@@ -195,6 +218,8 @@ export function Overlays() {
       );
     case "agent_message":
       return <MessageDialog key={o.id} id={o.id} Modal={Modal} close={close} />;
+    case "communication":
+      return <CommunicationDialog Modal={Modal} close={close} />;
     case "schedule":
       return <ScheduleDialog key={o.id ?? "new"} id={o.id} agent={o.agent} keep={o.draft} Modal={Modal} close={close} />;
     case "schedule_settings": {

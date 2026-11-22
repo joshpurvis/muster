@@ -59,8 +59,8 @@ export interface TabHome {
 export interface SidebarState {
   hidden: boolean;
   channels: boolean;
-  agents: boolean;
-  split: number;
+  /** The dock's width in CSS pixels (drag its right edge). Wider rows show more of each agent. */
+  width: number;
 }
 
 export interface TerminalDrawerState {
@@ -100,11 +100,16 @@ export interface WindowLayoutState {
 }
 
 export function defaultSidebar(): SidebarState {
-  return { hidden: false, channels: true, agents: true, split: 0.45 };
+  return { hidden: false, channels: true, width: SIDEBAR_WIDTH };
 }
 
-export function sidebarRatio(value: number): number {
-  return Number.isFinite(value) ? Math.max(0.2, Math.min(0.8, value)) : 0.45;
+/** The sidebar's default, narrowest and widest widths. */
+export const SIDEBAR_WIDTH = 240;
+export const SIDEBAR_MIN = 200;
+export const SIDEBAR_MAX = 420;
+
+export function sidebarWidth(value: number): number {
+  return Number.isFinite(value) ? Math.round(Math.max(SIDEBAR_MIN, Math.min(SIDEBAR_MAX, value))) : SIDEBAR_WIDTH;
 }
 
 /** The channel a tab that follows the shown channel (Questions, an add-on tab) belongs in: the
@@ -269,9 +274,9 @@ export function loadChannelLayout(raw: unknown, channels: number[], tabs: TabHom
       ...(Object.keys(questionsIn).length ? { questionsIn } : {}),
       sidebar: {
         hidden: side.hidden === true,
-        channels: side.channels !== false,
-        agents: side.agents !== false,
-        split: sidebarRatio(Number(side.split)),
+        // The list now holds the agents too: a window that showed the old Agents section shows it.
+        channels: side.channels !== false || (side as { agents?: unknown }).agents === true,
+        width: side.width === undefined ? SIDEBAR_WIDTH : sidebarWidth(Number(side.width)),
       },
       ...(obj.previous !== undefined ? { previous: obj.previous } : {}),
     }, channels, tabs);
@@ -297,7 +302,7 @@ export function loadChannelLayout(raw: unknown, channels: number[], tabs: TabHom
   }
   return reconcileChannels({
     v: 2, active: assigned.find((t) => t.id === focused)?.channel ?? active,
-    layouts, sidebar: { ...defaultSidebar(), agents: legacy ? !!legacy.agents : true },
+    layouts, sidebar: defaultSidebar(),
     ...(raw != null ? { previous: raw } : {}),
   }, channels, assigned);
 }

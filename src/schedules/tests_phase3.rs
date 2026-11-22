@@ -70,6 +70,25 @@ fn a_proposal_never_runs_until_the_human_approves_it() {
 }
 
 #[test]
+fn dismiss_removes_only_what_still_waits() {
+    let f = Fixture::new(at(LONDON, "2026-10-19T10:00"));
+    as_agent(&f, "worker", 41);
+    let propose = |prompt: &str| {
+        tool(&f, 41, "propose_schedule", json!({"prompt": prompt, "cron": "0 16 * * 5", "tz": LONDON, "reason": "r"})).unwrap()
+            ["schedule_id"].as_i64().unwrap()
+    };
+    let a = propose("First");
+    assert_eq!(dismiss(&f.hub, a).unwrap()["removed"], a);
+    assert!(f.hub.schedules.get(a).is_none());
+    // Approved in one window, then dismissed from another that hadn't seen it yet: it stays.
+    let b = propose("Second");
+    approve(&f.hub, b, None).unwrap();
+    assert!(err(dismiss(&f.hub, b)).contains("so it stays"));
+    assert!(f.hub.schedules.get(b).is_some());
+    assert!(err(dismiss(&f.hub, 99_999)).contains("no schedule"));
+}
+
+#[test]
 fn approving_checks_the_proposal_again() {
     let f = Fixture::new(at(LONDON, "2026-10-19T10:00"));
     as_agent(&f, "worker", 41);

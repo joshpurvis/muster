@@ -1,7 +1,7 @@
 // Custom context / dropdown menus: keyboard navigable, submenus, never native.
 import { signal } from "@preact/signals";
 import type { ComponentChildren } from "preact";
-import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
+import { useEffect, useId, useLayoutEffect, useRef, useState } from "preact/hooks";
 import { IconChevron } from "../icons.tsx";
 import { keyLabel } from "../keys.ts";
 import { cx } from "../util.ts";
@@ -39,7 +39,15 @@ interface MenuState {
 
 export const menu = signal<MenuState | null>(null);
 
+/** What had focus when the last menu opened: a dialog one of its items opens gives focus back
+ * there (Overlays `close`), not to the menu, which is gone by then. */
+export let menuOpener: HTMLElement | null = null;
+/** When the last menu closed (a dialog its item opens comes right after). */
+export let menuClosedAt = 0;
+
 export function openMenu(state: MenuState) {
+  const at = document.activeElement as HTMLElement | null;
+  if (!at?.closest(".menu")) menuOpener = at;
   menu.value = state;
 }
 
@@ -47,6 +55,8 @@ export function openMenu(state: MenuState) {
 export function openMenuAt(el: Element, items: MenuItem[], opts: Partial<MenuState> = {}) {
   const r = el.getBoundingClientRect();
   const alignRight = opts.alignRight ?? r.left > innerWidth * 0.6;
+  const at = document.activeElement as HTMLElement | null;
+  if (!at?.closest(".menu")) menuOpener = at;
   menu.value = {
     x: alignRight ? r.right : r.left,
     y: r.bottom + 4,
@@ -59,6 +69,7 @@ export function openMenuAt(el: Element, items: MenuItem[], opts: Partial<MenuSta
 
 export function closeMenu() {
   const m = menu.value;
+  if (m) menuClosedAt = Date.now();
   menu.value = null;
   m?.onClose?.();
 }
@@ -109,7 +120,8 @@ function MenuList(
 
   useLayoutEffect(() => {
     const el = ref.current!;
-    const r = el.getBoundingClientRect();
+    // Layout size, not the drawn box: its opening animation scales it while this runs.
+    const r = { width: el.offsetWidth, height: el.offsetHeight };
     let nx = alignRight ? x - r.width : x;
     let ny = y;
     if (nx + r.width > innerWidth - 6) nx = innerWidth - r.width - 6;
@@ -121,7 +133,8 @@ function MenuList(
     }
     setPos({ x: nx, y: ny, ready: true });
     if (autoFocus) setSel(items.findIndex((it) => isAction(it) && !it.disabled));
-    if (select !== undefined) setSel(select);
+    // A keyboard-opened menu selects its first item it can run (never a heading or a line).
+    if (select !== undefined) setSel(items.findIndex((it, i) => i >= select && isAction(it) && !it.disabled));
   }, [x, y]);
 
   // Focus once visible (visibility:hidden elements can't take focus).
@@ -130,6 +143,14 @@ function MenuList(
   }, [pos.ready]);
 
   const actionable = items.map((it, i) => (isAction(it) && !it.disabled ? i : -1)).filter((i) => i >= 0);
+  const uid = useId();
+
+  // A menu taller than the window scrolls; the keyboard's choice stays in view (the pointer's
+  // isn't scrolled: that would move the list under it).
+  const byKeys = useRef(false);
+  useEffect(() => {
+    if (sel >= 0 && byKeys.current) ref.current?.querySelector(`[data-i="${sel}"]`)?.scrollIntoView({ block: "nearest" });
+  }, [sel]);
 
   const openSub = (i: number, kb = false) => {
     const row = ref.current?.querySelector(`[data-i="${i}"]`);
@@ -150,6 +171,7 @@ function MenuList(
   };
 
   const onKey = (e: KeyboardEvent) => {
+    byKeys.current = true;
     // Keys reach this list only while it has focus, so an open submenu here was opened by
     // hover and isn't focused. Enter / → move into it; anything else closes it and is handled.
     if (sub) {
@@ -211,6 +233,7 @@ function MenuList(
         class="menu"
         role="menu"
         tabIndex={-1}
+        aria-activedescendant={sel >= 0 ? `${uid}-${sel}` : undefined}
         onKeyDown={onKey}
         style={{
           left: pos.x + "px",
@@ -226,8 +249,10 @@ function MenuList(
           return (
             <div
               key={i}
+              id={`${uid}-${i}`}
               data-i={i}
-              role="menuitem"
+              role={it.checked !== undefined ? "menuitemcheckbox" : "menuitem"}
+              aria-checked={it.checked !== undefined ? it.checked : undefined}
               aria-disabled={it.disabled}
               class={cx(
                 "menu-item",
@@ -237,6 +262,7 @@ function MenuList(
                 sub?.index === i && "open",
               )}
               onMouseEnter={() => {
+                byKeys.current = false;
                 // Keyboard follows the pointer: the list under the mouse takes focus.
                 if (!ref.current?.contains(document.activeElement)) ref.current?.focus();
                 setSel(i);

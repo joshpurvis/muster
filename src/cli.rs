@@ -888,7 +888,7 @@ pub enum ScheduleCmd {
     #[command(hide = true)]
     Approve { id: i64 },
     /// Inside an agent's session: propose a schedule; it runs only once the human approves it in
-    /// the Agents panel. Give one timing as for `add`, and --reason.
+    /// Muster's sidebar (Needs you). Give one timing as for `add`, and --reason.
     #[command(after_help = "Example (run by an agent):\n  muster schedule propose --weekly fri@16:00 --reason \"You asked for a weekly summary\" Summarise the Ideas note")]
     Propose {
         prompt: Vec<String>,
@@ -921,7 +921,7 @@ pub enum ScheduleCmd {
         #[arg(long)] tz: Option<String>,
     },
     /// Show the scheduling settings, or change the unattended cap and the quiet hours (from here
-    /// or an agent's session, either way). The other settings are under Agents panel → ⋯ →
+    /// or an agent's session, either way). The other settings are under the sidebar's Channels ⋯ →
     /// Scheduling settings.
     #[command(after_help = "Examples:\n  muster schedule settings\n  muster schedule settings --cap 60\n  \
         muster schedule settings --quiet 23:00-07:00")]
@@ -1120,7 +1120,7 @@ fn held_note(s: &Value) {
     if s["status"].as_str() == Some("held") {
         println!(
             "  Waiting for your approval: made or changed from the command line, it doesn't run until you click \
-             Approve on its card in Muster's Agents panel (`muster schedule rm {}` drops it).",
+             Approve in Needs you at the top of Muster's sidebar (`muster schedule rm {}` drops it).",
             s["id"]
         );
     }
@@ -1261,7 +1261,7 @@ pub fn schedule(d: &Discovery, cmd: ScheduleCmd) -> anyhow::Result<()> {
         ScheduleCmd::Approve { id } => Err(exit(
             2,
             format!(
-                "schedule {id}: {}. Open Muster's Agents panel and click Approve on its card (`muster schedule rm {id}` dismisses it).",
+                "schedule {id}: {}. Click Approve in Needs you at the top of Muster's sidebar (`muster schedule rm {id}` dismisses it).",
                 crate::rpc::APPROVE_BY_CLICK
             ),
         )),
@@ -1277,7 +1277,7 @@ pub fn schedule(d: &Discovery, cmd: ScheduleCmd) -> anyhow::Result<()> {
             });
             p.as_object_mut().unwrap().retain(|_, v| !v.is_null());
             let r = one("schedule.propose", p)?;
-            println!("schedule {}: proposed ({}{}). It runs once the human approves it in the Agents panel.",
+            println!("schedule {}: proposed ({}{}). It runs once the human approves it in Muster's sidebar (Needs you).",
                 r["schedule_id"], r["when"].as_str().unwrap_or(""), r["agent"].as_str().map(|a| format!(", on {a}")).unwrap_or_default());
             if let Some(e) = r["estimate"].as_str() {
                 println!("  {e}");

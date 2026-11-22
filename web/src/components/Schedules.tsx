@@ -658,8 +658,20 @@ function RunHistory({ s, now }: { s: Schedule; now: number }) {
   const h = scheduleRuns.value.get(s.id);
   const loading = !h || h.loading;
   const runs = h?.runs ?? [];
+  // Older runs is disabled while a page loads, and the last page removes it. If it had focus,
+  // focus comes back to it, or to this list once it is gone, instead of falling to the page.
+  const box = useRef<HTMLDivElement>(null);
+  const older = useRef<HTMLButtonElement>(null);
+  const olderFocused = useRef(false);
+  const hasOlder = !!(h?.more && !h.error);
+  useEffect(() => {
+    if (!olderFocused.current || loading) return;
+    const lost = !document.activeElement || document.activeElement === document.body;
+    if (lost) (hasOlder ? older.current : box.current)?.focus();
+    if (!hasOlder || !lost) olderFocused.current = document.activeElement === older.current;
+  }, [hasOlder, loading]);
   return (
-    <div role="listitem" class="sch-runs" aria-label={`Runs of ${s.name}`}>
+    <div ref={box} tabIndex={-1} role="listitem" class="sch-runs" aria-label={`Runs of ${s.name}`}>
       {loading && runs.length === 0 && <span class="sch-runs-note"><Spinner size={10} /> Loading runs…</span>}
       {h && !h.loading && !h.error && runs.length === 0 && <span class="sch-runs-note">No runs yet.</span>}
       {withSteps(runs).map(({ run, depth }) => <RunEntry key={run.id} r={run} now={now} depth={depth} />)}
@@ -671,14 +683,20 @@ function RunHistory({ s, now }: { s: Schedule; now: number }) {
           </button>
         </span>
       )}
-      {h?.more && !h.error && (
+      {hasOlder && (
         <button
+          ref={older}
           type="button"
           class="ap-older sch-older"
-          disabled={h.loading}
+          disabled={h!.loading}
+          onFocus={() => (olderFocused.current = true)}
+          onBlur={(e) => {
+            // Focus moving elsewhere clears the mark; a blur to nowhere (disabled, removed) keeps it.
+            if (e.relatedTarget) olderFocused.current = false;
+          }}
           onClick={() => loadScheduleRuns(s.id, true)}
         >
-          {h.loading ? <Spinner size={10} /> : null} Older runs
+          {h!.loading ? <Spinner size={10} /> : null} Older runs
         </button>
       )}
     </div>

@@ -2742,8 +2742,8 @@ pub fn switch_line(name: &str, sw: &Value) -> Option<String> {
         Some("restarted") => format!("{name} moved to {to} now: a new conversation started there."),
         Some("busy") => format!("{name} isn't idle, so it moves to {to} at its next start."),
         Some("replaced") => format!("A newer move of {name} replaced this one."),
-        Some("after_notes") => format!("{name} moves to {to} once it has saved its notes or after {} minutes without a reply, \
-            then restarts there if it is idle (otherwise at its next start).", crate::agents::SAVE_NOTES_WAIT.as_secs() / 60),
+        Some("after_notes") => format!("Muster waits for {name}'s reply, then restarts it on {to} if it is idle; otherwise it \
+            moves at its next start."),
         Some("failed") => format!("{name} didn't restart: {}. It moves to {to} at its next start.",
             sw["error"].as_str().unwrap_or("unknown error")),
         // No run to restart (`--now` asked, or not).

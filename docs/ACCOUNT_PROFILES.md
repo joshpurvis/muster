@@ -398,7 +398,8 @@ What the owner sees:
   restarts it on the new account once the reply arrives, or after 10 minutes, if it is idle then
   (a turn still running on the notes prompt is never cut off: it then moves at its next start);
   without Now it still moves at its next start. It is skipped when the old account is at its
-  limit. It isn't taken from an agent's session (it types a prompt as the human's).
+  limit. Only the human asks for it (it types a prompt as the human's): the window, or the CLI
+  in a terminal outside Muster; it is refused inside any Muster tab and from agents.
 - **Agents panel / tab menu:** "Switch account…" opens the same choice.
 - **CLI:** `muster agent edit NAME --profile PROFILE [--now] [--save-notes]` (until 21 Nov 2026
   notes were asked by default and `--no-save-notes` turned it off; that flag is still accepted).

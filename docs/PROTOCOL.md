@@ -1375,10 +1375,13 @@ until its next start. `now` without `account_profile` (or naming the profile it 
 to) applies the move that waits for its next start, as `now` with a move does (the window's
 Restart now, `muster agent edit NAME --now`); refused when no move waits. With it,
 `handoff_at` (the waiting move's `handoff.at`, what the window showed) refuses a move replaced
-since. `save_notes: true` is refused from an agent's session or a shell an agent typed into
-(`from_session`): the request types a prompt into the agent as the human's. Now restarts through
-a sleep under the start lock (src/sleep.rs: refused, as `busy`, while a prompt is being typed or
-waits, a message is on its way or keys were just typed), then a start, which is the move's new
+since. `save_notes: true` only from the human, as for `self_handoff` (a click in Muster's window,
+or `/api/rpc` with the client token, no `from_session`, from a terminal outside every Muster
+session; `muster agent edit --save-notes` passes `$MUSTER_SESSION_ID`): the request types a
+prompt into the agent as the human's. Now first checks the new account, provider and working
+location as a start would (a refusal stops nothing), then restarts through a sleep under the
+start lock (src/sleep.rs: refused, as `busy`, while a prompt is being typed or waits, a message
+is on its way or the human typed into it in the last 15 seconds), then a start, which is the move's new
 conversation; a run that stopped or fell asleep meanwhile isn't woken (`next_start`). A move sets `account_profile_id`, sets `reset_on_next_start` (a conversation
 can't follow it to another account; a location change in the same call needs no
 `reset_conversation`) and records `handoff: {from, at, reason?}` on the agent (`from`: the
@@ -1403,9 +1406,10 @@ at 100%): Muster sends it
 permission prompt (the owner can approve it), and only if that run is still live and idle when
 the message goes; otherwise `skipped`, with
 `notes_skipped` `off`, `not_running`, `busy` or `at_limit`. `outcome`: `next_start`;
-`restarted` (`now`, and it was idle: `agent.start` fresh under the start lock, as
-`start_fresh_if`); `busy` (`now`, but it wasn't idle: it moves at its next start); `replaced`
-(`now`, but by the time the start lock was free a newer move had replaced this one);
+`restarted` (`now`, and it was idle: put to sleep and started again on the new profile, a new
+conversation, as above); `busy` (`now`, but it wasn't idle: it moves at its next start); `replaced`
+(`now`, but a newer move had replaced this one: by the time the start lock was free, or while
+the old run stopped, when it started with the newer move);
 `after_notes` (`now` after the notes reply, if it is still running and idle and no newer move
 replaced this one; what happened, saved or no reply within the wait, is a `notice`); `failed` (`error`; it moves at its next start).
 

@@ -585,6 +585,7 @@ enum AgentCmd {
         now: bool,
         /// With --profile: first ask a running, idle agent to write what it needs into memory/
         /// (starts a turn on its current account). Off by default: HANDOFF.md and memory/ carry it.
+        /// Only the human asks: refused inside any Muster tab and from agents.
         #[arg(long, requires = "profile", conflicts_with = "no_save_notes")]
         save_notes: bool,
         /// The old opt-out, now the default: accepted and ignored.

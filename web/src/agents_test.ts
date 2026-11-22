@@ -1,5 +1,7 @@
 import {
   pendingMove,
+  restartShown,
+  restartShownChanged,
   saveNotesBlocked,
   sessionBusy,
   switchMessage,
@@ -521,7 +523,7 @@ Deno.test("the message after a move says when it takes effect", () => {
     "ada moved to Work: a new conversation started there.");
   assertEquals(switchMessage("ada", { ...sw, now: true, outcome: "busy", notes_skipped: "busy" }).level, "warn");
   assertEquals(switchMessage("ada", { ...sw, outcome: "next_start", notes_skipped: "at_limit" }).text.includes("at its limit"), true);
-  assertEquals(switchMessage("ada", { ...sw, now: true, notes: "asked", outcome: "after_notes" }).text.includes("once it replies"), true);
+  assertEquals(switchMessage("ada", { ...sw, now: true, notes: "asked", outcome: "after_notes" }).text.includes("waits up to 10 minutes for its reply, then restarts it on Work if it is idle; otherwise it moves at its next start"), true);
 });
 
 Deno.test("a move waiting for a restart says so, and offers Restart now only when it is idle", () => {
@@ -535,6 +537,7 @@ Deno.test("a move waiting for a restart says so, and offers Restart now only whe
     text: "Moves to Work at its next start",
     running: true,
     restart: true,
+    off: false,
     why: null,
     wait: undefined,
   });
@@ -546,4 +549,26 @@ Deno.test("a move waiting for a restart says so, and offers Restart now only whe
   const off = pendingMove(moving, session("exited"), profiles)!;
   assertEquals([off.restart, off.why], [false, "It isn't running: it starts on Work."]);
   assertEquals(pendingMove({ ...moving, account_profile_id: null }, undefined, profiles)!.to, "Default");
+  // Its destination turned off since: no Restart now, and the reason says why.
+  const disabled = [{ id: 1, name: "Personal", enabled: true }, { id: 2, name: "Work", enabled: false }] as Parameters<typeof pendingMove>[2];
+  const turnedOff = pendingMove(moving, session("idle"), disabled)!;
+  assertEquals([turnedOff.restart, turnedOff.off, turnedOff.wait], [false, true, "Work is disabled"]);
+  check(turnedOff.why!.startsWith("Work is disabled in Accounts"), turnedOff.why!);
+  assertEquals(pendingMove(moving, session("exited"), disabled)!.off, true);
+});
+
+Deno.test("a busy tab's Restart confirmation asks again when its run or move changed", () => {
+  const moving = agent({ account_profile_id: 2, handoff: { from: 1, at: 5 }, session_id: 7 });
+  const run = { ...session("working"), pid: 100 };
+  const shown = restartShown(moving, run);
+  assertEquals(shown, { pid: 100, move: 5, to: 2 });
+  assertEquals(restartShownChanged(shown, restartShown(moving, run)), false, "nothing changed");
+  assertEquals(restartShownChanged(shown, restartShown({ ...moving, account_profile_id: 1, handoff: { from: 1, at: 9 } }, run)), true, "move replaced");
+  assertEquals(restartShownChanged(shown, restartShown({ ...moving, handoff: null }, run)), true, "move applied or undone");
+  assertEquals(restartShownChanged(shown, restartShown(moving, { ...run, pid: 101 })), true, "another run");
+  assertEquals(restartShownChanged(shown, null), true, "the tab is gone");
+  // No move shown: a move saved since is a change too.
+  const plain = restartShown(agent({ session_id: 7 }), run);
+  assertEquals(plain, { pid: 100, move: null, to: null });
+  assertEquals(restartShownChanged(plain, restartShown(moving, run)), true);
 });

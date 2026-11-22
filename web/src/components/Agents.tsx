@@ -205,6 +205,13 @@ function agentMenu(a: Agent, x: number, y: number) {
   });
 }
 
+/** The row's explanation of a waiting move (its tooltip, and its screen-reader description). */
+function moveTip(move: NonNullable<ReturnType<typeof pendingMove>>): string {
+  if (!move.running) return move.off ? `${move.text}. ${move.why}` : `${move.text}: a new conversation there.`;
+  const why = move.restart ? "Restart now is in its menu." : move.why;
+  return `${move.text}. Until then it keeps running on ${move.from}. ${why}`;
+}
+
 function AgentRow({ a, now, selected }: { a: Agent; now: number; selected: boolean }) {
   const s = a.session_id !== null ? sessions.value.get(a.session_id) : undefined;
   const st = agentStatus(a, s);
@@ -231,6 +238,7 @@ function AgentRow({ a, now, selected }: { a: Agent; now: number; selected: boole
       aria-label={`${a.name}, ${KIND_LABEL[a.kind]}${billing.badge ? `, ${billing.note ?? OPENROUTER_BADGE}` : ""}, ${st.label}${move ? `; ${move.text}` : ""}${
         cold ? ", prompt cache likely expired" : dot ? `, ${CACHE_DOT_LABEL[dot]}` : ""
       }`}
+      aria-describedby={move ? `ap-move-${a.id}` : undefined}
       onClick={open}
       onKeyDown={(e) => {
         // Enter or Space on the row's own ⋯ button is the button's, not the row's.
@@ -283,11 +291,10 @@ function AgentRow({ a, now, selected }: { a: Agent; now: number; selected: boole
         {move && (
           <span
             class="ap-move"
-            data-tip={move.running
-              ? `${move.text}. Until then it keeps running on ${move.from}. Restart now is in its menu.`
-              : `${move.text}: a new conversation there.`}
+            data-tip={moveTip(move)}
           >
             {move.text}
+            <span class="sr-only" id={`ap-move-${a.id}`}>{moveTip(move)}</span>
           </span>
         )}
         {billing.badge && (
@@ -1439,18 +1446,22 @@ export function AgentDialog(
                     type="button"
                     class="btn"
                     disabled={!waiting.restart || restarting}
-                    aria-describedby={`${id}-waiting-hint`}
-                    onClick={async () => {
+                    aria-describedby={waiting.why ? `${id}-waiting-hint ${id}-waiting-why` : `${id}-waiting-hint`}
+                    onClick={async (e) => {
+                      const button = e.currentTarget;
                       setRestarting(true);
-                      await A.restartToMove(agent);
+                      const moved = await A.restartToMove(agent);
                       setRestarting(false);
-                      // The panel goes once it moved: keep the keyboard in the dialog.
-                      profileRef.current?.focus();
+                      // The panel goes once it moved: keep the keyboard in the dialog, unless it
+                      // was already elsewhere. A refused restart leaves focus where it is.
+                      if (moved && (document.activeElement === button || document.activeElement === document.body)) {
+                        profileRef.current?.focus();
+                      }
                     }}
                   >
                     Restart now
                   </button>
-                  {waiting.why && <span class="field-hint">{waiting.why}</span>}
+                  {waiting.why && <span class="field-hint" id={`${id}-waiting-why`}>{waiting.why}</span>}
                 </div>
               )}
             </div>

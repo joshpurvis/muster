@@ -55,6 +55,8 @@ pub const ASLEEP_DETAIL: &str = "asleep";
 const EXIT_WAIT: Duration = Duration::from_secs(10);
 /// An automatic sleep never happens within this long of the human typing into the agent.
 const HUMAN_QUIET_MS: i64 = 120_000;
+/// A move applied now (`Why::Move`) waits this long after the human last typed into the agent.
+const MOVE_QUIET_MS: i64 = 15_000;
 /// How long keys typed into a waking agent are held for it to be ready.
 const READY_WAIT: Duration = Duration::from_secs(600);
 /// The most typed bytes held for one waking agent.
@@ -547,8 +549,7 @@ pub fn blocker(agent: &Agent, info: Option<&SessionInfo>, f: &Facts) -> Option<S
     let Some(info) = info.filter(|i| f.live && i.state != AgentState::Exited) else {
         return Some("it isn't running".into());
     };
-    // A move waiting for its next start begins a new conversation anyway.
-    if agent.resume_id.is_none() && agent.handoff.is_none() {
+    if agent.resume_id.is_none() {
         return Some("its conversation isn't saved yet (it needs a finished turn first), so it couldn't pick it up again".into());
     }
     let state = match info.state {
@@ -607,6 +608,19 @@ pub fn due(agent: &Agent, info: &SessionInfo, human_at: Option<i64>, now: i64) -
         return false;
     }
     now - idle_since(info, human_at) >= i64::from(after) * minute_ms()
+}
+
+/// Did the human type into the agent too recently for this sleep? A reset waits
+/// `HUMAN_QUIET_MS`. A move applied now waits `MOVE_QUIET_MS`: a prompt submitted in its
+/// terminal whose turn hasn't shown yet (the hook that marks it working can come after Enter
+/// was taken) isn't cut off. Other sleeps check `due` or are the human's own.
+fn typed_just_now(why: Why, human_at: Option<i64>, now: i64) -> bool {
+    let quiet = match why {
+        Why::Reset => HUMAN_QUIET_MS,
+        Why::Move => MOVE_QUIET_MS,
+        _ => return false,
+    };
+    human_at.is_some_and(|t| now - t < quiet)
 }
 
 /// When the human last typed into session `id` (Unix ms), as far as this backend saw.
@@ -684,7 +698,12 @@ pub(crate) async fn sleep_held(hub: &Arc<Hub>, name: &str, why: Why, _held: &cra
         return Err(NotNow(format!("{} can't sleep now: you typed into it just now", a.name)).into());
     }
     let (info, f) = facts(hub, &a);
-    if let Some(no) = blocker(&a, info.as_ref(), &f) {
+    // A move applied now begins a new conversation anyway: no saved one is needed (only then).
+    let checked = match why {
+        Why::Move if a.handoff.is_some() && a.resume_id.is_none() => Agent { resume_id: Some(String::new()), ..a.clone() },
+        _ => a.clone(),
+    };
+    if let Some(no) = blocker(&checked, info.as_ref(), &f) {
         return Err(NotNow(format!("{} can't sleep now: {no}", a.name)).into());
     }
     let info = info.expect("blocker checked the session");
@@ -692,8 +711,9 @@ pub(crate) async fn sleep_held(hub: &Arc<Hub>, name: &str, why: Why, _held: &cra
     if why == Why::Idle && !due(&a, &info, human_at(hub, info.id, now), now) {
         return Err(NotNow(format!("{} was busy again", a.name)).into());
     }
-    if why == Why::Reset && human_at(hub, info.id, now).is_some_and(|t| now - t < HUMAN_QUIET_MS) {
-        return Err(NotNow(format!("{} can't sleep now: you typed into it just now", a.name)).into());
+    if typed_just_now(why, human_at(hub, info.id, now), now) {
+        let what = if why == Why::Move { "restart" } else { "sleep" };
+        return Err(NotNow(format!("{} can't {what} now: you typed into it just now", a.name)).into());
     }
     // The run that was checked: only it is stopped.
     let Some(generation) = hub.pty_generation(info.id) else {
@@ -1449,6 +1469,20 @@ pub fn spawn(hub: Arc<Hub>) {
 mod tests {
     use super::*;
 
+    /// A move applied now waits 15 s after the human typed into the agent (a prompt just
+    /// submitted may not show as working yet); a reset waits two minutes; other sleeps don't look.
+    #[test]
+    fn a_move_waits_briefly_after_the_human_typed() {
+        let now = 1_000_000;
+        assert!(typed_just_now(Why::Move, Some(now - MOVE_QUIET_MS + 1), now));
+        assert!(!typed_just_now(Why::Move, Some(now - MOVE_QUIET_MS), now));
+        assert!(!typed_just_now(Why::Move, None, now));
+        assert!(typed_just_now(Why::Reset, Some(now - MOVE_QUIET_MS), now), "a reset waits longer");
+        assert!(!typed_just_now(Why::Reset, Some(now - HUMAN_QUIET_MS), now));
+        assert!(!typed_just_now(Why::Manual, Some(now), now));
+        assert!(!typed_just_now(Why::Idle, Some(now), now), "`due` covers the idle timer");
+    }
+
     fn agent() -> Agent {
         Agent {
             account_profile_id: None,
@@ -1506,6 +1540,10 @@ mod tests {
         assert!(why(&a, info(AgentState::Idle), Facts { live: false, ..ready() }).contains("isn't running"));
         let fresh = Agent { resume_id: None, ..agent() };
         assert!(why(&fresh, info(AgentState::Idle), ready()).contains("couldn't pick it up again"));
+        // A move waiting for its next start doesn't let an ordinary sleep stop it without a saved
+        // conversation (only the move's own restart, `Why::Move`, skips that).
+        let moving = Agent { handoff: Some(crate::agents::Handoff { from: None, at: 1, reason: None }), ..fresh.clone() };
+        assert!(why(&moving, info(AgentState::Idle), ready()).contains("couldn't pick it up again"));
         let mut queued = info(AgentState::Idle);
         queued.queued = 1;
         assert!(why(&a, queued, ready()).contains("waiting"));

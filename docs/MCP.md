@@ -1148,7 +1148,7 @@ Rules (every one is checked in the tool, whatever the client):
   floor (every 15 minutes at most) applies as to the human's. Proposals and reminders share the
   post rate limit (30 per minute with note writes, panel updates and posts).
 - **Once made (a reminder) or approved (a proposal), it is an ordinary schedule:** origin
-  `schedule`, so the agent's accepted origins, the unattended cap (24 a day unless the owner changed it), the 200-a-day cap,
+  `schedule`, so the agent's accepted origins, the unattended cap (24 a day by default), the 200-a-day cap,
   the OpenRouter spend caps, quiet hours, a Claude subscription agent's 7-day expiry (from
   approval), the busy rule and the missed-run rule all apply when it runs.
 - A proposal nobody approves is removed after 7 days; a reminder a day after it ran (its message

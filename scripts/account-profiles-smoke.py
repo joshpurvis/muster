@@ -295,6 +295,14 @@ try:
     check(session(sid)["pid"] == replacement["pid"] and session(sid)["account_profile_id"] == personal
           and rec["handoff"] and rec["reset_on_next_start"] and rec["resumable"],
           "a tab restart onto a disabled profile changes nothing: same run, tab, conversation and pending move")
+    # Restart now (the move's own restart) checks the destination before stopping anything too.
+    sw = rpc("agent.update", {"name": "reviewer", "now": True})["switch"]
+    no_now = cli("agent", "edit", "reviewer", "--now")
+    rec = reviewer()
+    check(sw["outcome"] == "failed" and "disabled" in sw["error"] and "didn't restart" in no_now and "disabled" in no_now
+          and "moves to Work at its next start" in no_now and session(sid)["pid"] == replacement["pid"]
+          and session(sid)["state"] != "exited" and rec["handoff"] and rec["account_profile_id"] == work,
+          f"Restart now onto a disabled profile leaves the running agent alone ({no_now.strip()})")
     cli("profile", "enable", "Work")
     first = rpc("session.restart", {"id": sid})
     run = launched(sid, first["pid"])
@@ -359,6 +367,11 @@ try:
           "--now of a busy agent leaves its turn alone: the move waits for its next start")
     still = cli("agent", "edit", "reviewer", "--now")
     check("isn't idle" in still and session(sid)["pid"] == pid, "--now alone waits too while it is busy")
+    # The working agent applying its own move (its own session as the caller): it waits too.
+    own = rpc("agent.update", {"name": "reviewer", "now": True, "from_session": sid})["switch"]
+    time.sleep(1)
+    check(own["outcome"] == "busy" and session(sid)["pid"] == pid and reviewer()["handoff"] is not None
+          and reviewer()["account_profile_id"] == personal, "a working agent's own --now leaves its turn alone too")
     hooks(sid, "moved-conversation")
     until("idle after its turn", lambda: session(sid)["state"] == "idle")
     out = cli("agent", "edit", "reviewer", "--now", session=a["id"])
@@ -385,7 +398,7 @@ try:
     until("idle after its turn", lambda: session(sid)["state"] == "idle")
     asked_at = time.monotonic()
     out = cli("agent", "edit", "reviewer", "--profile", "Work", "--now", "--save-notes")
-    check("Asked it to save notes first" in out and "once it has saved its notes" in out,
+    check("Asked it to save notes first" in out and "then restarts it on Work if it is idle; otherwise it moves at its next start" in out,
           "--save-notes asks a running, idle agent to save its notes first")
     asked = until("the save-notes message", lambda: next((m for m in rpc("agent.messages", {"agent": "reviewer"})["messages"]
                                                         if "You are moving to account Work" in (m.get("text") or "")), None))
@@ -400,8 +413,13 @@ try:
     # the move waits for its next start (never cut off a turn); a notice says so.
     hooks(sid, "work-again")
     until("idle after its turn", lambda: session(sid)["state"] == "idle")
+    before = {m["id"] for m in asked_to_save()}
+    asked_at = time.monotonic()
     rpc("agent.update", {"name": "reviewer", "account_profile": personal, "now": True, "save_notes": True})
-    time.sleep(7.5)
+    # The notes prompt was sent and typed in (out of its queue, not refused), then the wait ran out.
+    until("the second notes prompt typed in", lambda: session(sid)["queued"] == 0 and any(
+        m["id"] not in before and "account Home" in m["text"] and not m["refused"] for m in asked_to_save()))
+    time.sleep(max(0.0, asked_at + 6 + 1.5 - time.monotonic()))
     check(session(sid)["pid"] == replied_pid and reviewer()["handoff"] is not None and reviewer()["account_profile_id"] == personal,
           "without a reply, the turn it was asked for isn't cut off: the move waits for its next start")
     # Its turn ends: Restart now (`now` alone, for the move shown) moves it.

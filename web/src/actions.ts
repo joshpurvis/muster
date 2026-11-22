@@ -91,7 +91,7 @@ import { openQuestionCount, questions, questionsFilter, questionsSupported, sele
 import { flushAllDrafts, flushDraft, knowNote, notes, persistAllDrafts, unsavedNotes } from "./notes.ts";
 import type { HelloResult, Note } from "./types.ts";
 import { inheritedProfile } from "./account_profiles.ts";
-import { isAsleep, pendingMove, providerPendingNote, switchMessage, upsertMessage } from "./agents.ts";
+import { isAsleep, pendingMove, providerPendingNote, restartShown, restartShownChanged, switchMessage, upsertMessage } from "./agents.ts";
 import type { MenuItem } from "./components/Menu.tsx";
 import { nextWhen } from "./schedules.ts";
 import { restartExpect, restartOutcome, restartWait } from "./updates.ts";
@@ -1085,28 +1085,37 @@ export function interruptSession(sid: SessionId) {
 }
 
 /** Restart / Interrupt from a tab or terminal menu: asks first while an agent is mid-turn (its
- * turn is lost). Palette commands and shortcuts act at once. Known gap: the dialog holds only the
- * session id, so if another client restarts that session while it is open, confirming acts on
- * the replacement run. */
-export function restartOrInterruptAsk(sid: SessionId, what: "restart" | "interrupt") {
+ * turn is lost). Palette commands and shortcuts act at once. The dialog names the run and the
+ * move it would apply; if either changed before Confirm (another client restarted it, or a move
+ * was saved or replaced), it asks again with what is true now instead of acting. */
+export function restartOrInterruptAsk(sid: SessionId, what: "restart" | "interrupt", again = false) {
   const s = sessions.value.get(sid);
   const act = () => (what === "restart" ? restartSession(sid) : interruptSession(sid));
-  if (!s || !midTurn(s)) return act();
+  if (!s || (!again && !midTurn(s))) return act();
   // A named agent with a move waiting: its restart is the move (a new conversation there).
-  const owner = agents.value.find((a) => a.session_id === sid);
+  const ownerOf = () => agents.value.find((a) => a.session_id === sid);
+  const owner = ownerOf();
   const move = owner ? pendingMove(owner, s, accountProfiles.value) : null;
+  const shown = restartShown(owner, s);
   overlay.value = {
     kind: "confirm",
-    title: `${KIND_LABEL[s.kind]} is working`,
+    title: again ? "Look again before restarting" : `${KIND_LABEL[s.kind]} is working`,
     // Claude and Codex both reopen their conversation (Codex: once it has a finished turn).
     body: what === "restart"
       ? move
-        ? `Restart it? Its current turn is lost, and it moves to ${move.to}: a new conversation there (its memory/ notes come along).`
-        : "Restart it? Its current turn is lost; it reopens the same conversation."
+        ? `Restart it? ${midTurn(s) ? "Its current turn is lost, and it" : "It"} moves to ${move.to}: a new conversation there (its memory/ notes come along).`
+        : `Restart it? ${midTurn(s) ? "Its current turn is lost; it" : "It"} reopens the same conversation.`
       : "Stop its current turn?",
     confirmLabel: what === "restart" ? "Restart" : "Interrupt",
     danger: true,
-    run: act,
+    run: () => {
+      const cur = sessions.value.get(sid);
+      if (what === "restart" && restartShownChanged(shown, cur ? restartShown(ownerOf(), cur) : null)) {
+        if (!cur || cur.state === "exited") return toast("warn", "That run ended before you confirmed: nothing was restarted.");
+        return restartOrInterruptAsk(sid, what, true);
+      }
+      act();
+    },
   };
 }
 
@@ -1971,8 +1980,9 @@ export function switchAgentAccount(name: string) {
 }
 
 /** Restart now: apply the move waiting for `a`'s next start, if it is still idle (`agent.update`
- * with `now` alone; the backend checks again, so a busy agent keeps its turn). */
-export async function restartToMove(a: Agent): Promise<void> {
+ * with `now` alone; the backend checks again, so a busy agent keeps its turn). True once it
+ * restarted on the new account. */
+export async function restartToMove(a: Agent): Promise<boolean> {
   try {
     // The move that was shown: one replaced since is refused, to look at again.
     const r = await rpc.call<Agent & { switch?: AgentSwitch }>("agent.update", {
@@ -1985,8 +1995,10 @@ export async function restartToMove(a: Agent): Promise<void> {
       const m = switchMessage(r.name, r.switch);
       toast(m.level, m.text, 8000);
     }
+    return r.switch?.outcome === "restarted";
   } catch (e) {
     toast("error", `Couldn't restart ${a.name}: ${e instanceof Error ? e.message : e}`);
+    return false;
   }
 }
 

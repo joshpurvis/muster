@@ -1211,16 +1211,7 @@ async fn dispatch_inner(hub: &Arc<Hub>, who: &Principal, method: &str, params: V
             // `http_call`).
             p.by_owner = from_session.is_none()
                 && (via == Via::Window || OWNER_TERMINAL.try_with(|ok| *ok).unwrap_or(false));
-            // An agent's session (or a shell it typed into) may move agents, not ask one to save
-            // notes (`muster agent edit --save-notes` passes `$MUSTER_SESSION_ID`).
-            p.from_agent = match from_session.as_ref().and_then(|v| v.as_u64()) {
-                Some(s) => match caller(hub, Some(s as SessionId))? {
-                    Caller::Agent(_) => true,
-                    Caller::Shell(s) => hub.agents().prov(s).is_some(),
-                    Caller::Human => false,
-                },
-                None => false,
-            };
+
             // Letting an agent take scheduled or triggered work, or moving one that does to or
             // from the subscription, only with a click in the owner's window: checked with the
             // record it changes, under one lock (`agents::widens_unattended`).
@@ -2164,11 +2155,12 @@ tokio::task_local! {
 }
 
 /// Does this call turn on something only the human may (`owner_terminal`): an agent's self
-/// handoff (src/self_handoff.rs), its message tools up front (src/mcp/tools.rs) or its lead role
-/// (`agents::Agent::lead`), alone or together?
+/// handoff (src/self_handoff.rs), its message tools up front (src/mcp/tools.rs), its lead role
+/// (`agents::Agent::lead`) or a move's notes request, typed into it as the human's
+/// (`agents::AgentUpdate::save_notes`), alone or together?
 fn grants_owner_switch(method: &str, params: &Value) -> bool {
     method == "agent.update"
-        && ["self_handoff", "tools_up_front", "lead"].iter().any(|k| params.get(*k) == Some(&Value::Bool(true)))
+        && ["self_handoff", "tools_up_front", "lead", "save_notes"].iter().any(|k| params.get(*k) == Some(&Value::Bool(true)))
 }
 
 /// Is the `/api/rpc` call on connection `peer` the human's own: the client token, on no session's
@@ -3182,8 +3174,16 @@ mod tests {
         let e = call(&hub, "agent.update", json!({"name": "rpc-mover", "account_profile": work, "save_notes": true, "from_session": 3}))
             .await.unwrap_err();
         assert!(e.contains("only the human asks for it"), "{e}");
+        // Without any caller named, but not the owner's window or terminal: refused too.
+        let e = call(&hub, "agent.update", json!({"name": "rpc-mover", "account_profile": work, "save_notes": true}))
+            .await.unwrap_err();
+        assert!(e.contains("only the human asks for it"), "{e}");
         let r = call(&hub, "agent.update", json!({"name": "rpc-mover", "account_profile": work, "now": true, "from_session": 3})).await.unwrap();
         assert_eq!((r["account_profile_id"].clone(), r["switch"]["notes_skipped"].as_str()), (json!(work), Some("off")), "{r}");
+        // A click in the window asks (not running here, so nothing is typed).
+        let r = dispatch_via(&hub, &Principal::Local, "agent.update",
+            json!({"name": "rpc-mover", "account_profile": "default", "save_notes": true}), Via::Window).await.map_err(|e| e.0).unwrap();
+        assert_eq!(r["switch"]["notes_skipped"], "not_running", "{r}");
     }
 
     #[tokio::test]
@@ -3742,6 +3742,8 @@ mod tests {
         let on = json!({"name": "rpc-otto", "tools_up_front": true});
         assert!(grants_owner_switch("agent.update", &on));
         assert!(grants_owner_switch("agent.update", &json!({"name": "rpc-otto", "self_handoff": true})));
+        assert!(grants_owner_switch("agent.update", &json!({"name": "rpc-otto", "account_profile": 2, "save_notes": true})));
+        assert!(!grants_owner_switch("agent.update", &json!({"name": "rpc-otto", "account_profile": 2, "save_notes": false})));
         assert!(!grants_owner_switch("agent.update", &json!({"name": "rpc-otto", "tools_up_front": false})));
         // `muster agent edit` typed in a Muster tab: refused, whatever the terminal check said.
         let mut from = on.clone();

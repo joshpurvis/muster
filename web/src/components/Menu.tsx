@@ -42,6 +42,8 @@ export const menu = signal<MenuState | null>(null);
 /** What had focus when the last menu opened: a dialog one of its items opens gives focus back
  * there (Overlays `close`), not to the menu, which is gone by then. */
 export let menuOpener: HTMLElement | null = null;
+/** When the last menu closed (a dialog its item opens comes right after). */
+export let menuClosedAt = 0;
 
 export function openMenu(state: MenuState) {
   const at = document.activeElement as HTMLElement | null;
@@ -67,6 +69,7 @@ export function openMenuAt(el: Element, items: MenuItem[], opts: Partial<MenuSta
 
 export function closeMenu() {
   const m = menu.value;
+  if (m) menuClosedAt = Date.now();
   menu.value = null;
   m?.onClose?.();
 }

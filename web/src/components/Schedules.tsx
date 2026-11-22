@@ -129,13 +129,15 @@ export function SchedulesPausedNotice() {
 /** Which Needs you item had keyboard focus, so when it goes (approved, dismissed or hidden, by
  * its button, its menu or from another window, however long the reply takes) focus moves to the
  * item now at its place, else the agent's row, else the Channels heading, never to the page. */
-const nyFocus = { index: -1, agent: 0 };
+const nyFocus = { index: -1, agent: 0, schedule: 0 };
 
 export function NeedsYou({ now, openAgent }: { now: number; openAgent: (agent: number) => void }) {
   const items = schedulesSupported.value ? needsYouItems(schedules.value, prefs.value.hiddenRuns) : [];
   useLayoutEffect(() => {
     const at = document.activeElement;
     if (nyFocus.index < 0 || (at && at !== document.body && at.isConnected)) return;
+    // Its item is still there (focus left by a click on empty space): nothing went, nothing to do.
+    if (document.querySelector(`.needs-you .ny-item[data-schedule="${nyFocus.schedule}"]`)) return;
     const names = [...document.querySelectorAll<HTMLElement>(".needs-you .ny-name")];
     const to = names[Math.min(nyFocus.index, names.length - 1)] ??
       document.querySelector<HTMLElement>(`.channel-row[data-agent-id="${nyFocus.agent}"] .channel-select`) ??
@@ -149,6 +151,7 @@ export function NeedsYou({ now, openAgent }: { now: number; openAgent: (agent: n
     const all = [...(e.currentTarget as HTMLElement).querySelectorAll(".ny-item")];
     nyFocus.index = item ? all.indexOf(item) : -1;
     nyFocus.agent = items.find((i) => String(i.schedule.id) === item?.dataset.schedule)?.schedule.agent_id ?? 0;
+    nyFocus.schedule = Number(item?.dataset.schedule ?? 0);
   };
   const left = (e: FocusEvent) => {
     // Gone to another place on purpose (not a menu or dialog it opened, not removed from the page).

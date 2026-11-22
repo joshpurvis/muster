@@ -234,8 +234,8 @@ function Row({ row, context, now }: { row: SidebarRow; context: string | null; n
     if (!c || e.detail === 0) return act();
     const id = a!.id, ch = c.id;
     clickTimer.current = setTimeout(() => {
-      // Its channel archived, or the agent removed, meanwhile: nothing to start.
-      if (!windowChannels.peek().some((x) => x.id === ch) || !agents.peek().some((x) => x.id === id)) return;
+      // Its channel archived, the agent removed, or another channel opened meanwhile: nothing to do.
+      if (activeChannelId.peek() !== ch || !windowChannels.peek().some((x) => x.id === ch) || !agents.peek().some((x) => x.id === id)) return;
       act();
     }, DOUBLE_MS);
   };

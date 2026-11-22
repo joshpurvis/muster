@@ -253,7 +253,8 @@ export function AgentCard(
     if (!el) return;
     const inn = () => (hadFocus.current = true);
     const out = (e: FocusEvent) => {
-      if (e.relatedTarget) hadFocus.current = false;
+      const to = e.relatedTarget as HTMLElement | null;
+      if (to && !to.closest(".menu-layer, .modal-backdrop")) hadFocus.current = false;
     };
     // Keyboard-opened, a press anywhere outside its row, its menus and dialogs closes it.
     const down = (e: PointerEvent) => {

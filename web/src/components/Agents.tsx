@@ -134,7 +134,7 @@ export function Feed({ now }: { now: number }) {
       if (!r.more) {
         olderState.done.add(key);
         // The button goes with nothing more to load: keyboard focus moves to the heading.
-        if (document.activeElement?.closest(".ap-older")) {
+        if (document.activeElement?.closest(".ap-feed .ap-older")) {
           setTimeout(() => document.querySelector<HTMLElement>(".ap-feed-toggle")?.focus(), 0);
         }
       }

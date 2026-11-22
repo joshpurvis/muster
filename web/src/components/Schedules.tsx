@@ -658,18 +658,18 @@ function RunHistory({ s, now }: { s: Schedule; now: number }) {
   const h = scheduleRuns.value.get(s.id);
   const loading = !h || h.loading;
   const runs = h?.runs ?? [];
-  // Older runs is disabled while a page loads, and the last page removes it. If it had focus,
-  // focus comes back to it, or to this list once it is gone, instead of falling to the page.
+  // Older runs stays focusable while a page loads (aria-disabled, not disabled, which would drop
+  // focus). The last page or an error removes it: if it had focus just before, focus goes to this
+  // list instead of falling to the page. Read before each commit, so leaving it is never undone.
   const box = useRef<HTMLDivElement>(null);
   const older = useRef<HTMLButtonElement>(null);
-  const olderFocused = useRef(false);
   const hasOlder = !!(h?.more && !h.error);
+  const olderHadFocus = !!older.current && document.activeElement === older.current;
   useEffect(() => {
-    if (!olderFocused.current || loading) return;
-    const lost = !document.activeElement || document.activeElement === document.body;
-    if (lost) (hasOlder ? older.current : box.current)?.focus();
-    if (!hasOlder || !lost) olderFocused.current = document.activeElement === older.current;
-  }, [hasOlder, loading]);
+    if (olderHadFocus && !hasOlder && (!document.activeElement || document.activeElement === document.body)) {
+      box.current?.focus();
+    }
+  });
   return (
     <div ref={box} tabIndex={-1} role="listitem" class="sch-runs" aria-label={`Runs of ${s.name}`}>
       {loading && runs.length === 0 && <span class="sch-runs-note"><Spinner size={10} /> Loading runs…</span>}
@@ -688,13 +688,8 @@ function RunHistory({ s, now }: { s: Schedule; now: number }) {
           ref={older}
           type="button"
           class="ap-older sch-older"
-          disabled={h!.loading}
-          onFocus={() => (olderFocused.current = true)}
-          onBlur={(e) => {
-            // Focus moving elsewhere clears the mark; a blur to nowhere (disabled, removed) keeps it.
-            if (e.relatedTarget) olderFocused.current = false;
-          }}
-          onClick={() => loadScheduleRuns(s.id, true)}
+          aria-disabled={h!.loading || undefined}
+          onClick={() => !h!.loading && loadScheduleRuns(s.id, true)}
         >
           {h!.loading ? <Spinner size={10} /> : null} Older runs
         </button>

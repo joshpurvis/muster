@@ -2569,6 +2569,10 @@ legend {
   pointer-events: auto;
   min-width: 180px;
   max-width: 320px;
+  /* A long menu (an agent's row: its own items, then its channel's) scrolls in a short window. */
+  max-height: calc(100vh - 24px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
   padding: 4px;
   background: var(--bg-overlay);
   border: 1px solid var(--border-strong);
@@ -3137,9 +3141,9 @@ legend {
   font-variant-numeric: tabular-nums; border: 1px solid var(--border-strong); color: var(--text-faint);
 }
 .row-chip:hover { color: var(--text); border-color: var(--text-faint); }
-.row-chip-wait { color: var(--st-attn); background: var(--attn-bg); border-color: var(--attn-border); }
+.row-chip-wait { color: var(--warn-text); background: var(--attn-bg); border-color: var(--attn-border); }
 .row-chip-bad {
-  color: var(--st-error); background: var(--del-bg);
+  color: var(--error-text); background: var(--del-bg);
   border-color: color-mix(in srgb, var(--st-error) 40%, transparent);
 }
 .row-chip + .channel-count, .row-chip + .channel-attention { margin-left: 0; }
@@ -3195,12 +3199,20 @@ legend {
 }
 .ny-head {
   display: flex; align-items: center; gap: 6px; padding: 0 2px 6px;
-  font-size: 10.5px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: var(--st-attn);
+  font-size: 10.5px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: var(--warn-text);
 }
 .ny-head .ap-count { text-transform: none; letter-spacing: 0; }
 .ny-item { display: flex; align-items: flex-start; gap: 6px; padding: 5px 2px 6px; min-width: 0; }
 .ny-item + .ny-item, .sch-runs + .ny-item { border-top: 1px solid var(--attn-border); }
-.ny-icon { flex: none; margin-top: 2px; color: var(--st-attn); }
+.ny-icon { flex: none; margin-top: 2px; color: var(--warn-text); }
+.needs-you .sch-chip.sch-bad { color: var(--error-text); }
+.needs-you .sch-approve { background: var(--accent-fill); }
+.needs-you .sch-approve:hover:not(:disabled) { background: var(--accent-fill-hover); }
+.ny-when { white-space: nowrap; }
+.ny-run .ny-name { display: flex; align-items: center; }
+.ny-run .ny-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.ny-chev { flex: none; margin-right: 3px; color: var(--text-faint); transition: transform var(--t) var(--ease); }
+.ny-chev.open { transform: rotate(90deg); }
 .ny-run .ny-icon { color: var(--text-faint); }
 .ny-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
 .ny-top { display: flex; align-items: center; gap: 4px; min-width: 0; }
@@ -3411,6 +3423,8 @@ legend {
 }
 
 .ap-feed.open {
+  /* A fixed share: sized to its messages, it would change height with each channel opened (it
+     follows the channel's agent) and move the list under the pointer. */
   flex: 0 1 46%;
 }
 

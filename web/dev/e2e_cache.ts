@@ -59,7 +59,9 @@ export async function cacheChecks(a: Browser, { shots, ok, check }: CacheCtx) {
   check((await a.eval(`document.activeElement?.className ?? ""`)) === focusBefore, "the bar never takes focus");
   check(!(await a.eval(`!!document.activeElement?.closest('.cache-bar')`)), "focus is not in the bar");
   check(await a.eval(`!!document.querySelector('[data-tab-sid="${sid}"] .tab-cold')`), "the tab says cold");
-  check(await a.eval(`!!document.querySelector('[data-agent="digest"] .ap-cold')`), "the agents row says cold");
+  check(await a.eval(`!!document.querySelector('.channel-row[data-agent="digest"] .row-cold')`), "the agent's row has cold (shown when wide)");
+  await a.eval(`${M}.agentCard.value = { agent: ${M}.agents.value.find((x) => x.name === "digest").id, byKey: true }`);
+  await a.wait(`getComputedStyle(document.querySelector('.agent-card .ap-cold') ?? document.body).display !== 'none' && !!document.querySelector('.agent-card .ap-cold')`, 2000);
   check(await a.eval(`!!${bar}.querySelector('.link-btn')`), "a named agent's bar offers Start fresh");
   // Said politely, once, without the ticking time; the tab's name says it too.
   await a.wait(`(${bar}.querySelector('[aria-live=polite]')?.textContent ?? "").includes("likely expired")`, 2000);
@@ -74,9 +76,10 @@ export async function cacheChecks(a: Browser, { shots, ok, check }: CacheCtx) {
   );
   await shot("bar-window");
   await shot("bar", `.pane:has(.cache-bar) .pane-body`, 0);
-  await shot("agents-row", `[data-agent="digest"]`, 6);
+  await shot("agent-card", `.agent-card`, 6);
   await shot("tab", `[data-tab-sid="${sid}"]`, 6);
-  ok("an agent idle past its cache lifetime shows the cold bar under its terminal, and cold on its tab and row");
+  await a.eval(`${M}.agentCard.value = null`);
+  ok("an agent idle past its cache lifetime shows the cold bar under its terminal, and cold on its tab and in its card");
 
   // ---- dismissed for this idle period; back after the next turn goes cold too
   await a.click(`.cache-bar .cache-x`);

@@ -274,7 +274,8 @@ export function loadChannelLayout(raw: unknown, channels: number[], tabs: TabHom
       ...(Object.keys(questionsIn).length ? { questionsIn } : {}),
       sidebar: {
         hidden: side.hidden === true,
-        channels: side.channels !== false,
+        // The list now holds the agents too: a window that showed the old Agents section shows it.
+        channels: side.channels !== false || (side as { agents?: unknown }).agents === true,
         width: side.width === undefined ? SIDEBAR_WIDTH : sidebarWidth(Number(side.width)),
       },
       ...(obj.previous !== undefined ? { previous: obj.previous } : {}),

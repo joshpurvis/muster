@@ -92,7 +92,7 @@ import type { HelloResult, Note } from "./types.ts";
 import { inheritedProfile } from "./account_profiles.ts";
 import { isAsleep, pendingMove, providerPendingNote, restartShown, restartShownChanged, switchMessage, upsertMessage } from "./agents.ts";
 import type { MenuItem } from "./components/Menu.tsx";
-import { nextWhen } from "./schedules.ts";
+import { isProposal, nextWhen } from "./schedules.ts";
 import { restartExpect, restartOutcome, restartWait } from "./updates.ts";
 import type {
   Agent,
@@ -1941,6 +1941,12 @@ export function approveSchedule(s: Schedule) {
 /** Dismiss an agent's proposal, or a schedule made outside the window: it is removed (it never
  * ran). */
 export function dismissProposal(s: Schedule) {
+  // A menu opened earlier holds the schedule as it was: approved since (here or in another
+  // window), it is no longer a proposal, and Dismiss must not remove it.
+  const live = schedules.peek().find((x) => x.id === s.id);
+  if (!live || !isProposal(live)) {
+    return toast("info", `${s.name} isn't waiting for approval any more, so it stays.`, 4000);
+  }
   rpc.call("schedule.remove", { id: s.id }).then(() => {
     schedules.value = schedules.value.filter((x) => x.id !== s.id);
     const whose = s.made_by && s.made_by.approved_at === null ? `${s.made_by.agent}'s proposal` : "the schedule";

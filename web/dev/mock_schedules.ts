@@ -555,7 +555,7 @@ export function scheduleMock(deps: ScheduleDeps) {
     throw new Error('when is required: {kind: "cron", cron}, {kind: "once", at} or {kind: "once", local}');
   }
 
-  function create(p: any) {
+  function create(p: any, madeBy: Sched["made_by"] = null) {
     const a = agentNamed(p.agent);
     const tz = String(p.tz ?? "").trim() || MOCK_ZONE;
     const when = whenIn(p.when, tz);
@@ -589,7 +589,10 @@ export function scheduleMock(deps: ScheduleDeps) {
       window_from: t,
       created_at: t,
       updated_at: t,
+      made_by: madeBy,
     };
+    // A proposal keeps no next run until it is approved, and is published once, as a proposal.
+    if (madeBy && madeBy.approved_at === null) s.next_run = null;
     list.push(s);
     return publish(s);
   }
@@ -622,6 +625,8 @@ export function scheduleMock(deps: ScheduleDeps) {
     }
     if ("note" in p) s.note_id = noteOf(p.note);
     if ("daily_cap" in p) s.daily_cap = capOf(p.daily_cap);
+    // Editing a proposal leaves it waiting: no next run until it is approved.
+    if (waiting(s)) s.next_run = null;
     s.updated_at = now();
     return publish(s);
   }
@@ -675,8 +680,9 @@ export function scheduleMock(deps: ScheduleDeps) {
         const s = get(p.id);
         if (!waiting(s)) throw new Error("it doesn't wait for approval");
         if (p.seen !== undefined && p.seen !== s.updated_at) throw new Error("it changed since you looked; look again");
+        const next = firstSlot(s.when, now());
         s.made_by!.approved_at = now();
-        s.next_run = firstSlot(s.when, now());
+        s.next_run = next;
         s.updated_at = now();
         return publish(s);
       }
@@ -710,6 +716,7 @@ export function scheduleMock(deps: ScheduleDeps) {
       }
       case "schedule.run": {
         const s = get(p.id);
+        if (waiting(s)) throw new Error("it waits for your approval: approve it first");
         const going = (runs.get(s.id) ?? []).some((r) => r.outcome === "pending");
         if (going) {
           const r = newRun(s, { kind: "manual", outcome: "skipped", finished_at: now(), reason: "busy: the previous run is still going" });
@@ -881,12 +888,10 @@ export function scheduleMock(deps: ScheduleDeps) {
 
   /** Seed: an agent's proposal waiting for approval, made `ageMs` ago. */
   function propose(p: any, by: string, reason: string, ageMs: number) {
-    const j = create(p) as { id: number };
-    const s = get(j.id);
     const a = agentNamed(by);
+    const j = create(p, { agent_id: a.id, agent: a.name, kind: "proposal", reason, at: now() - ageMs, approved_at: null }) as { id: number };
+    const s = get(j.id);
     s.created_at = s.updated_at = s.window_from = now() - ageMs;
-    s.made_by = { agent_id: a.id, agent: a.name, kind: "proposal", reason, at: now() - ageMs, approved_at: null };
-    s.next_run = null;
     return publish(s);
   }
 

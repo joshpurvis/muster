@@ -959,20 +959,24 @@ try {
       await a.key("Enter");
       await a.wait(`document.querySelector('.or-opt.on')?.dataset.model === 'qwen/qwen3.5-coder'`, 1000);
       await a.key("Ctrl+Enter");
-      await a.wait(`!document.querySelector('.agent-dlg') && !!document.querySelector('[data-agent="or-coder"] .or-badge')`, 3000);
+      // The badge is in the agent's card (hover or → on its row).
+      await a.wait(`!document.querySelector('.agent-dlg') && !!document.querySelector('.channel-row[data-agent="or-coder"]')`, 3000);
+      await a.eval(`${M}.agentCard.value = { agent: ${M}.agents.value.find((x) => x.name === 'or-coder')?.id, byKey: true }`);
+      await a.wait(`!!document.querySelector('.agent-card .or-badge')`, 3000);
       const orAgent: any = (await R(a, "agent.list", {})).find((x: any) => x.name === "or-coder");
       check(
         orAgent?.provider === "openrouter" && orAgent.model === "qwen/qwen3.5-coder",
         `created on OpenRouter with the picked model: ${JSON.stringify(orAgent)}`,
       );
       // Started, its tab carries the badge too.
-      await a.click(`[data-agent="or-coder"]`);
+      await a.click(`.channel-row[data-agent="or-coder"] .channel-select`);
       await a.wait(`!!document.querySelector('.tab.active .tab-or')`, 6000);
       await shot(a, "10f-agent-openrouter-badge");
       // Switched back to the subscription while running: it still bills OpenRouter until it
       // restarts, and both the row and the tab keep saying so.
       await R(a, "agent.update", { name: "or-coder", provider: "subscription" });
-      await a.wait(`document.querySelector('[data-agent="or-coder"] .or-badge')?.textContent === 'OpenRouter · until restart'`, 3000);
+      await a.eval(`${M}.agentCard.value = { agent: ${M}.agents.value.find((x) => x.name === 'or-coder')?.id, byKey: true }`);
+      await a.wait(`document.querySelector('.agent-card .or-badge')?.textContent === 'OpenRouter · until restart'`, 3000);
       check(await a.eval(`!!document.querySelector('.tab.active .tab-or')`), "the tab keeps its badge until a restart");
       await R(a, "agent.remove", { name: "or-coder" });
       await a.wait(`!document.querySelector('.tab-or')`, 3000);

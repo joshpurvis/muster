@@ -14,7 +14,7 @@ key press away, and the terminals keep running when the window closes.
 
 ## What you get
 
-- **Channels for projects.** Channels sit above Agents in a split sidebar. Each has its own
+- **Channels for projects.** The sidebar lists your channels, each named agent in its own channel's row. Each has its own
   tiles and tabs, so switching projects restores your arrangement. New tabs join the selected
   channel; Alt+Shift+N creates another channel, optionally in its own worktree. Drag tabs
   between tiles, channels and windows. Empty channels stay ready for your next session.

@@ -37,18 +37,21 @@ export function otherName(channel: Channel | null, agent: Agent | null): string 
   return agent.name;
 }
 
+/** Failed runs the human hid from Needs you: schedule id → the run hidden (a per-viewer pref). */
+export type HiddenRuns = Readonly<Record<string, number>>;
+
 /** The schedule's last run failed (blocked, refused, no reply, timed out, ended, failed) and the
  * human hasn't hidden that run. A newer run replaces it, so the next failure shows again. */
-export function failedRun(s: Schedule, hidden: readonly number[]): boolean {
+export function failedRun(s: Schedule, hidden: HiddenRuns): boolean {
   const r = s.last_run;
-  return !!r && !isProposal(s) && outcomeTone(r.outcome) === "bad" && !hidden.includes(r.id);
+  return !!r && !isProposal(s) && outcomeTone(r.outcome) === "bad" && hidden[s.id] !== r.id;
 }
 
 export type NeedsItem = { kind: "proposal"; schedule: Schedule } | { kind: "run"; schedule: Schedule };
 
 /** What the "Needs you" box holds: schedules waiting for approval, oldest first, then schedules
  * whose last run failed, newest failure first. Empty: the box isn't shown. */
-export function needsYouItems(schedules: Schedule[], hidden: readonly number[]): NeedsItem[] {
+export function needsYouItems(schedules: Schedule[], hidden: HiddenRuns): NeedsItem[] {
   const props = waitingProposals(schedules).map((s): NeedsItem => ({ kind: "proposal", schedule: s }));
   const runs = schedules.filter((s) => failedRun(s, hidden))
     .sort((a, b) => (b.last_run!.started_at - a.last_run!.started_at) || a.id - b.id)
@@ -65,7 +68,7 @@ export interface RowChip {
   label: string;
 }
 
-export function rowChip(agentId: number, schedules: Schedule[], hidden: readonly number[]): RowChip | null {
+export function rowChip(agentId: number, schedules: Schedule[], hidden: HiddenRuns): RowChip | null {
   const own = schedules.filter((s) => s.agent_id === agentId);
   if (!own.length) return null;
   const waiting = own.filter(isProposal).length;
@@ -81,9 +84,12 @@ export function rowChip(agentId: number, schedules: Schedule[], hidden: readonly
   return { tone: "plain", count: own.length, label: n(own.length, "schedule", "schedules") };
 }
 
-/** Remember a hidden failed run, keeping the newest `max` (a per-viewer pref). */
-export function hideRun(hidden: readonly number[], runId: number, max = 100): number[] {
-  return [runId, ...hidden.filter((x) => x !== runId)].slice(0, max);
+/** Hide a schedule's failed run; entries of schedules that are gone are dropped. */
+export function hideRun(hidden: HiddenRuns, scheduleId: number, runId: number, live: readonly number[]): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const [k, v] of Object.entries(hidden)) if (live.includes(Number(k))) out[k] = v;
+  out[scheduleId] = runId;
+  return out;
 }
 
 /** What a key does to an agent's card: → on a focused row opens it (focus moves in); Esc, or ←

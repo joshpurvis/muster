@@ -414,8 +414,8 @@ export interface Prefs {
   jumpRaises: boolean;
   /** The sidebar's message log is expanded. */
   agentFeed: boolean;
-  /** Failed schedule runs hidden from the sidebar's Needs you box (run ids, newest first). */
-  hiddenRuns: number[];
+  /** Failed schedule runs hidden from the sidebar's Needs you box: schedule id → the run hidden. */
+  hiddenRuns: Record<string, number>;
   /** The sidebar's Usage card shows each account's bars. */
   usageCard: boolean;
 }
@@ -430,7 +430,7 @@ const defaultPrefs: Prefs = {
   altToTerminal: false,
   jumpRaises: false,
   agentFeed: true,
-  hiddenRuns: [],
+  hiddenRuns: {},
   usageCard: true,
 };
 

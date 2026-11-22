@@ -22,8 +22,8 @@ import { Feed, useNow } from "./Agents.tsx";
 import { UsageCard } from "./AccountProfiles.tsx";
 import { NeedsYou, scheduleHeaderItems, SchedulesPausedNotice } from "./Schedules.tsx";
 import {
-  AgentCard, agentCard, AgentDot, agentFacts, closeCard, hoverCard, leaveCard, openAgentRow, openCardByKey,
-  rowMenuItems,
+  AgentCard, agentCard, AgentDot, agentFacts, channelHere, closeCard, hoverCard, leaveCard, openCardByKey,
+  rowAgentAction, rowFocusOut, rowMenuItems,
 } from "./AgentCard.tsx";
 
 /** From this width the rows show each agent's state and time, cold, and its schedule count. */
@@ -173,8 +173,8 @@ function qualifier(c: Channel, list: Channel[]): string | null {
 function channelItems(c: Channel, rename: () => void): MenuItem[] {
   return [
     { label: "Rename", run: rename },
-    { label: "New tab", run: () => { A.openChannel(c.id, false); A.newTabHere(); } },
-    { label: "New note", run: () => { A.openChannel(c.id, false); A.newNote(); } },
+    { label: "New tab", run: () => { if (channelHere(c.id)) { A.openChannel(c.id, false); A.newTabHere(); } } },
+    { label: "New note", run: () => { if (channelHere(c.id)) { A.openChannel(c.id, false); A.newNote(); } } },
     { label: "Permissions…", run: () => A.openPermissions(c.id) },
     { label: "Copy folder path", run: () => A.copy(c.cwd, "Path copied") },
     { label: "New channel in this project…",
@@ -186,6 +186,10 @@ function channelItems(c: Channel, rename: () => void): MenuItem[] {
     { label: "Archive channel…", danger: true, run: () => A.archiveChannelAsk(c) },
   ];
 }
+
+/** A click's agent action waits this long, so a double-click (rename) never starts or moves it. */
+const DOUBLE_MS = 260;
+let clickTimer = 0;
 
 /** A channel (with its agent, if one owns it), or an agent whose channel isn't in this window. */
 function Row({ row, context, now }: { row: SidebarRow; context: string | null; now: number }) {
@@ -215,14 +219,27 @@ function Row({ row, context, now }: { row: SidebarRow; context: string | null; n
       facts!.status,
       facts!.cold ? "prompt cache likely expired" : null,
       c ? (attention ? `${attention} need you` : `${count} ${count === 1 ? "tab" : "tabs"}`) : "no channel in this window",
-      chip && chip.tone !== "plain" ? chip.label : null,
+      chip?.label,
     ].filter(Boolean).join(", ")
     : undefined;
-  const open = () => a ? openAgentRow(a, c, hereIds.peek()) : A.openChannel(c!.id);
+  // The channel opens at once; starting or bringing back its agent waits out a double-click.
+  const open = (e: MouseEvent) => {
+    clearTimeout(clickTimer);
+    if (c) A.openChannel(c.id);
+    const act = a ? rowAgentAction(a, c, hereIds.peek()) : null;
+    if (!act) return;
+    if (!c || e.detail === 0) return act();
+    clickTimer = setTimeout(act, DOUBLE_MS);
+  };
+  const rename = () => {
+    clearTimeout(clickTimer);
+    setEditing(true);
+  };
   return <div ref={ref} class={cx("channel-row", active && "active", c && unread.value.has(c.id) && !active && "unread",
     c && d?.channel === c.id && "channel-drop", a && "agent-row", cardOpen && "card-open")}
     data-channel-id={c?.id} data-agent-id={a?.id} data-agent={a?.name}
     onMouseEnter={a ? () => hoverCard(a.id) : undefined} onMouseLeave={a ? () => leaveCard(a.id) : undefined}
+    onFocusOut={a ? (e) => rowFocusOut(a.id, e.currentTarget, e.relatedTarget as HTMLElement | null) : undefined}
     {...contextMenu(menu)}>
     {editing && c ? <div class="channel-rename"><InlineEdit fields={[{ value: c.name, label: "Channel name" }]}
       onCommit={([n]) => { setEditing(false); A.renameChannel(c.id, n); }} onCancel={() => setEditing(false)} /></div> :
@@ -232,9 +249,10 @@ function Row({ row, context, now }: { row: SidebarRow; context: string | null; n
         aria-controls={cardOpen ? `agent-card-${a!.id}` : undefined} aria-keyshortcuts={a ? "ArrowRight" : undefined}
         data-tip={a ? undefined :
           `${c!.name} · ${tildify(c!.cwd, meta.value.home)}${c!.branch ? ` · ${c!.branch}` : ""}${attention ? ` · ${attention} need you` : ""}${cache ? ` · ${CACHE_DOT_LABEL[cache]}` : ""}`}
-        onClick={open} onDblClick={c ? () => setEditing(true) : undefined}>
+        onClick={open} onDblClick={c ? rename : undefined}>
         {a ? <AgentDot a={a} /> : <StateDot state={state} cache={cache} />}
-        {context ? <span class="channel-label"><span class="channel-name">{name}</span>
+        {context ? <span class="channel-label">
+          <span class="channel-name">{name}{other && <span class="channel-agent"> {other}</span>}</span>
           <span class="channel-context">{context}</span></span> :
           <span class="channel-name">{name}{other && <span class="channel-agent"> {other}</span>}</span>}
         {facts && <span class="row-wide row-state">{facts.status}</span>}

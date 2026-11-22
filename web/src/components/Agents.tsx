@@ -174,7 +174,8 @@ export function Feed({ now }: { now: number }) {
             </div>
           )}
           {list.map((m) => <FeedEntry key={m.id} m={m} now={now} />)}
-          {list.length >= 20 && !olderState.done.has(selName ?? "*") && (
+          {/* Filtered to one agent, its older messages may lie past the newest page of all of them. */}
+          {(list.length >= 20 || selName) && !olderState.done.has(selName ?? "*") && (
             <button type="button" class="ap-older" onClick={older}>Older messages</button>
           )}
         </div>

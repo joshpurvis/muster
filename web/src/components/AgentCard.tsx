@@ -7,6 +7,9 @@ import {
   accountProfiles,
   cacheNow,
   meta,
+  overlay,
+  windowChannels,
+  toast,
   scheduleSettings,
   schedules,
   schedulesSupported,
@@ -27,8 +30,9 @@ import { ScheduleList } from "./Schedules.tsx";
 import { IconMore } from "../icons.tsx";
 
 /** The open card: whose, and whether the keyboard opened it (focus is in it; leaving the row
- * with the pointer doesn't close it). One at a time. */
-export const agentCard = signal<{ agent: number; byKey: boolean } | null>(null);
+ * with the pointer doesn't close it). `n` counts keyboard opens, so → on a row whose card is
+ * already open moves focus into it again. One at a time. */
+export const agentCard = signal<{ agent: number; byKey: boolean; n?: number } | null>(null);
 
 /** The agent's live facts, as its row and card show them. */
 export function agentFacts(a: Agent, now: number) {
@@ -98,15 +102,21 @@ function moveTip(move: NonNullable<ReturnType<typeof pendingMove>>): string {
   return `${move.text}. Until then it keeps running on ${move.from}. ${why}`;
 }
 
-/** Click on an agent's row: its channel, as any channel; an agent that isn't running starts (as
- * Show does), and one whose tab was closed or is in another window comes here. */
-export function openAgentRow(a: Agent, channel: Channel | null, here: ReadonlySet<number>) {
+/** What a click on an agent's row does beyond opening its channel: start an agent that isn't
+ * running (as Show does), or bring back its tab when it was closed or is in another window. An
+ * asleep agent's tab is only shown (looking never wakes it). Null: the channel is enough. */
+export function rowAgentAction(a: Agent, channel: Channel | null, here: ReadonlySet<number>): (() => void) | null {
   const s = a.session_id !== null ? sessions.peek().get(a.session_id) : undefined;
   const st = agentStatus(a, s);
-  if (channel && a.session_id !== null && here.has(a.session_id) && (st.live || st.asleep)) {
-    return A.openChannel(channel.id);
-  }
-  A.openAgent(a.name);
+  if (channel && a.session_id !== null && here.has(a.session_id) && (st.live || st.asleep)) return null;
+  return () => A.openAgent(a.name);
+}
+
+/** The channel is still in this window (a menu or card opened earlier may hold an archived one). */
+export function channelHere(id: number): boolean {
+  if (windowChannels.peek().some((c) => c.id === id)) return true;
+  toast("info", "That channel is no longer in this window.", 3000);
+  return false;
 }
 
 const OPEN_MS = 350;
@@ -121,8 +131,8 @@ export function hoverCard(agent: number) {
   const cur = agentCard.peek();
   if (cur?.agent === agent) return;
   clearTimeout(openTimer);
-  // A card the keyboard opened stays until the keyboard (or a click elsewhere) closes it.
-  if (cur?.byKey) return;
+  // A card the keyboard opened stays while focus is in it or its row.
+  if (cur?.byKey && document.activeElement?.closest(`.channel-row[data-agent-id="${cur.agent}"]`)) return;
   openTimer = setTimeout(() => (agentCard.value = { agent, byKey: false }), cur ? SWITCH_MS : OPEN_MS);
 }
 
@@ -152,13 +162,24 @@ export function closeCard(focusRow = false) {
   if (focusRow) rowButton(cur.agent)?.focus();
 }
 
-/** Open an agent's card from the keyboard (→ on its row, or a Needs you item): focus goes in. */
+/** Open an agent's card from the keyboard (→ on its row, or a Needs you item): focus goes in,
+ * also when it is already open. */
 export function openCardByKey(agent: number) {
   clearTimeout(openTimer);
   clearTimeout(closeTimer);
   const row = rowButton(agent);
   row?.scrollIntoView({ block: "nearest" });
-  agentCard.value = { agent, byKey: true };
+  agentCard.value = { agent, byKey: true, n: (agentCard.peek()?.n ?? 0) + 1 };
+}
+
+/** Focus left an agent's row and its card (Tab past the card, a click elsewhere): a card the
+ * keyboard opened closes. A dialog or menu it opened (a run's message, Edit…) keeps it, so focus
+ * comes back to it. */
+export function rowFocusOut(agent: number, row: HTMLElement, to: HTMLElement | null) {
+  const cur = agentCard.peek();
+  if (!cur || cur.agent !== agent || !cur.byKey || !to || row.contains(to) || menu.peek()) return;
+  if (to.closest?.(".modal-backdrop, .menu-layer")) return;
+  closeCard();
 }
 
 function rowButton(agent: number) {
@@ -178,6 +199,7 @@ export function AgentCard(
 ) {
   const ref = useRef<HTMLDivElement>(null);
   const byKey = agentCard.value?.byKey ?? false;
+  const opens = agentCard.value?.n ?? 0;
   const { s, st, cold, dot, status } = agentFacts(a, now);
   const billing = agentBilling(a, s);
   const spent = billing.badge ? scheduleSettings.value?.spend?.agents.find((x) => x.id === a.id)?.spent : undefined;
@@ -195,7 +217,11 @@ export function AgentCard(
     const place = () => {
       const r = row.getBoundingClientRect();
       const side = row.closest(".sidebar")?.getBoundingClientRect();
-      el.style.left = `${Math.round((side?.right ?? r.right) + 6)}px`;
+      // Beside the dock when there is room for it; in a narrow window, over the dock's right part.
+      const left = (side?.right ?? r.right) + 6;
+      const w = Math.min(360, innerWidth - 16);
+      el.style.width = `${w}px`;
+      el.style.left = `${Math.round(innerWidth - left - 8 >= Math.min(w, 300) ? left : Math.max(8, innerWidth - w - 8))}px`;
       const h = el.offsetHeight;
       el.style.top = `${Math.round(Math.max(8, Math.min(r.top - 6, innerHeight - h - 8)))}px`;
     };
@@ -205,9 +231,31 @@ export function AgentCard(
     return () => ro.disconnect();
   });
 
-  // Opened by the keyboard: focus its first button.
+  // Opened by the keyboard: focus its first button (again on each → while it is open).
   useEffect(() => {
     if (byKey) ref.current?.querySelector<HTMLElement>("button")?.focus();
+  }, [byKey, opens]);
+
+  // A live update removed the control that had focus (a proposal approved elsewhere): focus
+  // goes back into the card instead of falling out of it.
+  useEffect(() => {
+    if (byKey && !overlay.peek() && (!document.activeElement || document.activeElement === document.body)) {
+      ref.current?.querySelector<HTMLElement>("button")?.focus();
+    }
+  });
+
+  // Opened by hover, Esc closes it wherever focus is (before it reaches the terminal); menus and
+  // dialogs answer Esc first.
+  useEffect(() => {
+    if (byKey) return;
+    const key = (e: KeyboardEvent) => {
+      if (e.key !== "Escape" || menu.peek() || overlay.peek()) return;
+      e.preventDefault();
+      e.stopPropagation();
+      closeCard();
+    };
+    addEventListener("keydown", key, true);
+    return () => removeEventListener("keydown", key, true);
   }, [byKey]);
 
   // The row scrolled, the window lost focus or was resized: the card would float away; close it.
@@ -239,14 +287,6 @@ export function AgentCard(
           e.stopPropagation();
           closeCard(true);
         }
-      }}
-      onFocusOut={(e) => {
-        // Focus left the card and its row (Tab past its last button, a click elsewhere): close.
-        // A dialog or menu it opened (a run's message, Edit…) keeps it, so focus comes back to it.
-        const to = e.relatedTarget as HTMLElement | null;
-        if (!to || ref.current?.contains(to) || anchor.current?.contains(to) || menu.peek()) return;
-        if (to.closest?.(".modal-backdrop, .menu-layer")) return;
-        if (agentCard.peek()?.byKey) closeCard();
       }}
       onContextMenu={(e) => {
         // The card's own rows have their menus; empty space gets the row's.
@@ -299,11 +339,16 @@ export function AgentCard(
       <div class="ac-actions">
         <button type="button" class="btn btn-sm" onClick={() => A.openAgent(a.name)}>{showLabel}</button>
         {channel && (
-          <button type="button" class="btn btn-sm" onClick={() => { closeCard(); A.openChannel(channel.id, false); A.newTabHere(); }}>
+          <button type="button" class="btn btn-sm" onClick={() => {
+            if (!channelHere(channel.id)) return;
+            closeCard();
+            A.openChannel(channel.id, false);
+            A.newTabHere();
+          }}>
             New tab
           </button>
         )}
-        <button type="button" class="btn btn-sm" onClick={() => { closeCard(); A.editAgent(a.name, "memory"); }}>Memory…</button>
+        <button type="button" class="btn btn-sm" onClick={() => A.editAgent(a.name, "memory")}>Memory…</button>
         <button type="button" class="btn btn-sm" onClick={() => { closeCard(); A.openAgent(a.name, true); }}>Start fresh</button>
         <button type="button" class="btn btn-sm ac-more" aria-label={`More for ${a.name}`} aria-haspopup="menu" onClick={more}>
           <IconMore size={13} />

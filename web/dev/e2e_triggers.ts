@@ -169,7 +169,9 @@ export async function triggerChecks(a: Browser, { shots, ok, check }: TriggerCtx
   await a.wait(`!!${row(url.name)}`, 2000);
   await card(url.name);
   await a.eval(`${row(url.name)}.scrollIntoView({ block: 'center' })`);
-  await a.click(`${await rowSel(url.name)} .sch-more`);
+  await a.sleep(250); // the card settles where it fits once its rows are in
+  const rs = await rowSel(url.name);
+  await a.click(`${rs} .sch-more`);
   await a.wait(`!!document.querySelector('.menu')`, 2000);
   const labels = await menuLabels();
   check(labels.includes("Copy trigger command") && labels.includes("New secret…") && !labels.includes("Skip next run"), `the URL trigger's menu: ${labels}`);

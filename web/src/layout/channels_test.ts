@@ -128,6 +128,11 @@ Deno.test("sidebar preferences are window-wide, validated and survive channel re
   equal(sidebarWidth(NaN), 240);
   equal(sidebarWidth(-1), 200);
   equal(sidebarWidth(333.4), 333);
+  // A window that showed the old Agents section with Channels collapsed shows the merged list.
+  const agentsOnly = loadChannelLayout({ v: 2, layouts: {}, active: 10, sidebar: { channels: false, agents: true } }, [10], []);
+  equal(agentsOnly.sidebar.channels, true);
+  const neither = loadChannelLayout({ v: 2, layouts: {}, active: 10, sidebar: { channels: false, agents: false } }, [10], []);
+  equal(neither.sidebar.channels, false);
 });
 
 Deno.test("a new channel in an open folder joins it, across accounts", () => {

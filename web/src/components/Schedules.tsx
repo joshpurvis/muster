@@ -84,7 +84,7 @@ import type { Schedule, SchedulePreview, ScheduleRun, ScheduleSettings, WhenInpu
 import { KIND_LABEL } from "../types.ts";
 import { Kbd, Spinner } from "./common.tsx";
 import { openMenu, type MenuItem } from "./Menu.tsx";
-import { IconAgents, IconChevronDown, IconClock, IconMore, IconPause, IconShieldAlert, IconSpark, IconZap } from "../icons.tsx";
+import { IconAgents, IconChevron, IconChevronDown, IconClock, IconMore, IconPause, IconShieldAlert, IconSpark, IconZap } from "../icons.tsx";
 import { MoreOptions, PillSelect } from "./DialogKit.tsx";
 import { cx } from "../util.ts";
 import { idleText } from "../cache.ts";
@@ -147,6 +147,27 @@ export function NeedsYou({ now, openAgent }: { now: number; openAgent: (agent: n
   );
 }
 
+/** An action that takes an item out of Needs you (Approve, Dismiss, Hide) leaves keyboard focus
+ * on the next item, else the previous one, else the agent's row, else the Channels heading. */
+function keepFocus(from: Element, agentId: number, act: () => void) {
+  const item = from.closest(".ny-item");
+  const items = [...document.querySelectorAll<HTMLElement>(".needs-you .ny-item")];
+  const i = item ? items.indexOf(item as HTMLElement) : -1;
+  const next = [...items.slice(i + 1), ...items.slice(0, Math.max(0, i)).reverse()]
+    .map((x) => x.querySelector<HTMLElement>(".ny-name"));
+  act();
+  const settle = (tries: number) => {
+    if (document.activeElement && document.activeElement !== document.body && document.activeElement.isConnected) return;
+    const to = next.find((x) => x?.isConnected) ??
+      document.querySelector<HTMLElement>(`.channel-row[data-agent-id="${agentId}"] .channel-select`) ??
+      document.querySelector<HTMLElement>(".channels-panel .sidebar-heading");
+    if (to) to.focus();
+    else if (tries > 0) setTimeout(() => settle(tries - 1), 100);
+  };
+  // The item goes when the change comes back (Approve and Dismiss wait for the backend).
+  for (const ms of [0, 150, 400, 900]) setTimeout(() => settle(0), ms);
+}
+
 /** A waiting schedule in Needs you: its name (opens its agent's card, which shows the whole
  * proposal), who proposed it and when, and Approve / Edit… / Dismiss. */
 function NeedsProposal({ s, now, openAgent }: { s: Schedule; now: number; openAgent: (agent: number) => void }) {
@@ -179,6 +200,7 @@ function NeedsProposal({ s, now, openAgent }: { s: Schedule; now: number; openAg
           onKeyDown={(e) => {
             if (e.key === "ContextMenu" || (e.key === "F10" && e.shiftKey)) {
               e.preventDefault();
+              e.stopPropagation();
               const r = e.currentTarget.getBoundingClientRect();
               proposalMenu(s, r.left + 24, r.bottom - 4);
             }
@@ -187,13 +209,15 @@ function NeedsProposal({ s, now, openAgent }: { s: Schedule; now: number; openAg
           {s.name}
         </button>
         <span class="ny-sub">
-          {by}{on} · <span data-tip={new Date(since).toLocaleString()}>{nextWhenPast(since, now)}</span>
+          {by}{on} <span class="ny-when" data-tip={new Date(since).toLocaleString()}>· {nextWhenPast(since, now)}</span>
         </span>
         <span class="ny-actions">
-          <button type="button" class="btn btn-sm btn-primary sch-approve" onClick={() => A.approveSchedule(s)}>Approve</button>
+          <button type="button" class="btn btn-sm btn-primary sch-approve"
+            onClick={(e) => keepFocus(e.currentTarget, s.agent_id, () => A.approveSchedule(s))}>Approve</button>
           <button type="button" class="btn btn-sm" onClick={() => A.editSchedule(s.id)}>Edit…</button>
           {fresh
-            ? <button type="button" class="btn btn-sm sch-dismiss" onClick={() => A.dismissProposal(s)}>Dismiss</button>
+            ? <button type="button" class="btn btn-sm sch-dismiss"
+              onClick={(e) => keepFocus(e.currentTarget, s.agent_id, () => A.dismissProposal(s))}>Dismiss</button>
             : <button type="button" class="btn btn-sm sch-dismiss" onClick={() => A.removeSchedule(s)}>Remove…</button>}
         </span>
       </div>
@@ -234,19 +258,23 @@ function NeedsRun({ s, now }: { s: Schedule; now: number }) {
               onKeyDown={(e) => {
                 if (e.key === "ContextMenu" || (e.key === "F10" && e.shiftKey)) {
                   e.preventDefault();
+                  e.stopPropagation();
                   const r = e.currentTarget.getBoundingClientRect();
                   scheduleMenu(s, r.left + 24, r.bottom - 4);
                 }
               }}
             >
-              {s.name}
+              <IconChevron size={10} class={cx("ny-chev", open && "open")} />
+              <span class="ny-label">{s.name}</span>
             </button>
             <button
               type="button"
               class="sch-link ny-hide"
               data-tip="Take it out of Needs you until a run fails again"
               aria-label={`Hide ${s.name} until a run fails again`}
-              onClick={() => setPref("hiddenRuns", hideRun(prefs.value.hiddenRuns, last.id))}
+              onClick={(e) =>
+                keepFocus(e.currentTarget, s.agent_id, () =>
+                  setPref("hiddenRuns", hideRun(prefs.value.hiddenRuns, s.id, last.id, schedules.peek().map((x) => x.id))))}
             >
               Hide
             </button>
@@ -385,6 +413,7 @@ function ProposalCard({ s, now }: { s: Schedule; now: number }) {
         if (e.key === "ArrowDown" || e.key === "ArrowUp") moveRow(e);
         else if (e.key === "ContextMenu" || (e.key === "F10" && e.shiftKey)) {
           e.preventDefault();
+          e.stopPropagation();
           const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
           proposalMenu(s, r.left + 24, r.top + 24);
         }
@@ -562,6 +591,7 @@ function TimedRow({ s, now }: { s: Schedule; now: number }) {
           } else if (e.key === "ArrowDown" || e.key === "ArrowUp") moveRow(e);
           else if (e.key === "ContextMenu" || (e.key === "F10" && e.shiftKey)) {
             e.preventDefault();
+            e.stopPropagation();
             const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
             scheduleMenu(s, r.left + 24, r.bottom - 4);
           }

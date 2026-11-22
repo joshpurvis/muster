@@ -56,29 +56,34 @@ Deno.test("Needs you holds proposals oldest first, then failed runs newest first
     sch(6, 2, { last_run: run(103, "skipped") }),
     sch(7, 2, { last_run: run(104, "pending") }),
   ];
-  equal(needsYouItems(list, []).map((i) => [i.kind, i.schedule.id]), [
+  equal(needsYouItems(list, {}).map((i) => [i.kind, i.schedule.id]), [
     ["proposal", 5], ["proposal", 3], ["run", 4], ["run", 2],
   ]);
-  equal(needsYouItems(list, [102]).map((i) => i.schedule.id), [5, 3, 2]);
-  equal(needsYouItems([sch(1, 1)], []), []);
-  // A newer failed run of a hidden schedule shows again.
-  equal(failedRun(sch(2, 1, { last_run: run(105, "timed_out") }), [101]), true);
+  equal(needsYouItems(list, { 4: 102 }).map((i) => i.schedule.id), [5, 3, 2]);
+  equal(needsYouItems([sch(1, 1)], {}), []);
+  // A newer failed run of a hidden schedule shows again; hiding one schedule's run hides no other's.
+  equal(failedRun(sch(2, 1, { last_run: run(105, "timed_out") }), { 2: 101 }), true);
+  equal(failedRun(sch(2, 1, { last_run: run(102, "failed") }), { 4: 102 }), true);
 });
 
 Deno.test("an agent's row chip: red for a failed run, amber for a proposal, else its schedule count", () => {
   const list = [proposal(1, 1), sch(2, 1, { last_run: run(10, "blocked") }), sch(3, 2), sch(4, 2), proposal(5, 3)];
-  equal(rowChip(1, list, []), {
+  equal(rowChip(1, list, {}), {
     tone: "bad", count: 2, label: "1 schedule waits for your approval; 1 schedule's last run failed",
   });
-  equal(rowChip(1, list, [10]), { tone: "wait", count: 1, label: "1 schedule waits for your approval" });
-  equal(rowChip(2, list, []), { tone: "plain", count: 2, label: "2 schedules" });
-  equal(rowChip(3, list, [])?.tone, "wait");
-  equal(rowChip(9, list, []), null);
+  equal(rowChip(1, list, { 2: 10 }), { tone: "wait", count: 1, label: "1 schedule waits for your approval" });
+  equal(rowChip(2, list, {}), { tone: "plain", count: 2, label: "2 schedules" });
+  equal(rowChip(3, list, {})?.tone, "wait");
+  equal(rowChip(9, list, {}), null);
 });
 
-Deno.test("hiding a run keeps the newest first and caps the list", () => {
-  equal(hideRun([1, 2, 3], 2), [2, 1, 3]);
-  equal(hideRun([1, 2, 3], 4, 3), [4, 1, 2]);
+Deno.test("hiding a run is remembered per schedule; schedules that are gone are dropped", () => {
+  equal(hideRun({}, 7, 70, [7]), { 7: 70 });
+  // A newer failure of the same schedule replaces the old entry; a removed schedule's entry goes.
+  equal(hideRun({ 7: 70, 8: 80, 9: 90 }, 7, 71, [7, 8]), { 7: 71, 8: 80 });
+  // However many are hidden, one stays hidden until its schedule runs again.
+  const many = Object.fromEntries(Array.from({ length: 300 }, (_, i) => [i, i]));
+  equal(hideRun(many, 500, 1, [...Array(301).keys(), 500])[0], 0);
 });
 
 Deno.test("keys: → opens a focused row's card; Esc closes it, ← too from one of its buttons", () => {

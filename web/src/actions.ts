@@ -1101,11 +1101,11 @@ export function restartOrInterruptAsk(sid: SessionId, what: "restart" | "interru
     kind: "confirm",
     title: again ? "Look again before restarting" : `${KIND_LABEL[s.kind]} is working`,
     // Claude and Codex both reopen their conversation (Codex: once it has a finished turn).
-    body: what === "restart"
+    body: (again ? "Its run or its account move changed while this was open. " : "") + (what === "restart"
       ? move
         ? `Restart it? ${midTurn(s) ? "Its current turn is lost, and it" : "It"} moves to ${move.to}: a new conversation there (its memory/ notes come along).`
         : `Restart it? ${midTurn(s) ? "Its current turn is lost; it" : "It"} reopens the same conversation.`
-      : "Stop its current turn?",
+      : "Stop its current turn?"),
     confirmLabel: what === "restart" ? "Restart" : "Interrupt",
     danger: true,
     run: () => {

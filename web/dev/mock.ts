@@ -1581,6 +1581,22 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
     return { key_present: orKey };
   }
   if (method === "account_profile.list") return accountProfiles;
+  if (method === "account_profile.update") {
+    // Rename or turn a profile on or off (the directory is fixed, src/account_profiles.rs).
+    const pf = accountProfiles.find((x) => x.id === p.id);
+    if (!pf) throw new Error("no such profile");
+    if (typeof p.name === "string") pf.name = p.name;
+    if (typeof p.enabled === "boolean") pf.enabled = p.enabled;
+    broadcast("account_profiles_changed", accountProfiles);
+    return pf;
+  }
+  if (method === "mock.session_state") {
+    // Pretend a session's run changed state ({id, state}): a turn starting, say.
+    const s = sessions.get(p.id);
+    if (!s) throw new Error("no such session");
+    setState(s, p.state);
+    return {};
+  }
   if (method === "account_usage.get") return accountUsage();
   // Codex's plan limits as its newest session log saw them (src/codex_usage.rs).
   if (method === "codex_usage.get") {

@@ -447,13 +447,18 @@ try:
     until("idle after its turn", lambda: session(sid)["state"] == "idle")
     rpc("session.restart", {"id": sid, "expect": {"pid": timed_pid, "handoff_at": 1, "idle": False}}, error="changed since this was shown")
     rpc("session.restart", {"id": sid, "expect": {"pid": timed_pid + 100000, "handoff_at": None, "idle": False}}, error="changed since this was shown")
+    idle_since = session(sid)["state_since"]
     run_token = json.loads((DATA / "sessions" / str(sid) / "claude-mcp.json").read_text())["mcpServers"]["muster"]["headers"]["Authorization"].removeprefix("Bearer ")
     status, _ = http("/hook/UserPromptSubmit", {"session_id": "personal-again", "prompt": "a new turn"}, run_token)
     assert status == 200
     until("working", lambda: session(sid)["state"] == "working")
     rpc("session.restart", {"id": sid, "expect": {"pid": timed_pid, "handoff_at": None, "idle": True}}, error="changed since this was shown")
+    # A dialog shown for the idle run, or for an earlier turn: the turn that began since is new.
+    rpc("session.restart", {"id": sid, "expect": {"pid": timed_pid, "handoff_at": None, "idle": False, "since": idle_since}},
+        error="changed since this was shown")
     check(session(sid)["pid"] == timed_pid, "a Restart confirmation for another run, move or turn state stops nothing")
-    confirmed = rpc("session.restart", {"id": sid, "expect": {"pid": timed_pid, "handoff_at": None, "idle": False}})
+    confirmed = rpc("session.restart", {"id": sid, "expect": {"pid": timed_pid, "handoff_at": None, "idle": False,
+                                                          "since": session(sid)["state_since"]}})
     check(confirmed["pid"] != timed_pid, "the confirmation for what is true restarts it")
 
     # ----- usage display and placement suggestions (docs/ACCOUNT_PROFILES.md steps 2-3) -----

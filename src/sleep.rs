@@ -734,8 +734,9 @@ pub(crate) async fn sleep_held(hub: &Arc<Hub>, name: &str, why: Why, _held: &cra
         _ => human_at(hub, info.id, now),
     };
     if typed_just_now(why, typed, now) {
-        let what = if why == Why::Move { "restart" } else { "sleep" };
-        return Err(NotNow(format!("{} can't {what} now: you typed into it just now", a.name)).into());
+        // A move also counts an agent's keys: say it neutrally.
+        let (what, typed) = if why == Why::Move { ("restart", "keys were typed into it just now") } else { ("sleep", "you typed into it just now") };
+        return Err(NotNow(format!("{} can't {what} now: {typed}", a.name)).into());
     }
     // The run that was checked: only it is stopped.
     let Some(generation) = hub.pty_generation(info.id) else {

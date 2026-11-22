@@ -146,7 +146,7 @@ All ids are numbers. Types (`Workspace`, `Channel`, `SessionInfo`, `Event`) are 
 | `session.detach` | `{id}` | `{}` |
 | `session.resize` | `{id, cols, rows}` | `{}` (last resizer wins). Sets `SessionInfo.size_owner` to `"local"` (client token) or `"device:<id>"`; a change of owner alone also emits `session_upserted`. `size_owner` is runtime only (null after a daemon restart). |
 | `session.kill` | `{id}` | `{}` |
-| `session.restart` | `{id, expect?}` | `SessionInfo` (new process, same id, same kind/cwd/name; replay cleared). `expect: {pid, handoff_at?, idle?}`: what a Restart confirmation showed (the run's `pid`, the named agent's waiting move's `handoff.at` or null for none, and `idle: true` when it promised no turn is lost); refused with "it changed since this was shown: look again" when the run, the move or (with `idle`) its turn state differs, checked under the start lock for a named agent's tab. The window's busy-tab Restart sends it and asks again on that refusal. |
+| `session.restart` | `{id, expect?}` | `SessionInfo` (new process, same id, same kind/cwd/name; replay cleared). `expect: {pid, handoff_at?, idle?, since?}`: what the window showed (the run's `pid`, the named agent's waiting move's `handoff.at` or null for none, `idle: true` when no turn would be lost, and the run's `state_since`, so a turn that ended and another that began is a change); refused with "it changed since this was shown: look again" when any differs, checked under the start lock for a named agent's tab, and again after its folder is prepared, right before its conversation is reset. The window's tab and terminal menus send it (also for an idle run, which restarts without asking) and ask again on that refusal. |
 | `session.remove` | `{id}` | `{}` (kills if alive, deletes; emits `session_removed`). Removing a channel's last session leaves the empty channel available (see "Groups layout (v2)"). A named agent's session is never removed this way: it is hidden instead, as `session.hide`, and the reply is `{hidden: true, session: SessionInfo}` (so no client can stop an agent by closing its tab, whatever it knows about agents); `agent.remove` removes it. |
 | `session.hide` | `{id}` | `SessionInfo`. Closes a named agent's tab without stopping it: the session keeps its process, scrollback and channel and gets `hidden: true`, `window_id: null` (see "Groups layout (v2)", hidden agent tabs). Hiding a hidden one is a no-op; a session that isn't a named agent's is refused (`session N is not a named agent's`), so ordinary tabs close only with `session.remove`. `session.set_window` shows it again. No device scope. |
 | `session.rename` | `{id, name}` | `SessionInfo` |
@@ -1397,7 +1397,7 @@ note's text itself). `handoff` is cleared once that run has started; later start
 HANDOFF.md starts with a line saying Muster wrote it; a HANDOFF.md without that line (the agent's
 own) is renamed to `HANDOFF.agent.md` (or `HANDOFF.agent-N.md`) first, never overwritten.
 
-The reply's `switch` says what happens: `{to, now, running, outcome, notes, notes_skipped?, error?}`.
+The reply's `switch` says what happens: `{to, now, running, outcome, notes, notes_skipped?, error?, why?}`.
 `to` is the new profile's name; `running`: whether it had a live run when the move was handled (a snapshot). `notes` is `asked` when `save_notes` is true and the agent is running, idle (state `idle`, nothing queued; an errored
 run is not) and the account its run is on isn't at its limit (a current 5-hour or weekly figure
 at 100%): Muster sends it
@@ -1407,7 +1407,7 @@ permission prompt (the owner can approve it), and only if that run is still live
 the message goes; otherwise `skipped`, with
 `notes_skipped` `off`, `not_running`, `busy` or `at_limit`. `why` (with `busy`, when known): why
 the restart couldn't happen now, from the sleep's checks (an unsent draft, keys typed in the last
-15 seconds, by the human or an agent, ...). `outcome`: `next_start`;
+15 seconds, by the human or an agent: "keys were typed into it just now", ...). `outcome`: `next_start`;
 `restarted` (`now`, and it was idle: put to sleep and started again on the new profile, a new
 conversation, as above); `busy` (`now`, but it wasn't idle: it moves at its next start); `replaced`
 (`now`, but a newer move had replaced this one: by the time the start lock was free, or while

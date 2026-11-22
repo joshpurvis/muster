@@ -1436,8 +1436,10 @@ export function AgentDialog(
             <div class="field pill-panel move-panel" role="group" aria-labelledby={`${id}-waiting`}>
               <span class="field-label" id={`${id}-waiting`}>{waiting.text}</span>
               <span class="field-hint" id={`${id}-waiting-hint`}>
-                {waiting.running
+                {waiting.running && !waiting.off
                   ? `Until then it keeps running on ${waiting.from}. Restarting starts a new conversation on ${waiting.to}; its memory/ notes come along.`
+                  : waiting.running
+                  ? `Until then it keeps running on ${waiting.from}.`
                   : waiting.why}
               </span>
               {waiting.running && (

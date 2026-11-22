@@ -2625,6 +2625,10 @@ pub struct RestartExpect {
     pub handoff_at: Option<i64>,
     #[serde(default)]
     pub idle: bool,
+    /// The run's `state_since` when shown: a turn that ended and another that began since (same
+    /// run) is a change too.
+    #[serde(default)]
+    pub since: Option<i64>,
 }
 
 /// The words the window looks for to ask again (web/src/actions.ts `restartOrInterruptAsk`).
@@ -2634,7 +2638,8 @@ fn check_restart_expect(hub: &Hub, id: SessionId, agent: Option<&Agent>, e: &Res
     let s = hub.session(id).ok_or_else(|| anyhow::anyhow!("no such session: {id}"))?;
     let mid_turn = matches!(s.state, AgentState::Working | AgentState::NeedsApproval | AgentState::AskingQuestion | AgentState::Stuck);
     let handoff = agent.and_then(|a| a.handoff.as_ref()).map(|h| h.at);
-    anyhow::ensure!(s.pid == e.pid && handoff == e.handoff_at && !(e.idle && mid_turn), "{RESTART_CHANGED}: look again");
+    anyhow::ensure!(s.pid == e.pid && handoff == e.handoff_at && !(e.idle && mid_turn) && e.since.is_none_or(|t| t == s.state_since),
+        "{RESTART_CHANGED}: look again");
     Ok(())
 }
 
@@ -2658,6 +2663,12 @@ pub async fn restart_session(hub: &Arc<Hub>, id: SessionId, expect: Option<&Rest
     hub.check_account_profile(agent.account_profile_id)?;
     check_provider(hub, agent.kind, agent.provider, agent.model.as_deref(), true)?;
     let (channel, cwd) = prepare_channel(hub, &agent, None).await?;
+    // Preparing the folder can take a while: what was shown must still hold right before the
+    // conversation is reset and the run replaced (a move saved meanwhile is a change too).
+    if let Some(e) = expect {
+        agent = hub.agents().by_session(id).ok_or_else(|| anyhow::anyhow!("agent was removed"))?;
+        check_restart_expect(hub, id, Some(&agent), e)?;
+    }
     if agent.reset_on_next_start || agent.handoff.is_some() {
         hub.fence_conversation(id);
         agent = hub.agents().reset_for_start(hub.store(), agent.id, &agent.working_location)?;
@@ -2974,8 +2985,9 @@ fn move_preflight(hub: &Hub, a: &Agent) -> anyhow::Result<()> {
     check_location(hub, &a.working_location)?;
     // The folder it will run in, as `prepare_channel` picks it (its own channel's checkout, or its
     // home): a worktree removed on disk would stop it and then fail to start.
+    // Home: the start makes it again if it is missing (`ensure_home`), so only a checkout counts.
     let cwd = if a.working_location == WorkingLocation::Home {
-        Some(a.home_dir.clone())
+        None
     } else {
         let ws = a.working_location.workspace_id();
         let worktree = matches!(a.working_location, WorkingLocation::Worktree { .. });
@@ -3029,7 +3041,7 @@ async fn save_notes_then(hub: &Arc<Hub>, sw: Switch, to: String) {
             .await.map_err(|e| format!("{e:#}"))
     };
     let said = match &replied {
-        Ok(true) => format!("{name} answered the request to save its notes"),
+        Ok(true) => format!("{name} finished its turn on the request to save notes"),
         Ok(false) => format!("{name} didn't reply within {} minutes", save_notes_wait().as_secs() / 60),
         Err(e) => {
             tracing::warn!(agent = name, "asking it to save notes before its move: {e}");

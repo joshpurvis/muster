@@ -1067,7 +1067,7 @@ export function closeTaskRemoveWorktree(c: Channel) {
 export function restartSession(
   sid: SessionId,
   focus = true,
-  expect?: { pid: number | null; handoff_at: number | null; idle: boolean },
+  expect?: { pid: number | null; handoff_at: number | null; idle: boolean; since: number },
   changed?: () => void,
 ) {
   rpc.call("session.restart", expect ? { id: sid, expect } : { id: sid }).then(() => {
@@ -1101,17 +1101,29 @@ export function interruptSession(sid: SessionId) {
  * it asks again with what is true now instead of acting. */
 export function restartOrInterruptAsk(sid: SessionId, what: "restart" | "interrupt", again = false) {
   const s = sessions.value.get(sid);
-  const act = () => (what === "restart" ? restartSession(sid) : interruptSession(sid));
-  if (!s || (!again && !midTurn(s))) return act();
+  if (!s) return what === "restart" ? restartSession(sid) : interruptSession(sid);
   // A named agent with a move waiting: its restart is the move (a new conversation there).
   const ownerOf = () => agents.value.find((a) => a.session_id === sid);
   const owner = ownerOf();
   const move = owner ? pendingMove(owner, s, accountProfiles.value) : null;
   const shown = restartShown(owner, s);
   const busy = midTurn(s);
+  // Asked again after a refusal: only while the owner is still here (no other dialog opened
+  // meanwhile), and never to start a run that ended.
+  const askAgain = () => {
+    const cur = sessions.value.get(sid);
+    if (!cur || cur.state === "exited") return toast("warn", "That run ended before the restart: nothing was restarted.");
+    if (overlay.value) return toast("warn", "It changed before the restart, so nothing was restarted. Look again and restart it.");
+    restartOrInterruptAsk(sid, what, true);
+  };
+  // What the owner saw, for the backend to check (a turn that began, a move saved since).
+  const expect = { pid: shown.pid, handoff_at: shown.move, idle: !busy, since: s.state_since };
   if (what === "restart" && move?.off) {
     // It can't start there: say so rather than offer a restart the backend refuses.
     return toast("warn", `${owner!.name} can't restart: ${move.why}`, 8000);
+  }
+  if (!again && !busy) {
+    return what === "restart" ? restartSession(sid, true, expect, askAgain) : interruptSession(sid);
   }
   overlay.value = {
     kind: "confirm",
@@ -1119,7 +1131,7 @@ export function restartOrInterruptAsk(sid: SessionId, what: "restart" | "interru
     key: again ? `restart-again-${Date.now()}` : undefined,
     title: again ? "Look again before restarting" : `${KIND_LABEL[s.kind]} is working`,
     // Claude and Codex both reopen their conversation (Codex: once it has a finished turn).
-    body: (again ? "Its run or its account move changed while this was open. " : "") + (what === "restart"
+    body: (again ? "Its run, its turn or its account move changed before the restart. " : "") + (what === "restart"
       ? move
         ? `Restart it? ${busy ? "Its current turn is lost, and it" : "It"} moves to ${move.to}: a new conversation there (its memory/ notes come along).`
         : `Restart it? ${busy ? "Its current turn is lost; it" : "It"} reopens the same conversation.`
@@ -1127,15 +1139,11 @@ export function restartOrInterruptAsk(sid: SessionId, what: "restart" | "interru
     confirmLabel: what === "restart" ? "Restart" : "Interrupt",
     danger: true,
     run: () => {
-      if (what !== "restart") return act();
+      if (what !== "restart") return interruptSession(sid);
       const cur = sessions.value.get(sid);
       const now = cur ? restartShown(ownerOf(), cur) : null;
-      const askAgain = () => restartOrInterruptAsk(sid, what, true);
-      if (restartShownChanged(shown, now) || (!busy && cur && midTurn(cur))) {
-        if (!cur || cur.state === "exited") return toast("warn", "That run ended before you confirmed: nothing was restarted.");
-        return askAgain();
-      }
-      restartSession(sid, true, { pid: shown.pid, handoff_at: shown.move, idle: !busy }, askAgain);
+      if (restartShownChanged(shown, now) || (!busy && cur && midTurn(cur))) return askAgain();
+      restartSession(sid, true, expect, askAgain);
     },
   };
 }

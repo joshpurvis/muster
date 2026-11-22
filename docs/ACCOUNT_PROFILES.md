@@ -473,7 +473,8 @@ As built (2026-11-13), where it adds to the plan above:
   is launching gives that run the second move's prompt (its next start then hands off again);
   a run that exits at once still counts as the handoff's start.
 - The Now restart and its outcome after Save notes are notices, since the dialog has closed:
-  "saved its notes and moved to Work", or busy (moves at its next start).
+  "finished its turn on the request to save notes and moved to Work", or that it can't restart now
+  and why (it moves at its next start).
 - `agent.update` replies with `switch` (docs/PROTOCOL.md). The CLI also takes `--reason TEXT`.
 - Also from a Claude agent's tab menu ("Switch account…"), not only the Agents panel row.
 

@@ -710,9 +710,16 @@ async fn dispatch_inner(hub: &Arc<Hub>, who: &Principal, method: &str, params: V
             Ok(json!({}))
         }
         "session.restart" => {
-            let p: IdParam<SessionId> = parse(params)?;
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct P {
+                id: SessionId,
+                #[serde(default)]
+                expect: Option<crate::agents::RestartExpect>,
+            }
+            let p: P = parse(params)?;
             // A named agent's tab under the start lock, like every start of it (src/sleep.rs).
-            to_value(crate::agents::restart_session(hub, p.id).await?)
+            to_value(crate::agents::restart_session(hub, p.id, p.expect.as_ref()).await?)
         }
         "session.remove" => {
             let p: IdParam<SessionId> = parse(params)?;

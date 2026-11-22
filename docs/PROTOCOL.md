@@ -146,7 +146,7 @@ All ids are numbers. Types (`Workspace`, `Channel`, `SessionInfo`, `Event`) are 
 | `session.detach` | `{id}` | `{}` |
 | `session.resize` | `{id, cols, rows}` | `{}` (last resizer wins). Sets `SessionInfo.size_owner` to `"local"` (client token) or `"device:<id>"`; a change of owner alone also emits `session_upserted`. `size_owner` is runtime only (null after a daemon restart). |
 | `session.kill` | `{id}` | `{}` |
-| `session.restart` | `{id}` | `SessionInfo` (new process, same id, same kind/cwd/name; replay cleared) |
+| `session.restart` | `{id, expect?}` | `SessionInfo` (new process, same id, same kind/cwd/name; replay cleared). `expect: {pid, handoff_at?, idle?}`: what a Restart confirmation showed (the run's `pid`, the named agent's waiting move's `handoff.at` or null for none, and `idle: true` when it promised no turn is lost); refused with "it changed since this was shown: look again" when the run, the move or (with `idle`) its turn state differs, checked under the start lock for a named agent's tab. The window's busy-tab Restart sends it and asks again on that refusal. |
 | `session.remove` | `{id}` | `{}` (kills if alive, deletes; emits `session_removed`). Removing a channel's last session leaves the empty channel available (see "Groups layout (v2)"). A named agent's session is never removed this way: it is hidden instead, as `session.hide`, and the reply is `{hidden: true, session: SessionInfo}` (so no client can stop an agent by closing its tab, whatever it knows about agents); `agent.remove` removes it. |
 | `session.hide` | `{id}` | `SessionInfo`. Closes a named agent's tab without stopping it: the session keeps its process, scrollback and channel and gets `hidden: true`, `window_id: null` (see "Groups layout (v2)", hidden agent tabs). Hiding a hidden one is a no-op; a session that isn't a named agent's is refused (`session N is not a named agent's`), so ordinary tabs close only with `session.remove`. `session.set_window` shows it again. No device scope. |
 | `session.rename` | `{id, name}` | `SessionInfo` |
@@ -1381,7 +1381,7 @@ session; `muster agent edit --save-notes` passes `$MUSTER_SESSION_ID`): the requ
 prompt into the agent as the human's. Now first checks the new account, provider and working
 location as a start would (a refusal stops nothing), then restarts through a sleep under the
 start lock (src/sleep.rs: refused, as `busy`, while a prompt is being typed or waits, a message
-is on its way or the human typed into it in the last 15 seconds), then a start, which is the move's new
+is on its way or the human, or an agent's keys, typed into it in the last 15 seconds), then a start, which is the move's new
 conversation; a run that stopped or fell asleep meanwhile isn't woken (`next_start`). A move sets `account_profile_id`, sets `reset_on_next_start` (a conversation
 can't follow it to another account; a location change in the same call needs no
 `reset_conversation`) and records `handoff: {from, at, reason?}` on the agent (`from`: the
@@ -1405,13 +1405,15 @@ at 100%): Muster sends it
 (origin human) and waits for its reply, up to 10 minutes, also through a turn stopped on a
 permission prompt (the owner can approve it), and only if that run is still live and idle when
 the message goes; otherwise `skipped`, with
-`notes_skipped` `off`, `not_running`, `busy` or `at_limit`. `outcome`: `next_start`;
+`notes_skipped` `off`, `not_running`, `busy` or `at_limit`. `why` (with `busy`, when known): why
+the restart couldn't happen now, from the sleep's checks (an unsent draft, keys typed in the last
+15 seconds, by the human or an agent, ...). `outcome`: `next_start`;
 `restarted` (`now`, and it was idle: put to sleep and started again on the new profile, a new
 conversation, as above); `busy` (`now`, but it wasn't idle: it moves at its next start); `replaced`
 (`now`, but a newer move had replaced this one: by the time the start lock was free, or while
 the old run stopped, when it started with the newer move);
 `after_notes` (`now` after the notes reply, if it is still running and idle and no newer move
-replaced this one; what happened, saved or no reply within the wait, is a `notice`); `failed` (`error`; it moves at its next start).
+replaced this one; what happened, a reply or none within the wait, is a `notice`); `failed` (`error`: a refused destination stops nothing, and the move still waits).
 
 Selection is resolved before creation and saved on the session. Restarts never re-resolve
 workspace defaults. Named-agent replacement sessions use the agent's pinned selection and

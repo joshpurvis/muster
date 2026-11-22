@@ -1445,18 +1445,22 @@ export function AgentDialog(
                   <button
                     type="button"
                     class="btn"
-                    disabled={!waiting.restart || restarting}
+                    disabled={!waiting.restart}
+                    // Kept focusable while the request runs (a disabled button drops focus).
+                    aria-disabled={restarting || undefined}
                     aria-describedby={waiting.why ? `${id}-waiting-hint ${id}-waiting-why` : `${id}-waiting-hint`}
                     onClick={async (e) => {
+                      if (restarting) return;
                       const button = e.currentTarget;
                       setRestarting(true);
-                      const moved = await A.restartToMove(agent);
+                      await A.restartToMove(agent);
                       setRestarting(false);
-                      // The panel goes once it moved: keep the keyboard in the dialog, unless it
-                      // was already elsewhere. A refused restart leaves focus where it is.
-                      if (moved && (document.activeElement === button || document.activeElement === document.body)) {
-                        profileRef.current?.focus();
-                      }
+                      // Unless the owner moved on: back to the button if it is still there, or to
+                      // the account picker once the panel went (the move happened or changed).
+                      const lost = document.activeElement === button || document.activeElement === document.body || !document.activeElement;
+                      if (!lost) return;
+                      if (button.isConnected && !button.disabled) button.focus();
+                      else profileRef.current?.focus();
                     }}
                   >
                     Restart now

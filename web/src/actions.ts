@@ -1062,10 +1062,20 @@ export function closeTaskRemoveWorktree(c: Channel) {
   };
 }
 
-export function restartSession(sid: SessionId, focus = true) {
-  rpc.call("session.restart", { id: sid }).then(() => {
+/** `expect`: what a confirmation showed; the backend refuses a restart that would now do
+ * something else (`changed`, if given, then runs instead of the failure toast). */
+export function restartSession(
+  sid: SessionId,
+  focus = true,
+  expect?: { pid: number | null; handoff_at: number | null; idle: boolean },
+  changed?: () => void,
+) {
+  rpc.call("session.restart", expect ? { id: sid, expect } : { id: sid }).then(() => {
     if (focus && focusedSession.value?.id === sid) focusActiveTerminalSoon();
-  }).catch(fail("Restart failed")).catch(() => {});
+  }).catch((e) => {
+    if (changed && String(e instanceof Error ? e.message : e).includes("changed since this was shown")) return changed();
+    fail("Restart failed")(e);
+  }).catch(() => {});
 }
 
 export function killSession(sid: SessionId) {
@@ -1085,9 +1095,10 @@ export function interruptSession(sid: SessionId) {
 }
 
 /** Restart / Interrupt from a tab or terminal menu: asks first while an agent is mid-turn (its
- * turn is lost). Palette commands and shortcuts act at once. The dialog names the run and the
- * move it would apply; if either changed before Confirm (another client restarted it, or a move
- * was saved or replaced), it asks again with what is true now instead of acting. */
+ * turn is lost). Palette commands and shortcuts act at once. The dialog names the run, the move
+ * it would apply and whether a turn is lost; Confirm sends them (`session.restart`'s `expect`),
+ * and if any changed (another client restarted it, a move was saved or replaced, a turn began)
+ * it asks again with what is true now instead of acting. */
 export function restartOrInterruptAsk(sid: SessionId, what: "restart" | "interrupt", again = false) {
   const s = sessions.value.get(sid);
   const act = () => (what === "restart" ? restartSession(sid) : interruptSession(sid));
@@ -1097,24 +1108,34 @@ export function restartOrInterruptAsk(sid: SessionId, what: "restart" | "interru
   const owner = ownerOf();
   const move = owner ? pendingMove(owner, s, accountProfiles.value) : null;
   const shown = restartShown(owner, s);
+  const busy = midTurn(s);
+  if (what === "restart" && move?.off) {
+    // It can't start there: say so rather than offer a restart the backend refuses.
+    return toast("warn", `${owner!.name} can't restart: ${move.why}`, 8000);
+  }
   overlay.value = {
     kind: "confirm",
+    // A new dialog each time it asks again (its focus starts on Cancel, not on Restart).
+    key: again ? `restart-again-${Date.now()}` : undefined,
     title: again ? "Look again before restarting" : `${KIND_LABEL[s.kind]} is working`,
     // Claude and Codex both reopen their conversation (Codex: once it has a finished turn).
     body: (again ? "Its run or its account move changed while this was open. " : "") + (what === "restart"
       ? move
-        ? `Restart it? ${midTurn(s) ? "Its current turn is lost, and it" : "It"} moves to ${move.to}: a new conversation there (its memory/ notes come along).`
-        : `Restart it? ${midTurn(s) ? "Its current turn is lost; it" : "It"} reopens the same conversation.`
+        ? `Restart it? ${busy ? "Its current turn is lost, and it" : "It"} moves to ${move.to}: a new conversation there (its memory/ notes come along).`
+        : `Restart it? ${busy ? "Its current turn is lost; it" : "It"} reopens the same conversation.`
       : "Stop its current turn?"),
     confirmLabel: what === "restart" ? "Restart" : "Interrupt",
     danger: true,
     run: () => {
+      if (what !== "restart") return act();
       const cur = sessions.value.get(sid);
-      if (what === "restart" && restartShownChanged(shown, cur ? restartShown(ownerOf(), cur) : null)) {
+      const now = cur ? restartShown(ownerOf(), cur) : null;
+      const askAgain = () => restartOrInterruptAsk(sid, what, true);
+      if (restartShownChanged(shown, now) || (!busy && cur && midTurn(cur))) {
         if (!cur || cur.state === "exited") return toast("warn", "That run ended before you confirmed: nothing was restarted.");
-        return restartOrInterruptAsk(sid, what, true);
+        return askAgain();
       }
-      act();
+      restartSession(sid, true, { pid: shown.pid, handoff_at: shown.move, idle: !busy }, askAgain);
     },
   };
 }

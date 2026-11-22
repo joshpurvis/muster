@@ -2613,14 +2613,46 @@ pub async fn wake_if_asleep(hub: &Arc<Hub>, id: i64) -> anyhow::Result<Option<Ag
     Ok(Some(s))
 }
 
+/// What a Restart confirmation showed (`session.restart`'s `expect`): the run it would end
+/// (`pid`), the account move it named (`handoff_at`, the waiting move's `handoff.at`; None: no
+/// move) and whether it said the run was idle, so no turn would be lost (`idle`). A restart that
+/// would now do something else is refused, to be asked again.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestartExpect {
+    pub pid: Option<u32>,
+    #[serde(default)]
+    pub handoff_at: Option<i64>,
+    #[serde(default)]
+    pub idle: bool,
+}
+
+/// The words the window looks for to ask again (web/src/actions.ts `restartOrInterruptAsk`).
+pub const RESTART_CHANGED: &str = "it changed since this was shown";
+
+fn check_restart_expect(hub: &Hub, id: SessionId, agent: Option<&Agent>, e: &RestartExpect) -> anyhow::Result<()> {
+    let s = hub.session(id).ok_or_else(|| anyhow::anyhow!("no such session: {id}"))?;
+    let mid_turn = matches!(s.state, AgentState::Working | AgentState::NeedsApproval | AgentState::AskingQuestion | AgentState::Stuck);
+    let handoff = agent.and_then(|a| a.handoff.as_ref()).map(|h| h.at);
+    anyhow::ensure!(s.pid == e.pid && handoff == e.handoff_at && !(e.idle && mid_turn), "{RESTART_CHANGED}: look again");
+    Ok(())
+}
+
 /// `session.restart` of session `id`: a named agent's tab restarts under the start lock, like
 /// any start of it, so a sleep that checked the old run can't stop the new one (src/sleep.rs).
-pub async fn restart_session(hub: &Arc<Hub>, id: SessionId) -> anyhow::Result<SessionInfo> {
+/// With `expect`, only if the run, its move and its turn are still as shown.
+pub async fn restart_session(hub: &Arc<Hub>, id: SessionId, expect: Option<&RestartExpect>) -> anyhow::Result<SessionInfo> {
     if hub.agents().by_session(id).is_none() {
+        if let Some(e) = expect {
+            check_restart_expect(hub, id, None, e)?;
+        }
         return hub.restart_session(id).await;
     }
     let _one = hub.agents().start_lock.lock().await;
     let mut agent = hub.agents().by_session(id).ok_or_else(|| anyhow::anyhow!("agent was removed"))?;
+    if let Some(e) = expect {
+        check_restart_expect(hub, id, Some(&agent), e)?;
+    }
     // As `start_once`: before the conversation is reset or the tab moved, so a profile that can't
     // start leaves both as they were.
     hub.check_account_profile(agent.account_profile_id)?;
@@ -2865,9 +2897,14 @@ pub async fn switch_account(hub: &Arc<Hub>, sw: Switch) -> Value {
     };
     out["notes"] = json!("skipped");
     out["notes_skipped"] = json!(why);
-    let outcome = if sw.now && live.is_some() { restart_moved(hub, &sw).await } else { Ok("next_start") };
+    let outcome = if sw.now && live.is_some() { restart_moved(hub, &sw).await } else { Ok(("next_start", None)) };
     match outcome {
-        Ok(o) => out["outcome"] = json!(o),
+        Ok((o, why)) => {
+            out["outcome"] = json!(o);
+            if let Some(why) = why {
+                out["why"] = json!(why);
+            }
+        }
         Err(e) => {
             out["outcome"] = json!("failed");
             out["error"] = json!(format!("{e:#}"));
@@ -2897,29 +2934,35 @@ pub fn notes_skipped(wanted: bool, live: Option<&SessionInfo>, at_limit: impl Fn
 /// conversation. `restarted`, `busy` (it moves at its next start, its turn untouched),
 /// `replaced` (a newer move, or a start that already moved it) or `next_start` (it stopped or
 /// fell asleep meanwhile: nothing to restart, and it isn't woken).
-async fn restart_moved(hub: &Arc<Hub>, sw: &Switch) -> anyhow::Result<&'static str> {
+async fn restart_moved(hub: &Arc<Hub>, sw: &Switch) -> anyhow::Result<(&'static str, Option<String>)> {
     #[cfg(test)]
     if hub.agents().fake_fresh_start.load(std::sync::atomic::Ordering::Relaxed) {
-        return fake_restart_moved(hub, sw);
+        return fake_restart_moved(hub, sw).map(|o| (o, None));
     }
     let held = hub.agents().start_lock.lock().await;
     let Some(a) = hub.agents().get(&sw.name).filter(|a| a.handoff.as_ref().is_some_and(|h| h.at == sw.at)) else {
-        return Ok("replaced");
+        return Ok(("replaced", None));
     };
-    let Some(live) = live_session(hub, &a) else { return Ok("next_start") };
+    let Some(live) = live_session(hub, &a) else { return Ok(("next_start", None)) };
     if !session_idle(&live) {
-        return Ok("busy");
+        return Ok(("busy", None));
     }
     move_preflight(hub, &a)?;
     if let Err(e) = crate::sleep::sleep_held(hub, &sw.name, crate::sleep::Why::Move, &held).await {
-        return if e.downcast_ref::<crate::sleep::NotNow>().is_some() { Ok("busy") } else { Err(e) };
+        let Some(no) = e.downcast_ref::<crate::sleep::NotNow>() else { return Err(e) };
+        // Its run ended meanwhile: nothing to restart, it moves at its next start.
+        if hub.agents().get(&sw.name).and_then(|b| live_session(hub, &b)).is_none() {
+            return Ok(("next_start", None));
+        }
+        // Why it couldn't restart now (an unsent draft, a prompt just typed, ...), for the owner.
+        return Ok(("busy", Some(no.reason().to_string())));
     }
     // A move saved while its run stopped is the one it starts with: say so.
     let same = hub.agents().get(&sw.name).is_some_and(|b| b.handoff.as_ref().is_some_and(|h| h.at == sw.at));
     let s = start_locked(hub, &sw.name, false, None, None).await
         .map_err(|e| e.context("it is asleep, and moves when it next wakes"))?;
     publish(hub, &s.agent);
-    Ok(if same { "restarted" } else { "replaced" })
+    Ok((if same { "restarted" } else { "replaced" }, None))
 }
 
 /// What the start checks, before a move's restart stops anything: a move to a disabled account
@@ -2928,7 +2971,22 @@ async fn restart_moved(hub: &Arc<Hub>, sw: &Switch) -> anyhow::Result<&'static s
 fn move_preflight(hub: &Hub, a: &Agent) -> anyhow::Result<()> {
     hub.check_account_profile(a.account_profile_id)?;
     check_provider(hub, a.kind, a.provider, a.model.as_deref(), true)?;
-    check_location(hub, &a.working_location)
+    check_location(hub, &a.working_location)?;
+    // The folder it will run in, as `prepare_channel` picks it (its own channel's checkout, or its
+    // home): a worktree removed on disk would stop it and then fail to start.
+    let cwd = if a.working_location == WorkingLocation::Home {
+        Some(a.home_dir.clone())
+    } else {
+        let ws = a.working_location.workspace_id();
+        let worktree = matches!(a.working_location, WorkingLocation::Worktree { .. });
+        a.channel_id.and_then(|id| hub.channel(id))
+            .filter(|c| !c.archived && Some(c.workspace_id) == ws && c.owns_worktree == worktree)
+            .map(|c| c.cwd)
+    };
+    if let Some(cwd) = cwd {
+        anyhow::ensure!(Path::new(&cwd).is_dir(), "working directory is missing: {cwd}");
+    }
+    Ok(())
 }
 
 /// `restart_moved` in unit tests (no terminal host): the same checks, then the start's handoff
@@ -2971,7 +3029,7 @@ async fn save_notes_then(hub: &Arc<Hub>, sw: Switch, to: String) {
             .await.map_err(|e| format!("{e:#}"))
     };
     let said = match &replied {
-        Ok(true) => format!("{name} saved its notes"),
+        Ok(true) => format!("{name} answered the request to save its notes"),
         Ok(false) => format!("{name} didn't reply within {} minutes", save_notes_wait().as_secs() / 60),
         Err(e) => {
             tracing::warn!(agent = name, "asking it to save notes before its move: {e}");
@@ -2986,11 +3044,12 @@ async fn save_notes_then(hub: &Arc<Hub>, sw: Switch, to: String) {
         return;
     }
     match restart_moved(hub, &sw).await {
-        Ok("restarted") => hub.notice("info", format!("{said} and moved to {to}.")),
-        Ok("replaced") => {}
-        Ok("next_start") => hub.notice("info", format!("{said}. It stopped meanwhile, so it moves to {to} at its next start.")),
-        Ok(_) => hub.notice("info", format!("{said}. It isn't idle, so it moves to {to} at its next start.")),
-        Err(e) => hub.notice("warn", format!("{said}, but didn't restart on {to}: {e:#}. It moves there at its next start.")),
+        Ok(("restarted", _)) => hub.notice("info", format!("{said} and moved to {to}.")),
+        Ok(("replaced", _)) => {}
+        Ok(("next_start", _)) => hub.notice("info", format!("{said}. It stopped meanwhile, so it moves to {to} at its next start.")),
+        Ok((_, why)) => hub.notice("info", format!("{said}. It can't restart now ({}), so it moves to {to} at its next start.",
+            why.as_deref().unwrap_or("it isn't idle"))),
+        Err(e) => hub.notice("warn", format!("{said}, but didn't restart on {to}: {e:#}. The move still waits.")),
     }
 }
 

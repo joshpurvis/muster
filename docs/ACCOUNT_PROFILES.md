@@ -388,8 +388,10 @@ What the owner sees:
 - **Edit agent:** the account picker becomes active for Claude agents. When the owner picks
   another account, the dialog says: "Moving to Work starts a new conversation. Its memory/ notes
   come along. The current conversation stays on Personal." Below it are two choices, **At its
-  next start** (the default) and **Now**. *Now* restarts the agent only if it is idle, using the
-  same check as `start_fresh_if`. If it is busy, the dialog says so and the switch waits for the
+  next start** (the default) and **Now**. *Now* first checks that the new account, provider and
+  working folder can start (if not, nothing is stopped and the move waits), then restarts the
+  agent only if it is idle: running, nothing queued or being typed, no unsent draft, nobody typed
+  into it in the last 15 seconds. Otherwise the message says why and the switch waits for the
   next start.
 - **Save notes first** (checkbox; off by default since 21 Nov 2026, now worded "Wake it first to
   save notes", and offered when the agent is running, idle and its current

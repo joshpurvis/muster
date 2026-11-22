@@ -178,7 +178,7 @@ export function Overlays() {
     case "shortcuts":
       return <Shortcuts />;
     case "confirm":
-      return <Confirm {...o} />;
+      return <Confirm {...o} key={o.key} />;
     case "permissions":
       return <PermissionsDialog key={o.channelId} channelId={o.channelId} Modal={Modal} close={close} />;
     case "agent":

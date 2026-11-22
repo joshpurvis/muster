@@ -523,7 +523,7 @@ export function pendingMove(
   return {
     to,
     from: profileName(profiles, a.handoff.from),
-    text: `Moves to ${to} at its next start`,
+    text: off ? `Can't move to ${to} yet: it is disabled` : `Moves to ${to} at its next start`,
     running,
     restart: idle && !off,
     off,
@@ -537,7 +537,7 @@ export function pendingMove(
       ? "It is busy. Restart now works once it is idle."
       : `It isn't running: it starts on ${to}.`,
     // The menus' short hint beside a disabled Restart now.
-    wait: off ? `${to} is disabled` : idle || !running ? undefined : queued ? "messages waiting" : "when idle",
+    wait: off ? "account disabled" : idle || !running ? undefined : queued ? "messages waiting" : "when idle",
   };
 }
 
@@ -571,7 +571,12 @@ export function switchMessage(name: string, sw: AgentSwitch): { level: "success"
     case "restarted":
       return { level: "success", text: `${name} moved to ${sw.to}: a new conversation started there.${notes}` };
     case "busy":
-      return { level: "warn", text: `${name} isn't idle, so it moves to ${sw.to} at its next start.${notes}` };
+      return {
+        level: "warn",
+        text: sw.why
+          ? `${name} can't restart now (${sw.why}), so it moves to ${sw.to} at its next start.${notes}`
+          : `${name} isn't idle, so it moves to ${sw.to} at its next start.${notes}`,
+      };
     case "replaced":
       return { level: "warn", text: `A newer move of ${name} replaced this one.` };
     case "after_notes":
@@ -582,7 +587,7 @@ export function switchMessage(name: string, sw: AgentSwitch): { level: "success"
     case "failed":
       return {
         level: "warn",
-        text: `${name} didn't restart: ${sw.error ?? "unknown error"}. It moves to ${sw.to} at its next start.`,
+        text: `${name} didn't restart: ${sw.error ?? "unknown error"}. The move to ${sw.to} still waits.`,
       };
     default:
       return {

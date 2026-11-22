@@ -252,6 +252,8 @@ export interface AgentSwitch {
   notes: "asked" | "skipped";
   notes_skipped?: "off" | "not_running" | "busy" | "at_limit";
   error?: string;
+  /** With `busy`: why it couldn't restart now (an unsent draft, keys just typed, ...). */
+  why?: string;
 }
 
 export interface Agent {

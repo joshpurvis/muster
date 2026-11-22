@@ -300,7 +300,7 @@ try:
     no_now = cli("agent", "edit", "reviewer", "--now")
     rec = reviewer()
     check(sw["outcome"] == "failed" and "disabled" in sw["error"] and "didn't restart" in no_now and "disabled" in no_now
-          and "moves to Work at its next start" in no_now and session(sid)["pid"] == replacement["pid"]
+          and "The move to Work still waits" in no_now and session(sid)["pid"] == replacement["pid"]
           and session(sid)["state"] != "exited" and rec["handoff"] and rec["account_profile_id"] == work,
           f"Restart now onto a disabled profile leaves the running agent alone ({no_now.strip()})")
     cli("profile", "enable", "Work")
@@ -416,21 +416,45 @@ try:
     before = {m["id"] for m in asked_to_save()}
     asked_at = time.monotonic()
     rpc("agent.update", {"name": "reviewer", "account_profile": personal, "now": True, "save_notes": True})
-    # The notes prompt was sent and typed in (out of its queue, not refused), then the wait ran out.
+    # The notes prompt was sent and typed in (out of its queue, not refused), and its turn began
+    # (Claude's submit hook); then the wait runs out with the turn still going.
     until("the second notes prompt typed in", lambda: session(sid)["queued"] == 0 and any(
         m["id"] not in before and "account Home" in m["text"] and not m["refused"] for m in asked_to_save()))
+    status, _ = http("/hook/UserPromptSubmit", {"session_id": "work-again", "prompt": "You are moving to account Home."},
+                     json.loads((DATA / "sessions" / str(sid) / "claude-mcp.json").read_text())["mcpServers"]["muster"]["headers"]["Authorization"].removeprefix("Bearer "))
+    assert status == 200
+    until("the notes turn working", lambda: session(sid)["state"] == "working")
     time.sleep(max(0.0, asked_at + 6 + 1.5 - time.monotonic()))
     check(session(sid)["pid"] == replied_pid and reviewer()["handoff"] is not None and reviewer()["account_profile_id"] == personal,
           "without a reply, the turn it was asked for isn't cut off: the move waits for its next start")
     # Its turn ends: Restart now (`now` alone, for the move shown) moves it.
     hooks(sid, "work-again", reply="Saved.")
     until("idle after its turn", lambda: session(sid)["state"] == "idle")
-    stale = rpc("agent.update", {"name": "reviewer", "now": True, "handoff_at": reviewer()["handoff"]["at"] - 1}, error="changed since")
+    # The move shown is replaced (twice, ending where it was) before Restart now is clicked.
+    shown_at = reviewer()["handoff"]["at"]
+    rpc("agent.update", {"name": "reviewer", "account_profile": "default"})
+    rpc("agent.update", {"name": "reviewer", "account_profile": personal})
+    stale = rpc("agent.update", {"name": "reviewer", "now": True, "handoff_at": shown_at}, error="changed since")
+    check(session(sid)["pid"] == replied_pid, "a replaced move's Restart now stops nothing")
     sw = rpc("agent.update", {"name": "reviewer", "now": True, "handoff_at": reviewer()["handoff"]["at"]})["switch"]
     timed_pid = session(sid)["pid"]
     check(stale and sw["outcome"] == "restarted" and timed_pid != replied_pid
           and launched(sid, timed_pid)["config_dir"] == str(BASE / "personal"),
           "Restart now applies the move it showed, and refuses one replaced since")
+    # A busy tab's Restart confirmation sends what it showed: the run, the move (none here) and
+    # whether a turn would be lost. Anything else is refused, to ask again; nothing is stopped.
+    hooks(sid, "personal-again")
+    until("idle after its turn", lambda: session(sid)["state"] == "idle")
+    rpc("session.restart", {"id": sid, "expect": {"pid": timed_pid, "handoff_at": 1, "idle": False}}, error="changed since this was shown")
+    rpc("session.restart", {"id": sid, "expect": {"pid": timed_pid + 100000, "handoff_at": None, "idle": False}}, error="changed since this was shown")
+    run_token = json.loads((DATA / "sessions" / str(sid) / "claude-mcp.json").read_text())["mcpServers"]["muster"]["headers"]["Authorization"].removeprefix("Bearer ")
+    status, _ = http("/hook/UserPromptSubmit", {"session_id": "personal-again", "prompt": "a new turn"}, run_token)
+    assert status == 200
+    until("working", lambda: session(sid)["state"] == "working")
+    rpc("session.restart", {"id": sid, "expect": {"pid": timed_pid, "handoff_at": None, "idle": True}}, error="changed since this was shown")
+    check(session(sid)["pid"] == timed_pid, "a Restart confirmation for another run, move or turn state stops nothing")
+    confirmed = rpc("session.restart", {"id": sid, "expect": {"pid": timed_pid, "handoff_at": None, "idle": False}})
+    check(confirmed["pid"] != timed_pid, "the confirmation for what is true restarts it")
 
     # ----- usage display and placement suggestions (docs/ACCOUNT_PROFILES.md steps 2-3) -----
     now = int(time.time())

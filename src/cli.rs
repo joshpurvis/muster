@@ -2740,11 +2740,14 @@ pub fn switch_line(name: &str, sw: &Value) -> Option<String> {
     };
     let what = match sw["outcome"].as_str() {
         Some("restarted") => format!("{name} moved to {to} now: a new conversation started there."),
-        Some("busy") => format!("{name} isn't idle, so it moves to {to} at its next start."),
+        Some("busy") => match sw["why"].as_str() {
+            Some(why) => format!("{name} can't restart now ({why}), so it moves to {to} at its next start."),
+            None => format!("{name} isn't idle, so it moves to {to} at its next start."),
+        },
         Some("replaced") => format!("A newer move of {name} replaced this one."),
         Some("after_notes") => format!("Muster waits for {name}'s reply, then restarts it on {to} if it is idle; otherwise it \
             moves at its next start."),
-        Some("failed") => format!("{name} didn't restart: {}. It moves to {to} at its next start.",
+        Some("failed") => format!("{name} didn't restart: {}. The move to {to} still waits.",
             sw["error"].as_str().unwrap_or("unknown error")),
         // No run to restart (`--now` asked, or not).
         _ if sw["now"] == true || sw["running"] == false => format!("{name} isn't running, so it moves to {to} at its next \
@@ -3048,6 +3051,11 @@ mod tests {
         assert!(l.contains("isn't running") && l.contains("moves to Work at its next start") && !l.contains("--now"), "{l}");
         let l = line(json!({"to": "Work", "now": true, "notes": "skipped", "notes_skipped": "off", "outcome": "busy"}));
         assert!(l.contains("isn't idle") && l.contains("moves to Work at its next start"), "{l}");
+        let l = line(json!({"to": "Work", "now": true, "notes": "skipped", "notes_skipped": "off", "outcome": "busy",
+            "why": "unsent text is in the input box"}));
+        assert_eq!(l, "alpha can't restart now (unsent text is in the input box), so it moves to Work at its next start.");
+        let l = line(json!({"to": "Work", "now": true, "notes": "skipped", "outcome": "failed", "error": "profile is disabled"}));
+        assert_eq!(l, "alpha didn't restart: profile is disabled. The move to Work still waits.");
         let l = line(json!({"to": "Work", "now": false, "notes": "asked", "outcome": "next_start"}));
         assert!(l.contains("Asked it to save notes first"), "{l}");
     }

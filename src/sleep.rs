@@ -130,6 +130,10 @@ struct Inner {
     /// on their way to its terminal, until the terminal host has settled them (`keys`, `admit`,
     /// `Admitted`). A sleep checks neither moved (`claim`).
     input: HashMap<SessionId, (u64, Arc<AtomicU32>)>,
+    /// When raw input that isn't the human's (an agent's `muster keys` on a human-rooted turn)
+    /// was last admitted to each session: a move applied now waits after it as after the
+    /// human's own typing (`typed_just_now`).
+    raw_at: HashMap<SessionId, std::time::Instant>,
     /// Why an agent's last wake failed, until it wakes or sleeps again (its asleep bar says so).
     failed: HashMap<i64, String>,
     /// After a failed wake: no panel click wakes the agent before this.
@@ -314,6 +318,7 @@ pub fn admit(hub: &Arc<Hub>, id: SessionId) -> anyhow::Result<Admitted> {
     if g.waking.values().any(|t| *t == id) {
         anyhow::bail!("session {id} is an agent that is waking up; try again once it is ready");
     }
+    g.raw_at.insert(id, std::time::Instant::now());
     Ok(g.admit(id))
 }
 
@@ -623,6 +628,11 @@ fn typed_just_now(why: Why, human_at: Option<i64>, now: i64) -> bool {
     human_at.is_some_and(|t| now - t < quiet)
 }
 
+/// When raw input that isn't the human's was last admitted to session `id` (Unix ms).
+fn raw_at(hub: &Hub, id: SessionId, now: i64) -> Option<i64> {
+    hub.agents().sleep.inner.lock().raw_at.get(&id).map(|at| now - at.elapsed().as_millis() as i64)
+}
+
 /// When the human last typed into session `id` (Unix ms), as far as this backend saw.
 fn human_at(hub: &Hub, id: SessionId, now: i64) -> Option<i64> {
     hub.human_input_of(id).map(|(_, at)| now - at.elapsed().as_millis() as i64)
@@ -661,6 +671,13 @@ pub enum Why {
 /// The agent can't sleep now; the text says why.
 #[derive(Debug)]
 pub struct NotNow(pub String);
+
+impl NotNow {
+    /// The reason alone, without "<name> can't sleep now: ".
+    pub fn reason(&self) -> &str {
+        self.0.split_once(": ").map_or(&self.0, |(_, r)| r)
+    }
+}
 
 impl std::fmt::Display for NotNow {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -711,7 +728,12 @@ pub(crate) async fn sleep_held(hub: &Arc<Hub>, name: &str, why: Why, _held: &cra
     if why == Why::Idle && !due(&a, &info, human_at(hub, info.id, now), now) {
         return Err(NotNow(format!("{} was busy again", a.name)).into());
     }
-    if typed_just_now(why, human_at(hub, info.id, now), now) {
+    // A move also waits after keys an agent typed in (they can submit a prompt too).
+    let typed = match why {
+        Why::Move => human_at(hub, info.id, now).max(raw_at(hub, info.id, now)),
+        _ => human_at(hub, info.id, now),
+    };
+    if typed_just_now(why, typed, now) {
         let what = if why == Why::Move { "restart" } else { "sleep" };
         return Err(NotNow(format!("{} can't {what} now: you typed into it just now", a.name)).into());
     }
@@ -1483,6 +1505,17 @@ mod tests {
         assert!(!typed_just_now(Why::Idle, Some(now), now), "`due` covers the idle timer");
     }
 
+    /// Keys an agent types into a session (not the human's) are timed too, for a move's wait.
+    #[tokio::test]
+    async fn an_agents_keys_are_timed_for_a_move() {
+        let hub = hub(false);
+        let now = now_ms();
+        assert_eq!(raw_at(&hub, 1, now), None);
+        drop(admit(&hub, 1).unwrap());
+        let at = raw_at(&hub, 1, now_ms()).unwrap();
+        assert!(now_ms() - at < 1_000 && typed_just_now(Why::Move, Some(at), now_ms()));
+    }
+
     fn agent() -> Agent {
         Agent {
             account_profile_id: None,
@@ -1897,7 +1930,7 @@ mod tests {
         let h = hub.clone();
         let send = tokio::spawn(async move { for_send(&h, 1).await.map(|(id, guard)| (id, guard.is_some())) });
         let h = hub.clone();
-        let restart = tokio::spawn(async move { crate::agents::restart_session(&h, 1).await.is_ok() });
+        let restart = tokio::spawn(async move { crate::agents::restart_session(&h, 1, None).await.is_ok() });
         until("the send registers", || hub.agents().sleep.deliveries(1) == 1).await;
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!send.is_finished() && !restart.is_finished());

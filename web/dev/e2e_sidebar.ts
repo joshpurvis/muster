@@ -157,8 +157,8 @@ try {
   check(await a.eval(`!!document.querySelector('.agent-card')`), "moving into the card keeps it open");
   check(await a.eval(`document.querySelectorAll('.agent-card .sch-prop, .agent-card .sch-row').length`) === 3, "its schedules: the proposal card and two rows");
   await shot("sidebar-card-hover");
-  // Shift+F10 on a schedule in the card opens the schedule's menu, not the row's.
-  await a.eval(`document.querySelector('.agent-card .sch-row').focus()`);
+  // Shift+F10 on a schedule in the card (or its ⋯) opens the schedule's menu, not the row's.
+  await a.eval(`document.querySelector('.agent-card .sch-row .sch-more').focus()`);
   await a.key("Shift+F10");
   await a.wait(`!!document.querySelector('.menu')`, 2000);
   check(
@@ -200,7 +200,7 @@ try {
   check(await a.eval(`(() => { const r = document.querySelector('.menu .menu-item.sel').getBoundingClientRect(); return r.bottom <= innerHeight; })()`), "the chosen last item is in view");
   await a.key("Escape");
   // In a narrow window the card stays inside it.
-  await a.size(560, 800);
+  await a.size(520, 800);
   await a.eval(`document.querySelector(${js(sel("orchestrator"))}).focus()`);
   await a.key("Right");
   await a.wait(`!!document.querySelector('.agent-card')`, 2000);
@@ -251,9 +251,13 @@ try {
   await a.key("Enter");
   await a.wait(`document.querySelectorAll('.needs-you .ny-prop').length === 1`, 3000);
   await a.wait(`!!document.activeElement?.closest('.needs-you') && document.activeElement.matches('.ny-name')`, 2000);
+  const weekly = await a.eval(`${M}.schedules.value.find((s) => s.name === 'Weekly dependency check')`);
   await a.click(".needs-you .ny-prop .sch-approve");
   await a.wait(`!document.querySelector('.needs-you .ny-prop')`, 3000);
   check(await a.eval(`document.querySelector(${js(`${row("worker")} .row-chip-bad`)})?.textContent`) === "1", "the red chip now counts the failed run only");
+  // Dismiss sent by a window that hadn't seen the approval yet: the backend keeps the schedule.
+  const kept = await a.eval(`${M}.rpc.call('schedule.remove', { id: ${weekly.id}, waiting: true }).then(() => 'removed', (e) => String(e))`);
+  check(kept.includes("so it stays") && await a.eval(`${M}.schedules.value.some((s) => s.id === ${weekly.id})`), `an approved schedule survives a late Dismiss: ${kept}`);
   await a.click(".needs-you .ny-hide");
   await a.wait(`!document.querySelector('.needs-you')`, 2000);
   check(await a.eval(`!!document.querySelector(${js(`${row("worker")} .row-chip-plain`)})`), "the row's chip is back to the plain count");

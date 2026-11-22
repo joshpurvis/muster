@@ -9,7 +9,6 @@ import {
   agentMessages,
   agents,
   knowSchedule,
-  overlay,
   scheduleHistoryOpen,
   loadScheduleRuns,
   scheduleRuns,
@@ -127,12 +126,37 @@ export function SchedulesPausedNotice() {
 /** "Needs you", at the top of the sidebar while anything waits for the human: schedules waiting
  * for approval (Approve / Edit… / Dismiss), then schedules whose last run failed (its history on
  * click, the schedule's menu, Hide). Gone when empty. `openAgent` opens the agent's card. */
+/** Which Needs you item had keyboard focus, so when it goes (approved, dismissed or hidden, by
+ * its button, its menu or from another window, however long the reply takes) focus moves to the
+ * item now at its place, else the agent's row, else the Channels heading, never to the page. */
+const nyFocus = { index: -1, agent: 0 };
+
 export function NeedsYou({ now, openAgent }: { now: number; openAgent: (agent: number) => void }) {
-  if (!schedulesSupported.value) return null;
-  const items = needsYouItems(schedules.value, prefs.value.hiddenRuns);
+  const items = schedulesSupported.value ? needsYouItems(schedules.value, prefs.value.hiddenRuns) : [];
+  useLayoutEffect(() => {
+    const at = document.activeElement;
+    if (nyFocus.index < 0 || (at && at !== document.body && at.isConnected)) return;
+    const names = [...document.querySelectorAll<HTMLElement>(".needs-you .ny-name")];
+    const to = names[Math.min(nyFocus.index, names.length - 1)] ??
+      document.querySelector<HTMLElement>(`.channel-row[data-agent-id="${nyFocus.agent}"] .channel-select`) ??
+      document.querySelector<HTMLElement>(".channels-panel .sidebar-heading");
+    nyFocus.index = -1;
+    to?.focus();
+  });
   if (!items.length) return null;
+  const track = (e: FocusEvent) => {
+    const item = (e.target as HTMLElement).closest<HTMLElement>(".ny-item");
+    const all = [...(e.currentTarget as HTMLElement).querySelectorAll(".ny-item")];
+    nyFocus.index = item ? all.indexOf(item) : -1;
+    nyFocus.agent = items.find((i) => String(i.schedule.id) === item?.dataset.schedule)?.schedule.agent_id ?? 0;
+  };
+  const left = (e: FocusEvent) => {
+    // Gone to another place on purpose (not a menu or dialog it opened, not removed from the page).
+    const to = e.relatedTarget as HTMLElement | null;
+    if (to && !(e.currentTarget as HTMLElement).contains(to) && !to.closest(".menu-layer, .modal-backdrop")) nyFocus.index = -1;
+  };
   return (
-    <section class="needs-you" aria-label={`Needs you: ${items.length}`}>
+    <section class="needs-you" aria-label={`Needs you: ${items.length}`} onFocusIn={track} onFocusOut={left}>
       <div class="ny-head" aria-hidden="true">
         <IconSpark size={12} /><span>Needs you</span><span class="ap-count">{items.length}</span>
       </div>
@@ -145,27 +169,6 @@ export function NeedsYou({ now, openAgent }: { now: number; openAgent: (agent: n
       </div>
     </section>
   );
-}
-
-/** An action that takes an item out of Needs you (Approve, Dismiss, Hide) leaves keyboard focus
- * on the next item, else the previous one, else the agent's row, else the Channels heading. */
-function keepFocus(from: Element, agentId: number, act: () => void) {
-  const item = from.closest(".ny-item");
-  const items = [...document.querySelectorAll<HTMLElement>(".needs-you .ny-item")];
-  const i = item ? items.indexOf(item as HTMLElement) : -1;
-  const next = [...items.slice(i + 1), ...items.slice(0, Math.max(0, i)).reverse()]
-    .map((x) => x.querySelector<HTMLElement>(".ny-name"));
-  act();
-  const settle = (tries: number) => {
-    if (document.activeElement && document.activeElement !== document.body && document.activeElement.isConnected) return;
-    const to = next.find((x) => x?.isConnected) ??
-      document.querySelector<HTMLElement>(`.channel-row[data-agent-id="${agentId}"] .channel-select`) ??
-      document.querySelector<HTMLElement>(".channels-panel .sidebar-heading");
-    if (to) to.focus();
-    else if (tries > 0) setTimeout(() => settle(tries - 1), 100);
-  };
-  // The item goes when the change comes back (Approve and Dismiss wait for the backend).
-  for (const ms of [0, 150, 400, 900]) setTimeout(() => settle(0), ms);
 }
 
 /** A waiting schedule in Needs you: its name (opens its agent's card, which shows the whole
@@ -182,6 +185,14 @@ function NeedsProposal({ s, now, openAgent }: { s: Schedule; now: number; openAg
       role="listitem"
       class="ny-item ny-prop"
       data-schedule={s.id}
+      onKeyDown={(e) => {
+        if (e.key === "ContextMenu" || (e.key === "F10" && e.shiftKey)) {
+          e.preventDefault();
+          e.stopPropagation();
+          const r = (e.target as HTMLElement).getBoundingClientRect();
+          proposalMenu(s, r.left + 24, r.bottom - 4, true);
+        }
+      }}
       aria-label={`${s.name}. ${by}${on}, ${nextWhenPast(since, now)}. Waits for your approval.`}
       onContextMenu={(e) => {
         e.preventDefault();
@@ -197,14 +208,6 @@ function NeedsProposal({ s, now, openAgent }: { s: Schedule; now: number; openAg
           data-tip={`Read it in ${s.agent ?? "its agent"}'s card`}
           aria-haspopup="dialog"
           onClick={() => openAgent(s.agent_id)}
-          onKeyDown={(e) => {
-            if (e.key === "ContextMenu" || (e.key === "F10" && e.shiftKey)) {
-              e.preventDefault();
-              e.stopPropagation();
-              const r = e.currentTarget.getBoundingClientRect();
-              proposalMenu(s, r.left + 24, r.bottom - 4);
-            }
-          }}
         >
           {s.name}
         </button>
@@ -213,11 +216,11 @@ function NeedsProposal({ s, now, openAgent }: { s: Schedule; now: number; openAg
         </span>
         <span class="ny-actions">
           <button type="button" class="btn btn-sm btn-primary sch-approve"
-            onClick={(e) => keepFocus(e.currentTarget, s.agent_id, () => A.approveSchedule(s))}>Approve</button>
+            onClick={() => A.approveSchedule(s)}>Approve</button>
           <button type="button" class="btn btn-sm" onClick={() => A.editSchedule(s.id)}>Edit…</button>
           {fresh
             ? <button type="button" class="btn btn-sm sch-dismiss"
-              onClick={(e) => keepFocus(e.currentTarget, s.agent_id, () => A.dismissProposal(s))}>Dismiss</button>
+              onClick={() => A.dismissProposal(s)}>Dismiss</button>
             : <button type="button" class="btn btn-sm sch-dismiss" onClick={() => A.removeSchedule(s)}>Remove…</button>}
         </span>
       </div>
@@ -240,6 +243,14 @@ function NeedsRun({ s, now }: { s: Schedule; now: number }) {
         role="listitem"
         class={cx("ny-item ny-run", open && "open")}
         data-schedule={s.id}
+        onKeyDown={(e) => {
+          if (e.key === "ContextMenu" || (e.key === "F10" && e.shiftKey)) {
+            e.preventDefault();
+            e.stopPropagation();
+            const r = (e.target as HTMLElement).getBoundingClientRect();
+            scheduleMenu(s, r.left + 24, r.bottom - 4, true);
+          }
+        }}
         onContextMenu={(e) => {
           e.preventDefault();
           e.stopPropagation();
@@ -255,14 +266,6 @@ function NeedsRun({ s, now }: { s: Schedule; now: number }) {
               aria-expanded={open}
               aria-label={`${s.name}, on ${s.agent ?? "a removed agent"}: last run ${OUTCOME_LABEL[last.outcome]}${reason ? ` (${reason})` : ""}. ${next.text}. Show its runs`}
               onClick={toggle}
-              onKeyDown={(e) => {
-                if (e.key === "ContextMenu" || (e.key === "F10" && e.shiftKey)) {
-                  e.preventDefault();
-                  e.stopPropagation();
-                  const r = e.currentTarget.getBoundingClientRect();
-                  scheduleMenu(s, r.left + 24, r.bottom - 4);
-                }
-              }}
             >
               <IconChevron size={10} class={cx("ny-chev", open && "open")} />
               <span class="ny-label">{s.name}</span>
@@ -272,9 +275,7 @@ function NeedsRun({ s, now }: { s: Schedule; now: number }) {
               class="sch-link ny-hide"
               data-tip="Take it out of Needs you until a run fails again"
               aria-label={`Hide ${s.name} until a run fails again`}
-              onClick={(e) =>
-                keepFocus(e.currentTarget, s.agent_id, () =>
-                  setPref("hiddenRuns", hideRun(prefs.value.hiddenRuns, s.id, last.id, schedules.peek().map((x) => x.id))))}
+              onClick={() => setPref("hiddenRuns", hideRun(prefs.value.hiddenRuns, s.id, last.id, schedules.peek().map((x) => x.id)))}
             >
               Hide
             </button>
@@ -324,13 +325,14 @@ export function moveRow(e: KeyboardEvent) {
 
 /** A waiting schedule's ⋯ menu: approve, edit first, or dismiss (a held change of one of yours:
  * remove it, with the usual question). Nothing else: it doesn't run until approved. */
-function proposalMenu(s: Schedule, x: number, y: number) {
+function proposalMenu(s: Schedule, x: number, y: number, kb = false) {
   const proposal = !!s.made_by && s.made_by.approved_at === null;
   const fresh = proposal || (s.held?.what ?? []).includes("made");
   openMenu({
     x,
     y,
     minWidth: 180,
+    select: kb ? 0 : undefined,
     items: [
       { header: proposal ? `${s.name} (proposed by ${s.made_by?.agent ?? "an agent"})` : `${s.name} (waits for your approval)` },
       { label: "Approve", run: () => A.approveSchedule(s) },
@@ -343,14 +345,15 @@ function proposalMenu(s: Schedule, x: number, y: number) {
   });
 }
 
-function scheduleMenu(s: Schedule, x: number, y: number) {
-  if (isProposal(s)) return proposalMenu(s, x, y);
+function scheduleMenu(s: Schedule, x: number, y: number, kb = false) {
+  if (isProposal(s)) return proposalMenu(s, x, y, kb);
   const open = scheduleHistoryOpen.value.has(s.id);
   const over = s.status === "done" || isExpired(s, Date.now()) || s.next_run === null;
   openMenu({
     x,
     y,
     minWidth: 190,
+    select: kb ? 0 : undefined,
     items: [
       { header: s.name },
       { label: "Edit…", run: () => A.editSchedule(s.id) },
@@ -409,14 +412,15 @@ function ProposalCard({ s, now }: { s: Schedule; now: number }) {
       tabIndex={0}
       aria-label={label}
       onKeyDown={(e) => {
-        if (e.target !== e.currentTarget) return;
-        if (e.key === "ArrowDown" || e.key === "ArrowUp") moveRow(e);
-        else if (e.key === "ContextMenu" || (e.key === "F10" && e.shiftKey)) {
+        // The menu key from the card or any of its buttons: its own menu.
+        if (e.key === "ContextMenu" || (e.key === "F10" && e.shiftKey)) {
           e.preventDefault();
           e.stopPropagation();
           const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
-          proposalMenu(s, r.left + 24, r.top + 24);
+          return proposalMenu(s, r.left + 24, r.top + 24, true);
         }
+        if (e.target !== e.currentTarget) return;
+        if (e.key === "ArrowDown" || e.key === "ArrowUp") moveRow(e);
       }}
       onContextMenu={(e) => {
         e.preventDefault();
@@ -584,17 +588,18 @@ function TimedRow({ s, now }: { s: Schedule; now: number }) {
         data-tip={`${reading}${allPaused && next.tone === "next" ? " · all schedules are paused" : ""}`}
         onClick={toggle}
         onKeyDown={(e) => {
+          // The menu key from the row or its buttons (⋯, Renew): the schedule's menu.
+          if (e.key === "ContextMenu" || (e.key === "F10" && e.shiftKey)) {
+            e.preventDefault();
+            e.stopPropagation();
+            const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+            return scheduleMenu(s, r.left + 24, r.bottom - 4, true);
+          }
           if (e.target !== e.currentTarget) return;
           if (e.key === "Enter" || e.key === " ") {
             e.preventDefault();
             toggle();
           } else if (e.key === "ArrowDown" || e.key === "ArrowUp") moveRow(e);
-          else if (e.key === "ContextMenu" || (e.key === "F10" && e.shiftKey)) {
-            e.preventDefault();
-            e.stopPropagation();
-            const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
-            scheduleMenu(s, r.left + 24, r.bottom - 4);
-          }
         }}
         onContextMenu={(e) => {
           e.preventDefault();
@@ -1009,7 +1014,7 @@ export function ScheduleDialog(
           then: steps.then ?? undefined,
         });
         knowSchedule(s);
-        overlay.value = null;
+        close();
         A.revealSidebar();
         if (!A.heldToast(s)) toast(
           "success",
@@ -1017,7 +1022,6 @@ export function ScheduleDialog(
             ? `${s.name} for ${s.agent ?? d.agent}: ${s.reading.replace(/^When /, "runs when ")}.`
             : `Scheduled ${s.name} for ${s.agent ?? d.agent}${s.next_run !== null ? `: next ${nextWhen(s.next_run, Date.now())}` : ""}.`,
         );
-        A.focusActiveTerminalSoon();
         return;
       }
       const patch = schedulePatch(sched, fields);
@@ -1026,8 +1030,8 @@ export function ScheduleDialog(
         knowSchedule(s);
         if (sched.status === "held" || !A.heldToast(s)) toast("success", "Saved.", 2500);
       }
-      overlay.value = null;
-      A.focusActiveTerminalSoon();
+      // As Cancel: back to the card's button that opened it, else the terminal.
+      close();
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));
       setBusy(false);

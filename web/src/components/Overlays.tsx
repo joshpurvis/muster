@@ -46,6 +46,7 @@ import { DEFAULT_PERMISSIONS, KIND_LABEL, needsHuman, STATE_LABEL, STATE_PRIORIT
 import { PermissionsDialog, PermissionsPanel, PermissionsPill } from "./Permissions.tsx";
 import { PillToggle } from "./DialogKit.tsx";
 import { AgentDialog, MessageDialog } from "./Agents.tsx";
+import { menuOpener } from "./Menu.tsx";
 import { CommunicationDialog } from "./Communication.tsx";
 import { ScheduleDialog, ScheduleSettingsDialog } from "./Schedules.tsx";
 import { AccountProfilesDialog, ProfilePill, ProfileUsage } from "./AccountProfiles.tsx";
@@ -89,7 +90,11 @@ function Modal(
   const ref = useRef<HTMLDivElement>(null);
   // Who opened it, taken at its first render (by its first effect a field inside it may have
   // taken focus already): `close` gives focus back to a button of an agent's card or Needs you.
-  const [first] = useState(() => document.activeElement as HTMLElement | null);
+  const [first] = useState(() => {
+    const at = document.activeElement as HTMLElement | null;
+    // Opened from a menu item: the menu is going, so whoever opened the menu.
+    return at?.closest(".menu") ? menuOpener : at;
+  });
   useEffect(() => {
     const prev = document.activeElement as HTMLElement | null;
     opener = first;

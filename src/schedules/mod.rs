@@ -1609,6 +1609,20 @@ pub fn remove(hub: &Hub, id: i64) -> anyhow::Result<Value> {
     Ok(json!({ "removed": id }))
 }
 
+/// Dismiss a schedule that waits for approval (an agent's proposal, or one made outside the
+/// window): removed only while it still waits, decided under the removal's lock, so Dismiss from a
+/// window that hasn't seen an approval made elsewhere can't remove the approved schedule.
+pub fn dismiss(hub: &Hub, id: i64) -> anyhow::Result<Value> {
+    if remove_if(hub, id, |s| s.waiting_approval().then_some(()))?.is_some() {
+        return Ok(json!({ "removed": id }));
+    }
+    ensure!(hub.schedules.get(id).is_none(), "{DISMISS_KEPT}");
+    anyhow::bail!("no schedule {id}")
+}
+
+/// Why `schedule.remove` with `waiting` kept a schedule.
+pub const DISMISS_KEPT: &str = "it isn't waiting for approval any more (it was approved or changed meanwhile), so it stays";
+
 /// Remove schedule `id` only if `still` says so of it as it is now, decided and removed under one
 /// lock (the tidying: an approval just before must keep it). `Some(what still said)`: removed;
 /// None: kept, or already gone.

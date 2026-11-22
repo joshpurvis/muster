@@ -555,7 +555,7 @@ export function scheduleMock(deps: ScheduleDeps) {
     throw new Error('when is required: {kind: "cron", cron}, {kind: "once", at} or {kind: "once", local}');
   }
 
-  function create(p: any, madeBy: Sched["made_by"] = null) {
+  function create(p: any, madeBy: Sched["made_by"] = null, at?: number) {
     const a = agentNamed(p.agent);
     const tz = String(p.tz ?? "").trim() || MOCK_ZONE;
     const when = whenIn(p.when, tz);
@@ -593,6 +593,7 @@ export function scheduleMock(deps: ScheduleDeps) {
     };
     // A proposal keeps no next run until it is approved, and is published once, as a proposal.
     if (madeBy && madeBy.approved_at === null) s.next_run = null;
+    if (at !== undefined) s.created_at = s.updated_at = s.window_from = at;
     list.push(s);
     return publish(s);
   }
@@ -690,6 +691,10 @@ export function scheduleMock(deps: ScheduleDeps) {
         return update(p);
       case "schedule.remove": {
         const s = get(p.id);
+        // `waiting` (Dismiss): only while it still waits for approval (src/schedules/mod.rs `dismiss`).
+        if (p.waiting && !waiting(s)) {
+          throw new Error("it isn't waiting for approval any more (it was approved or changed meanwhile), so it stays");
+        }
         list.splice(list.indexOf(s), 1);
         runs.delete(s.id);
         broadcast("schedule_removed", { id: s.id, agent_id: s.agent_id });
@@ -889,10 +894,8 @@ export function scheduleMock(deps: ScheduleDeps) {
   /** Seed: an agent's proposal waiting for approval, made `ageMs` ago. */
   function propose(p: any, by: string, reason: string, ageMs: number) {
     const a = agentNamed(by);
-    const j = create(p, { agent_id: a.id, agent: a.name, kind: "proposal", reason, at: now() - ageMs, approved_at: null }) as { id: number };
-    const s = get(j.id);
-    s.created_at = s.updated_at = s.window_from = now() - ageMs;
-    return publish(s);
+    const j = create(p, { agent_id: a.id, agent: a.name, kind: "proposal", reason, at: now() - ageMs, approved_at: null }, now() - ageMs) as { id: number };
+    return j;
   }
 
   return {

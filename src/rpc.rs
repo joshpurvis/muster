@@ -1443,7 +1443,17 @@ async fn dispatch_inner(hub: &Arc<Hub>, who: &Principal, method: &str, params: V
                     Via::Window => crate::schedules::update(hub, parse(params)?)?,
                     Via::Outside => crate::schedules::update_held(hub, parse(params)?, crate::schedules::HELD_WHY)?,
                 }),
-                "schedule.remove" => Ok(crate::schedules::remove(hub, parse::<Id>(params)?.id)?),
+                "schedule.remove" => {
+                    // `waiting`: Dismiss of a schedule waiting for approval; refused once it doesn't.
+                    #[derive(Deserialize)]
+                    struct P {
+                        id: i64,
+                        #[serde(default)]
+                        waiting: bool,
+                    }
+                    let p: P = parse(params)?;
+                    Ok(if p.waiting { crate::schedules::dismiss(hub, p.id)? } else { crate::schedules::remove(hub, p.id)? })
+                }
                 "schedule.pause" | "schedule.skip" => {
                     #[derive(Deserialize)]
                     struct P {

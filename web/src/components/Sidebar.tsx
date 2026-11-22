@@ -187,15 +187,16 @@ function channelItems(c: Channel, rename: () => void): MenuItem[] {
   ];
 }
 
-/** A click's agent action waits this long, so a double-click (rename) never starts or moves it. */
-const DOUBLE_MS = 260;
-let clickTimer = 0;
+/** A click's agent action waits this long, so a double-click (rename) never starts or moves it:
+ * longer than GTK's default double-click time (400 ms), which Muster's window uses. */
+const DOUBLE_MS = 450;
 
 /** A channel (with its agent, if one owns it), or an agent whose channel isn't in this window. */
 function Row({ row, context, now }: { row: SidebarRow; context: string | null; now: number }) {
   const { channel: c, agent: a } = row;
   const [editing, setEditing] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
+  const clickTimer = useRef(0);
   const items = c ? sessionsByChannel.value.get(c.id) ?? [] : [];
   const attention = items.filter((s) => needsHuman(s.state)).length;
   const state = aggregateState(items);
@@ -224,15 +225,22 @@ function Row({ row, context, now }: { row: SidebarRow; context: string | null; n
     : undefined;
   // The channel opens at once; starting or bringing back its agent waits out a double-click.
   const open = (e: MouseEvent) => {
-    clearTimeout(clickTimer);
+    clearTimeout(clickTimer.current);
+    // The second click of a double-click: it renames (dblclick), nothing more.
+    if (e.detail >= 2) return;
     if (c) A.openChannel(c.id);
     const act = a ? rowAgentAction(a, c, hereIds.peek()) : null;
     if (!act) return;
     if (!c || e.detail === 0) return act();
-    clickTimer = setTimeout(act, DOUBLE_MS);
+    const id = a!.id, ch = c.id;
+    clickTimer.current = setTimeout(() => {
+      // Its channel archived, or the agent removed, meanwhile: nothing to start.
+      if (!windowChannels.peek().some((x) => x.id === ch) || !agents.peek().some((x) => x.id === id)) return;
+      act();
+    }, DOUBLE_MS);
   };
   const rename = () => {
-    clearTimeout(clickTimer);
+    clearTimeout(clickTimer.current);
     setEditing(true);
   };
   return <div ref={ref} class={cx("channel-row", active && "active", c && unread.value.has(c.id) && !active && "unread",

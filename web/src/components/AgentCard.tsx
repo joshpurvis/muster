@@ -131,8 +131,8 @@ export function hoverCard(agent: number) {
   const cur = agentCard.peek();
   if (cur?.agent === agent) return;
   clearTimeout(openTimer);
-  // A card the keyboard opened stays while focus is in it or its row.
-  if (cur?.byKey && document.activeElement?.closest(`.channel-row[data-agent-id="${cur.agent}"]`)) return;
+  // A card the keyboard opened stays while focus is in it or its row, or one of its menus is open.
+  if (cur?.byKey && (menu.peek() || document.activeElement?.closest(`.channel-row[data-agent-id="${cur.agent}"]`))) return;
   openTimer = setTimeout(() => (agentCard.value = { agent, byKey: false }), cur ? SWITCH_MS : OPEN_MS);
 }
 
@@ -144,7 +144,8 @@ export function leaveCard(agent: number) {
   const check = () => {
     const cur = agentCard.peek();
     if (!cur || cur.agent !== agent || cur.byKey) return;
-    if (menu.peek()) {
+    // A menu or dialog it opened, or focus in it (back from that dialog), keeps it.
+    if (menu.peek() || overlay.peek() || document.activeElement?.closest(`.channel-row[data-agent-id="${agent}"]`)) {
       closeTimer = setTimeout(check, CLOSE_MS);
       return;
     }
@@ -217,11 +218,13 @@ export function AgentCard(
     const place = () => {
       const r = row.getBoundingClientRect();
       const side = row.closest(".sidebar")?.getBoundingClientRect();
-      // Beside the dock when there is room for it; in a narrow window, over the dock's right part.
+      // Beside the dock, narrowed to the room there (down to 300 px); in a window too narrow for
+      // that, over the dock's right part.
       const left = (side?.right ?? r.right) + 6;
-      const w = Math.min(360, innerWidth - 16);
+      const room = innerWidth - left - 8;
+      const w = room >= 300 ? Math.min(360, room) : Math.min(360, innerWidth - 16);
       el.style.width = `${w}px`;
-      el.style.left = `${Math.round(innerWidth - left - 8 >= Math.min(w, 300) ? left : Math.max(8, innerWidth - w - 8))}px`;
+      el.style.left = `${Math.round(room >= 300 ? left : Math.max(8, innerWidth - w - 8))}px`;
       const h = el.offsetHeight;
       el.style.top = `${Math.round(Math.max(8, Math.min(r.top - 6, innerHeight - h - 8)))}px`;
     };
@@ -236,20 +239,45 @@ export function AgentCard(
     if (byKey) ref.current?.querySelector<HTMLElement>("button")?.focus();
   }, [byKey, opens]);
 
-  // A live update removed the control that had focus (a proposal approved elsewhere): focus
-  // goes back into the card instead of falling out of it.
+  // A live update removed the control that had focus (a proposal approved elsewhere, the last
+  // page of runs): focus goes back into the card instead of falling out of it. Only when focus
+  // was in it: a click on empty space elsewhere closes the card (below) and is never undone.
+  const hadFocus = useRef(false);
   useEffect(() => {
-    if (byKey && !overlay.peek() && (!document.activeElement || document.activeElement === document.body)) {
+    if (byKey && hadFocus.current && !overlay.peek() && (!document.activeElement || document.activeElement === document.body)) {
       ref.current?.querySelector<HTMLElement>("button")?.focus();
     }
   });
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const inn = () => (hadFocus.current = true);
+    const out = (e: FocusEvent) => {
+      if (e.relatedTarget) hadFocus.current = false;
+    };
+    // Keyboard-opened, a press anywhere outside its row, its menus and dialogs closes it.
+    const down = (e: PointerEvent) => {
+      const t = e.target as HTMLElement | null;
+      if (!agentCard.peek()?.byKey || !t || anchor.current?.contains(t) || t.closest?.(".menu-layer, .modal-backdrop")) return;
+      closeCard();
+    };
+    el.addEventListener("focusin", inn);
+    el.addEventListener("focusout", out);
+    document.addEventListener("pointerdown", down, true);
+    return () => {
+      el.removeEventListener("focusin", inn);
+      el.removeEventListener("focusout", out);
+      document.removeEventListener("pointerdown", down, true);
+    };
+  }, []);
 
-  // Opened by hover, Esc closes it wherever focus is (before it reaches the terminal); menus and
-  // dialogs answer Esc first.
+  // Opened by hover, Esc closes it while focus is outside the sidebar (the terminal: before it
+  // sees the key); in the sidebar (a rename, the card itself) the focused control answers Esc,
+  // and an open menu or dialog does first.
   useEffect(() => {
     if (byKey) return;
     const key = (e: KeyboardEvent) => {
-      if (e.key !== "Escape" || menu.peek() || overlay.peek()) return;
+      if (e.key !== "Escape" || menu.peek() || overlay.peek() || document.activeElement?.closest(".sidebar")) return;
       e.preventDefault();
       e.stopPropagation();
       closeCard();
@@ -286,6 +314,12 @@ export function AgentCard(
           e.preventDefault();
           e.stopPropagation();
           closeCard(true);
+        } else if (e.key === "ContextMenu" || (e.key === "F10" && e.shiftKey)) {
+          // The menu key on a control of the card without a menu of its own: the row's menu, not
+          // whatever is behind the card. (Schedules open theirs and stop the key.)
+          e.preventDefault();
+          e.stopPropagation();
+          openMenuAt(e.target as Element, menuItems(), { minWidth: 200, alignRight: false, select: 0 });
         }
       }}
       onContextMenu={(e) => {

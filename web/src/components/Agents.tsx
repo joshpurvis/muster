@@ -11,6 +11,7 @@ import {
   agentFilter,
   agentMessages,
   agents,
+  helloEpoch,
   knowAgent,
   openRouter,
   overlay,
@@ -109,6 +110,9 @@ const olderState = { busy: false, done: new Set<string>() };
 /** The sidebar's Messages section: the log, filtered to the open channel's agent. */
 export function Feed({ now }: { now: number }) {
   const open = prefs.value.agentFeed;
+  // A reconnect reloads the newest page of all messages: what was paged in before is gone.
+  const epoch = helloEpoch.value;
+  useEffect(() => olderState.done.clear(), [epoch]);
   const sel = agentFilter.value;
   const selName = sel !== null ? agents.value.find((a) => a.id === sel)?.name : undefined;
   const list = feedFor(agentMessages.value, sel);
@@ -127,7 +131,13 @@ export function Feed({ now }: { now: number }) {
       let log = agentMessages.value;
       for (const m of r.messages) log = upsertMessage(log, m, 1000);
       agentMessages.value = log;
-      if (!r.more) olderState.done.add(key);
+      if (!r.more) {
+        olderState.done.add(key);
+        // The button goes with nothing more to load: keyboard focus moves to the heading.
+        if (document.activeElement?.closest(".ap-older")) {
+          setTimeout(() => document.querySelector<HTMLElement>(".ap-feed-toggle")?.focus(), 0);
+        }
+      }
     } catch (e) {
       toast("error", `Couldn't load older messages: ${e instanceof Error ? e.message : e}`);
     } finally {
@@ -170,7 +180,9 @@ export function Feed({ now }: { now: number }) {
         <div class="ap-feed-list">
           {list.length === 0 && (
             <div class="ap-empty">
-              {selName ? `No messages to ${selName} yet.` : "Messages agents send each other show here."}
+              {selName
+                ? olderState.done.has(selName) ? `No messages to ${selName} yet.` : `None of the latest messages are to ${selName}.`
+                : "Messages agents send each other show here."}
             </div>
           )}
           {list.map((m) => <FeedEntry key={m.id} m={m} now={now} />)}

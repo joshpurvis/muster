@@ -39,7 +39,13 @@ interface MenuState {
 
 export const menu = signal<MenuState | null>(null);
 
+/** What had focus when the last menu opened: a dialog one of its items opens gives focus back
+ * there (Overlays `close`), not to the menu, which is gone by then. */
+export let menuOpener: HTMLElement | null = null;
+
 export function openMenu(state: MenuState) {
+  const at = document.activeElement as HTMLElement | null;
+  if (!at?.closest(".menu")) menuOpener = at;
   menu.value = state;
 }
 
@@ -47,6 +53,8 @@ export function openMenu(state: MenuState) {
 export function openMenuAt(el: Element, items: MenuItem[], opts: Partial<MenuState> = {}) {
   const r = el.getBoundingClientRect();
   const alignRight = opts.alignRight ?? r.left > innerWidth * 0.6;
+  const at = document.activeElement as HTMLElement | null;
+  if (!at?.closest(".menu")) menuOpener = at;
   menu.value = {
     x: alignRight ? r.right : r.left,
     y: r.bottom + 4,
@@ -134,9 +142,11 @@ function MenuList(
   const actionable = items.map((it, i) => (isAction(it) && !it.disabled ? i : -1)).filter((i) => i >= 0);
   const uid = useId();
 
-  // A menu taller than the window scrolls; the keyboard's choice stays in view.
+  // A menu taller than the window scrolls; the keyboard's choice stays in view (the pointer's
+  // isn't scrolled: that would move the list under it).
+  const byKeys = useRef(false);
   useEffect(() => {
-    if (sel >= 0) ref.current?.querySelector(`[data-i="${sel}"]`)?.scrollIntoView({ block: "nearest" });
+    if (sel >= 0 && byKeys.current) ref.current?.querySelector(`[data-i="${sel}"]`)?.scrollIntoView({ block: "nearest" });
   }, [sel]);
 
   const openSub = (i: number, kb = false) => {
@@ -158,6 +168,7 @@ function MenuList(
   };
 
   const onKey = (e: KeyboardEvent) => {
+    byKeys.current = true;
     // Keys reach this list only while it has focus, so an open submenu here was opened by
     // hover and isn't focused. Enter / → move into it; anything else closes it and is handled.
     if (sub) {
@@ -248,6 +259,7 @@ function MenuList(
                 sub?.index === i && "open",
               )}
               onMouseEnter={() => {
+                byKeys.current = false;
                 // Keyboard follows the pointer: the list under the mouse takes focus.
                 if (!ref.current?.contains(document.activeElement)) ref.current?.focus();
                 setSel(i);

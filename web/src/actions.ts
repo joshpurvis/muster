@@ -1947,7 +1947,8 @@ export function dismissProposal(s: Schedule) {
   if (!live || !isProposal(live)) {
     return toast("info", `${s.name} isn't waiting for approval any more, so it stays.`, 4000);
   }
-  rpc.call("schedule.remove", { id: s.id }).then(() => {
+  // `waiting`: the backend removes it only while it still waits (another window may have approved it).
+  rpc.call("schedule.remove", { id: s.id, waiting: true }).then(() => {
     schedules.value = schedules.value.filter((x) => x.id !== s.id);
     const whose = s.made_by && s.made_by.approved_at === null ? `${s.made_by.agent}'s proposal` : "the schedule";
     toast("info", `Dismissed ${whose} ${s.name}.`, 3000);

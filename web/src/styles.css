@@ -3366,10 +3366,10 @@ legend {
 /* A move to another account waiting for the agent's next start (docs/UI.md "Agents panel"). */
 .ap-move {
   font-size: 11px;
+  line-height: 1.35;
   color: var(--warn-text);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  /* Wraps in a narrow panel: the "at its next start" part is the point. */
+  overflow-wrap: anywhere;
 }
 
 .ap-more {

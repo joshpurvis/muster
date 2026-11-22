@@ -1092,12 +1092,17 @@ export function restartOrInterruptAsk(sid: SessionId, what: "restart" | "interru
   const s = sessions.value.get(sid);
   const act = () => (what === "restart" ? restartSession(sid) : interruptSession(sid));
   if (!s || !midTurn(s)) return act();
+  // A named agent with a move waiting: its restart is the move (a new conversation there).
+  const owner = agents.value.find((a) => a.session_id === sid);
+  const move = owner ? pendingMove(owner, s, accountProfiles.value) : null;
   overlay.value = {
     kind: "confirm",
     title: `${KIND_LABEL[s.kind]} is working`,
     // Claude and Codex both reopen their conversation (Codex: once it has a finished turn).
     body: what === "restart"
-      ? "Restart it? Its current turn is lost; it reopens the same conversation."
+      ? move
+        ? `Restart it? Its current turn is lost, and it moves to ${move.to}: a new conversation there (its memory/ notes come along).`
+        : "Restart it? Its current turn is lost; it reopens the same conversation."
       : "Stop its current turn?",
     confirmLabel: what === "restart" ? "Restart" : "Interrupt",
     danger: true,
@@ -1969,7 +1974,12 @@ export function switchAgentAccount(name: string) {
  * with `now` alone; the backend checks again, so a busy agent keeps its turn). */
 export async function restartToMove(a: Agent): Promise<void> {
   try {
-    const r = await rpc.call<Agent & { switch?: AgentSwitch }>("agent.update", { name: a.name, now: true });
+    // The move that was shown: one replaced since is refused, to look at again.
+    const r = await rpc.call<Agent & { switch?: AgentSwitch }>("agent.update", {
+      name: a.name,
+      now: true,
+      handoff_at: a.handoff?.at,
+    });
     knowAgent(r);
     if (r.switch) {
       const m = switchMessage(r.name, r.switch);
@@ -1990,7 +2000,7 @@ export function pendingMoveItems(a: Agent | undefined): MenuItem[] {
     "sep",
     { header: p.text },
     ...(p.running
-      ? [{ label: `Restart now on ${p.to}`, hint: p.restart ? undefined : "when idle", disabled: !p.restart, run: () => restartToMove(a) }]
+      ? [{ label: `Restart now on ${p.to}`, hint: p.restart ? undefined : p.wait, disabled: !p.restart, run: () => restartToMove(a) }]
       : []),
   ];
 }

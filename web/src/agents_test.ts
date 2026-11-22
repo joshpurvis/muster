@@ -536,10 +536,13 @@ Deno.test("a move waiting for a restart says so, and offers Restart now only whe
     running: true,
     restart: true,
     why: null,
+    wait: undefined,
   });
   const busy = pendingMove(moving, session("working"), profiles)!;
-  assertEquals([busy.restart, busy.why], [false, "It is busy. Restart now works once it is idle."]);
-  assertEquals(pendingMove(moving, { ...session("idle"), queued: 2 }, profiles)!.restart, false, "messages waiting");
+  assertEquals([busy.restart, busy.why, busy.wait], [false, "It is busy. Restart now works once it is idle.", "when idle"]);
+  const queued = pendingMove(moving, { ...session("idle"), queued: 2 }, profiles)!;
+  assertEquals([queued.restart, queued.wait], [false, "messages waiting"]);
+  check(queued.why!.startsWith("It has messages waiting to be typed"), queued.why!);
   const off = pendingMove(moving, session("exited"), profiles)!;
   assertEquals([off.restart, off.why], [false, "It isn't running: it starts on Work."]);
   assertEquals(pendingMove({ ...moving, account_profile_id: null }, undefined, profiles)!.to, "Default");

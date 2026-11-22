@@ -160,7 +160,9 @@ schedules wait at once (counted under the lock that adds one), and one nobody ap
 schedule runs: a Run now or a "Then…" step already waiting in line is skipped, and its prompt in an
 agent's queue is taken back (fix round 3). The settings, a note's triggers and an agent's accepted
 work and provider aren't held: from outside the window they are refused, with
-where to do it instead. Narrowing applies directly from anywhere: pausing, removing, a rename,
+where to do it instead (except the unattended cap and the quiet hours, which the CLI and agents
+change either way; an agent's session changes no other setting, not even to tighten one).
+Narrowing applies directly from anywhere a schedule change is taken: pausing, removing, a rename,
 alerts, quiet hours on, a lower cap, fewer watched folders. Approving takes what the owner looked
 at: the UI sends the schedule's `updated_at`, and a schedule changed since is refused, to look at
 again. Approving a held new schedule or a renewal starts a Claude subscription schedule's 7 days;

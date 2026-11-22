@@ -228,11 +228,13 @@ function AgentRow({ a, now, selected }: { a: Agent; now: number; selected: boole
       data-agent={a.name}
       data-tip={persona || undefined}
       tabIndex={0}
-      aria-label={`${a.name}, ${KIND_LABEL[a.kind]}${billing.badge ? `, ${billing.note ?? OPENROUTER_BADGE}` : ""}, ${st.label}${move ? `, ${move.text.toLowerCase()}` : ""}${
+      aria-label={`${a.name}, ${KIND_LABEL[a.kind]}${billing.badge ? `, ${billing.note ?? OPENROUTER_BADGE}` : ""}, ${st.label}${move ? `; ${move.text}` : ""}${
         cold ? ", prompt cache likely expired" : dot ? `, ${CACHE_DOT_LABEL[dot]}` : ""
       }`}
       onClick={open}
       onKeyDown={(e) => {
+        // Enter or Space on the row's own ⋯ button is the button's, not the row's.
+        if ((e.key === "Enter" || e.key === " ") && e.target !== e.currentTarget) return;
         if (e.key === "Enter" || e.key === " ") {
           e.preventDefault();
           open();
@@ -849,6 +851,9 @@ export function AgentDialog(
   // Off by default: asking starts a turn, and HANDOFF.md and memory/ carry it over anyway.
   const [saveNotes, setSaveNotes] = useState(false);
   const [restarting, setRestarting] = useState(false);
+  /** The account picker was changed here: until then it follows the agent's account, so a move
+   * made elsewhere (the CLI, an agent) while this dialog is open is never undone by Save. */
+  const [profileTouched, setProfileTouched] = useState(false);
   const [moveReason, setMoveReason] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -948,14 +953,15 @@ export function AgentDialog(
   const sleepMin = d.sleep ? parseSleepAfter(d.sleepAfter) : 0;
   const locationChanged = !!agent && JSON.stringify(d.working_location) !== JSON.stringify(agent.working_location ?? { mode: "home" });
   /** Moving a Claude agent to another account (docs/ACCOUNT_PROFILES.md). */
-  const moving = !!agent && agent.kind === "claude" && !sameChoice(d.account_profile, agent.account_profile_id ?? "default");
+  const profileChoice = agent && !profileTouched ? agent.account_profile_id ?? "default" : d.account_profile;
+  const moving = !!agent && agent.kind === "claude" && !sameChoice(profileChoice, agent.account_profile_id ?? "default");
   const agentSession = agent?.session_id != null ? sessions.value.get(agent.session_id) : undefined;
   // Where its conversation is: with an earlier move still pending, the account it moves from.
   const fromName = profileName(
     accountProfiles.value,
     agent?.handoff ? agent.handoff.from : agent?.account_profile_id,
   );
-  const toName = profileName(accountProfiles.value, d.account_profile === "default" ? null : d.account_profile);
+  const toName = profileName(accountProfiles.value, profileChoice === "default" ? null : profileChoice);
   // Save notes asks the running process, on the account it started with.
   const runProfile = agentSession?.account_profile_id ?? null;
   const notesBlocked = moving
@@ -1049,7 +1055,7 @@ export function AgentDialog(
         patch.permissions = d.permissions;
       }
       if (moving) {
-        patch.account_profile = d.account_profile;
+        patch.account_profile = profileChoice;
         patch.now = moveNow;
         patch.save_notes = saveNotes && !notesBlocked;
         if (moveReason.trim()) patch.handoff_reason = moveReason.trim();
@@ -1243,8 +1249,11 @@ export function AgentDialog(
             />
             {d.kind === "claude" && (
               <ProfilePill
-                value={d.account_profile}
-                onChange={(choice) => set({ account_profile: choice ?? "default" })}
+                value={profileChoice}
+                onChange={(choice) => {
+                  setProfileTouched(true);
+                  set({ account_profile: choice ?? "default" });
+                }}
                 tip={editing
                   ? "Another profile moves this agent to that account: a new conversation there, with its memory/ notes."
                   : undefined}
@@ -1345,9 +1354,10 @@ export function AgentDialog(
           )}
           {d.kind === "claude" && (!editing || usage) && (
             <ProfileUsage
-              value={d.account_profile}
+              value={profileChoice}
               table={usage}
               onUse={(choice) => {
+                setProfileTouched(true);
                 set({ account_profile: choice });
                 profileRef.current?.focus();
               }}
@@ -1399,9 +1409,11 @@ export function AgentDialog(
                 Wake it first to save notes
               </label>
               <span class="field-hint" id={`${id}-notes`}>
-                {notesBlocked ?? (saveNotes
-                  ? `Muster first asks it to write what it needs into memory/ (a turn on ${fromName}), and moves it once it replies or after 10 minutes.`
-                  : "Off: it moves without a turn. HANDOFF.md and its memory/ notes tell it where it left off.")}
+                {notesBlocked ?? (!saveNotes
+                  ? "Off: nothing is sent to it. Its memory/ notes come along, and HANDOFF.md gives it its recent Muster messages."
+                  : moveNow
+                  ? `Muster first asks it to write what it needs into memory/ (a turn on ${fromName}). Once it replies, or after 10 minutes, it restarts on ${toName} if it is idle.`
+                  : `Muster first asks it to write what it needs into memory/ (a turn on ${fromName}). It still moves at its next start.`)}
               </span>
               <input
                 class="quiet-input move-reason"
@@ -1432,6 +1444,8 @@ export function AgentDialog(
                       setRestarting(true);
                       await A.restartToMove(agent);
                       setRestarting(false);
+                      // The panel goes once it moved: keep the keyboard in the dialog.
+                      profileRef.current?.focus();
                     }}
                   >
                     Restart now

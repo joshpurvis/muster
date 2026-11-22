@@ -547,7 +547,8 @@ pub fn blocker(agent: &Agent, info: Option<&SessionInfo>, f: &Facts) -> Option<S
     let Some(info) = info.filter(|i| f.live && i.state != AgentState::Exited) else {
         return Some("it isn't running".into());
     };
-    if agent.resume_id.is_none() {
+    // A move waiting for its next start begins a new conversation anyway.
+    if agent.resume_id.is_none() && agent.handoff.is_none() {
         return Some("its conversation isn't saved yet (it needs a finished turn first), so it couldn't pick it up again".into());
     }
     let state = match info.state {
@@ -638,6 +639,9 @@ pub enum Why {
     /// An idle agent reset (src/auto_reset.rs) stops it before forgetting its conversation; it
     /// says so in its own words, so this sleep logs nothing of its own.
     Reset,
+    /// A move to another account applied now (`agents::restart_moved`): stopped only to be
+    /// started at once on the new account, so this sleep logs nothing of its own either.
+    Move,
 }
 
 /// The agent can't sleep now; the text says why.
@@ -726,12 +730,12 @@ pub(crate) async fn sleep_held(hub: &Arc<Hub>, name: &str, why: Why, _held: &cra
     }
     let a = hub.agents().by_id(a.id).ok_or_else(|| anyhow::anyhow!("{name} was removed"))?;
     crate::agents::publish(hub, &a);
-    if why == Why::Reset {
+    if matches!(why, Why::Reset | Why::Move) {
         return Ok(a);
     }
     let idle = now - idle_since(&info, human_at(hub, info.id, now));
     let text = match why {
-        Why::Manual | Why::Reset => format!("{} is asleep. A message sent with wake on wakes it.", a.name),
+        Why::Manual | Why::Reset | Why::Move => format!("{} is asleep. A message sent with wake on wakes it.", a.name),
         Why::Idle => format!(
             "{} fell asleep after {} idle. A message sent with wake on wakes it.",
             a.name,

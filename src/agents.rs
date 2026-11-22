@@ -1934,6 +1934,10 @@ pub struct AgentUpdate {
     /// its current account is at its limit).
     #[serde(default)]
     pub save_notes: Option<bool>,
+    /// With `now` alone: apply only the waiting move recorded at this time (`Handoff::at`, what
+    /// the window showed); a move replaced since is refused, to look at again.
+    #[serde(default)]
+    pub handoff_at: Option<i64>,
     /// With a move: why, for HANDOFF.md.
     #[serde(default)]
     pub handoff_reason: Option<String>,
@@ -1954,6 +1958,11 @@ pub struct AgentUpdate {
     /// the caller (not a request field).
     #[serde(skip)]
     pub by_owner: bool,
+    /// The call names an agent's session, or a shell an agent has typed into (`from_session`):
+    /// it may move agents, but not ask one to save notes, which types a prompt as the human's.
+    /// Set by the RPC layer.
+    #[serde(skip)]
+    pub from_agent: bool,
 }
 
 /// An account move `update` recorded, for `switch_account` to carry out.
@@ -2047,6 +2056,17 @@ pub fn update_switch(hub: &Hub, req: AgentUpdate, outside: bool) -> anyhow::Resu
         "{} has no move waiting: `now` goes with a move to another account, or applies one that waits for its next start",
         cur.name
     );
+    if let (Some(h), Some(at)) = (&waiting, req.handoff_at) {
+        anyhow::ensure!(h.at == at, "the move of {} changed since this was shown: it now moves to {}; look again",
+            cur.name, profile_name(hub, cur.account_profile_id));
+    }
+    anyhow::ensure!(
+        !(req.save_notes == Some(true) && req.from_agent),
+        "asking {} to save notes first types a prompt into it as if you had, so only the human asks for it (Muster's window, \
+         or `muster agent edit --save-notes` in a terminal outside Muster). Move it without --save-notes: HANDOFF.md and its \
+         memory/ carry it over",
+        cur.name
+    );
     let reason = clean_opt(req.handoff_reason.map(|r| crate::mcp::tools::clean_text(&r)))
         .map(|r| truncate_bytes(&r, HANDOFF_REASON_MAX));
     anyhow::ensure!(reason.is_none() || moving.is_some(), "handoff_reason goes with a move to another account_profile");
@@ -2133,6 +2153,13 @@ pub fn update_switch(hub: &Hub, req: AgentUpdate, outside: bool) -> anyhow::Resu
             Err(e) if only_revokes => tracing::warn!(agent = %next.name, "rewriting the persona file after taking a right back: {e:#}"),
             r => r?,
         }
+    }
+    // `now` alone changes nothing in the record: written back, it could restore a move a start
+    // cleared meanwhile.
+    if serde_json::to_value(&next)? == serde_json::to_value(&cur)? {
+        let save_notes = req.save_notes.unwrap_or(false);
+        let switch = waiting.map(|h| Switch { name: cur.name.clone(), from: h.from, to: cur.account_profile_id, at: h.at, now: true, save_notes });
+        return Ok((cur, switch));
     }
     let next = hub.agents().set_config(hub.store(), &next)?;
     let save_notes = req.save_notes.unwrap_or(false);
@@ -2866,19 +2893,50 @@ pub fn notes_skipped(wanted: bool, live: Option<&SessionInfo>, at_limit: impl Fn
 /// Restart a moved agent now if it is idle and move `sw` is still the one waiting (both checked
 /// under the start lock): `restarted`, `busy` (it moves at its next start) or `replaced` (a newer
 /// move, or a start that already moved it).
+/// Restart a moved agent now, on its new account, if move `sw` is still the one waiting and the
+/// run that was there is still running and idle: put it to sleep under the start lock (the
+/// sleep's own claim refuses while a prompt is being typed or waits, a message is on its way, or
+/// keys were typed just now: src/sleep.rs `claim`), then start it, which is the move's new
+/// conversation. `restarted`, `busy` (it moves at its next start, its turn untouched),
+/// `replaced` (a newer move, or a start that already moved it) or `next_start` (it stopped or
+/// fell asleep meanwhile: nothing to restart, and it isn't woken).
 async fn restart_moved(hub: &Arc<Hub>, sw: &Switch) -> anyhow::Result<&'static str> {
-    let replaced = std::sync::atomic::AtomicBool::new(false);
-    let ok = |s: &SessionInfo| {
-        let current = hub.agents().get(&sw.name).and_then(|a| a.handoff).is_some_and(|h| h.at == sw.at);
-        replaced.store(!current, std::sync::atomic::Ordering::Relaxed);
-        current && session_idle(s)
+    #[cfg(test)]
+    if hub.agents().fake_fresh_start.load(std::sync::atomic::Ordering::Relaxed) {
+        return fake_restart_moved(hub, sw);
+    }
+    let held = hub.agents().start_lock.lock().await;
+    let Some(a) = hub.agents().get(&sw.name).filter(|a| a.handoff.as_ref().is_some_and(|h| h.at == sw.at)) else {
+        return Ok("replaced");
     };
-    match start_fresh_if(hub, &sw.name, &ok).await {
-        Ok(_) => Ok("restarted"),
-        Err(e) if e.downcast_ref::<NotIdle>().is_some() => {
-            Ok(if replaced.load(std::sync::atomic::Ordering::Relaxed) { "replaced" } else { "busy" })
+    let Some(live) = live_session(hub, &a) else { return Ok("next_start") };
+    if !session_idle(&live) {
+        return Ok("busy");
+    }
+    if let Err(e) = crate::sleep::sleep_held(hub, &sw.name, crate::sleep::Why::Move, &held).await {
+        return if e.downcast_ref::<crate::sleep::NotNow>().is_some() { Ok("busy") } else { Err(e) };
+    }
+    let s = start_locked(hub, &sw.name, false, None, None).await
+        .map_err(|e| e.context("it is asleep, and moves when it next wakes"))?;
+    publish(hub, &s.agent);
+    Ok("restarted")
+}
+
+/// `restart_moved` in unit tests (no terminal host): the same checks, then the start's handoff
+/// done, as `fake_fresh_start` does.
+#[cfg(test)]
+fn fake_restart_moved(hub: &Arc<Hub>, sw: &Switch) -> anyhow::Result<&'static str> {
+    let Some(a) = hub.agents().get(&sw.name).filter(|a| a.handoff.as_ref().is_some_and(|h| h.at == sw.at)) else {
+        return Ok("replaced");
+    };
+    let Some(sid) = a.session_id else { return Ok("next_start") };
+    match hub.session(sid) {
+        Some(s) if s.state != AgentState::Exited && !session_idle(&s) => Ok("busy"),
+        Some(s) if s.state != AgentState::Exited => {
+            handed_off(hub, a.id, sw.at);
+            Ok("restarted")
         }
-        Err(e) => Err(e),
+        _ => Ok("next_start"),
     }
 }
 
@@ -2892,7 +2950,10 @@ async fn save_notes_then(hub: &Arc<Hub>, sw: Switch, to: String) {
     let deadline = tokio::time::Instant::now() + save_notes_wait();
     // Only to the run that was checked: one that stopped or slept since would be started, on the
     // new account, by the delivery.
-    let still = |hub: &Hub| hub.agents().get(&name).and_then(|a| live_session(hub, &a)).is_some_and(|s| session_idle(&s));
+    // ...and only while this move is still the one waiting (a newer move asks, or not, itself).
+    let still = |hub: &Hub| hub.agents().get(&name)
+        .filter(|a| a.handoff.as_ref().is_some_and(|h| h.at == sw.at))
+        .and_then(|a| live_session(hub, &a)).is_some_and(|s| session_idle(&s));
     let replied = if !still(hub) {
         Err("it was no longer running and idle".to_string())
     } else {
@@ -4939,6 +5000,29 @@ mod tests {
         // Not running: it moves at its next start.
         let v = switch_account(&hub, sw).await;
         assert_eq!(v["outcome"], "next_start", "{v}");
+        // The move the window showed: one replaced since is refused, to look at again.
+        let e = edit(&hub, json!({"name": "waiting", "now": true, "handoff_at": first.at - 1}), true).unwrap_err();
+        assert!(e.contains("changed since this was shown") && e.contains("moves to Work"), "{e}");
+        assert!(edit(&hub, json!({"name": "waiting", "now": true, "handoff_at": first.at}), true).unwrap().1.is_some());
+        // `now` alone writes nothing back: a start that clears the move meanwhile stays cleared.
+        hub.agents().clear_handoff(hub.store(), _a.id, first.at).unwrap();
+        assert!(edit(&hub, json!({"name": "waiting", "now": true}), true).unwrap_err().contains("no move waiting"));
+        assert!(hub.store().load_agents().unwrap().into_iter().find(|b| b.id == _a.id).unwrap().handoff.is_none());
+    }
+
+    /// Asking an agent to save notes types a prompt into it as the human's: never on an agent's
+    /// behalf (`from_agent`), which may still move it.
+    #[tokio::test]
+    async fn an_agent_moves_agents_but_cannot_ask_for_notes() {
+        let (hub, _personal, work, _a) = moving_fixture("by-agent").await;
+        let mut req: AgentUpdate = serde_json::from_value(json!({"name": "by-agent", "account_profile": work, "save_notes": true})).unwrap();
+        req.from_agent = true;
+        let e = format!("{:#}", update_switch(&hub, req, true).unwrap_err());
+        assert!(e.contains("only the human asks for it"), "{e}");
+        assert_eq!(hub.agents().get("by-agent").unwrap().handoff, None, "nothing changed");
+        let mut req: AgentUpdate = serde_json::from_value(json!({"name": "by-agent", "account_profile": work})).unwrap();
+        req.from_agent = true;
+        assert!(update_switch(&hub, req, true).unwrap().1.is_some());
     }
 
     /// The first start after a move writes HANDOFF.md and gets the prompt; once that run has

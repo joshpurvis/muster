@@ -394,9 +394,11 @@ What the owner sees:
 - **Save notes first** (checkbox; off by default since 21 Nov 2026, now worded "Wake it first to
   save notes", and offered when the agent is running, idle and its current
   account still has room): before switching, Muster sends one message, "You are moving to
-  account Work. Write anything you would need to continue into memory/ now." Muster switches
-  once the reply arrives, or after 10 minutes. It is skipped when the old account is at its
-  limit.
+  account Work. Write anything you would need to continue into memory/ now." With Now, Muster
+  restarts it on the new account once the reply arrives, or after 10 minutes, if it is idle then
+  (a turn still running on the notes prompt is never cut off: it then moves at its next start);
+  without Now it still moves at its next start. It is skipped when the old account is at its
+  limit. It isn't taken from an agent's session (it types a prompt as the human's).
 - **Agents panel / tab menu:** "Switch account…" opens the same choice.
 - **CLI:** `muster agent edit NAME --profile PROFILE [--now] [--save-notes]` (until 21 Nov 2026
   notes were asked by default and `--no-save-notes` turned it off; that flag is still accepted).
@@ -488,6 +490,12 @@ being moved, let's make a way to avoid that in the future"):
   has nothing queued, the same check as Now), and as a panel in Edit agent with a **Restart now**
   button. `agent.update` with `now` alone (`muster agent edit NAME --now`) applies the move that
   waits; the CLI says "moved to Work now" or "moves to Work at its next start".
+- Review fixes (same day): Now and Restart now restart through a sleep under the start lock (the
+  sleep's own claim refuses while a prompt is being typed or waits, a message is on its way or keys
+  were just typed), then a start; a run that stopped or fell asleep meanwhile isn't woken. Restart
+  now sends the move it showed (`handoff_at`) and a replaced one is refused. Edit agent's picker
+  follows the agent's account until changed, so Save never undoes a move made elsewhere. An agent's
+  session can't ask for notes (it would type a prompt as the human).
 
 ### Phase B: an agent that can use either account
 

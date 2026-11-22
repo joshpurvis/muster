@@ -337,6 +337,10 @@ try:
     # The guards beside it stay: its accepted work only shrinks from here.
     no_wider = refused("agent", "edit", "reviewer", "--accepts", "human,schedule")
     check(no_wider and "click in Muster's window" in no_wider, "letting an agent take scheduled work still takes the window")
+    as_agent = subprocess.run([str(BIN), "agent", "edit", "nightly", "--profile", "Home", "--save-notes"],
+                              env={**ENV, "MUSTER_SESSION_ID": str(a["id"])}, cwd=REPO, text=True, capture_output=True, timeout=20)
+    check(as_agent.returncode != 0 and "only the human asks for it" in as_agent.stderr,
+          f"an agent's session can't ask another agent to save notes ({as_agent.stderr.strip()})")
     no_now = refused("agent", "edit", "coder", "--now")
     check(no_now and "no move waiting" in no_now, "--now alone with no move waiting is refused")
     # --now from an agent's session, without saving notes: a busy agent waits, an idle one
@@ -392,14 +396,23 @@ try:
     check(time.monotonic() - asked_at < 5.5 and launched(sid, replied_pid)["config_dir"] == str(BASE / "work")
           and next(m for m in rpc("agent.messages", {"agent": "reviewer"})["messages"] if m["id"] == asked["id"])["reply"]
           == "Saved my notes to memory/.", "once it replies, the agent restarts on the new profile")
-    # No reply: the move goes ahead once the wait is over.
+    # No reply within the wait: the notes prompt's turn hasn't ended, so Now leaves it alone and
+    # the move waits for its next start (never cut off a turn); a notice says so.
     hooks(sid, "work-again")
     until("idle after its turn", lambda: session(sid)["state"] == "idle")
-    started = time.monotonic()
     rpc("agent.update", {"name": "reviewer", "account_profile": personal, "now": True, "save_notes": True})
-    timed_pid = until("the restart after the wait", lambda: session(sid)["pid"] != replied_pid and session(sid)["pid"])
-    check(time.monotonic() - started >= 5 and launched(sid, timed_pid)["config_dir"] == str(BASE / "personal"),
-          "without a reply, the move goes ahead after the wait")
+    time.sleep(7.5)
+    check(session(sid)["pid"] == replied_pid and reviewer()["handoff"] is not None and reviewer()["account_profile_id"] == personal,
+          "without a reply, the turn it was asked for isn't cut off: the move waits for its next start")
+    # Its turn ends: Restart now (`now` alone, for the move shown) moves it.
+    hooks(sid, "work-again", reply="Saved.")
+    until("idle after its turn", lambda: session(sid)["state"] == "idle")
+    stale = rpc("agent.update", {"name": "reviewer", "now": True, "handoff_at": reviewer()["handoff"]["at"] - 1}, error="changed since")
+    sw = rpc("agent.update", {"name": "reviewer", "now": True, "handoff_at": reviewer()["handoff"]["at"]})["switch"]
+    timed_pid = session(sid)["pid"]
+    check(stale and sw["outcome"] == "restarted" and timed_pid != replied_pid
+          and launched(sid, timed_pid)["config_dir"] == str(BASE / "personal"),
+          "Restart now applies the move it showed, and refuses one replaced since")
 
     # ----- usage display and placement suggestions (docs/ACCOUNT_PROFILES.md steps 2-3) -----
     now = int(time.time())

@@ -907,7 +907,7 @@ outside the window, and there:
 | `schedule.renew` | Held (`renewed`); the approval renews it from then. A schedule that doesn't expire is left as it is. |
 | `schedule.settings.set` | Refused whole when it loosens a limit (resuming all, a higher spend cap, clearing or raising an agent's spend cap, another watched folder); tightening applies. The unattended cap and the quiet hours apply either way. |
 | `note.set_triggers` | `on: true` refused; `off` applies. |
-| `agent.update` | Refused: adding `schedule` or `webhook` to `accepts`, and changing the `provider` of a Claude agent that takes scheduled or triggered work or is named in a schedule (its own or a "Then…" step's): that changes whether its schedules expire after 7 days and what pays for them. Moving one to another `account_profile` applies (the owner, 21 Nov 2026). Also refused: `self_handoff: true`, `tools_up_front: true` and `lead: true` (see "Self handoff"; only from the window, or `/api/rpc` from a terminal outside every session). Anything else applies. The check and the write happen under one lock with the record as it is then, so an older edit can't put back what the owner took away. |
+| `agent.update` | Refused: adding `schedule` or `webhook` to `accepts`, and changing the `provider` of a Claude agent that still takes scheduled or triggered work after the call or is named in a schedule (its own or a "Then…" step's): that changes whether its schedules expire after 7 days and what pays for them. Moving one to another `account_profile` applies (the owner, 21 Nov 2026). Also refused: `self_handoff: true`, `tools_up_front: true` and `lead: true` (see "Self handoff"; only from the window, or `/api/rpc` from a terminal outside every session). Anything else applies. The check and the write happen under one lock with the record as it is then, so an older edit can't put back what the owner took away. A new `working_location` is refused from outside the window too (see `agent.update`). |
 
 A held schedule never runs (the scheduler, Run now and Skip next refuse it, a trigger isn't watched
 or fired, and a run already waiting, a Run now or a "Then…" step included, is skipped before it is
@@ -1373,7 +1373,13 @@ over without one) and `handoff_reason` (a string, kept to 2,000 bytes; refused
 without a move). Without `now`, a running agent keeps its current account and conversation
 until its next start. `now` without `account_profile` (or naming the profile it already moves
 to) applies the move that waits for its next start, as `now` with a move does (the window's
-Restart now, `muster agent edit NAME --now`); refused when no move waits. A move sets `account_profile_id`, sets `reset_on_next_start` (a conversation
+Restart now, `muster agent edit NAME --now`); refused when no move waits. With it,
+`handoff_at` (the waiting move's `handoff.at`, what the window showed) refuses a move replaced
+since. `save_notes: true` is refused from an agent's session or a shell an agent typed into
+(`from_session`): the request types a prompt into the agent as the human's. Now restarts through
+a sleep under the start lock (src/sleep.rs: refused, as `busy`, while a prompt is being typed or
+waits, a message is on its way or keys were just typed), then a start, which is the move's new
+conversation; a run that stopped or fell asleep meanwhile isn't woken (`next_start`). A move sets `account_profile_id`, sets `reset_on_next_start` (a conversation
 can't follow it to another account; a location change in the same call needs no
 `reset_conversation`) and records `handoff: {from, at, reason?}` on the agent (`from`: the
 profile the old conversation lives on, null for Default; a second move before a start keeps it).
@@ -1389,7 +1395,7 @@ HANDOFF.md starts with a line saying Muster wrote it; a HANDOFF.md without that 
 own) is renamed to `HANDOFF.agent.md` (or `HANDOFF.agent-N.md`) first, never overwritten.
 
 The reply's `switch` says what happens: `{to, now, running, outcome, notes, notes_skipped?, error?}`.
-`to` is the new profile's name; `running`: it had a live run (one `now` could restart). `notes` is `asked` when the agent is running, idle (state `idle`, nothing queued; an errored
+`to` is the new profile's name; `running`: whether it had a live run when the move was handled (a snapshot). `notes` is `asked` when `save_notes` is true and the agent is running, idle (state `idle`, nothing queued; an errored
 run is not) and the account its run is on isn't at its limit (a current 5-hour or weekly figure
 at 100%): Muster sends it
 "You are moving to account <to>. Write anything you would need to continue into memory/ now."

@@ -975,9 +975,11 @@ sends only what changed (`schedule.settings.set`). The dialog scrolls in a short
   profile opens a panel under the pills: "Moving to Work starts a new conversation. Its memory/
   notes come along. The current conversation stays on Personal."; **At its next start** (default)
   · **Now** ("Restarts it only if it is idle. If it is busy, it moves at its next start.");
-  **Wake it first to save notes**, off by default ("Off: it moves without a turn. HANDOFF.md and
-  its memory/ notes tell it where it left off."; ticked: Muster first asks it to write what it
-  needs into memory/, a turn on its current account), disabled with the reason when the agent
+  **Wake it first to save notes**, off by default ("Off: nothing is sent to it. Its memory/ notes
+  come along, and HANDOFF.md gives it its recent Muster messages."; ticked, it says Muster first
+  asks it to write what it needs into memory/, a turn on its current account, then with Now that
+  it restarts on the new account once it replies or after 10 minutes if idle, and without Now
+  that it still moves at its next start), disabled with the reason when the agent
   isn't running, is busy, or its account is at its limit; and an optional reason for its handoff
   note. With a
   move, a changed working repository needs no keep-or-reset choice. Saving shows what happens
@@ -986,7 +988,11 @@ sends only what changed (`schedule.settings.set`). The dialog scrolls in a short
   Edit agent: "Moves to Work at its next start", "Until then it keeps running on Personal.
   Restarting starts a new conversation on Work; its memory/ notes come along." and a **Restart
   now** button (disabled, with "It is busy. Restart now works once it is idle.", while it is
-  busy; for an agent that isn't running only "It isn't running: it starts on Work."). The
+  busy, "It has messages waiting to be typed…" while prompts wait; for an agent that isn't running
+  only "It isn't running: it starts on Work."; Restart now sends the move it showed, so one
+  replaced from elsewhere meanwhile is refused). The picker follows the agent's account until
+  you change it, so a move made from the CLI while the dialog is open isn't undone by Save. A
+  restart of a busy agent's tab with a move waiting says it moves there (a new conversation). The
   agent's row in the Agents panel shows the same "Moves to Work at its next start" line in amber
   under its state. A Claude agent's tab menu has Switch account… as well.
 - Model and Effort pills for the agent's kind (`agent.models`): Default (the CLI's

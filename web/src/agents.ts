@@ -511,18 +511,27 @@ export function pendingMove(
   a: Agent,
   s: SessionInfo | undefined,
   profiles: AccountProfile[],
-): { to: string; from: string; text: string; running: boolean; restart: boolean; why: string | null } | null {
+): { to: string; from: string; text: string; running: boolean; restart: boolean; why: string | null; wait?: string } | null {
   if (a.kind !== "claude" || !a.handoff) return null;
   const to = profileName(profiles, a.account_profile_id);
   const running = !!s && s.state !== "exited";
   const idle = running && s.state === "idle" && s.queued === 0;
+  const queued = running && s.state === "idle" && s.queued > 0;
   return {
     to,
     from: profileName(profiles, a.handoff.from),
     text: `Moves to ${to} at its next start`,
     running,
     restart: idle,
-    why: idle ? null : running ? "It is busy. Restart now works once it is idle." : `It isn't running: it starts on ${to}.`,
+    why: idle
+      ? null
+      : queued
+      ? "It has messages waiting to be typed. Restart now works once they are in and it is idle."
+      : running
+      ? "It is busy. Restart now works once it is idle."
+      : `It isn't running: it starts on ${to}.`,
+    // The menus' short hint beside a disabled Restart now.
+    wait: idle || !running ? undefined : queued ? "messages waiting" : "when idle",
   };
 }
 

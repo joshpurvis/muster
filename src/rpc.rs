@@ -1211,6 +1211,16 @@ async fn dispatch_inner(hub: &Arc<Hub>, who: &Principal, method: &str, params: V
             // `http_call`).
             p.by_owner = from_session.is_none()
                 && (via == Via::Window || OWNER_TERMINAL.try_with(|ok| *ok).unwrap_or(false));
+            // An agent's session (or a shell it typed into) may move agents, not ask one to save
+            // notes (`muster agent edit --save-notes` passes `$MUSTER_SESSION_ID`).
+            p.from_agent = match from_session.as_ref().and_then(|v| v.as_u64()) {
+                Some(s) => match caller(hub, Some(s as SessionId))? {
+                    Caller::Agent(_) => true,
+                    Caller::Shell(s) => hub.agents().prov(s).is_some(),
+                    Caller::Human => false,
+                },
+                None => false,
+            };
             // Letting an agent take scheduled or triggered work, or moving one that does to or
             // from the subscription, only with a click in the owner's window: checked with the
             // record it changes, under one lock (`agents::widens_unattended`).
@@ -3168,6 +3178,12 @@ mod tests {
         // Now it takes scheduled work, and still moves from outside the window (the owner, 21 Nov 2026).
         let r = call(&hub, "agent.update", json!({"name": "rpc-mover", "account_profile": "default"})).await.unwrap();
         assert!(r["account_profile_id"].is_null() && r["switch"]["outcome"] == "next_start", "{r}");
+        // From an agent's session (`from_session`): it moves, with Now; asking for notes is refused.
+        let e = call(&hub, "agent.update", json!({"name": "rpc-mover", "account_profile": work, "save_notes": true, "from_session": 3}))
+            .await.unwrap_err();
+        assert!(e.contains("only the human asks for it"), "{e}");
+        let r = call(&hub, "agent.update", json!({"name": "rpc-mover", "account_profile": work, "now": true, "from_session": 3})).await.unwrap();
+        assert_eq!((r["account_profile_id"].clone(), r["switch"]["notes_skipped"].as_str()), (json!(work), Some("off")), "{r}");
     }
 
     #[tokio::test]
@@ -3593,9 +3609,10 @@ mod tests {
 
     /// Where the owner's window isn't the caller (the CLI, `/api/rpc`, a script, an agent that
     /// dropped `MUSTER_SESSION_ID`): a new schedule, or a change that widens one, is held for a
-    /// click; settings, a note's triggers and an agent's accepted work only tighten.
+    /// click; a note's triggers, an agent's accepted work and the settings other than the
+    /// unattended cap and the quiet hours only tighten.
     #[tokio::test]
-    async fn outside_the_window_new_work_waits_for_a_click_and_limits_only_tighten() {
+    async fn outside_the_window_new_work_waits_for_a_click_and_other_limits_only_tighten() {
         let (hub, _st) = fixture();
         agent(&hub, "rpc-sam"); // Claude: takes human work only
         crate::agents::create(&hub, NewAgent {

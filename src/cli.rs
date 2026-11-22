@@ -2716,6 +2716,10 @@ pub fn agent_edit(d: &Discovery, o: AgentOpts) -> anyhow::Result<()> {
     if let Value::Object(m) = move_params(&o.switch, to) {
         params.as_object_mut().expect("an object").extend(m);
     }
+    // Asking an agent to save notes is the human's: say whose call it is.
+    if o.switch.save_notes && let Some(id) = env_session() {
+        params["from_session"] = json!(id);
+    }
     let b = client::rpc(d, "agent.update", params)?;
     print_agent("updated", &b, &o.name);
     if let Some(line) = switch_line(b["name"].as_str().unwrap_or(&o.name), &b["switch"]) {
@@ -2738,7 +2742,8 @@ pub fn switch_line(name: &str, sw: &Value) -> Option<String> {
         Some("restarted") => format!("{name} moved to {to} now: a new conversation started there."),
         Some("busy") => format!("{name} isn't idle, so it moves to {to} at its next start."),
         Some("replaced") => format!("A newer move of {name} replaced this one."),
-        Some("after_notes") => format!("{name} moves to {to} once it has saved its notes, then restarts if idle."),
+        Some("after_notes") => format!("{name} moves to {to} once it has saved its notes or after {} minutes without a reply, \
+            then restarts there if it is idle (otherwise at its next start).", crate::agents::SAVE_NOTES_WAIT.as_secs() / 60),
         Some("failed") => format!("{name} didn't restart: {}. It moves to {to} at its next start.",
             sw["error"].as_str().unwrap_or("unknown error")),
         // No run to restart (`--now` asked, or not).

@@ -1337,6 +1337,9 @@ async function agentMethod(method: string, p: any): Promise<unknown> {
       const moving = to !== undefined && to !== (a.account_profile_id ?? null);
       // `now` alone applies the move waiting for its next start (Restart now).
       if (!moving && p.now && !a.handoff) throw new Error(`${a.name} has no move waiting`);
+      if (!moving && p.now && p.handoff_at != null && a.handoff && a.handoff.at !== p.handoff_at) {
+        throw new Error(`the move of ${a.name} changed since this was shown; look again`);
+      }
       if (moving || (p.now && a.handoff)) {
         if (a.kind !== "claude") throw new Error("account_profile is only supported for Claude agents");
         if (moving) {
@@ -1347,7 +1350,7 @@ async function agentMethod(method: string, p: any): Promise<unknown> {
         const s = a.session_id !== null ? sessions.get(a.session_id) : undefined;
         const live = !!s && s.state !== "exited";
         // Notes only when asked (`save_notes`, off by default).
-        const notes = p.save_notes === true && live && s.state === "idle";
+        const notes = p.save_notes === true && live && s.state === "idle" && s.queued === 0;
         const restarted = !notes && p.now && live && s.state === "idle" && s.queued === 0;
         sw = {
           to: accountProfiles.find((x) => x.id === (a.account_profile_id ?? null))?.name ?? "Default",

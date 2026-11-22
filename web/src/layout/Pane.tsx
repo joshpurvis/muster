@@ -166,6 +166,7 @@ function tabMenu(s: SessionInfo, c: Channel | undefined, paneId: string, tabsInG
   if (A.canSwitchAccount(owner)) {
     items.push({ label: "Switch account…", run: () => A.switchAgentAccount(owner.name) });
   }
+  items.push(...A.pendingMoveItems(owner));
   items.push(
     "sep",
     {

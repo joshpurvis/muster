@@ -3,6 +3,7 @@
 // (agents_test.ts).
 
 import type {
+  AccountProfile,
   Agent,
   AgentSwitch,
   AgentMessage,
@@ -17,6 +18,7 @@ import type {
 } from "./types.ts";
 import { STATE_LABEL } from "./types.ts";
 import { idleText } from "./cache.ts";
+import { profileName } from "./account_profiles.ts";
 
 /** What a row shows: the dot's state, whether a process runs, and the state's label and start. */
 export interface AgentStatus {
@@ -501,6 +503,63 @@ export function saveNotesBlocked(s: SessionInfo | undefined, oldAtLimit: boolean
   return null;
 }
 
+/** A move to another account waiting for the agent's next start (`handoff`): a running agent
+ * keeps its old account until it restarts. `restart`: Restart now can apply it, on the same check
+ * as the move's Now (a running, idle agent with nothing queued: src/agents.rs `session_idle`);
+ * `why`: why not, when it can't. null: no move waiting. */
+export function pendingMove(
+  a: Agent,
+  s: SessionInfo | undefined,
+  profiles: AccountProfile[],
+): { to: string; from: string; text: string; running: boolean; restart: boolean; off: boolean; why: string | null; wait?: string } | null {
+  if (a.kind !== "claude" || !a.handoff) return null;
+  const to = profileName(profiles, a.account_profile_id);
+  const running = !!s && s.state !== "exited";
+  const idle = running && s.state === "idle" && s.queued === 0;
+  const queued = running && s.state === "idle" && s.queued > 0;
+  // A destination turned off since the move was saved: it can't start there (the backend checks
+  // before stopping anything, src/agents.rs `restart_moved`).
+  const off = a.account_profile_id != null && profiles.find((p) => p.id === a.account_profile_id)?.enabled === false;
+  return {
+    to,
+    from: profileName(profiles, a.handoff.from),
+    text: off ? `Can't move to ${to} yet: it is disabled` : `Moves to ${to} at its next start`,
+    running,
+    restart: idle && !off,
+    off,
+    why: off
+      ? `${to} is disabled in Accounts, so it can't start there. Turn ${to} back on, or pick another account.`
+      : idle
+      ? null
+      : queued
+      ? "It has messages waiting to be typed. Restart now works once they are in and it is idle."
+      : running
+      ? "It is busy. Restart now works once it is idle."
+      : `It isn't running: it starts on ${to}.`,
+    // The menus' short hint beside a disabled Restart now.
+    wait: off ? "account disabled" : idle || !running ? undefined : queued ? "messages waiting" : "when idle",
+  };
+}
+
+/** What a busy tab's Restart confirmation showed: the run it would end and the move it named
+ * (`null`: none). Confirming acts only if both are still so (`restartShownChanged`). */
+export interface RestartShown {
+  pid: number | null;
+  move: number | null;
+  to: number | null;
+}
+
+export function restartShown(a: Agent | undefined, s: SessionInfo): RestartShown {
+  const move = a && a.kind === "claude" && a.handoff ? a.handoff : null;
+  return { pid: s.pid, move: move ? move.at : null, to: move ? a!.account_profile_id ?? null : null };
+}
+
+/** The run or the move changed since the confirmation was shown (another client restarted it,
+ * or a move was saved, replaced or applied): confirming must ask again, not act. */
+export function restartShownChanged(shown: RestartShown, now: RestartShown | null): boolean {
+  return !now || now.pid !== shown.pid || now.move !== shown.move || now.to !== shown.to;
+}
+
 /** The message after saving a move (`agent.update`'s `switch`). */
 export function switchMessage(name: string, sw: AgentSwitch): { level: "success" | "warn"; text: string } {
   const notes = sw.notes === "asked"
@@ -512,18 +571,23 @@ export function switchMessage(name: string, sw: AgentSwitch): { level: "success"
     case "restarted":
       return { level: "success", text: `${name} moved to ${sw.to}: a new conversation started there.${notes}` };
     case "busy":
-      return { level: "warn", text: `${name} isn't idle, so it moves to ${sw.to} at its next start.${notes}` };
+      return {
+        level: "warn",
+        text: sw.why
+          ? `${name} can't restart now (${sw.why}), so it moves to ${sw.to} at its next start.${notes}`
+          : `${name} isn't idle, so it moves to ${sw.to} at its next start.${notes}`,
+      };
     case "replaced":
       return { level: "warn", text: `A newer move of ${name} replaced this one.` };
     case "after_notes":
       return {
         level: "success",
-        text: `Asked ${name} to save its notes. It moves to ${sw.to} once it replies (at most 10 minutes), then restarts if idle.`,
+        text: `Asked ${name} to save its notes. Muster waits up to 10 minutes for its reply, then restarts it on ${sw.to} if it is idle; otherwise it moves at its next start.`,
       };
     case "failed":
       return {
         level: "warn",
-        text: `${name} didn't restart: ${sw.error ?? "unknown error"}. It moves to ${sw.to} at its next start.`,
+        text: `${name} didn't restart: ${sw.error ?? "unknown error"}. The move to ${sw.to} still waits.`,
       };
     default:
       return {

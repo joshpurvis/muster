@@ -1334,21 +1334,40 @@ async function agentMethod(method: string, p: any): Promise<unknown> {
       // A move to another account (src/agents.rs `update_switch` / `switch_account`, loosely).
       const to = p.account_profile === undefined ? undefined : typeof p.account_profile === "number" ? p.account_profile : null;
       let sw: Record<string, unknown> | undefined;
-      if (to !== undefined && to !== (a.account_profile_id ?? null)) {
+      const moving = to !== undefined && to !== (a.account_profile_id ?? null);
+      // `now` alone applies the move waiting for its next start (Restart now).
+      if (!moving && p.now && !a.handoff) throw new Error(`${a.name} has no move waiting`);
+      if (!moving && p.now && p.handoff_at != null && a.handoff && a.handoff.at !== p.handoff_at) {
+        throw new Error(`the move of ${a.name} changed since this was shown; look again`);
+      }
+      if (moving || (p.now && a.handoff)) {
         if (a.kind !== "claude") throw new Error("account_profile is only supported for Claude agents");
-        a.handoff = { from: a.handoff?.from ?? a.account_profile_id ?? null, at: now(), reason: p.handoff_reason };
-        a.account_profile_id = to;
-        a.reset_on_next_start = true;
+        if (moving) {
+          a.handoff = { from: a.handoff?.from ?? a.account_profile_id ?? null, at: now(), reason: p.handoff_reason };
+          a.account_profile_id = to;
+          a.reset_on_next_start = true;
+        }
         const s = a.session_id !== null ? sessions.get(a.session_id) : undefined;
         const live = !!s && s.state !== "exited";
-        const notes = p.save_notes !== false && live && s.state === "idle";
+        // Notes only when asked (`save_notes`, off by default).
+        const notes = p.save_notes === true && live && s.state === "idle" && s.queued === 0;
+        const restarted = !notes && p.now && live && s.state === "idle" && s.queued === 0;
         sw = {
-          to: accountProfiles.find((x) => x.id === to)?.name ?? "Default",
+          to: accountProfiles.find((x) => x.id === (a.account_profile_id ?? null))?.name ?? "Default",
           now: !!p.now,
+          running: live,
           notes: notes ? "asked" : "skipped",
-          notes_skipped: notes ? undefined : p.save_notes === false ? "off" : live ? "busy" : "not_running",
-          outcome: notes && p.now ? "after_notes" : p.now && live ? (s.state === "idle" ? "restarted" : "busy") : "next_start",
+          notes_skipped: notes ? undefined : p.save_notes !== true ? "off" : live ? "busy" : "not_running",
+          outcome: notes && p.now ? "after_notes" : p.now && live ? (restarted ? "restarted" : "busy") : "next_start",
         };
+        if (restarted) {
+          // The run that starts is on the new account: the move is done.
+          a.handoff = null;
+          a.reset_on_next_start = false;
+          const run = s!;
+          setState(run, "starting");
+          setTimeout(() => run.state === "starting" && setState(run, "idle"), 1500);
+        }
       }
       broadcast("agent_upserted", agentJson(a));
       return sw ? { ...agentJson(a), switch: sw } : agentJson(a);
@@ -1562,6 +1581,22 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
     return { key_present: orKey };
   }
   if (method === "account_profile.list") return accountProfiles;
+  if (method === "account_profile.update") {
+    // Rename or turn a profile on or off (the directory is fixed, src/account_profiles.rs).
+    const pf = accountProfiles.find((x) => x.id === p.id);
+    if (!pf) throw new Error("no such profile");
+    if (typeof p.name === "string") pf.name = p.name;
+    if (typeof p.enabled === "boolean") pf.enabled = p.enabled;
+    broadcast("account_profiles_changed", accountProfiles);
+    return pf;
+  }
+  if (method === "mock.session_state") {
+    // Pretend a session's run changed state ({id, state}): a turn starting, say.
+    const s = sessions.get(p.id);
+    if (!s) throw new Error("no such session");
+    setState(s, p.state);
+    return {};
+  }
   if (method === "account_usage.get") return accountUsage();
   // Codex's plan limits as its newest session log saw them (src/codex_usage.rs).
   if (method === "codex_usage.get") {

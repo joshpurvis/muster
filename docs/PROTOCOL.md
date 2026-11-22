@@ -146,7 +146,7 @@ All ids are numbers. Types (`Workspace`, `Channel`, `SessionInfo`, `Event`) are 
 | `session.detach` | `{id}` | `{}` |
 | `session.resize` | `{id, cols, rows}` | `{}` (last resizer wins). Sets `SessionInfo.size_owner` to `"local"` (client token) or `"device:<id>"`; a change of owner alone also emits `session_upserted`. `size_owner` is runtime only (null after a daemon restart). |
 | `session.kill` | `{id}` | `{}` |
-| `session.restart` | `{id}` | `SessionInfo` (new process, same id, same kind/cwd/name; replay cleared) |
+| `session.restart` | `{id, expect?}` | `SessionInfo` (new process, same id, same kind/cwd/name; replay cleared). `expect: {pid, handoff_at?, idle?, since?}`: what the window showed (the run's `pid`, the named agent's waiting move's `handoff.at` or null for none, `idle: true` when no turn would be lost, and the run's `state_since`, so a turn that ended and another that began is a change); refused with "it changed since this was shown: look again" when any differs, checked under the start lock for a named agent's tab, and again after its folder is prepared, right before its conversation is reset. The window's tab and terminal menus send it (also for an idle run, which restarts without asking) and ask again on that refusal. |
 | `session.remove` | `{id}` | `{}` (kills if alive, deletes; emits `session_removed`). Removing a channel's last session leaves the empty channel available (see "Groups layout (v2)"). A named agent's session is never removed this way: it is hidden instead, as `session.hide`, and the reply is `{hidden: true, session: SessionInfo}` (so no client can stop an agent by closing its tab, whatever it knows about agents); `agent.remove` removes it. |
 | `session.hide` | `{id}` | `SessionInfo`. Closes a named agent's tab without stopping it: the session keeps its process, scrollback and channel and gets `hidden: true`, `window_id: null` (see "Groups layout (v2)", hidden agent tabs). Hiding a hidden one is a no-op; a session that isn't a named agent's is refused (`session N is not a named agent's`), so ordinary tabs close only with `session.remove`. `session.set_window` shows it again. No device scope. |
 | `session.rename` | `{id, name}` | `SessionInfo` |
@@ -568,7 +568,8 @@ sent through the same path as `agent.ask`, so the agent's accepted origins, the 
 (`agent_message`). Desktop client token only: devices get no `schedule.*` method and no schedule
 events. Only the human makes, approves or changes schedules: a mutating call whose
 `from_session` is an agent's session, or a shell tab with an agent's provenance (one an agent
-spawned or typed into), is refused. Agents propose schedules and set one-off reminders through
+spawned or typed into), is refused, except a `schedule.settings.set` that changes only the
+unattended cap or the quiet hours. Agents propose schedules and set one-off reminders through
 their MCP tools (Phase 3, below; docs/MCP.md "Schedules").
 
 ```ts
@@ -613,7 +614,7 @@ type ScheduleSettings = { paused: boolean /* "Pause all schedules" */; quiet_sta
 | `schedule.runs` | `{id, before?, limit? = 20 (1..200)}` | `{runs: Run[], more}`, newest first, below run id `before`. The newest 500 runs per schedule are kept. |
 | `schedule.preview` | `{when: WhenInput, tz?, quiet_hours?, agent?}` | `{reading, tz, when /* resolved */, next: number[] /* up to 3 */, quiet: boolean[] /* each falls in quiet hours (with quiet_hours, else the agent's default) */, quiet_hours_default, missed_default: "run_once" \| "skip", expires: boolean}`. Errors as `schedule.create` would give them. The dialog calls it as you type. |
 | `schedule.settings.get` | `{}` | `ScheduleSettings` |
-| `schedule.settings.set` | `{paused?, quiet_start?, quiet_end?, unattended_cap? (1..200)}` | `ScheduleSettings`. Emits `schedule_settings` and a `schedule_upserted` per schedule. A change that loosens a limit is taken only from a click in Muster's window (Phase 3, "Held"). |
+| `schedule.settings.set` | `{paused?, quiet_start?, quiet_end?, unattended_cap? (1..200)}` | `ScheduleSettings`. Emits `schedule_settings` and a `schedule_upserted` per schedule. The unattended cap and the quiet hours change from anywhere, either way, also from an agent's session when they are the only fields (`muster schedule settings`); a change that loosens another limit is taken only from a click in Muster's window (Phase 3, "Held"). |
 
 Events: `schedule_upserted` (`Schedule`) when one is made or changed or its next run moves,
 `schedule_removed {id, agent_id}`, `schedule_run` (`Run`) when a run is recorded or changes
@@ -727,7 +728,10 @@ type Then = { on_success: Step | null; on_failure: Step | null };
 agent's session or a shell with an agent's provenance, like the schedule calls (a guard against
 an agent's mistake, not a security boundary: the client token can do anything). Devices get none.
 Since Phase 3's second fix round, what makes or widens unattended work also needs a click in
-Muster's window; elsewhere it is held or refused (Phase 3, "Held").
+Muster's window; elsewhere it is held or refused (Phase 3, "Held"). Two settings are the
+exception (the owner, 21 Nov 2026): the unattended cap and the quiet hours, which the CLI and
+agents change too (a `schedule.settings.set` with only `unattended_cap`, `quiet_start` and
+`quiet_end`).
 
 **Trigger URL.** `POST /api/trigger/<name>` with `Authorization: Bearer <secret>`, on the
 daemon's loopback listener only (a request through `tailscale serve` is refused); the body (at
@@ -901,9 +905,9 @@ outside the window, and there:
 | `schedule.pause` | `on: true` applies; `on: false` resumes it held (`resumed`). |
 | `schedule.skip` | `on: true` applies; `on: false` undoes it held (`unskipped`). |
 | `schedule.renew` | Held (`renewed`); the approval renews it from then. A schedule that doesn't expire is left as it is. |
-| `schedule.settings.set` | Refused when it loosens anything (resuming all, moving quiet hours, a higher unattended or spend cap, clearing or raising an agent's spend cap, another watched folder); tightening applies. |
+| `schedule.settings.set` | Refused whole when it loosens a limit (resuming all, a higher spend cap, clearing or raising an agent's spend cap, another watched folder); tightening applies. The unattended cap and the quiet hours apply either way. |
 | `note.set_triggers` | `on: true` refused; `off` applies. |
-| `agent.update` | Refused: adding `schedule` or `webhook` to `accepts`, and changing the `provider` or `account_profile` of a Claude agent that takes scheduled or triggered work or is named in a schedule (its own or a "Then…" step's): that changes whether its schedules expire after 7 days and what pays for them (for a profile, which account pays). Also refused: `self_handoff: true`, `tools_up_front: true` and `lead: true` (see "Self handoff"; only from the window, or `/api/rpc` from a terminal outside every session). Anything else applies. The check and the write happen under one lock with the record as it is then, so an older edit can't put back what the owner took away. |
+| `agent.update` | Refused: adding `schedule` or `webhook` to `accepts`, and changing the `provider` of a Claude agent that still takes scheduled or triggered work after the call or is named in a schedule (its own or a "Then…" step's): that changes whether its schedules expire after 7 days and what pays for them. Moving one to another `account_profile` applies (the owner, 21 Nov 2026). Also refused: `self_handoff: true`, `tools_up_front: true` and `lead: true` (see "Self handoff"; only from the window, or `/api/rpc` from a terminal outside every session). Anything else applies. The check and the write happen under one lock with the record as it is then, so an older edit can't put back what the owner took away. A new `working_location` is refused from outside the window too (see `agent.update`). |
 
 A held schedule never runs (the scheduler, Run now and Skip next refuse it, a trigger isn't watched
 or fired, and a run already waiting, a Run now or a "Then…" step included, is skipped before it is
@@ -1361,9 +1365,24 @@ the agent record; `agent.update` moves it (below).
 
 `agent.update` with `account_profile` (an id or `"default"`) moves a Claude agent to that
 profile; its current one is no change, a Codex agent is refused (even with `"default"`), and
-the profile is checked as at creation (enabled, its folder present). Optional with it: `now` (default false),
-`save_notes` (default true) and `handoff_reason` (a string, kept to 2,000 bytes; refused
-without a move). A move sets `account_profile_id`, sets `reset_on_next_start` (a conversation
+the profile is checked as at creation (enabled, its folder present). It works from anywhere,
+also for an agent that takes scheduled or triggered work (the CLI, an agent's session, a
+script; until 21 Nov 2026 that took a click in Muster's window). Optional with it: `now` (default false),
+`save_notes` (default false: asking starts a turn, and HANDOFF.md and memory/ carry the agent
+over without one) and `handoff_reason` (a string, kept to 2,000 bytes; refused
+without a move). Without `now`, a running agent keeps its current account and conversation
+until its next start. `now` without `account_profile` (or naming the profile it already moves
+to) applies the move that waits for its next start, as `now` with a move does (the window's
+Restart now, `muster agent edit NAME --now`); refused when no move waits. With it,
+`handoff_at` (the waiting move's `handoff.at`, what the window showed) refuses a move replaced
+since. `save_notes: true` only from the human, as for `self_handoff` (a click in Muster's window,
+or `/api/rpc` with the client token, no `from_session`, from a terminal outside every Muster
+session; `muster agent edit --save-notes` passes `$MUSTER_SESSION_ID`): the request types a
+prompt into the agent as the human's. Now first checks the new account, provider and working
+location as a start would (a refusal stops nothing), then restarts through a sleep under the
+start lock (src/sleep.rs: refused, as `busy`, while a prompt is being typed or waits, a message
+is on its way or the human, or an agent's keys, typed into it in the last 15 seconds), then a start, which is the move's new
+conversation; a run that stopped or fell asleep meanwhile isn't woken (`next_start`). A move sets `account_profile_id`, sets `reset_on_next_start` (a conversation
 can't follow it to another account; a location change in the same call needs no
 `reset_conversation`) and records `handoff: {from, at, reason?}` on the agent (`from`: the
 profile the old conversation lives on, null for Default; a second move before a start keeps it).
@@ -1378,20 +1397,23 @@ note's text itself). `handoff` is cleared once that run has started; later start
 HANDOFF.md starts with a line saying Muster wrote it; a HANDOFF.md without that line (the agent's
 own) is renamed to `HANDOFF.agent.md` (or `HANDOFF.agent-N.md`) first, never overwritten.
 
-The reply's `switch` says what happens: `{to, now, outcome, notes, notes_skipped?, error?}`.
-`to` is the new profile's name. `notes` is `asked` when the agent is running, idle (state `idle`, nothing queued; an errored
+The reply's `switch` says what happens: `{to, now, running, outcome, notes, notes_skipped?, error?, why?}`.
+`to` is the new profile's name; `running`: whether it had a live run when the move was handled (a snapshot). `notes` is `asked` when `save_notes` is true and the agent is running, idle (state `idle`, nothing queued; an errored
 run is not) and the account its run is on isn't at its limit (a current 5-hour or weekly figure
 at 100%): Muster sends it
 "You are moving to account <to>. Write anything you would need to continue into memory/ now."
 (origin human) and waits for its reply, up to 10 minutes, also through a turn stopped on a
 permission prompt (the owner can approve it), and only if that run is still live and idle when
 the message goes; otherwise `skipped`, with
-`notes_skipped` `off`, `not_running`, `busy` or `at_limit`. `outcome`: `next_start`;
-`restarted` (`now`, and it was idle: `agent.start` fresh under the start lock, as
-`start_fresh_if`); `busy` (`now`, but it wasn't idle: it moves at its next start); `replaced`
-(`now`, but by the time the start lock was free a newer move had replaced this one);
+`notes_skipped` `off`, `not_running`, `busy` or `at_limit`. `why` (with `busy`, when known): why
+the restart couldn't happen now, from the sleep's checks (an unsent draft, keys typed in the last
+15 seconds, by the human or an agent: "keys were typed into it just now", ...). `outcome`: `next_start`;
+`restarted` (`now`, and it was idle: put to sleep and started again on the new profile, a new
+conversation, as above); `busy` (`now`, but it wasn't idle: it moves at its next start); `replaced`
+(`now`, but a newer move had replaced this one: by the time the start lock was free, or while
+the old run stopped, when it started with the newer move);
 `after_notes` (`now` after the notes reply, if it is still running and idle and no newer move
-replaced this one; what happened, saved or no reply within the wait, is a `notice`); `failed` (`error`; it moves at its next start).
+replaced this one; what happened, a reply or none within the wait, is a `notice`); `failed` (`error`: a refused destination stops nothing, and the move still waits).
 
 Selection is resolved before creation and saved on the session. Restarts never re-resolve
 workspace defaults. Named-agent replacement sessions use the agent's pinned selection and

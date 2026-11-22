@@ -118,8 +118,10 @@ def rpc(method, params=None, error=None):
     return response["result"]
 
 
-def cli(*args):
-    return subprocess.run([str(BIN), *args], env=ENV, cwd=REPO, text=True,
+def cli(*args, session=None):
+    """`muster ARGS`; `session`: run as inside that Muster session (an agent's, for a Claude one)."""
+    env = {**ENV, "MUSTER_SESSION_ID": str(session)} if session is not None else ENV
+    return subprocess.run([str(BIN), *args], env=env, cwd=REPO, text=True,
                           capture_output=True, check=True, timeout=20).stdout
 
 
@@ -270,9 +272,18 @@ try:
         rows = [json.loads(line) for line in (BASE / "launches.jsonl").read_text().splitlines()]
         return [r for r in rows if r["id"] == sid]
 
+    def asked_to_save():
+        return [m for m in rpc("agent.messages", {"agent": "reviewer"})["messages"] if "You are moving to account" in (m.get("text") or "")]
+
     sid = replacement["id"]
-    moved = cli("agent", "edit", "reviewer", "--profile", "Work", "--no-save-notes", "--reason", "smoke move")
-    check("reviewer moves to Work at its next start" in moved, "the CLI move says when it applies")
+    hooks(sid, "fixture-conversation")
+    until("idle after its turn", lambda: session(sid)["state"] == "idle")
+    moved = cli("agent", "edit", "reviewer", "--profile", "Work", "--reason", "smoke move")
+    check("reviewer moves to Work at its next start" in moved and "keeps running on its current account" in moved
+          and "muster agent edit reviewer --now" in moved, "the CLI move says when it applies, and how to move it now")
+    time.sleep(1)
+    check(asked_to_save() == [] and session(sid)["pid"] == replacement["pid"],
+          "a move without --save-notes sends the idle agent nothing: no turn is started")
     rec = reviewer()
     check(rec["account_profile_id"] == work and rec["handoff"]["from"] == personal and rec["reset_on_next_start"]
           and session(sid)["pid"] == replacement["pid"] and session(sid)["account_profile_id"] == personal,
@@ -284,6 +295,14 @@ try:
     check(session(sid)["pid"] == replacement["pid"] and session(sid)["account_profile_id"] == personal
           and rec["handoff"] and rec["reset_on_next_start"] and rec["resumable"],
           "a tab restart onto a disabled profile changes nothing: same run, tab, conversation and pending move")
+    # Restart now (the move's own restart) checks the destination before stopping anything too.
+    sw = rpc("agent.update", {"name": "reviewer", "now": True})["switch"]
+    no_now = cli("agent", "edit", "reviewer", "--now")
+    rec = reviewer()
+    check(sw["outcome"] == "failed" and "disabled" in sw["error"] and "didn't restart" in no_now and "disabled" in no_now
+          and "The move to Work still waits" in no_now and session(sid)["pid"] == replacement["pid"]
+          and session(sid)["state"] != "exited" and rec["handoff"] and rec["account_profile_id"] == work,
+          f"Restart now onto a disabled profile leaves the running agent alone ({no_now.strip()})")
     cli("profile", "enable", "Work")
     first = rpc("session.restart", {"id": sid})
     run = launched(sid, first["pid"])
@@ -309,27 +328,78 @@ try:
         return p.returncode != 0 and p.stderr
     cli("agent", "new", "coder", "--kind", "codex")
     cli("agent", "new", "nightly", "--accepts", "human,schedule")
+    cli("agent", "new", "hooked", "--accepts", "human,webhook")
     cli("profile", "disable", "Home")
     no_codex = refused("agent", "edit", "coder", "--profile", "Work")
     no_disabled = refused("agent", "edit", "nightly", "--profile", "Home")
     cli("profile", "enable", "Home")
-    no_outside = refused("agent", "edit", "nightly", "--profile", "Work")
-    check(no_codex and "only supported for Claude" in no_codex and no_disabled and "disabled" in no_disabled
-          and no_outside and "click" in no_outside and next(x for x in rpc("agent.list") if x["name"] == "nightly")["account_profile_id"] is None,
-          "Codex agents, disabled profiles and a scheduled agent moved from outside the window are refused")
-    # Now, without Save notes: an idle agent restarts on the new profile at once.
+    check(no_codex and "only supported for Claude" in no_codex and no_disabled and "disabled" in no_disabled,
+          "Codex agents and disabled profiles are refused")
+    # An agent that takes scheduled or triggered work moves from the command line, and from an
+    # agent's session, like any other (the owner, 21 Nov 2026).
+    cli("agent", "edit", "nightly", "--profile", "Work")
+    cli("agent", "edit", "hooked", "--profile", "Work", session=a["id"])
+    agents_now = {x["name"]: x for x in rpc("agent.list")}
+    check(agents_now["nightly"]["account_profile_id"] == work and agents_now["hooked"]["account_profile_id"] == work,
+          "scheduled and triggered agents move from the CLI and from an agent's session")
+    # The guards beside it stay: its accepted work only shrinks from here.
+    no_wider = refused("agent", "edit", "reviewer", "--accepts", "human,schedule")
+    check(no_wider and "click in Muster's window" in no_wider, "letting an agent take scheduled work still takes the window")
+    as_agent = subprocess.run([str(BIN), "agent", "edit", "nightly", "--profile", "Home", "--save-notes"],
+                              env={**ENV, "MUSTER_SESSION_ID": str(a["id"])}, cwd=REPO, text=True, capture_output=True, timeout=20)
+    check(as_agent.returncode != 0 and "only the human asks for it" in as_agent.stderr,
+          f"an agent's session can't ask another agent to save notes ({as_agent.stderr.strip()})")
+    no_now = refused("agent", "edit", "coder", "--now")
+    check(no_now and "no move waiting" in no_now, "--now alone with no move waiting is refused")
+    # --now from an agent's session, without saving notes: a busy agent waits, an idle one
+    # restarts on the new profile at once; nothing is asked of it either way.
     hooks(sid, "moved-conversation")
     until("idle after its turn", lambda: session(sid)["state"] == "idle")
-    sw = rpc("agent.update", {"name": "reviewer", "account_profile": personal, "now": True, "save_notes": False})["switch"]
+    pid = session(sid)["pid"]
+    status, _ = http("/hook/UserPromptSubmit", {"session_id": "moved-conversation", "prompt": "a long job"},
+                     json.loads((DATA / "sessions" / str(sid) / "claude-mcp.json").read_text())["mcpServers"]["muster"]["headers"]["Authorization"].removeprefix("Bearer "))
+    assert status == 200
+    until("working", lambda: session(sid)["state"] == "working")
+    waits = cli("agent", "edit", "reviewer", "--profile", "Home", "--now", session=a["id"])
+    time.sleep(1)
+    check("isn't idle, so it moves to Home at its next start" in waits and session(sid)["pid"] == pid
+          and reviewer()["handoff"] is not None and reviewer()["account_profile_id"] == personal,
+          "--now of a busy agent leaves its turn alone: the move waits for its next start")
+    still = cli("agent", "edit", "reviewer", "--now")
+    check("isn't idle" in still and session(sid)["pid"] == pid, "--now alone waits too while it is busy")
+    # The working agent applying its own move (its own session as the caller): it waits too.
+    own = rpc("agent.update", {"name": "reviewer", "now": True, "from_session": sid})["switch"]
+    time.sleep(1)
+    check(own["outcome"] == "busy" and session(sid)["pid"] == pid and reviewer()["handoff"] is not None
+          and reviewer()["account_profile_id"] == personal, "a working agent's own --now leaves its turn alone too")
+    hooks(sid, "moved-conversation")
+    until("idle after its turn", lambda: session(sid)["state"] == "idle")
+    out = cli("agent", "edit", "reviewer", "--now", session=a["id"])
     now_pid = session(sid)["pid"]
-    check(sw["outcome"] == "restarted" and launched(sid, now_pid)["config_dir"] == str(BASE / "personal")
-          and "--resume" not in launched(sid, now_pid)["args"], "Now restarts an idle agent on the new profile")
-    # Save notes first: asked, the move waits for the reply, then Now restarts it.
+    check("reviewer moved to Home now" in out and now_pid != pid and launched(sid, now_pid)["config_dir"] == str(BASE / "personal")
+          and "--resume" not in launched(sid, now_pid)["args"] and reviewer()["handoff"] is None,
+          "--now alone, once it is idle, restarts it on the new profile")
+    check(asked_to_save() == [], "no move above asked it to save notes")
+    # A fresh move with --now from the CLI: an idle agent restarts on the new profile at once.
+    hooks(sid, "home-conversation")
+    until("idle after its turn", lambda: session(sid)["state"] == "idle")
+    out = cli("agent", "edit", "reviewer", "--profile", "Work", "--now")
+    moved_pid = session(sid)["pid"]
+    check("reviewer moved to Work now" in out and moved_pid != now_pid and launched(sid, moved_pid)["config_dir"] == str(BASE / "work"),
+          "--profile with --now restarts an idle agent on the new profile")
+    hooks(sid, "work-conversation")
+    until("idle after its turn", lambda: session(sid)["state"] == "idle")
+    sw = rpc("agent.update", {"name": "reviewer", "account_profile": personal, "now": True})["switch"]
+    now_pid = session(sid)["pid"]
+    check(sw["outcome"] == "restarted" and sw["notes"] == "skipped" and launched(sid, now_pid)["config_dir"] == str(BASE / "personal"),
+          "the RPC's Now without save_notes doesn't ask for notes either")
+    # --save-notes: asked, the move waits for the reply, then Now restarts it.
     hooks(sid, "home-again")
     until("idle after its turn", lambda: session(sid)["state"] == "idle")
     asked_at = time.monotonic()
-    sw = rpc("agent.update", {"name": "reviewer", "account_profile": work, "now": True})["switch"]
-    check(sw["notes"] == "asked" and sw["outcome"] == "after_notes", "Save notes first is asked of a running, idle agent")
+    out = cli("agent", "edit", "reviewer", "--profile", "Work", "--now", "--save-notes")
+    check("Asked it to save notes first" in out and "then restarts it on Work if it is idle; otherwise it moves at its next start" in out,
+          "--save-notes asks a running, idle agent to save its notes first")
     asked = until("the save-notes message", lambda: next((m for m in rpc("agent.messages", {"agent": "reviewer"})["messages"]
                                                         if "You are moving to account Work" in (m.get("text") or "")), None))
     time.sleep(1.5)
@@ -339,14 +409,57 @@ try:
     check(time.monotonic() - asked_at < 5.5 and launched(sid, replied_pid)["config_dir"] == str(BASE / "work")
           and next(m for m in rpc("agent.messages", {"agent": "reviewer"})["messages"] if m["id"] == asked["id"])["reply"]
           == "Saved my notes to memory/.", "once it replies, the agent restarts on the new profile")
-    # No reply: the move goes ahead once the wait is over.
+    # No reply within the wait: the notes prompt's turn hasn't ended, so Now leaves it alone and
+    # the move waits for its next start (never cut off a turn); a notice says so.
     hooks(sid, "work-again")
     until("idle after its turn", lambda: session(sid)["state"] == "idle")
-    started = time.monotonic()
-    rpc("agent.update", {"name": "reviewer", "account_profile": personal, "now": True})
-    timed_pid = until("the restart after the wait", lambda: session(sid)["pid"] != replied_pid and session(sid)["pid"])
-    check(time.monotonic() - started >= 5 and launched(sid, timed_pid)["config_dir"] == str(BASE / "personal"),
-          "without a reply, the move goes ahead after the wait")
+    before = {m["id"] for m in asked_to_save()}
+    asked_at = time.monotonic()
+    rpc("agent.update", {"name": "reviewer", "account_profile": personal, "now": True, "save_notes": True})
+    # The notes prompt was sent and typed in (out of its queue, not refused), and its turn began
+    # (Claude's submit hook); then the wait runs out with the turn still going.
+    until("the second notes prompt typed in", lambda: session(sid)["queued"] == 0 and any(
+        m["id"] not in before and "account Home" in m["text"] and not m["refused"] for m in asked_to_save()))
+    status, _ = http("/hook/UserPromptSubmit", {"session_id": "work-again", "prompt": "You are moving to account Home."},
+                     json.loads((DATA / "sessions" / str(sid) / "claude-mcp.json").read_text())["mcpServers"]["muster"]["headers"]["Authorization"].removeprefix("Bearer "))
+    assert status == 200
+    until("the notes turn working", lambda: session(sid)["state"] == "working")
+    time.sleep(max(0.0, asked_at + 6 + 1.5 - time.monotonic()))
+    check(session(sid)["pid"] == replied_pid and reviewer()["handoff"] is not None and reviewer()["account_profile_id"] == personal,
+          "without a reply, the turn it was asked for isn't cut off: the move waits for its next start")
+    # Its turn ends: Restart now (`now` alone, for the move shown) moves it.
+    hooks(sid, "work-again", reply="Saved.")
+    until("idle after its turn", lambda: session(sid)["state"] == "idle")
+    # The move shown is replaced (twice, ending where it was) before Restart now is clicked.
+    shown_at = reviewer()["handoff"]["at"]
+    rpc("agent.update", {"name": "reviewer", "account_profile": "default"})
+    rpc("agent.update", {"name": "reviewer", "account_profile": personal})
+    stale = rpc("agent.update", {"name": "reviewer", "now": True, "handoff_at": shown_at}, error="changed since")
+    check(session(sid)["pid"] == replied_pid, "a replaced move's Restart now stops nothing")
+    sw = rpc("agent.update", {"name": "reviewer", "now": True, "handoff_at": reviewer()["handoff"]["at"]})["switch"]
+    timed_pid = session(sid)["pid"]
+    check(stale and sw["outcome"] == "restarted" and timed_pid != replied_pid
+          and launched(sid, timed_pid)["config_dir"] == str(BASE / "personal"),
+          "Restart now applies the move it showed, and refuses one replaced since")
+    # A busy tab's Restart confirmation sends what it showed: the run, the move (none here) and
+    # whether a turn would be lost. Anything else is refused, to ask again; nothing is stopped.
+    hooks(sid, "personal-again")
+    until("idle after its turn", lambda: session(sid)["state"] == "idle")
+    rpc("session.restart", {"id": sid, "expect": {"pid": timed_pid, "handoff_at": 1, "idle": False}}, error="changed since this was shown")
+    rpc("session.restart", {"id": sid, "expect": {"pid": timed_pid + 100000, "handoff_at": None, "idle": False}}, error="changed since this was shown")
+    idle_since = session(sid)["state_since"]
+    run_token = json.loads((DATA / "sessions" / str(sid) / "claude-mcp.json").read_text())["mcpServers"]["muster"]["headers"]["Authorization"].removeprefix("Bearer ")
+    status, _ = http("/hook/UserPromptSubmit", {"session_id": "personal-again", "prompt": "a new turn"}, run_token)
+    assert status == 200
+    until("working", lambda: session(sid)["state"] == "working")
+    rpc("session.restart", {"id": sid, "expect": {"pid": timed_pid, "handoff_at": None, "idle": True}}, error="changed since this was shown")
+    # A dialog shown for the idle run, or for an earlier turn: the turn that began since is new.
+    rpc("session.restart", {"id": sid, "expect": {"pid": timed_pid, "handoff_at": None, "idle": False, "since": idle_since}},
+        error="changed since this was shown")
+    check(session(sid)["pid"] == timed_pid, "a Restart confirmation for another run, move or turn state stops nothing")
+    confirmed = rpc("session.restart", {"id": sid, "expect": {"pid": timed_pid, "handoff_at": None, "idle": False,
+                                                          "since": session(sid)["state_since"]}})
+    check(confirmed["pid"] != timed_pid, "the confirmation for what is true restarts it")
 
     # ----- usage display and placement suggestions (docs/ACCOUNT_PROFILES.md steps 2-3) -----
     now = int(time.time())

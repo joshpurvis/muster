@@ -710,9 +710,16 @@ async fn dispatch_inner(hub: &Arc<Hub>, who: &Principal, method: &str, params: V
             Ok(json!({}))
         }
         "session.restart" => {
-            let p: IdParam<SessionId> = parse(params)?;
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct P {
+                id: SessionId,
+                #[serde(default)]
+                expect: Option<crate::agents::RestartExpect>,
+            }
+            let p: P = parse(params)?;
             // A named agent's tab under the start lock, like every start of it (src/sleep.rs).
-            to_value(crate::agents::restart_session(hub, p.id).await?)
+            to_value(crate::agents::restart_session(hub, p.id, p.expect.as_ref()).await?)
         }
         "session.remove" => {
             let p: IdParam<SessionId> = parse(params)?;
@@ -1211,6 +1218,7 @@ async fn dispatch_inner(hub: &Arc<Hub>, who: &Principal, method: &str, params: V
             // `http_call`).
             p.by_owner = from_session.is_none()
                 && (via == Via::Window || OWNER_TERMINAL.try_with(|ok| *ok).unwrap_or(false));
+
             // Letting an agent take scheduled or triggered work, or moving one that does to or
             // from the subscription, only with a click in the owner's window: checked with the
             // record it changes, under one lock (`agents::widens_unattended`).
@@ -1388,8 +1396,9 @@ async fn dispatch_inner(hub: &Arc<Hub>, who: &Principal, method: &str, params: V
             }
             // An agent's session, or a shell tab an agent has typed into (its provenance is an
             // agent's chain): only a shell the human drives may make or change schedules, so
-            // unattended work can't set up more of itself.
-            if !reads {
+            // unattended work can't set up more of itself. The unattended cap and the quiet hours
+            // are the exception (`cap_or_quiet_only`).
+            if !reads && !cap_or_quiet_only(method, &params) {
                 let refused = match caller(hub, from)? {
                     Caller::Human => false,
                     Caller::Agent(_) => true,
@@ -1567,6 +1576,15 @@ async fn dispatch_inner(hub: &Arc<Hub>, who: &Principal, method: &str, params: V
         }
         _ => Err(RpcError(format!("unknown method: {method}"))),
     }
+}
+
+/// A `schedule.settings.set` that changes only the unattended cap or the quiet hours: agents may
+/// make it too, either way (the owner, 21 Nov 2026). Any other field beside them (even `null`)
+/// keeps the whole call the human's.
+fn cap_or_quiet_only(method: &str, params: &Value) -> bool {
+    let field = |k: &String| matches!(k.as_str(), "unattended_cap" | "quiet_start" | "quiet_end");
+    method == "schedule.settings.set"
+        && params.as_object().is_some_and(|o| o.keys().all(|k| field(k) || k == "from_session") && o.keys().any(field))
 }
 
 /// `muster schedule propose/remind` (`schedule.propose`, `schedule.remind`: an agent's only), and
@@ -2144,11 +2162,12 @@ tokio::task_local! {
 }
 
 /// Does this call turn on something only the human may (`owner_terminal`): an agent's self
-/// handoff (src/self_handoff.rs), its message tools up front (src/mcp/tools.rs) or its lead role
-/// (`agents::Agent::lead`), alone or together?
+/// handoff (src/self_handoff.rs), its message tools up front (src/mcp/tools.rs), its lead role
+/// (`agents::Agent::lead`) or a move's notes request, typed into it as the human's
+/// (`agents::AgentUpdate::save_notes`), alone or together?
 fn grants_owner_switch(method: &str, params: &Value) -> bool {
     method == "agent.update"
-        && ["self_handoff", "tools_up_front", "lead"].iter().any(|k| params.get(*k) == Some(&Value::Bool(true)))
+        && ["self_handoff", "tools_up_front", "lead", "save_notes"].iter().any(|k| params.get(*k) == Some(&Value::Bool(true)))
 }
 
 /// Is the `/api/rpc` call on connection `peer` the human's own: the client token, on no session's
@@ -3148,15 +3167,30 @@ mod tests {
         assert_eq!(r["reset_on_next_start"], json!(true));
         assert!(r["handoff"]["at"].is_i64() && r["handoff"]["from"].is_null());
         // Not running: nothing to save notes from or restart; it moves at its next start.
-        assert_eq!(r["switch"], json!({"to": "Work", "now": true, "notes": "skipped", "notes_skipped": "not_running",
+        assert_eq!(r["switch"], json!({"to": "Work", "now": true, "running": false, "notes": "skipped", "notes_skipped": "off",
             "outcome": "next_start"}));
         let same = call(&hub, "agent.update", json!({"name": "rpc-mover", "account_profile": work})).await.unwrap();
         assert!(same.get("switch").is_none(), "its current profile again is no move");
         call(&hub, "agent.update", json!({"name": "rpc-mover", "accepts": ["human", "schedule"]})).await.unwrap_err();
         dispatch_via(&hub, &Principal::Local, "agent.update", json!({"name": "rpc-mover", "accepts": ["human", "schedule"]}),
             Via::Window).await.map_err(|e| e.0).unwrap();
-        let e = call(&hub, "agent.update", json!({"name": "rpc-mover", "account_profile": "default"})).await.unwrap_err();
-        assert!(e.contains("which account pays"), "{e}");
+        // Now it takes scheduled work, and still moves from outside the window (the owner, 21 Nov 2026).
+        let r = call(&hub, "agent.update", json!({"name": "rpc-mover", "account_profile": "default"})).await.unwrap();
+        assert!(r["account_profile_id"].is_null() && r["switch"]["outcome"] == "next_start", "{r}");
+        // From an agent's session (`from_session`): it moves, with Now; asking for notes is refused.
+        let e = call(&hub, "agent.update", json!({"name": "rpc-mover", "account_profile": work, "save_notes": true, "from_session": 3}))
+            .await.unwrap_err();
+        assert!(e.contains("only the human asks for it"), "{e}");
+        // Without any caller named, but not the owner's window or terminal: refused too.
+        let e = call(&hub, "agent.update", json!({"name": "rpc-mover", "account_profile": work, "save_notes": true}))
+            .await.unwrap_err();
+        assert!(e.contains("only the human asks for it"), "{e}");
+        let r = call(&hub, "agent.update", json!({"name": "rpc-mover", "account_profile": work, "now": true, "from_session": 3})).await.unwrap();
+        assert_eq!((r["account_profile_id"].clone(), r["switch"]["notes_skipped"].as_str()), (json!(work), Some("off")), "{r}");
+        // A click in the window asks (not running here, so nothing is typed).
+        let r = dispatch_via(&hub, &Principal::Local, "agent.update",
+            json!({"name": "rpc-mover", "account_profile": "default", "save_notes": true}), Via::Window).await.map_err(|e| e.0).unwrap();
+        assert_eq!(r["switch"]["notes_skipped"], "not_running", "{r}");
     }
 
     #[tokio::test]
@@ -3481,6 +3515,9 @@ mod tests {
                 ("schedule.update", json!({"id": id, "prompt": "wider"})),
                 ("schedule.create", json!({"agent": "rpc-wk", "prompt": "p", "when": {"kind": "cron", "cron": "0 9 * * *"}})),
                 ("schedule.settings.set", json!({"watch_folders": ["/tmp"]})),
+                ("schedule.settings.set", json!({"paused": true})),
+                // Another setting beside the cap is refused whole.
+                ("schedule.settings.set", json!({"unattended_cap": 9, "spend_cap": 1.0})),
             ] {
                 let mut p = p;
                 p["from_session"] = json!(from);
@@ -3488,6 +3525,12 @@ mod tests {
                 assert!(e.contains("can't be called from an agent's session"), "{m} from {from}: {e}");
             }
         }
+        // The unattended cap and the quiet hours: an agent (and a shell it typed into) changes them too.
+        assert_ne!(hub.schedules.settings().unattended_cap, 9);
+        let r = call(&hub, "schedule.settings.set", json!({"unattended_cap": 120, "from_session": 3})).await.unwrap();
+        assert_eq!(r["unattended_cap"], 120);
+        let r = call(&hub, "schedule.settings.set", json!({"quiet_start": "22:00", "quiet_end": "07:30", "from_session": 1})).await.unwrap();
+        assert_eq!((r["quiet_start"].as_str(), r["quiet_end"].as_str()), (Some("22:00"), Some("07:30")), "{r}");
         assert!(hub.schedules.get(id).unwrap().waiting_approval());
         // Pausing its own is the agent's (the MCP pause_schedule); the human approves, and only
         // with a click in a window: never through `dispatch` (the CLI, `/api/rpc`).
@@ -3573,9 +3616,10 @@ mod tests {
 
     /// Where the owner's window isn't the caller (the CLI, `/api/rpc`, a script, an agent that
     /// dropped `MUSTER_SESSION_ID`): a new schedule, or a change that widens one, is held for a
-    /// click; settings, a note's triggers and an agent's accepted work only tighten.
+    /// click; a note's triggers, an agent's accepted work and the settings other than the
+    /// unattended cap and the quiet hours only tighten.
     #[tokio::test]
-    async fn outside_the_window_new_work_waits_for_a_click_and_limits_only_tighten() {
+    async fn outside_the_window_new_work_waits_for_a_click_and_other_limits_only_tighten() {
         let (hub, _st) = fixture();
         agent(&hub, "rpc-sam"); // Claude: takes human work only
         crate::agents::create(&hub, NewAgent {
@@ -3605,12 +3649,22 @@ mod tests {
         assert_eq!(call(&hub, "schedule.update", json!({"id": id, "prompt": "more"})).await.unwrap()["status"], "held");
         let other = r["id"].as_i64().unwrap();
         assert_eq!(call(&hub, "schedule.update", json!({"id": other, "name": "n"})).await.unwrap()["status"], "active");
-        // Settings: tightening applies, loosening is refused.
+        // Settings: the unattended cap and the quiet hours change from here either way; the
+        // other limits only tighten (resuming all, a higher spend cap, another watched folder).
         call(&hub, "schedule.settings.set", json!({"unattended_cap": 5})).await.unwrap();
-        let e = call(&hub, "schedule.settings.set", json!({"unattended_cap": 6})).await.unwrap_err();
-        assert!(e.contains("takes a click in Muster's window"), "{e}");
+        let r = call(&hub, "schedule.settings.set", json!({"unattended_cap": 60})).await.unwrap();
+        assert_eq!(r["unattended_cap"], 60, "a higher cap from the command line applies");
+        let r = call(&hub, "schedule.settings.set", json!({"quiet_start": "21:30", "quiet_end": "06:15"})).await.unwrap();
+        assert_eq!((r["quiet_start"].as_str(), r["quiet_end"].as_str()), (Some("21:30"), Some("06:15")), "{r}");
         let e = call(&hub, "schedule.settings.set", json!({"watch_folders": ["/tmp"]})).await.unwrap_err();
-        assert!(e.contains("watched folder"), "{e}");
+        assert!(e.contains("watched folder") && e.contains("takes a click in Muster's window"), "{e}");
+        call(&hub, "schedule.settings.set", json!({"paused": true})).await.unwrap();
+        let e = call(&hub, "schedule.settings.set", json!({"paused": false, "unattended_cap": 70})).await.unwrap_err();
+        assert!(e.contains("Resuming all schedules") && e.contains("takes a click in Muster's window"), "{e}");
+        assert_eq!(hub.schedules.settings().unattended_cap, 60, "a refused change applies nothing");
+        let e = call(&hub, "schedule.settings.set", json!({"spend_cap": 150.0})).await.unwrap_err();
+        assert!(e.contains("spend cap"), "{e}");
+        dispatch_via(&hub, &Principal::Local, "schedule.settings.set", json!({"paused": false}), Via::Window).await.map_err(|e| e.0).unwrap();
         // A note's triggers: off from anywhere, on only from the window.
         let n = crate::notes::create(&hub, Some("Ideas"), "", crate::model::NoteAuthor::human(), None, None).unwrap();
         let e = call(&hub, "note.set_triggers", json!({"id": n.id, "on": true})).await.unwrap_err();
@@ -3695,6 +3749,8 @@ mod tests {
         let on = json!({"name": "rpc-otto", "tools_up_front": true});
         assert!(grants_owner_switch("agent.update", &on));
         assert!(grants_owner_switch("agent.update", &json!({"name": "rpc-otto", "self_handoff": true})));
+        assert!(grants_owner_switch("agent.update", &json!({"name": "rpc-otto", "account_profile": 2, "save_notes": true})));
+        assert!(!grants_owner_switch("agent.update", &json!({"name": "rpc-otto", "account_profile": 2, "save_notes": false})));
         assert!(!grants_owner_switch("agent.update", &json!({"name": "rpc-otto", "tools_up_front": false})));
         // `muster agent edit` typed in a Muster tab: refused, whatever the terminal check said.
         let mut from = on.clone();

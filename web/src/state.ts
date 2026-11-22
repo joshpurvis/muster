@@ -499,6 +499,8 @@ export type Overlay =
   | { kind: "schedule_settings"; back?: ScheduleOverlay }
   | {
     kind: "confirm";
+    /** A new value draws a new dialog (its focus starts again: Cancel for a danger one). */
+    key?: string;
     title: string;
     /** One paragraph, or several. */
     body: string | string[];

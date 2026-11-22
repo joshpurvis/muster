@@ -91,11 +91,13 @@ import { openQuestionCount, questions, questionsFilter, questionsSupported, sele
 import { flushAllDrafts, flushDraft, knowNote, notes, persistAllDrafts, unsavedNotes } from "./notes.ts";
 import type { HelloResult, Note } from "./types.ts";
 import { inheritedProfile } from "./account_profiles.ts";
-import { isAsleep, providerPendingNote, upsertMessage } from "./agents.ts";
+import { isAsleep, pendingMove, providerPendingNote, restartShown, restartShownChanged, switchMessage, upsertMessage } from "./agents.ts";
+import type { MenuItem } from "./components/Menu.tsx";
 import { nextWhen } from "./schedules.ts";
 import { restartExpect, restartOutcome, restartWait } from "./updates.ts";
 import type {
   Agent,
+  AgentSwitch,
   Schedule,
   ScheduleRun,
   ScheduleSettings,
@@ -1060,10 +1062,20 @@ export function closeTaskRemoveWorktree(c: Channel) {
   };
 }
 
-export function restartSession(sid: SessionId, focus = true) {
-  rpc.call("session.restart", { id: sid }).then(() => {
+/** `expect`: what a confirmation showed; the backend refuses a restart that would now do
+ * something else (`changed`, if given, then runs instead of the failure toast). */
+export function restartSession(
+  sid: SessionId,
+  focus = true,
+  expect?: { pid: number | null; handoff_at: number | null; idle: boolean; since: number },
+  changed?: () => void,
+) {
+  rpc.call("session.restart", expect ? { id: sid, expect } : { id: sid }).then(() => {
     if (focus && focusedSession.value?.id === sid) focusActiveTerminalSoon();
-  }).catch(fail("Restart failed")).catch(() => {});
+  }).catch((e) => {
+    if (changed && String(e instanceof Error ? e.message : e).includes("changed since this was shown")) return changed();
+    fail("Restart failed")(e);
+  }).catch(() => {});
 }
 
 export function killSession(sid: SessionId) {
@@ -1083,23 +1095,56 @@ export function interruptSession(sid: SessionId) {
 }
 
 /** Restart / Interrupt from a tab or terminal menu: asks first while an agent is mid-turn (its
- * turn is lost). Palette commands and shortcuts act at once. Known gap: the dialog holds only the
- * session id, so if another client restarts that session while it is open, confirming acts on
- * the replacement run. */
-export function restartOrInterruptAsk(sid: SessionId, what: "restart" | "interrupt") {
+ * turn is lost). Palette commands and shortcuts act at once. The dialog names the run, the move
+ * it would apply and whether a turn is lost; Confirm sends them (`session.restart`'s `expect`),
+ * and if any changed (another client restarted it, a move was saved or replaced, a turn began)
+ * it asks again with what is true now instead of acting. */
+export function restartOrInterruptAsk(sid: SessionId, what: "restart" | "interrupt", again = false) {
   const s = sessions.value.get(sid);
-  const act = () => (what === "restart" ? restartSession(sid) : interruptSession(sid));
-  if (!s || !midTurn(s)) return act();
+  if (!s) return what === "restart" ? restartSession(sid) : interruptSession(sid);
+  // A named agent with a move waiting: its restart is the move (a new conversation there).
+  const ownerOf = () => agents.value.find((a) => a.session_id === sid);
+  const owner = ownerOf();
+  const move = owner ? pendingMove(owner, s, accountProfiles.value) : null;
+  const shown = restartShown(owner, s);
+  const busy = midTurn(s);
+  // Asked again after a refusal: only while the owner is still here (no other dialog opened
+  // meanwhile), and never to start a run that ended.
+  const askAgain = () => {
+    const cur = sessions.value.get(sid);
+    if (!cur || cur.state === "exited") return toast("warn", "That run ended before the restart: nothing was restarted.");
+    if (overlay.value) return toast("warn", "It changed before the restart, so nothing was restarted. Look again and restart it.");
+    restartOrInterruptAsk(sid, what, true);
+  };
+  // What the owner saw, for the backend to check (a turn that began, a move saved since).
+  const expect = { pid: shown.pid, handoff_at: shown.move, idle: !busy, since: s.state_since };
+  if (what === "restart" && move?.off) {
+    // It can't start there: say so rather than offer a restart the backend refuses.
+    return toast("warn", `${owner!.name} can't restart: ${move.why}`, 8000);
+  }
+  if (!again && !busy) {
+    return what === "restart" ? restartSession(sid, true, expect, askAgain) : interruptSession(sid);
+  }
   overlay.value = {
     kind: "confirm",
-    title: `${KIND_LABEL[s.kind]} is working`,
+    // A new dialog each time it asks again (its focus starts on Cancel, not on Restart).
+    key: again ? `restart-again-${Date.now()}` : undefined,
+    title: again ? "Look again before restarting" : `${KIND_LABEL[s.kind]} is working`,
     // Claude and Codex both reopen their conversation (Codex: once it has a finished turn).
-    body: what === "restart"
-      ? "Restart it? Its current turn is lost; it reopens the same conversation."
-      : "Stop its current turn?",
+    body: (again ? "Its run, its turn or its account move changed before the restart. " : "") + (what === "restart"
+      ? move
+        ? `Restart it? ${busy ? "Its current turn is lost, and it" : "It"} moves to ${move.to}: a new conversation there (its memory/ notes come along).`
+        : `Restart it? ${busy ? "Its current turn is lost; it" : "It"} reopens the same conversation.`
+      : "Stop its current turn?"),
     confirmLabel: what === "restart" ? "Restart" : "Interrupt",
     danger: true,
-    run: act,
+    run: () => {
+      if (what !== "restart") return interruptSession(sid);
+      const cur = sessions.value.get(sid);
+      const now = cur ? restartShown(ownerOf(), cur) : null;
+      if (restartShownChanged(shown, now) || (!busy && cur && midTurn(cur))) return askAgain();
+      restartSession(sid, true, expect, askAgain);
+    },
   };
 }
 
@@ -1961,6 +2006,44 @@ export function canSwitchAccount(a: Agent | undefined): a is Agent {
 /** "Switch account…": Edit agent, on its account picker (docs/ACCOUNT_PROFILES.md). */
 export function switchAgentAccount(name: string) {
   overlay.value = { kind: "agent", name, tab: "settings", focus: "profile" };
+}
+
+/** Restart now: apply the move waiting for `a`'s next start, if it is still idle (`agent.update`
+ * with `now` alone; the backend checks again, so a busy agent keeps its turn). True once it
+ * restarted on the new account. */
+export async function restartToMove(a: Agent): Promise<boolean> {
+  try {
+    // The move that was shown: one replaced since is refused, to look at again.
+    const r = await rpc.call<Agent & { switch?: AgentSwitch }>("agent.update", {
+      name: a.name,
+      now: true,
+      handoff_at: a.handoff?.at,
+    });
+    knowAgent(r);
+    if (r.switch) {
+      const m = switchMessage(r.name, r.switch);
+      toast(m.level, m.text, 8000);
+    }
+    return r.switch?.outcome === "restarted";
+  } catch (e) {
+    toast("error", `Couldn't restart ${a.name}: ${e instanceof Error ? e.message : e}`);
+    return false;
+  }
+}
+
+/** The menu items for a move waiting for `a`'s next start (Agents panel row, its tab): what
+ * waits, and Restart now while it is running (enabled once it is idle). None without one. */
+export function pendingMoveItems(a: Agent | undefined): MenuItem[] {
+  const s = a?.session_id != null ? sessions.value.get(a.session_id) : undefined;
+  const p = a ? pendingMove(a, s, accountProfiles.value) : null;
+  if (!a || !p) return [];
+  return [
+    "sep",
+    { header: p.text },
+    ...(p.running
+      ? [{ label: `Restart now on ${p.to}`, hint: p.restart ? undefined : p.wait, disabled: !p.restart, run: () => restartToMove(a) }]
+      : []),
+  ];
 }
 
 

@@ -1122,12 +1122,14 @@ Rules (every one is checked in the tool, whatever the client):
 
 - **Only the human approves, resumes or widens.** No tool approves, resumes, edits or makes a
   schedule directly; `schedule.update`, `schedule.create`, resuming and the settings are refused
-  from an agent's session and from a shell an agent has typed into, and `schedule.approve` is
+  from an agent's session and from a shell an agent has typed into (except the unattended cap
+  and the quiet hours, which an agent changes with `muster schedule settings --cap N` or
+  `--quiet 23:00-07:00`, either way), and `schedule.approve` is
   taken only from a click in Muster's window (a WebSocket of the UI's that holds a window, whose
   program is known and isn't inside any session: never the CLI, `/api/rpc` or a script;
   docs/PROTOCOL.md "Schedules"). A schedule made or widened anywhere else (the CLI without a
   session id, `/api/rpc`, a script) is held for that click like a proposal, and settings that
-  loosen a limit are refused there. To change an approved schedule an agent proposes a new one.
+  loosen another limit (resuming all, spend caps, watched folders) are refused there. To change an approved schedule an agent proposes a new one.
   (Agents run as the owner's user, so this raises the bar rather than closing it:
   docs/SCHEDULING_PLAN.md "Approval and its limits".)
 - **Not from unattended work.** A session handling scheduled or triggered work (any chain a
@@ -1146,7 +1148,7 @@ Rules (every one is checked in the tool, whatever the client):
   floor (every 15 minutes at most) applies as to the human's. Proposals and reminders share the
   post rate limit (30 per minute with note writes, panel updates and posts).
 - **Once made (a reminder) or approved (a proposal), it is an ordinary schedule:** origin
-  `schedule`, so the agent's accepted origins, the unattended cap (24 a day), the 200-a-day cap,
+  `schedule`, so the agent's accepted origins, the unattended cap (24 a day by default), the 200-a-day cap,
   the OpenRouter spend caps, quiet hours, a Claude subscription agent's 7-day expiry (from
   approval), the busy rule and the missed-run rule all apply when it runs.
 - A proposal nobody approves is removed after 7 days; a reminder a day after it ran (its message

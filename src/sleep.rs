@@ -55,6 +55,8 @@ pub const ASLEEP_DETAIL: &str = "asleep";
 const EXIT_WAIT: Duration = Duration::from_secs(10);
 /// An automatic sleep never happens within this long of the human typing into the agent.
 const HUMAN_QUIET_MS: i64 = 120_000;
+/// A move applied now (`Why::Move`) waits this long after the human last typed into the agent.
+const MOVE_QUIET_MS: i64 = 15_000;
 /// How long keys typed into a waking agent are held for it to be ready.
 const READY_WAIT: Duration = Duration::from_secs(600);
 /// The most typed bytes held for one waking agent.
@@ -128,6 +130,10 @@ struct Inner {
     /// on their way to its terminal, until the terminal host has settled them (`keys`, `admit`,
     /// `Admitted`). A sleep checks neither moved (`claim`).
     input: HashMap<SessionId, (u64, Arc<AtomicU32>)>,
+    /// When raw input that isn't the human's (an agent's `muster keys` on a human-rooted turn)
+    /// was last admitted to each session: a move applied now waits after it as after the
+    /// human's own typing (`typed_just_now`).
+    raw_at: HashMap<SessionId, std::time::Instant>,
     /// Why an agent's last wake failed, until it wakes or sleeps again (its asleep bar says so).
     failed: HashMap<i64, String>,
     /// After a failed wake: no panel click wakes the agent before this.
@@ -312,6 +318,7 @@ pub fn admit(hub: &Arc<Hub>, id: SessionId) -> anyhow::Result<Admitted> {
     if g.waking.values().any(|t| *t == id) {
         anyhow::bail!("session {id} is an agent that is waking up; try again once it is ready");
     }
+    g.raw_at.insert(id, std::time::Instant::now());
     Ok(g.admit(id))
 }
 
@@ -608,6 +615,30 @@ pub fn due(agent: &Agent, info: &SessionInfo, human_at: Option<i64>, now: i64) -
     now - idle_since(info, human_at) >= i64::from(after) * minute_ms()
 }
 
+/// Did the human type into the agent too recently for this sleep? A reset waits
+/// `HUMAN_QUIET_MS`. A move applied now waits `MOVE_QUIET_MS`: a prompt submitted in its
+/// terminal whose turn hasn't shown yet (the hook that marks it working can come after Enter
+/// was taken) isn't cut off. Other sleeps check `due` or are the human's own.
+fn typed_just_now(why: Why, human_at: Option<i64>, now: i64) -> bool {
+    let quiet = match why {
+        Why::Reset => HUMAN_QUIET_MS,
+        Why::Move => MOVE_QUIET_MS,
+        _ => return false,
+    };
+    human_at.is_some_and(|t| now - t < quiet)
+}
+
+/// Why input refused this sleep, in words: a move also counts an agent's keys, so it doesn't
+/// say the owner typed.
+fn typed_reason(why: Why) -> &'static str {
+    if why == Why::Move { "keys were typed into it just now" } else { "you typed into it just now" }
+}
+
+/// When raw input that isn't the human's was last admitted to session `id` (Unix ms).
+fn raw_at(hub: &Hub, id: SessionId, now: i64) -> Option<i64> {
+    hub.agents().sleep.inner.lock().raw_at.get(&id).map(|at| now - at.elapsed().as_millis() as i64)
+}
+
 /// When the human last typed into session `id` (Unix ms), as far as this backend saw.
 fn human_at(hub: &Hub, id: SessionId, now: i64) -> Option<i64> {
     hub.human_input_of(id).map(|(_, at)| now - at.elapsed().as_millis() as i64)
@@ -638,11 +669,21 @@ pub enum Why {
     /// An idle agent reset (src/auto_reset.rs) stops it before forgetting its conversation; it
     /// says so in its own words, so this sleep logs nothing of its own.
     Reset,
+    /// A move to another account applied now (`agents::restart_moved`): stopped only to be
+    /// started at once on the new account, so this sleep logs nothing of its own either.
+    Move,
 }
 
 /// The agent can't sleep now; the text says why.
 #[derive(Debug)]
 pub struct NotNow(pub String);
+
+impl NotNow {
+    /// The reason alone, without "<name> can't sleep now: ".
+    pub fn reason(&self) -> &str {
+        self.0.split_once(": ").map_or(&self.0, |(_, r)| r)
+    }
+}
 
 impl std::fmt::Display for NotNow {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -677,10 +718,15 @@ pub(crate) async fn sleep_held(hub: &Arc<Hub>, name: &str, why: Why, _held: &cra
     // could miss it.
     let (seen, on_way) = a.session_id.map_or((0, 0), |s| hub.agents().sleep.input_seq(s));
     if on_way > 0 {
-        return Err(NotNow(format!("{} can't sleep now: you typed into it just now", a.name)).into());
+        return Err(NotNow(format!("{} can't sleep now: {}", a.name, typed_reason(why))).into());
     }
     let (info, f) = facts(hub, &a);
-    if let Some(no) = blocker(&a, info.as_ref(), &f) {
+    // A move applied now begins a new conversation anyway: no saved one is needed (only then).
+    let checked = match why {
+        Why::Move if a.handoff.is_some() && a.resume_id.is_none() => Agent { resume_id: Some(String::new()), ..a.clone() },
+        _ => a.clone(),
+    };
+    if let Some(no) = blocker(&checked, info.as_ref(), &f) {
         return Err(NotNow(format!("{} can't sleep now: {no}", a.name)).into());
     }
     let info = info.expect("blocker checked the session");
@@ -688,8 +734,15 @@ pub(crate) async fn sleep_held(hub: &Arc<Hub>, name: &str, why: Why, _held: &cra
     if why == Why::Idle && !due(&a, &info, human_at(hub, info.id, now), now) {
         return Err(NotNow(format!("{} was busy again", a.name)).into());
     }
-    if why == Why::Reset && human_at(hub, info.id, now).is_some_and(|t| now - t < HUMAN_QUIET_MS) {
-        return Err(NotNow(format!("{} can't sleep now: you typed into it just now", a.name)).into());
+    // A move also waits after keys an agent typed in (they can submit a prompt too).
+    let typed = match why {
+        Why::Move => human_at(hub, info.id, now).max(raw_at(hub, info.id, now)),
+        _ => human_at(hub, info.id, now),
+    };
+    if typed_just_now(why, typed, now) {
+        // A move also counts an agent's keys: say it neutrally.
+        let what = if why == Why::Move { "restart" } else { "sleep" };
+        return Err(NotNow(format!("{} can't {what} now: {}", a.name, typed_reason(why))).into());
     }
     // The run that was checked: only it is stopped.
     let Some(generation) = hub.pty_generation(info.id) else {
@@ -704,6 +757,7 @@ pub(crate) async fn sleep_held(hub: &Arc<Hub>, name: &str, why: Why, _held: &cra
         state.claim(hub, a.id, info.id, seen)
     };
     if let Err(no) = claimed {
+        let no = if no == "you typed into it just now" { typed_reason(why) } else { no };
         return Err(NotNow(format!("{} can't sleep now: {no}", a.name)).into());
     }
     if let Err(e) = hub.agents().set_asleep(hub.store(), a.id, Some(now), Some(generation)) {
@@ -726,12 +780,12 @@ pub(crate) async fn sleep_held(hub: &Arc<Hub>, name: &str, why: Why, _held: &cra
     }
     let a = hub.agents().by_id(a.id).ok_or_else(|| anyhow::anyhow!("{name} was removed"))?;
     crate::agents::publish(hub, &a);
-    if why == Why::Reset {
+    if matches!(why, Why::Reset | Why::Move) {
         return Ok(a);
     }
     let idle = now - idle_since(&info, human_at(hub, info.id, now));
     let text = match why {
-        Why::Manual | Why::Reset => format!("{} is asleep. A message sent with wake on wakes it.", a.name),
+        Why::Manual | Why::Reset | Why::Move => format!("{} is asleep. A message sent with wake on wakes it.", a.name),
         Why::Idle => format!(
             "{} fell asleep after {} idle. A message sent with wake on wakes it.",
             a.name,
@@ -1445,6 +1499,31 @@ pub fn spawn(hub: Arc<Hub>) {
 mod tests {
     use super::*;
 
+    /// A move applied now waits 15 s after the human typed into the agent (a prompt just
+    /// submitted may not show as working yet); a reset waits two minutes; other sleeps don't look.
+    #[test]
+    fn a_move_waits_briefly_after_the_human_typed() {
+        let now = 1_000_000;
+        assert!(typed_just_now(Why::Move, Some(now - MOVE_QUIET_MS + 1), now));
+        assert!(!typed_just_now(Why::Move, Some(now - MOVE_QUIET_MS), now));
+        assert!(!typed_just_now(Why::Move, None, now));
+        assert!(typed_just_now(Why::Reset, Some(now - MOVE_QUIET_MS), now), "a reset waits longer");
+        assert!(!typed_just_now(Why::Reset, Some(now - HUMAN_QUIET_MS), now));
+        assert!(!typed_just_now(Why::Manual, Some(now), now));
+        assert!(!typed_just_now(Why::Idle, Some(now), now), "`due` covers the idle timer");
+    }
+
+    /// Keys an agent types into a session (not the human's) are timed too, for a move's wait.
+    #[tokio::test]
+    async fn an_agents_keys_are_timed_for_a_move() {
+        let hub = hub(false);
+        let now = now_ms();
+        assert_eq!(raw_at(&hub, 1, now), None);
+        drop(admit(&hub, 1).unwrap());
+        let at = raw_at(&hub, 1, now_ms()).unwrap();
+        assert!(now_ms() - at < 1_000 && typed_just_now(Why::Move, Some(at), now_ms()));
+    }
+
     fn agent() -> Agent {
         Agent {
             account_profile_id: None,
@@ -1502,6 +1581,10 @@ mod tests {
         assert!(why(&a, info(AgentState::Idle), Facts { live: false, ..ready() }).contains("isn't running"));
         let fresh = Agent { resume_id: None, ..agent() };
         assert!(why(&fresh, info(AgentState::Idle), ready()).contains("couldn't pick it up again"));
+        // A move waiting for its next start doesn't let an ordinary sleep stop it without a saved
+        // conversation (only the move's own restart, `Why::Move`, skips that).
+        let moving = Agent { handoff: Some(crate::agents::Handoff { from: None, at: 1, reason: None }), ..fresh.clone() };
+        assert!(why(&moving, info(AgentState::Idle), ready()).contains("couldn't pick it up again"));
         let mut queued = info(AgentState::Idle);
         queued.queued = 1;
         assert!(why(&a, queued, ready()).contains("waiting"));
@@ -1855,7 +1938,7 @@ mod tests {
         let h = hub.clone();
         let send = tokio::spawn(async move { for_send(&h, 1).await.map(|(id, guard)| (id, guard.is_some())) });
         let h = hub.clone();
-        let restart = tokio::spawn(async move { crate::agents::restart_session(&h, 1).await.is_ok() });
+        let restart = tokio::spawn(async move { crate::agents::restart_session(&h, 1, None).await.is_ok() });
         until("the send registers", || hub.agents().sleep.deliveries(1) == 1).await;
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!send.is_finished() && !restart.is_finished());

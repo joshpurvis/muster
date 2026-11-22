@@ -143,8 +143,9 @@ docs/UI.md "Agents panel". Choices made while building it:
 everything that makes or widens unattended work: making a schedule, an edit that widens one (its
 prompt, timing, time zone, "Then…" steps, reply note, missed-run rule, conversation, quiet hours
 off, a higher or no daily cap), resuming one, undoing Skip next, renewing one, settings that
-loosen a limit (resuming all, moving quiet hours, a higher unattended or spend cap, clearing an
-agent's spend cap, another watched folder), allowing triggers on a note, letting an agent
+loosen a limit (resuming all, a higher spend cap, clearing an agent's spend cap, another watched
+folder; the unattended cap and the quiet hours change from the CLI and agents too since 21 Nov
+2026, the owner's call), allowing triggers on a note, letting an agent
 take scheduled or triggered work, and changing the provider of a Claude agent that takes such work
 or is named in a schedule (fix round 3: leaving the subscription drops its schedules' 7-day expiry,
 so an expired one would run again; joining it puts that work on the subscription). Done anywhere but a click in Muster's window, a schedule change
@@ -158,9 +159,13 @@ schedules wait at once (counted under the lock that adds one), and one nobody ap
 7 days (decided again as it is removed, so one approved at that moment stays). Nothing of a held
 schedule runs: a Run now or a "Then…" step already waiting in line is skipped, and its prompt in an
 agent's queue is taken back (fix round 3). The settings, a note's triggers and an agent's accepted
-work and provider aren't held: from outside the window they are refused, with
-where to do it instead. Narrowing applies directly from anywhere: pausing, removing, a rename,
-alerts, quiet hours on, a lower cap, fewer watched folders. Approving takes what the owner looked
+work and provider aren't held: what would widen them from outside the window is refused, with
+where to do it instead. Narrowing a schedule applies directly from anywhere a schedule change is
+taken: pausing, removing, a rename, alerts. The global settings: the CLI and RPC outside the
+window may tighten any of them (pause all, a lower spend cap, fewer watched folders) and change
+the unattended cap and the quiet hours either way; resuming all, a higher spend cap or more
+watched folders take the window. An agent's session changes only the unattended cap and the
+quiet hours (either way) and no other setting, not even to tighten one. Approving takes what the owner looked
 at: the UI sends the schedule's `updated_at`, and a schedule changed since is refused, to look at
 again. Approving a held new schedule or a renewal starts a Claude subscription schedule's 7 days;
 approving a held change keeps them.

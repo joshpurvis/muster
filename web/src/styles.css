@@ -3363,6 +3363,15 @@ legend {
   color: var(--text-faint);
 }
 
+/* A move to another account waiting for the agent's next start (docs/UI.md "Agents panel"). */
+.ap-move {
+  font-size: 11px;
+  line-height: 1.35;
+  color: var(--warn-text);
+  /* Wraps in a narrow panel: the "at its next start" part is the point. */
+  overflow-wrap: anywhere;
+}
+
 .ap-more {
   position: absolute;
   right: 4px;
@@ -4243,6 +4252,13 @@ legend {
 
 .move-panel .field-hint {
   margin: 0;
+}
+
+.move-restart {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 10px;
 }
 
 .move-panel .check.muted {

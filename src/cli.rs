@@ -920,12 +920,29 @@ pub enum ScheduleCmd {
         #[arg(long)] name: Option<String>,
         #[arg(long)] tz: Option<String>,
     },
+    /// Show the scheduling settings, or change the unattended cap and the quiet hours (from here
+    /// or an agent's session, either way). The other settings are under Agents panel → ⋯ →
+    /// Scheduling settings.
+    #[command(after_help = "Examples:\n  muster schedule settings\n  muster schedule settings --cap 60\n  \
+        muster schedule settings --quiet 23:00-07:00")]
+    Settings {
+        /// Unattended messages (scheduled or triggered) each agent may get a day, 1 to 200.
+        #[arg(long, value_name = "N")] cap: Option<u32>,
+        /// Quiet hours, START-END in 24-hour time: runs that keep quiet hours skip them.
+        #[arg(long, value_name = "HH:MM-HH:MM")] quiet: Option<String>,
+    },
     /// A schedule's runs, newest first: RUN  TIME  KIND  OUTCOME  REASON.
     History {
         id: i64,
         #[arg(long, default_value_t = 20)] limit: usize,
         #[arg(long)] json: bool,
     },
+}
+
+/// `muster schedule settings --quiet START-END`: the two times (checked by the backend).
+pub fn parse_quiet(s: &str) -> anyhow::Result<(String, String)> {
+    let (a, b) = s.split_once('-').ok_or_else(|| exit(2, format!("--quiet takes START-END, e.g. 23:00-07:00, not `{s}`")))?;
+    Ok((a.trim().to_string(), b.trim().to_string()))
 }
 
 /// `--on EVENT` as a trigger `when`.
@@ -1280,6 +1297,29 @@ pub fn schedule(d: &Discovery, cmd: ScheduleCmd) -> anyhow::Result<()> {
             p.as_object_mut().unwrap().retain(|_, v| !v.is_null());
             let r = one("schedule.remind", p)?;
             println!("schedule {}: reminder at {}", r["schedule_id"], r["runs_at"].as_str().unwrap_or("?"));
+            Ok(())
+        }
+        ScheduleCmd::Settings { cap, quiet } => {
+            let mut change = json!({});
+            if let Some(n) = cap {
+                change["unattended_cap"] = json!(n);
+            }
+            if let Some(q) = quiet {
+                let (from, to) = parse_quiet(&q)?;
+                change["quiet_start"] = json!(from);
+                change["quiet_end"] = json!(to);
+            }
+            let changed = change.as_object().is_some_and(|o| !o.is_empty());
+            let s = if changed { one("schedule.settings.set", change)? } else { one("schedule.settings.get", json!({}))? };
+            println!(
+                "{}unattended cap {} messages a day per agent; quiet hours {}-{} ({}){}",
+                if changed { "saved: " } else { "" },
+                s["unattended_cap"],
+                s["quiet_start"].as_str().unwrap_or("?"),
+                s["quiet_end"].as_str().unwrap_or("?"),
+                s["tz"].as_str().unwrap_or("local time"),
+                if s["paused"] == true { "; all schedules are paused" } else { "" },
+            );
             Ok(())
         }
         ScheduleCmd::History { id, limit, json } => {
@@ -2501,8 +2541,28 @@ pub struct SwitchOpts {
 
 impl Default for SwitchOpts {
     fn default() -> Self {
-        SwitchOpts { now: false, save_notes: true, reason: None }
+        SwitchOpts { now: false, save_notes: false, reason: None }
     }
+}
+
+/// The `agent.update` fields for a move (`account_profile`: the profile it moves to, resolved):
+/// with one, when it applies and whether to ask for notes first; with `--now` alone, apply the
+/// move already waiting.
+pub fn move_params(o: &SwitchOpts, account_profile: Option<Value>) -> Value {
+    let mut p = json!({});
+    match account_profile {
+        Some(to) => {
+            p["account_profile"] = to;
+            p["now"] = json!(o.now);
+            p["save_notes"] = json!(o.save_notes);
+            if let Some(r) = &o.reason {
+                p["handoff_reason"] = json!(r);
+            }
+        }
+        None if o.now => p["now"] = json!(true),
+        None => {}
+    }
+    p
 }
 
 pub struct AgentOpts {
@@ -2652,13 +2712,9 @@ pub fn agent_edit(d: &Discovery, o: AgentOpts) -> anyhow::Result<()> {
         Value::Null
     };
     let mut params = o.params(&base)?;
-    if let Some(profile) = &o.profile {
-        params["account_profile"] = profile_choice(d, profile)?;
-        params["now"] = json!(o.switch.now);
-        params["save_notes"] = json!(o.switch.save_notes);
-        if let Some(r) = &o.switch.reason {
-            params["handoff_reason"] = json!(r);
-        }
+    let to = o.profile.as_deref().map(|p| profile_choice(d, p)).transpose()?;
+    if let Value::Object(m) = move_params(&o.switch, to) {
+        params.as_object_mut().expect("an object").extend(m);
     }
     let b = client::rpc(d, "agent.update", params)?;
     print_agent("updated", &b, &o.name);
@@ -2679,13 +2735,17 @@ pub fn switch_line(name: &str, sw: &Value) -> Option<String> {
         _ => String::new(),
     };
     let what = match sw["outcome"].as_str() {
-        Some("restarted") => format!("{name} moved to {to}: a new conversation started there."),
+        Some("restarted") => format!("{name} moved to {to} now: a new conversation started there."),
         Some("busy") => format!("{name} isn't idle, so it moves to {to} at its next start."),
         Some("replaced") => format!("A newer move of {name} replaced this one."),
         Some("after_notes") => format!("{name} moves to {to} once it has saved its notes, then restarts if idle."),
         Some("failed") => format!("{name} didn't restart: {}. It moves to {to} at its next start.",
             sw["error"].as_str().unwrap_or("unknown error")),
-        _ => format!("{name} moves to {to} at its next start (a new conversation; memory/ comes along)."),
+        // No run to restart (`--now` asked, or not).
+        _ if sw["now"] == true || sw["running"] == false => format!("{name} isn't running, so it moves to {to} at its next \
+            start (a new conversation; memory/ comes along)."),
+        _ => format!("{name} moves to {to} at its next start (a new conversation; memory/ comes along). Until then it keeps \
+            running on its current account: `muster agent edit {name} --now` moves it now if it is idle."),
     };
     Some(format!("{what}{notes}"))
 }
@@ -2960,6 +3020,38 @@ mod tests {
         if env_session().is_some() {
             assert!(opts(Some(true)).params(&json!({})).unwrap().get("from_session").is_some());
         }
+    }
+
+    /// What `muster agent edit --profile` asks for: notes only with --save-notes; --now alone
+    /// applies the move already waiting.
+    #[test]
+    fn move_params_and_what_the_move_says() {
+        let p = |now, save_notes, profile: Option<Value>| move_params(&SwitchOpts { now, save_notes, reason: None }, profile);
+        assert_eq!(p(false, false, Some(json!(2))), json!({"account_profile": 2, "now": false, "save_notes": false}));
+        assert_eq!(p(true, true, Some(json!("default"))), json!({"account_profile": "default", "now": true, "save_notes": true}));
+        assert_eq!(p(true, false, None), json!({"now": true}));
+        assert_eq!(p(false, false, None), json!({}));
+        assert!(!SwitchOpts::default().save_notes);
+        let line = |sw: Value| switch_line("alpha", &sw).unwrap();
+        let l = line(json!({"to": "Work", "now": true, "notes": "skipped", "notes_skipped": "off", "outcome": "restarted"}));
+        assert!(l.starts_with("alpha moved to Work now"), "{l}");
+        let l = line(json!({"to": "Work", "now": false, "running": true, "notes": "skipped", "notes_skipped": "off", "outcome": "next_start"}));
+        assert!(l.contains("moves to Work at its next start") && l.contains("alpha --now"), "{l}");
+        let l = line(json!({"to": "Work", "now": false, "running": false, "notes": "skipped", "notes_skipped": "off", "outcome": "next_start"}));
+        assert!(l.contains("isn't running") && !l.contains("--now"), "{l}");
+        let l = line(json!({"to": "Work", "now": true, "notes": "skipped", "notes_skipped": "off", "outcome": "next_start"}));
+        assert!(l.contains("isn't running") && l.contains("moves to Work at its next start") && !l.contains("--now"), "{l}");
+        let l = line(json!({"to": "Work", "now": true, "notes": "skipped", "notes_skipped": "off", "outcome": "busy"}));
+        assert!(l.contains("isn't idle") && l.contains("moves to Work at its next start"), "{l}");
+        let l = line(json!({"to": "Work", "now": false, "notes": "asked", "outcome": "next_start"}));
+        assert!(l.contains("Asked it to save notes first"), "{l}");
+    }
+
+    #[test]
+    fn quiet_hours_flag() {
+        assert_eq!(parse_quiet("22:00-07:30").unwrap(), ("22:00".to_string(), "07:30".to_string()));
+        assert_eq!(parse_quiet(" 9:00 - 17:00 ").unwrap(), ("9:00".to_string(), "17:00".to_string()));
+        assert!(parse_quiet("22:00").is_err());
     }
 
     /// `muster agent start --fresh` says the prompts that were waiting are kept; `muster agent ls`

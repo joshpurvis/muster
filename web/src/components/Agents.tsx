@@ -52,6 +52,7 @@ import {
   priceLabel,
   parseSleepAfter,
   readMemoryFile,
+  pendingMove,
   saveNotesBlocked,
   switchMessage,
   SLEEP_AFTER_DEFAULT,
@@ -181,6 +182,7 @@ function agentMenu(a: Agent, x: number, y: number) {
       { label: "Memory…", run: () => A.editAgent(a.name, "memory") },
       ...(A.canSwitchAccount(a) ? [{ label: "Switch account…", run: () => A.switchAgentAccount(a.name) }] : []),
       ...(schedulesSupported.value ? [{ label: "New schedule…", run: () => A.newScheduleDialog(a.name) }] : []),
+      ...A.pendingMoveItems(a),
       "sep",
       ...(asleep
         ? [
@@ -213,6 +215,8 @@ function AgentRow({ a, now, selected }: { a: Agent; now: number; selected: boole
   const cold = !!s && (st.asleep ? wakeCold(s, cacheNow()) : isCold(s, cacheNow()));
   const dot = s && st.live ? cacheDot(s, cacheNow(), windowPrefs.value?.cache_warn !== false) : null;
   const persona = firstLine(a.persona);
+  // A move to another account waiting for its next start (docs/ACCOUNT_PROFILES.md).
+  const move = pendingMove(a, s, accountProfiles.value);
   const open = () => {
     agentFilter.value = a.id;
     A.openAgent(a.name);
@@ -224,7 +228,7 @@ function AgentRow({ a, now, selected }: { a: Agent; now: number; selected: boole
       data-agent={a.name}
       data-tip={persona || undefined}
       tabIndex={0}
-      aria-label={`${a.name}, ${KIND_LABEL[a.kind]}${billing.badge ? `, ${billing.note ?? OPENROUTER_BADGE}` : ""}, ${st.label}${
+      aria-label={`${a.name}, ${KIND_LABEL[a.kind]}${billing.badge ? `, ${billing.note ?? OPENROUTER_BADGE}` : ""}, ${st.label}${move ? `, ${move.text.toLowerCase()}` : ""}${
         cold ? ", prompt cache likely expired" : dot ? `, ${CACHE_DOT_LABEL[dot]}` : ""
       }`}
       onClick={open}
@@ -274,6 +278,16 @@ function AgentRow({ a, now, selected }: { a: Agent; now: number; selected: boole
             </span>
           )}
         </span>
+        {move && (
+          <span
+            class="ap-move"
+            data-tip={move.running
+              ? `${move.text}. Until then it keeps running on ${move.from}. Restart now is in its menu.`
+              : `${move.text}: a new conversation there.`}
+          >
+            {move.text}
+          </span>
+        )}
         {billing.badge && (
           <span
             class={cx("or-badge", billing.note && "or-badge-pending")}
@@ -832,7 +846,9 @@ export function AgentDialog(
   const [conversation, setConversation] = useState<"" | "keep" | "reset">("");
   /** A move to another account: when it applies, Save notes first, and why. */
   const [moveNow, setMoveNow] = useState(false);
-  const [saveNotes, setSaveNotes] = useState(true);
+  // Off by default: asking starts a turn, and HANDOFF.md and memory/ carry it over anyway.
+  const [saveNotes, setSaveNotes] = useState(false);
+  const [restarting, setRestarting] = useState(false);
   const [moveReason, setMoveReason] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -949,6 +965,8 @@ export function AgentDialog(
       profileName(accountProfiles.value, runProfile),
     )
     : null;
+  // A move already waiting for its next start (none while another account is picked here).
+  const waiting = agent && !moving ? pendingMove(agent, agentSession, accountProfiles.value) : null;
   const locationValid = d.working_location.mode === "home" || workspaces.value.some(w => w.is_git && w.id === (d.working_location as { workspace_id: number }).workspace_id);
   const canSave = locationValid && (!locationChanged || moving || conversation !== "") && !busy && !nErr && d.accepts.length > 0 && !orBlocked && sleepMin !== null;
   const checkoutHint = d.working_location.mode === "worktree"
@@ -1378,11 +1396,12 @@ export function AgentDialog(
                   aria-describedby={`${id}-notes`}
                   onChange={(e) => setSaveNotes((e.target as HTMLInputElement).checked)}
                 />
-                Save notes first
+                Wake it first to save notes
               </label>
               <span class="field-hint" id={`${id}-notes`}>
-                {notesBlocked ??
-                  `Muster first asks it to write what it needs into memory/, and moves it once it replies or after 10 minutes.`}
+                {notesBlocked ?? (saveNotes
+                  ? `Muster first asks it to write what it needs into memory/ (a turn on ${fromName}), and moves it once it replies or after 10 minutes.`
+                  : "Off: it moves without a turn. HANDOFF.md and its memory/ notes tell it where it left off.")}
               </span>
               <input
                 class="quiet-input move-reason"
@@ -1392,6 +1411,34 @@ export function AgentDialog(
                 aria-label="Reason for the move"
                 onInput={(e) => setMoveReason((e.target as HTMLInputElement).value)}
               />
+            </div>
+          )}
+          {waiting && agent && (
+            <div class="field pill-panel move-panel" role="group" aria-labelledby={`${id}-waiting`}>
+              <span class="field-label" id={`${id}-waiting`}>{waiting.text}</span>
+              <span class="field-hint" id={`${id}-waiting-hint`}>
+                {waiting.running
+                  ? `Until then it keeps running on ${waiting.from}. Restarting starts a new conversation on ${waiting.to}; its memory/ notes come along.`
+                  : waiting.why}
+              </span>
+              {waiting.running && (
+                <div class="move-restart">
+                  <button
+                    type="button"
+                    class="btn"
+                    disabled={!waiting.restart || restarting}
+                    aria-describedby={`${id}-waiting-hint`}
+                    onClick={async () => {
+                      setRestarting(true);
+                      await A.restartToMove(agent);
+                      setRestarting(false);
+                    }}
+                  >
+                    Restart now
+                  </button>
+                  {waiting.why && <span class="field-hint">{waiting.why}</span>}
+                </div>
+              )}
             </div>
           )}
           {locationChanged && !moving && (
@@ -1419,11 +1466,8 @@ export function AgentDialog(
           {agent?.working_directory && (
             <p class="field-hint">
               Current working directory: <code>{agent.working_directory}</code>
-              {agent.handoff
-                ? ` · Moves to ${profileName(accountProfiles.value, agent.account_profile_id)} at next start (new conversation)`
-                : agent.reset_on_next_start
-                ? " · New conversation at next start"
-                : ""}
+              {/* A waiting move has its own panel above. */}
+              {!agent.handoff && agent.reset_on_next_start ? " · New conversation at next start" : ""}
             </p>
           )}
           <div class="inline-field">

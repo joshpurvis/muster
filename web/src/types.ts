@@ -246,6 +246,8 @@ export interface AgentSwitch {
   /** The new profile's name. */
   to: string;
   now: boolean;
+  /** It had a run to restart (older daemons: absent). */
+  running?: boolean;
   outcome: "next_start" | "restarted" | "busy" | "replaced" | "after_notes" | "failed";
   notes: "asked" | "skipped";
   notes_skipped?: "off" | "not_running" | "busy" | "at_limit";

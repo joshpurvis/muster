@@ -2170,9 +2170,15 @@ async function schedules(c: Client, d: Daemon): Promise<{ c: Client; d: Daemon }
   ok((await runs(id))[0].reason.includes("unattended"), "a run past the unattended cap is refused, with the reason");
   const refusedMsgs = (await c.call("agent.messages", { agent: "sched" })).messages.filter((m: Json) => m.refused);
   ok(refusedMsgs.some((m: Json) => m.refused.includes("unattended") && m.origin === "schedule"), "the refusal is in the agent's message log");
-  const raise = await c.call("schedule.settings.set", { unattended_cap: 24 }).then(() => "raised", (e: Error) => String(e));
-  ok(raise.includes("higher unattended cap"), `a script can lower a cap but not raise it (${raise})`);
-  await w.call("schedule.settings.set", { unattended_cap: 24 });
+  // Raising it works from a script too (the owner, 21 Nov 2026), and from the CLI.
+  const raise = await c.call("schedule.settings.set", { unattended_cap: 20 }).then(() => "raised", (e: Error) => String(e));
+  ok(raise === "raised", `a script can raise the unattended cap (${raise})`);
+  const quiet = await c.call("schedule.settings.get");
+  const viaCli = await sch("settings", "--cap", "24", "--quiet", "23:30-06:30");
+  const after = await c.call("schedule.settings.get");
+  ok(viaCli.ok && after.unattended_cap === 24 && after.quiet_start === "23:30" && after.quiet_end === "06:30",
+    `muster schedule settings --cap --quiet (${viaCli.err.trim()})`);
+  await c.call("schedule.settings.set", { quiet_start: quiet.quiet_start, quiet_end: quiet.quiet_end });
   await c.call("agent.remove", { name: "nosched" });
 
   // Missed runs across a restart: Muster is "off" for two days (a test clock offset), landing at

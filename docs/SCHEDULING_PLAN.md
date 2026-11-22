@@ -143,8 +143,9 @@ docs/UI.md "Agents panel". Choices made while building it:
 everything that makes or widens unattended work: making a schedule, an edit that widens one (its
 prompt, timing, time zone, "Then…" steps, reply note, missed-run rule, conversation, quiet hours
 off, a higher or no daily cap), resuming one, undoing Skip next, renewing one, settings that
-loosen a limit (resuming all, moving quiet hours, a higher unattended or spend cap, clearing an
-agent's spend cap, another watched folder), allowing triggers on a note, letting an agent
+loosen a limit (resuming all, a higher spend cap, clearing an agent's spend cap, another watched
+folder; the unattended cap and the quiet hours change from the CLI and agents too since 21 Nov
+2026, the owner's call), allowing triggers on a note, letting an agent
 take scheduled or triggered work, and changing the provider of a Claude agent that takes such work
 or is named in a schedule (fix round 3: leaving the subscription drops its schedules' 7-day expiry,
 so an expired one would run again; joining it puts that work on the subscription). Done anywhere but a click in Muster's window, a schedule change

@@ -391,13 +391,17 @@ What the owner sees:
   next start** (the default) and **Now**. *Now* restarts the agent only if it is idle, using the
   same check as `start_fresh_if`. If it is busy, the dialog says so and the switch waits for the
   next start.
-- **Save notes first** (checkbox, on by default when the agent is running, idle and its current
+- **Save notes first** (checkbox; off by default since 21 Nov 2026, now worded "Wake it first to
+  save notes", and offered when the agent is running, idle and its current
   account still has room): before switching, Muster sends one message, "You are moving to
   account Work. Write anything you would need to continue into memory/ now." Muster switches
   once the reply arrives, or after 10 minutes. It is skipped when the old account is at its
   limit.
 - **Agents panel / tab menu:** "Switch account…" opens the same choice.
-- **CLI:** `muster agent edit NAME --profile PROFILE [--now] [--no-save-notes]`.
+- **CLI:** `muster agent edit NAME --profile PROFILE [--now] [--save-notes]` (until 21 Nov 2026
+  notes were asked by default and `--no-save-notes` turned it off; that flag is still accepted).
+  Without `--now` a running agent keeps its current account until its next start;
+  `muster agent edit NAME --now` alone applies a move already waiting.
 
 How it works:
 
@@ -410,8 +414,9 @@ How it works:
 3. Same checks as at creation: Claude agents only, the target profile must be enabled and
    present (`check_account_profile`), and picking the current profile again is not a change.
    Moving an agent that takes scheduled or webhook work, or is named in a schedule, changes which
-   account pays for unattended runs. So, like a provider change (`widens_unattended`), it takes a
-   click in Muster's window and is refused from the CLI or MCP.
+   account pays for unattended runs. Until 21 Nov 2026 that took a click in Muster's window; the
+   owner asked for it from the CLI and agents too ("allow you to edit accounts in the future"), so
+   it now works from anywhere. A provider change of such an agent still takes the click.
 4. Handoff, from Muster's own records only (the old profile folder is never opened): before the
    first start after a switch, Muster writes `<home>/HANDOFF.md`, which it owns and overwrites on
    each switch. It holds the old and new account names and the time, the agent's last 5 requests
@@ -425,8 +430,8 @@ How it works:
 
 Tests: switching a profile forces a reset and moves the tab's profile; the first start writes
 HANDOFF.md and passes the prompt, and the second start does neither; a Codex agent, a disabled
-profile and a scheduled agent switched from outside the window are refused; Save notes waits for
-the reply and gives up after its timeout. The smoke test (`scripts/account-profiles-smoke.py`)
+profile are refused (a scheduled agent switched from outside the window was too, until 21 Nov
+2026); Save notes waits for the reply and gives up after its timeout. The smoke test (`scripts/account-profiles-smoke.py`)
 switches a fake-Claude agent between two synthetic profiles and checks each run's
 `CLAUDE_CONFIG_DIR`. `docs/PROTOCOL.md` and `docs/CLI.md` document the new field and flags.
 
@@ -466,6 +471,23 @@ As built (2026-11-13), where it adds to the plan above:
   "saved its notes and moved to Work", or busy (moves at its next start).
 - `agent.update` replies with `switch` (docs/PROTOCOL.md). The CLI also takes `--reason TEXT`.
 - Also from a Claude agent's tab menu ("Switch account…"), not only the Agents panel row.
+
+Changes on 21 Nov 2026 (the owner: "allow you to edit accounts in the future. i hate all these
+random rules i didnt ask for blocking us", and "its waking up idle agents to tell them to prepare
+being moved, let's make a way to avoid that in the future"):
+
+- A move works from the CLI and an agent's session for every Claude agent, also one that takes
+  scheduled or triggered work.
+- Save notes first is off by default (window, CLI and `agent.update`): HANDOFF.md and memory/
+  carry the agent over, and asking started a turn on every idle agent moved. `--save-notes` (CLI)
+  and "Wake it first to save notes" (the dialog, unticked) keep it as an opt-in. A busy agent is
+  never asked either way, as before.
+- A move without Now waits for the agent's next start, and the window now says so wherever the
+  agent shows: "Moves to Work at its next start" under its row in the Agents panel, at the top of
+  its row and tab menus with **Restart now on Work** (enabled only while it is running, idle and
+  has nothing queued, the same check as Now), and as a panel in Edit agent with a **Restart now**
+  button. `agent.update` with `now` alone (`muster agent edit NAME --now`) applies the move that
+  waits; the CLI says "moved to Work now" or "moves to Work at its next start".
 
 ### Phase B: an agent that can use either account
 

@@ -568,7 +568,8 @@ sent through the same path as `agent.ask`, so the agent's accepted origins, the 
 (`agent_message`). Desktop client token only: devices get no `schedule.*` method and no schedule
 events. Only the human makes, approves or changes schedules: a mutating call whose
 `from_session` is an agent's session, or a shell tab with an agent's provenance (one an agent
-spawned or typed into), is refused. Agents propose schedules and set one-off reminders through
+spawned or typed into), is refused, except a `schedule.settings.set` that changes only the
+unattended cap or the quiet hours. Agents propose schedules and set one-off reminders through
 their MCP tools (Phase 3, below; docs/MCP.md "Schedules").
 
 ```ts
@@ -613,7 +614,7 @@ type ScheduleSettings = { paused: boolean /* "Pause all schedules" */; quiet_sta
 | `schedule.runs` | `{id, before?, limit? = 20 (1..200)}` | `{runs: Run[], more}`, newest first, below run id `before`. The newest 500 runs per schedule are kept. |
 | `schedule.preview` | `{when: WhenInput, tz?, quiet_hours?, agent?}` | `{reading, tz, when /* resolved */, next: number[] /* up to 3 */, quiet: boolean[] /* each falls in quiet hours (with quiet_hours, else the agent's default) */, quiet_hours_default, missed_default: "run_once" \| "skip", expires: boolean}`. Errors as `schedule.create` would give them. The dialog calls it as you type. |
 | `schedule.settings.get` | `{}` | `ScheduleSettings` |
-| `schedule.settings.set` | `{paused?, quiet_start?, quiet_end?, unattended_cap? (1..200)}` | `ScheduleSettings`. Emits `schedule_settings` and a `schedule_upserted` per schedule. A change that loosens a limit is taken only from a click in Muster's window (Phase 3, "Held"). |
+| `schedule.settings.set` | `{paused?, quiet_start?, quiet_end?, unattended_cap? (1..200)}` | `ScheduleSettings`. Emits `schedule_settings` and a `schedule_upserted` per schedule. The unattended cap and the quiet hours change from anywhere, either way, also from an agent's session when they are the only fields (`muster schedule settings`); a change that loosens another limit is taken only from a click in Muster's window (Phase 3, "Held"). |
 
 Events: `schedule_upserted` (`Schedule`) when one is made or changed or its next run moves,
 `schedule_removed {id, agent_id}`, `schedule_run` (`Run`) when a run is recorded or changes
@@ -727,7 +728,10 @@ type Then = { on_success: Step | null; on_failure: Step | null };
 agent's session or a shell with an agent's provenance, like the schedule calls (a guard against
 an agent's mistake, not a security boundary: the client token can do anything). Devices get none.
 Since Phase 3's second fix round, what makes or widens unattended work also needs a click in
-Muster's window; elsewhere it is held or refused (Phase 3, "Held").
+Muster's window; elsewhere it is held or refused (Phase 3, "Held"). Two settings are the
+exception (the owner, 21 Nov 2026): the unattended cap and the quiet hours, which the CLI and
+agents change too (a `schedule.settings.set` with only `unattended_cap`, `quiet_start` and
+`quiet_end`).
 
 **Trigger URL.** `POST /api/trigger/<name>` with `Authorization: Bearer <secret>`, on the
 daemon's loopback listener only (a request through `tailscale serve` is refused); the body (at
@@ -901,9 +905,9 @@ outside the window, and there:
 | `schedule.pause` | `on: true` applies; `on: false` resumes it held (`resumed`). |
 | `schedule.skip` | `on: true` applies; `on: false` undoes it held (`unskipped`). |
 | `schedule.renew` | Held (`renewed`); the approval renews it from then. A schedule that doesn't expire is left as it is. |
-| `schedule.settings.set` | Refused when it loosens anything (resuming all, moving quiet hours, a higher unattended or spend cap, clearing or raising an agent's spend cap, another watched folder); tightening applies. |
+| `schedule.settings.set` | Refused whole when it loosens a limit (resuming all, a higher spend cap, clearing or raising an agent's spend cap, another watched folder); tightening applies. The unattended cap and the quiet hours apply either way. |
 | `note.set_triggers` | `on: true` refused; `off` applies. |
-| `agent.update` | Refused: adding `schedule` or `webhook` to `accepts`, and changing the `provider` or `account_profile` of a Claude agent that takes scheduled or triggered work or is named in a schedule (its own or a "Then…" step's): that changes whether its schedules expire after 7 days and what pays for them (for a profile, which account pays). Also refused: `self_handoff: true`, `tools_up_front: true` and `lead: true` (see "Self handoff"; only from the window, or `/api/rpc` from a terminal outside every session). Anything else applies. The check and the write happen under one lock with the record as it is then, so an older edit can't put back what the owner took away. |
+| `agent.update` | Refused: adding `schedule` or `webhook` to `accepts`, and changing the `provider` of a Claude agent that takes scheduled or triggered work or is named in a schedule (its own or a "Then…" step's): that changes whether its schedules expire after 7 days and what pays for them. Moving one to another `account_profile` applies (the owner, 21 Nov 2026). Also refused: `self_handoff: true`, `tools_up_front: true` and `lead: true` (see "Self handoff"; only from the window, or `/api/rpc` from a terminal outside every session). Anything else applies. The check and the write happen under one lock with the record as it is then, so an older edit can't put back what the owner took away. |
 
 A held schedule never runs (the scheduler, Run now and Skip next refuse it, a trigger isn't watched
 or fired, and a run already waiting, a Run now or a "Then…" step included, is skipped before it is
@@ -1361,9 +1365,15 @@ the agent record; `agent.update` moves it (below).
 
 `agent.update` with `account_profile` (an id or `"default"`) moves a Claude agent to that
 profile; its current one is no change, a Codex agent is refused (even with `"default"`), and
-the profile is checked as at creation (enabled, its folder present). Optional with it: `now` (default false),
-`save_notes` (default true) and `handoff_reason` (a string, kept to 2,000 bytes; refused
-without a move). A move sets `account_profile_id`, sets `reset_on_next_start` (a conversation
+the profile is checked as at creation (enabled, its folder present). It works from anywhere,
+also for an agent that takes scheduled or triggered work (the CLI, an agent's session, a
+script; until 21 Nov 2026 that took a click in Muster's window). Optional with it: `now` (default false),
+`save_notes` (default false: asking starts a turn, and HANDOFF.md and memory/ carry the agent
+over without one) and `handoff_reason` (a string, kept to 2,000 bytes; refused
+without a move). Without `now`, a running agent keeps its current account and conversation
+until its next start. `now` without `account_profile` (or naming the profile it already moves
+to) applies the move that waits for its next start, as `now` with a move does (the window's
+Restart now, `muster agent edit NAME --now`); refused when no move waits. A move sets `account_profile_id`, sets `reset_on_next_start` (a conversation
 can't follow it to another account; a location change in the same call needs no
 `reset_conversation`) and records `handoff: {from, at, reason?}` on the agent (`from`: the
 profile the old conversation lives on, null for Default; a second move before a start keeps it).
@@ -1378,8 +1388,8 @@ note's text itself). `handoff` is cleared once that run has started; later start
 HANDOFF.md starts with a line saying Muster wrote it; a HANDOFF.md without that line (the agent's
 own) is renamed to `HANDOFF.agent.md` (or `HANDOFF.agent-N.md`) first, never overwritten.
 
-The reply's `switch` says what happens: `{to, now, outcome, notes, notes_skipped?, error?}`.
-`to` is the new profile's name. `notes` is `asked` when the agent is running, idle (state `idle`, nothing queued; an errored
+The reply's `switch` says what happens: `{to, now, running, outcome, notes, notes_skipped?, error?}`.
+`to` is the new profile's name; `running`: it had a live run (one `now` could restart). `notes` is `asked` when the agent is running, idle (state `idle`, nothing queued; an errored
 run is not) and the account its run is on isn't at its limit (a current 5-hour or weekly figure
 at 100%): Muster sends it
 "You are moving to account <to>. Write anything you would need to continue into memory/ now."

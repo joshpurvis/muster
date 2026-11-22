@@ -1899,17 +1899,13 @@ fn cents(dollars: f64) -> anyhow::Result<u32> {
 }
 
 /// What a settings change loosens, in words (empty: it only tightens or changes nothing): more
-/// may then run unattended, so from outside Muster's window it is refused.
+/// may then run unattended, so from outside Muster's window it is refused. The unattended cap
+/// and the quiet hours are not on the list: they change from the command line and agents too,
+/// either way (the owner, 21 Nov 2026).
 pub fn settings_widened(before: &Settings, after: &Settings) -> Vec<&'static str> {
     let mut out = Vec::new();
     if before.paused && !after.paused {
         out.push("resuming all schedules");
-    }
-    if before.quiet_start != after.quiet_start || before.quiet_end != after.quiet_end {
-        out.push("moving the quiet hours");
-    }
-    if after.unattended_cap > before.unattended_cap {
-        out.push("a higher unattended cap");
     }
     if after.spend_cap_cents > before.spend_cap_cents {
         out.push("a higher spend cap");
@@ -1924,7 +1920,8 @@ pub fn settings_widened(before: &Settings, after: &Settings) -> Vec<&'static str
 }
 
 /// `schedule.settings.set`. `window`: from a click in Muster's window; otherwise a change that
-/// loosens a limit (`settings_widened`) is refused, and only tightening applies.
+/// loosens one of the limits in `settings_widened` is refused whole (the unattended cap and the
+/// quiet hours change either way).
 pub fn set_settings(hub: &Hub, c: SettingsChange, window: bool) -> anyhow::Result<Value> {
     let next = {
         let mut g = hub.schedules.inner.lock();
@@ -1974,8 +1971,8 @@ pub fn set_settings(hub: &Hub, c: SettingsChange, window: bool) -> anyhow::Resul
         ensure!(
             window || wider.is_empty(),
             "{} would let more run unattended, so it takes a click in Muster's window (Agents panel → ⋯ → \
-             Scheduling settings). From the command line or a script these settings only tighten: pause all, lower caps, \
-             fewer watched folders",
+             Scheduling settings). From the command line or a script these settings only tighten: pause all, lower spend \
+             caps, fewer watched folders. The unattended cap and the quiet hours change from there either way",
             capitalize(&wider.join(", "))
         );
         hub.store().save_runtime(SETTINGS_KEY, &next)?;

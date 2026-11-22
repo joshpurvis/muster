@@ -794,7 +794,7 @@ fn outside_the_window_widening_holds_and_narrowing_applies() {
 }
 
 #[test]
-fn outside_the_window_settings_only_tighten() {
+fn outside_the_window_settings_only_tighten_except_the_cap_and_quiet_hours() {
     let f = Fixture::new(at(LONDON, "2026-10-19T08:00"));
     let d = temp_dir("settings");
     let set = |v: Value| set_settings(&f.hub, serde_json::from_value(v).unwrap(), false).map_err(|e| e.to_string());
@@ -807,16 +807,23 @@ fn outside_the_window_settings_only_tighten() {
     // Loosening is refused, and nothing changes.
     for (v, what) in [
         (json!({"paused": false}), "Resuming all schedules"),
-        (json!({"unattended_cap": 11}), "higher unattended cap"),
         (json!({"spend_cap": 3.0}), "higher spend cap"),
         (json!({"agent_spend_caps": {"worker": null}}), "cleared agent spend cap"),
-        (json!({"quiet_start": "01:00"}), "quiet hours"),
         (json!({"watch_folders": [d]}), "another watched folder"),
+        // With a cap or quiet hours beside it, the whole change is refused.
+        (json!({"paused": false, "unattended_cap": 11, "quiet_start": "01:00"}), "Resuming all schedules"),
     ] {
         let e = set(v.clone()).unwrap_err();
         assert!(e.to_lowercase().contains(&what.to_lowercase()) && e.contains("Muster's window"), "{v}: {e}");
+        let what_loosens = e.split(" would let").next().unwrap();
+        assert!(!what_loosens.contains("unattended cap") && !what_loosens.contains("quiet hours"), "{v}: {e}");
     }
     assert_eq!(f.hub.schedules.settings(), st);
+    // The unattended cap and the quiet hours change either way from outside the window too (the
+    // owner, 21 Nov 2026).
+    set(json!({"unattended_cap": 150, "quiet_start": "01:00", "quiet_end": "05:30"})).unwrap();
+    let st = f.hub.schedules.settings();
+    assert!(st.unattended_cap == 150 && st.quiet_start == "01:00" && st.quiet_end == "05:30" && st.paused);
     // From the window: anything.
     set_settings(&f.hub, serde_json::from_value(json!({"paused": false, "watch_folders": [d]})).unwrap(), true).unwrap();
     let _ = std::fs::remove_dir_all(&d);

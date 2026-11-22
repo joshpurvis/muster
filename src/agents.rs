@@ -1925,11 +1925,13 @@ pub struct AgentUpdate {
     #[serde(default)]
     pub account_profile: Option<crate::account_profiles::ProfileChoice>,
     /// With a move: restart the agent now if it is running and idle (`start_fresh_if`);
-    /// otherwise (and by default) the move applies at its next start.
+    /// otherwise (and by default) the move applies at its next start. Without one: apply the
+    /// move already waiting for its next start the same way (refused when none is waiting).
     #[serde(default)]
     pub now: bool,
-    /// With a move: first ask a running, idle agent to write what it needs into memory/
-    /// (default on; skipped when its current account is at its limit).
+    /// With a move: first ask a running, idle agent to write what it needs into memory/ (off by
+    /// default: HANDOFF.md and its memory/ carry it over, and asking starts a turn; skipped when
+    /// its current account is at its limit).
     #[serde(default)]
     pub save_notes: Option<bool>,
     /// With a move: why, for HANDOFF.md.
@@ -2037,6 +2039,14 @@ pub fn update_switch(hub: &Hub, req: AgentUpdate, outside: bool) -> anyhow::Resu
         }
         _ => None,
     };
+    // `now` alone: the move waiting for its next start, now (Restart now, `--now` without
+    // `--profile`).
+    let waiting = cur.handoff.clone().filter(|_| cur.kind == SessionKind::Claude && moving.is_none() && req.now);
+    anyhow::ensure!(
+        !req.now || moving.is_some() || waiting.is_some(),
+        "{} has no move waiting: `now` goes with a move to another account, or applies one that waits for its next start",
+        cur.name
+    );
     let reason = clean_opt(req.handoff_reason.map(|r| crate::mcp::tools::clean_text(&r)))
         .map(|r| truncate_bytes(&r, HANDOFF_REASON_MAX));
     anyhow::ensure!(reason.is_none() || moving.is_some(), "handoff_reason goes with a move to another account_profile");
@@ -2125,14 +2135,19 @@ pub fn update_switch(hub: &Hub, req: AgentUpdate, outside: bool) -> anyhow::Resu
         }
     }
     let next = hub.agents().set_config(hub.store(), &next)?;
-    let switch = moving.map(|to| Switch {
-        name: next.name.clone(),
-        from: cur.account_profile_id,
-        to,
-        at: next.handoff.as_ref().map_or(0, |h| h.at),
-        now: req.now,
-        save_notes: req.save_notes.unwrap_or(true),
-    });
+    let save_notes = req.save_notes.unwrap_or(false);
+    let switch = match (moving, waiting) {
+        (Some(to), _) => Some(Switch {
+            name: next.name.clone(),
+            from: cur.account_profile_id,
+            to,
+            at: next.handoff.as_ref().map_or(0, |h| h.at),
+            now: req.now,
+            save_notes,
+        }),
+        (None, Some(h)) => Some(Switch { name: next.name.clone(), from: h.from, to: cur.account_profile_id, at: h.at, now: true, save_notes }),
+        (None, None) => None,
+    };
     if next.permissions != cur.permissions
         && let Some(c) = next.channel_id.and_then(|c| hub.channel(c)).filter(|c| !c.archived)
     {
@@ -2150,11 +2165,10 @@ pub fn update_switch(hub: &Hub, req: AgentUpdate, outside: bool) -> anyhow::Resu
 /// or changes the provider of a Claude agent that takes such work or is named in a schedule (its
 /// own or a "Then…" step): leaving the subscription drops its schedules' 7-day expiry (an
 /// expired one would run again) and their quiet-hours default; joining it puts that work on the
-/// subscription, which the Schedule opt-in's warning is about. Moving such an agent to another
-/// account profile changes which account pays for that work, so it takes the click too. Model,
-/// effort, persona,
-/// permissions and autostart don't change whether or when unattended work runs (the tab's
-/// permissions are the owner's to set from anywhere: `channel.set_permissions`).
+/// subscription, which the Schedule opt-in's warning is about. Model, effort, persona,
+/// permissions, autostart and the account profile don't change whether or when unattended work
+/// runs (the tab's permissions are the owner's to set from anywhere: `channel.set_permissions`;
+/// moving an agent to another account works from the CLI and agents too, the owner, 21 Nov 2026).
 pub fn widens_unattended(hub: &Hub, cur: &Agent, next: &Agent) -> Option<String> {
     let unattended = |o: &Origin| matches!(o, Origin::Schedule | Origin::Webhook);
     if next.accepts_origins.iter().any(|o| unattended(o) && !cur.accepts_origins.contains(o)) {
@@ -2172,16 +2186,6 @@ pub fn widens_unattended(hub: &Hub, cur: &Agent, next: &Agent) -> Option<String>
             "changing the provider of {}, which takes scheduled or triggered work or is named in a schedule, takes a click in \
              Muster's window (Edit agent, in the Agents panel): it changes whether its schedules stop after 7 days and what \
              pays for them. From here, first take away its Schedule and Webhook and remove the schedules that name it",
-            cur.name
-        ));
-    }
-    if next.account_profile_id != cur.account_profile_id
-        && (next.accepts_origins.iter().any(unattended) || crate::schedules::names_agent(hub, cur.id))
-    {
-        return Some(format!(
-            "moving {}, which takes scheduled or triggered work or is named in a schedule, to another account takes a click \
-             in Muster's window (Edit agent, in the Agents panel): it changes which account pays for its unattended runs. \
-             From here, first take away its Schedule and Webhook and remove the schedules that name it",
             cur.name
         ));
     }
@@ -2819,7 +2823,7 @@ fn at_limit(hub: &Hub, id: Option<crate::account_profiles::ProfileId>) -> bool {
 /// Carry out move `sw` that `update_switch` recorded: Save notes first (in the background, up to
 /// `SAVE_NOTES_WAIT`), and with `now` a restart if the agent is idle. What happened, for the
 /// `agent.update` reply (`switch`): `outcome` is `next_start`, `restarted`, `busy` (Now was
-/// asked, it moves at its next start), `replaced` (a newer move came first), `after_notes`
+/// asked, it moves at its next start; `running`: it had a run to restart), `replaced` (a newer move came first), `after_notes`
 /// (restarts once it saved its notes) or `failed` (`error`); `notes` is `asked` or `skipped` (`notes_skipped`: `off`, `not_running`,
 /// `busy` or `at_limit`).
 pub async fn switch_account(hub: &Arc<Hub>, sw: Switch) -> Value {
@@ -2827,7 +2831,7 @@ pub async fn switch_account(hub: &Arc<Hub>, sw: Switch) -> Value {
     let live = hub.agents().get(&sw.name).and_then(|a| live_session(hub, &a));
     // The account the running process is on (with an earlier move still pending, not `sw.from`).
     let skip = notes_skipped(sw.save_notes, live.as_ref(), || at_limit(hub, live.as_ref().and_then(|s| s.account_profile_id)));
-    let mut out = json!({ "to": to, "now": sw.now });
+    let mut out = json!({ "to": to, "now": sw.now, "running": live.is_some() });
     let Some(why) = skip else {
         out["notes"] = json!("asked");
         out["outcome"] = json!(if sw.now { "after_notes" } else { "next_start" });
@@ -4880,14 +4884,61 @@ mod tests {
         create(&hub, serde_json::from_value(json!({"name": "coder", "kind": "codex"})).unwrap()).unwrap();
         assert!(edit(&hub, json!({"name": "coder", "account_profile": work}), false).unwrap_err().contains("only supported for Claude"));
         assert!(edit(&hub, json!({"name": "coder", "account_profile": "default"}), false).unwrap_err().contains("only supported for Claude"));
-        // An agent that takes unattended work moves only with a click in Muster's window.
+        // An agent that takes unattended work moves from the command line or an agent's session
+        // too (the owner, 21 Nov 2026), not only with a click in Muster's window.
         create(&hub, serde_json::from_value(json!({"name": "cron", "accepts": ["human", "schedule"]})).unwrap()).unwrap();
-        assert!(edit(&hub, json!({"name": "cron", "account_profile": work}), true).unwrap_err().contains("which account pays"));
-        assert_eq!(hub.agents().get("cron").unwrap().account_profile_id, None, "nothing changed");
-        assert!(edit(&hub, json!({"name": "cron", "account_profile": work}), false).unwrap().1.is_some());
-        // Dropping its unattended work in the same request lets it move from outside.
+        let (moved, sw) = edit(&hub, json!({"name": "cron", "account_profile": work}), true).unwrap();
+        assert!(sw.is_some() && moved.account_profile_id == Some(work) && moved.handoff.is_some());
         create(&hub, serde_json::from_value(json!({"name": "hook", "accepts": ["human", "webhook"]})).unwrap()).unwrap();
-        assert!(edit(&hub, json!({"name": "hook", "account_profile": work, "accepts": ["human"]}), true).is_ok());
+        assert!(edit(&hub, json!({"name": "hook", "account_profile": work}), true).unwrap().1.is_some());
+        // The guards beside it stay: from outside, its accepted work only shrinks, and a scheduled
+        // agent's provider changes only from the window.
+        assert!(edit(&hub, json!({"name": "hook", "accepts": ["human", "webhook", "schedule"]}), true).unwrap_err()
+            .contains("takes a click in Muster's window"));
+        let cur = hub.agents().get("cron").unwrap();
+        let mut other = cur.clone();
+        other.provider = Provider::OpenRouter;
+        assert!(widens_unattended(&hub, &cur, &other).unwrap().contains("changing the provider of cron"));
+        other.provider = cur.provider;
+        other.account_profile_id = None;
+        assert_eq!(widens_unattended(&hub, &cur, &other), None, "a move alone widens nothing");
+    }
+
+    /// A move asks the agent to save notes only when asked to (`save_notes`): HANDOFF.md and its
+    /// memory/ carry it over, so by default nothing wakes it.
+    #[tokio::test]
+    async fn a_move_asks_for_notes_only_when_asked() {
+        let (hub, _personal, work, _a) = moving_fixture("quiet-move").await;
+        let (_, sw) = edit(&hub, json!({"name": "quiet-move", "account_profile": work}), true).unwrap();
+        assert!(!sw.unwrap().save_notes, "a move doesn't ask for notes by default");
+        let (_, sw) = edit(&hub, json!({"name": "quiet-move", "account_profile": "default", "save_notes": true}), true).unwrap();
+        assert!(sw.unwrap().save_notes, "--save-notes asks");
+        // No running session: nothing to ask, nothing started.
+        let sw = edit(&hub, json!({"name": "quiet-move", "account_profile": work}), true).unwrap().1.unwrap();
+        let v = switch_account(&hub, sw).await;
+        assert_eq!((v["notes"].as_str(), v["notes_skipped"].as_str(), v["outcome"].as_str()), (Some("skipped"), Some("off"), Some("next_start")), "{v}");
+    }
+
+    /// `now` alone applies the move that is waiting for the agent's next start (the window's
+    /// Restart now, `muster agent edit NAME --now`); with no move waiting it is refused.
+    #[tokio::test]
+    async fn now_alone_applies_the_waiting_move() {
+        let (hub, personal, work, _a) = moving_fixture("waiting").await;
+        let e = edit(&hub, json!({"name": "waiting", "now": true}), true).unwrap_err();
+        assert!(e.contains("no move waiting"), "{e}");
+        let (_, first) = edit(&hub, json!({"name": "waiting", "account_profile": work}), true).unwrap();
+        let first = first.unwrap();
+        assert!(!first.now);
+        let (still, sw) = edit(&hub, json!({"name": "waiting", "now": true}), true).unwrap();
+        let sw = sw.expect("the waiting move, now");
+        assert_eq!((sw.from, sw.to, sw.at, sw.now, sw.save_notes), (Some(personal), Some(work), first.at, true, false));
+        assert_eq!(still.handoff.as_ref().map(|h| h.at), Some(first.at), "the move itself is unchanged");
+        // Naming the account it already moves to, with now, is the same.
+        let sw = edit(&hub, json!({"name": "waiting", "account_profile": work, "now": true}), true).unwrap().1.unwrap();
+        assert_eq!((sw.to, sw.at, sw.now), (Some(work), first.at, true));
+        // Not running: it moves at its next start.
+        let v = switch_account(&hub, sw).await;
+        assert_eq!(v["outcome"], "next_start", "{v}");
     }
 
     /// The first start after a move writes HANDOFF.md and gets the prompt; once that run has

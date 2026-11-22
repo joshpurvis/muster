@@ -3,6 +3,7 @@
 // (agents_test.ts).
 
 import type {
+  AccountProfile,
   Agent,
   AgentSwitch,
   AgentMessage,
@@ -17,6 +18,7 @@ import type {
 } from "./types.ts";
 import { STATE_LABEL } from "./types.ts";
 import { idleText } from "./cache.ts";
+import { profileName } from "./account_profiles.ts";
 
 /** What a row shows: the dot's state, whether a process runs, and the state's label and start. */
 export interface AgentStatus {
@@ -499,6 +501,29 @@ export function saveNotesBlocked(s: SessionInfo | undefined, oldAtLimit: boolean
   if (s.state !== "idle" || s.queued > 0) return "It isn't idle. Muster asks only an idle agent.";
   if (oldAtLimit) return `${oldName} is at its limit, so it couldn't answer.`;
   return null;
+}
+
+/** A move to another account waiting for the agent's next start (`handoff`): a running agent
+ * keeps its old account until it restarts. `restart`: Restart now can apply it, on the same check
+ * as the move's Now (a running, idle agent with nothing queued: src/agents.rs `session_idle`);
+ * `why`: why not, when it can't. null: no move waiting. */
+export function pendingMove(
+  a: Agent,
+  s: SessionInfo | undefined,
+  profiles: AccountProfile[],
+): { to: string; from: string; text: string; running: boolean; restart: boolean; why: string | null } | null {
+  if (a.kind !== "claude" || !a.handoff) return null;
+  const to = profileName(profiles, a.account_profile_id);
+  const running = !!s && s.state !== "exited";
+  const idle = running && s.state === "idle" && s.queued === 0;
+  return {
+    to,
+    from: profileName(profiles, a.handoff.from),
+    text: `Moves to ${to} at its next start`,
+    running,
+    restart: idle,
+    why: idle ? null : running ? "It is busy. Restart now works once it is idle." : `It isn't running: it starts on ${to}.`,
+  };
 }
 
 /** The message after saving a move (`agent.update`'s `switch`). */

@@ -576,14 +576,19 @@ enum AgentCmd {
         name: String,
         /// Move this Claude agent to another profile (name/id, or "default"): its next start is
         /// a new conversation there, with HANDOFF.md from Muster's records; memory/ comes along.
-        /// An agent that takes scheduled or triggered work moves only from Muster's window.
+        /// Without --now a running agent keeps its current account until it next starts.
         #[arg(long, value_name = "PROFILE")]
         profile: Option<String>,
-        /// With --profile: restart it now if it is idle (otherwise at its next start).
-        #[arg(long, requires = "profile")]
+        /// Restart it now on the new account if it is idle (nothing running, nothing queued); a
+        /// busy agent moves at its next start. Without --profile: apply the move already waiting.
+        #[arg(long)]
         now: bool,
-        /// With --profile: don't first ask a running, idle agent to save notes into memory/.
-        #[arg(long, requires = "profile")]
+        /// With --profile: first ask a running, idle agent to write what it needs into memory/
+        /// (starts a turn on its current account). Off by default: HANDOFF.md and memory/ carry it.
+        #[arg(long, requires = "profile", conflicts_with = "no_save_notes")]
+        save_notes: bool,
+        /// The old opt-out, now the default: accepted and ignored.
+        #[arg(long, hide = true)]
         no_save_notes: bool,
         /// With --profile: why, written into its HANDOFF.md.
         #[arg(long, value_name = "TEXT", requires = "profile")]
@@ -874,7 +879,8 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
                 name,
                 profile,
                 now,
-                no_save_notes,
+                save_notes,
+                no_save_notes: _,
                 reason,
                 provider,
                 model,
@@ -894,7 +900,7 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
                     name,
                     kind: None,
                     profile,
-                    switch: cli::SwitchOpts { now, save_notes: !no_save_notes, reason },
+                    switch: cli::SwitchOpts { now, save_notes, reason },
                     provider,
                     model,
                     effort,
@@ -2146,6 +2152,33 @@ mod tests {
                 _ => panic!("not `new`"),
             }
         }
+    }
+
+    /// A move asks for notes only with `--save-notes` (`--no-save-notes`, the old default's
+    /// opt-out, is still accepted); `--now` alone applies a move already waiting.
+    #[test]
+    fn agent_edit_move_flags() {
+        let switch = |args: &[&str]| match parse(args).unwrap_or_else(|e| panic!("{args:?}: {e}")) {
+            Cmd::Agent { action: AgentCmd::Edit { profile, now, save_notes, .. } } => (profile, now, save_notes),
+            _ => panic!("not `agent edit`"),
+        };
+        assert_eq!(switch(&["agent", "edit", "ada", "--profile", "Work"]), (Some("Work".into()), false, false));
+        assert_eq!(switch(&["agent", "edit", "ada", "--profile", "Work", "--save-notes", "--now"]), (Some("Work".into()), true, true));
+        assert_eq!(switch(&["agent", "edit", "ada", "--profile", "Work", "--no-save-notes"]), (Some("Work".into()), false, false));
+        assert_eq!(switch(&["agent", "edit", "ada", "--now"]), (None, true, false));
+        assert!(parse(&["agent", "edit", "ada", "--save-notes"]).is_err(), "--save-notes goes with a move");
+        assert!(parse(&["agent", "edit", "ada", "--profile", "Work", "--save-notes", "--no-save-notes"]).is_err());
+        let mut cmd = Cli::command();
+        let help = cmd.find_subcommand_mut("agent").unwrap().find_subcommand_mut("edit").unwrap().render_long_help().to_string();
+        assert!(help.contains("Without --now") && help.contains("next start") && help.contains("--save-notes"), "{help}");
+        assert!(!help.contains("only from Muster's window") && !help.contains("no-save-notes"), "{help}");
+    }
+
+    #[test]
+    fn schedule_settings_flags() {
+        assert!(parse(&["schedule", "settings"]).is_ok());
+        assert!(parse(&["schedule", "settings", "--cap", "50", "--quiet", "22:00-07:00"]).is_ok());
+        assert!(parse(&["schedule", "settings", "--cap", "x"]).is_err());
     }
 
     fn agent_args(args: &[&str]) -> (Option<PathBuf>, Option<String>, Vec<String>) {

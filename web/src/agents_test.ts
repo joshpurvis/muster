@@ -1,4 +1,5 @@
 import {
+  pendingMove,
   saveNotesBlocked,
   sessionBusy,
   switchMessage,
@@ -521,4 +522,25 @@ Deno.test("the message after a move says when it takes effect", () => {
   assertEquals(switchMessage("ada", { ...sw, now: true, outcome: "busy", notes_skipped: "busy" }).level, "warn");
   assertEquals(switchMessage("ada", { ...sw, outcome: "next_start", notes_skipped: "at_limit" }).text.includes("at its limit"), true);
   assertEquals(switchMessage("ada", { ...sw, now: true, notes: "asked", outcome: "after_notes" }).text.includes("once it replies"), true);
+});
+
+Deno.test("a move waiting for a restart says so, and offers Restart now only when it is idle", () => {
+  const profiles = [{ id: 1, name: "Personal" }, { id: 2, name: "Work" }] as Parameters<typeof pendingMove>[2];
+  const moving = agent({ account_profile_id: 2, handoff: { from: 1, at: 5 }, session_id: 7 });
+  assertEquals(pendingMove(agent(), session("idle"), profiles), null, "no move waiting");
+  assertEquals(pendingMove(agent({ kind: "codex", handoff: { from: 1, at: 5 } }), undefined, profiles), null);
+  assertEquals(pendingMove(moving, session("idle"), profiles), {
+    to: "Work",
+    from: "Personal",
+    text: "Moves to Work at its next start",
+    running: true,
+    restart: true,
+    why: null,
+  });
+  const busy = pendingMove(moving, session("working"), profiles)!;
+  assertEquals([busy.restart, busy.why], [false, "It is busy. Restart now works once it is idle."]);
+  assertEquals(pendingMove(moving, { ...session("idle"), queued: 2 }, profiles)!.restart, false, "messages waiting");
+  const off = pendingMove(moving, session("exited"), profiles)!;
+  assertEquals([off.restart, off.why], [false, "It isn't running: it starts on Work."]);
+  assertEquals(pendingMove({ ...moving, account_profile_id: null }, undefined, profiles)!.to, "Default");
 });

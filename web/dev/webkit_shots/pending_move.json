@@ -1,0 +1,18 @@
+[
+  {"until": "globalThis.__muster?.windowId?.value != null && globalThis.__muster.agents.value.some((a) => a.name === 'orchestrator')", "settle": 0.5},
+  {"js": "const m = globalThis.__muster; m.agentsPanelOpen.value = true; await m.rpc.call('agent.start', {name: 'orchestrator'});"},
+  {"until": "(() => { const m = globalThis.__muster; const a = m.agents.value.find((x) => x.name === 'orchestrator'); const s = a && a.session_id != null && m.sessions.value.get(a.session_id); return s && s.state === 'idle'; })()", "timeout": 15},
+  {"js": "await globalThis.__muster.rpc.call('agent.update', {name: 'orchestrator', account_profile: 1});"},
+  {"until": "globalThis.__muster.agents.value.find((x) => x.name === 'orchestrator')?.handoff", "settle": 0.6, "shot": "panel", "crop": ".agents-panel", "pad": 0},
+  {"js": "document.querySelector('[data-agent=orchestrator] .ap-more').click();", "until": "document.querySelector('.menu')", "settle": 0.4, "shot": "row-menu", "crop": ".menu", "pad": 16},
+  {"js": "document.querySelector('.menu').dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', bubbles: true}));", "until": "!document.querySelector('.menu')"},
+  {"js": "const m = globalThis.__muster; const sid = m.agents.value.find((x) => x.name === 'orchestrator').session_id; const t = document.querySelector(`[data-tab-sid=\"${sid}\"]`); const r = t.getBoundingClientRect(); t.dispatchEvent(new MouseEvent('contextmenu', {bubbles: true, cancelable: true, clientX: r.left + 20, clientY: r.bottom - 4}));", "until": "document.querySelector('.menu')", "settle": 0.4, "shot": "tab-menu", "crop": ".menu", "pad": 16},
+  {"js": "document.querySelector('.menu').dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', bubbles: true}));", "until": "!document.querySelector('.menu')"},
+  {"js": "document.querySelector('[data-agent=orchestrator] .ap-more').click();", "until": "document.querySelector('.menu')"},
+  {"js": "[...document.querySelectorAll('.menu [role=menuitem]')].find((e) => e.querySelector('.menu-label')?.textContent === 'Edit…').click();", "until": "document.querySelector('.modal:not(.switcher)')", "settle": 0.6, "shot": "edit-pending", "crop": ".modal:not(.switcher)", "pad": 12},
+  {"js": "const sel = [...document.querySelectorAll('.modal:not(.switcher) select')].find((s) => [...s.options].some((o) => o.textContent.startsWith('Default ·'))); sel.value = '2'; sel.dispatchEvent(new Event('change', {bubbles: true}));", "until": "document.querySelector('.move-panel')", "settle": 0.6, "shot": "move-dialog", "crop": ".modal:not(.switcher)", "pad": 12},
+  {"js": "[...document.querySelectorAll('.modal:not(.switcher) button')].find((b) => b.textContent.trim() === 'Cancel').click();", "until": "!document.querySelector('.modal:not(.switcher)')"},
+  {"js": "document.querySelector('[data-agent=orchestrator] .ap-more').click();", "until": "document.querySelector('.menu')"},
+  {"js": "[...document.querySelectorAll('.menu [role=menuitem]')].find((e) => e.querySelector('.menu-label')?.textContent === 'Restart now on Work').click();", "until": "!globalThis.__muster.agents.value.find((x) => x.name === 'orchestrator')?.handoff", "settle": 0.8, "shot": "panel-restarted", "crop": ".agents-panel", "pad": 0},
+  {"js": "return {move_line: !!document.querySelector('[data-agent=orchestrator] .ap-move'), toast: document.querySelector('.toast')?.textContent ?? null};"}
+]

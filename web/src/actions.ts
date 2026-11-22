@@ -91,11 +91,13 @@ import { openQuestionCount, questions, questionsFilter, questionsSupported, sele
 import { flushAllDrafts, flushDraft, knowNote, notes, persistAllDrafts, unsavedNotes } from "./notes.ts";
 import type { HelloResult, Note } from "./types.ts";
 import { inheritedProfile } from "./account_profiles.ts";
-import { isAsleep, providerPendingNote, upsertMessage } from "./agents.ts";
+import { isAsleep, pendingMove, providerPendingNote, switchMessage, upsertMessage } from "./agents.ts";
+import type { MenuItem } from "./components/Menu.tsx";
 import { nextWhen } from "./schedules.ts";
 import { restartExpect, restartOutcome, restartWait } from "./updates.ts";
 import type {
   Agent,
+  AgentSwitch,
   Schedule,
   ScheduleRun,
   ScheduleSettings,
@@ -1961,6 +1963,36 @@ export function canSwitchAccount(a: Agent | undefined): a is Agent {
 /** "Switch account…": Edit agent, on its account picker (docs/ACCOUNT_PROFILES.md). */
 export function switchAgentAccount(name: string) {
   overlay.value = { kind: "agent", name, tab: "settings", focus: "profile" };
+}
+
+/** Restart now: apply the move waiting for `a`'s next start, if it is still idle (`agent.update`
+ * with `now` alone; the backend checks again, so a busy agent keeps its turn). */
+export async function restartToMove(a: Agent): Promise<void> {
+  try {
+    const r = await rpc.call<Agent & { switch?: AgentSwitch }>("agent.update", { name: a.name, now: true });
+    knowAgent(r);
+    if (r.switch) {
+      const m = switchMessage(r.name, r.switch);
+      toast(m.level, m.text, 8000);
+    }
+  } catch (e) {
+    toast("error", `Couldn't restart ${a.name}: ${e instanceof Error ? e.message : e}`);
+  }
+}
+
+/** The menu items for a move waiting for `a`'s next start (Agents panel row, its tab): what
+ * waits, and Restart now while it is running (enabled once it is idle). None without one. */
+export function pendingMoveItems(a: Agent | undefined): MenuItem[] {
+  const s = a?.session_id != null ? sessions.value.get(a.session_id) : undefined;
+  const p = a ? pendingMove(a, s, accountProfiles.value) : null;
+  if (!a || !p) return [];
+  return [
+    "sep",
+    { header: p.text },
+    ...(p.running
+      ? [{ label: `Restart now on ${p.to}`, hint: p.restart ? undefined : "when idle", disabled: !p.restart, run: () => restartToMove(a) }]
+      : []),
+  ];
 }
 
 

@@ -87,23 +87,36 @@ pub fn user_settings_file() -> std::path::PathBuf {
 /// Muster adds its rule to the user's rather than in their place. A missing, unreadable or
 /// malformed file gives none (agy reports a malformed one itself).
 pub(crate) fn user_allow_rules(file: &Path) -> Vec<String> {
-    use std::io::Read;
-    use std::os::unix::fs::OpenOptionsExt;
-    let read = || -> Option<Value> {
-        let file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(file).ok()?;
-        if !file.metadata().ok()?.is_file() {
-            return None;
-        }
-        let mut data = Vec::new();
-        file.take(4 << 20).read_to_end(&mut data).ok()?;
-        serde_json::from_slice(&data).ok()
-    };
-    read()
+    read_json(file)
         .and_then(|v| v.pointer("/permissions/allow").and_then(Value::as_array).cloned())
         .unwrap_or_default()
         .into_iter()
         .filter_map(|r| r.as_str().map(str::to_string))
         .collect()
+}
+
+/// A JSON file of the user's: a regular file of at most 4 MiB (never blocks on a FIFO).
+fn read_json(file: &Path) -> Option<Value> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(file).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut data = Vec::new();
+    file.take(4 << 20).read_to_end(&mut data).ok()?;
+    serde_json::from_slice(&data).ok()
+}
+
+/// MCP config files that could name another server `muster`: agy keeps a duplicate name for the
+/// server already running, so `MUSTER_TOOLS_RULE` would allow that one instead.
+pub fn other_server_files(cwd: &Path) -> [std::path::PathBuf; 2] {
+    [crate::paths::home_dir().join(".gemini/config/mcp_config.json"), cwd.join(".agents/mcp_config.json")]
+}
+
+/// Any of `files` configures a server named `muster`. An unreadable file counts as none.
+pub(crate) fn names_muster(files: &[std::path::PathBuf]) -> bool {
+    files.iter().filter_map(|f| read_json(f)).any(|v| v.pointer("/mcpServers/muster").is_some())
 }
 
 /// The session's private settings: the title callback, and with `allow` the user's allow rules
@@ -195,12 +208,13 @@ pub fn is_startup_screen(screen: &ScreenSnapshot) -> bool {
     !lines[..top].iter().any(|l| l.starts_with("> ") || l.trim_end() == ">")
 }
 
-fn launch(ctx: &SpawnCtx, settings: bool, mcp: bool, user_settings: &Path) -> anyhow::Result<CommandSpec> {
+fn launch(ctx: &SpawnCtx, settings: bool, mcp: bool, user_settings: &Path, other_servers: &[std::path::PathBuf]) -> anyhow::Result<CommandSpec> {
     let mut args = Vec::new();
     if settings {
         let file = ctx.session_dir.join("antigravity-settings.json");
         crate::agents::refuse_symlink(&file)?;
-        let allow = mcp.then(|| user_allow_rules(user_settings));
+        // Another server named `muster` would get the rule: then each call asks, as before.
+        let allow = (mcp && !names_muster(other_servers)).then(|| user_allow_rules(user_settings));
         crate::paths::write_private(
             &file,
             &serde_json::to_vec_pretty(&settings_json(&ctx.muster_bin, allow))?,
@@ -349,6 +363,7 @@ impl Adapter for AntigravityAdapter {
             on("MUSTER_ANTIGRAVITY_SETTINGS"),
             on("MUSTER_ANTIGRAVITY_MCP"),
             &user_settings_file(),
+            &other_server_files(&ctx.cwd),
         )
     }
 
@@ -748,7 +763,7 @@ mod tests {
             ),
         ] {
             ctx.permissions.antigravity_mode = mode;
-            let spec = launch(&ctx, false, false, &user).unwrap();
+            let spec = launch(&ctx, false, false, &user, &[]).unwrap();
             assert_eq!(
                 spec.args,
                 [flag, "--model", "demo", "--prompt-interactive=read alpha"]
@@ -761,18 +776,18 @@ mod tests {
         let mcp = workspace.join(".agents/mcp_config.json");
         let settings = format!("--settings={}", file.display());
         let add_dir = format!("--add-dir={}", workspace.display());
-        assert_eq!(launch(&ctx, true, false, &user).unwrap().args[0], settings);
+        assert_eq!(launch(&ctx, true, false, &user, &[]).unwrap().args[0], settings);
         assert!(!workspace.exists());
         let read = |p| serde_json::from_slice::<Value>(&std::fs::read(p).unwrap()).unwrap();
         // Without Muster's MCP server there is no rule for it, and the user's list is untouched.
         assert!(read(&file).get("permissions").is_none());
         // A fresh run with Muster's tools gets its first prompt after `/clear`, through the queue.
-        let fresh = launch(&ctx, false, true, &user).unwrap();
+        let fresh = launch(&ctx, false, true, &user, &[]).unwrap();
         assert_eq!(fresh.args, [add_dir.as_str(), "--dangerously-skip-permissions", "--model", "demo"]);
         assert!(!fresh.consumed_initial_prompt && opens_new_conversation(&fresh.args));
-        assert!(!opens_new_conversation(&launch(&ctx, true, false, &user).unwrap().args));
+        assert!(!opens_new_conversation(&launch(&ctx, true, false, &user, &[]).unwrap().args));
         ctx.extra_args = vec!["--conversation".into(), "conv-demo".into()];
-        let spec = launch(&ctx, true, true, &user).unwrap();
+        let spec = launch(&ctx, true, true, &user, &[]).unwrap();
         assert_eq!(spec.program, "agy");
         assert!(!spec.consumed_initial_prompt);
         assert!(!opens_new_conversation(&spec.args), "a resumed conversation has its tools");
@@ -793,6 +808,12 @@ mod tests {
         let title = json!({"type":"command","command":"'/tmp/demo app/muster' hook antigravity state"});
         // No user settings file: Muster's rule alone.
         assert_eq!(read(&file), json!({"title": title, "permissions": {"allow": [MUSTER_TOOLS_RULE]}}));
+        let clash = std::env::temp_dir().join(format!("muster-agy-clash-{:x}.json", rand::random::<u64>()));
+        std::fs::write(&clash, r#"{"mcpServers":{"muster":{"command":"other"}}}"#).unwrap();
+        launch(&ctx, true, true, &user, &[clash.clone()]).unwrap();
+        assert_eq!(read(&file), json!({"title": title}), "another `muster` server gets no rule");
+        std::fs::remove_file(clash).unwrap();
+        launch(&ctx, true, true, &user, &[]).unwrap();
         assert_eq!(
             std::fs::read_to_string(workspace.join(".agents/AGENTS.md")).unwrap(),
             TOOLS_INSTRUCTION
@@ -812,15 +833,15 @@ mod tests {
         let other = dir.join("fixture");
         std::fs::create_dir(&other).unwrap();
         std::os::unix::fs::symlink(&other, workspace.join(".agents")).unwrap();
-        assert!(launch(&ctx, false, true, &user).is_err());
+        assert!(launch(&ctx, false, true, &user, &[]).is_err());
         assert_eq!(std::fs::read_dir(other).unwrap().count(), 0);
         std::fs::remove_file(workspace.join(".agents")).unwrap();
         std::fs::write(workspace.join("old-run"), "fixture").unwrap();
-        launch(&ctx, false, true, &user).unwrap();
+        launch(&ctx, false, true, &user, &[]).unwrap();
         assert!(!workspace.join("old-run").exists());
         std::fs::remove_file(&mcp).unwrap();
         std::os::unix::fs::symlink(dir.join("absent"), &mcp).unwrap();
-        assert!(launch(&ctx, false, true, &user).is_err());
+        assert!(launch(&ctx, false, true, &user, &[]).is_err());
         assert!(!dir.join("absent").exists());
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -853,6 +874,12 @@ mod tests {
         assert!(std::process::Command::new("mkfifo").arg(&file).status().unwrap().success());
         assert!(user_allow_rules(&file).is_empty());
         assert!(settings_json(Path::new("muster"), None).get("permissions").is_none());
+        // Another server named `muster` in the user's or the folder's MCP config: no rule.
+        let other = dir.join("mcp_config.json");
+        std::fs::write(&other, r#"{"mcpServers":{"linter":{"command":"lint"}}}"#).unwrap();
+        assert!(!names_muster(&[dir.join("absent.json"), other.clone()]));
+        std::fs::write(&other, r#"{"mcpServers":{"muster":{"serverUrl":"http://127.0.0.1:9/mcp"}}}"#).unwrap();
+        assert!(names_muster(&[dir.join("absent.json"), other.clone()]));
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

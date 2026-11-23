@@ -261,6 +261,11 @@ pub struct Queues {
     /// In memory only: prompts from other agents or schedules a fresh start did not keep
     /// (`drop_queue`), to be returned to their senders as refused (`return_unsent`).
     returns: Mutex<Vec<Item>>,
+    /// In memory only: each fresh Antigravity run's new-conversation step
+    /// (`prepare_new_conversation`): its run, and the human's last keystroke when the run was
+    /// first ready for it (a trust dialog answered before that is fine). A step with no record
+    /// (queued before a backend restart) is dropped.
+    opening: Mutex<HashMap<SessionId, (u64, Option<Option<u64>>)>>,
 }
 
 impl Queues {
@@ -283,7 +288,7 @@ impl Queues {
             }
         }
         store.save_runtime("prompt-queues", &queues)?;
-        Ok(Self { inner: Mutex::new(queues), store: store.clone(), retry_at: Mutex::new(HashMap::new()), view_noticed: Mutex::default(), stalls: Mutex::default(), returns: Mutex::default() })
+        Ok(Self { inner: Mutex::new(queues), store: store.clone(), retry_at: Mutex::new(HashMap::new()), view_noticed: Mutex::default(), stalls: Mutex::default(), returns: Mutex::default(), opening: Mutex::default() })
     }
 
     fn edit<T>(&self, id: SessionId, change: impl FnOnce(&mut SessQ) -> T) -> anyhow::Result<T> {
@@ -904,7 +909,8 @@ pub async fn send(
             rebase(q, generation);
             join_parked(hub, q, &item)?;
             // Never ahead of a held self-handoff prompt: the new conversation reads it first.
-            let at = q.items.iter().take_while(|i| held(i)).count();
+            // Nor ahead of a fresh Antigravity run's new-conversation step.
+            let at = q.items.iter().take_while(|i| held(i) || i.new_conversation).count();
             q.items.insert(at, item);
             Ok(q.items.len() as u32)
         })??;
@@ -1192,10 +1198,27 @@ pub(crate) fn prepare_new_conversation(hub: &Hub, id: SessionId, generation: u64
     let item = Item { generation: Some(generation), text: "/clear".into(), clear_first: false, attempts: 0,
         draft_noticed: false, source: crate::agents::Source::Human, panel: None, handoff: None, new_conversation: true };
     hub.injection.edit(id, |q| {
-        rebase(q, Some(generation));
+        // A queue parked by a fresh start stays parked until this run is confirmed (`adopt`).
+        if !parked(q) { rebase(q, Some(generation)); }
         q.items.retain(|i| !i.new_conversation);
         q.items.push_front(item);
-    })
+    })?;
+    hub.injection.opening.lock().insert(id, (generation, None));
+    Ok(())
+}
+
+/// The new-conversation step of run `generation` may still go: this backend queued it for
+/// this run, and the human hasn't typed in the tab since the run was first ready for it.
+/// `arm`: record that moment now if it isn't yet (the run is ready, on its startup screen).
+fn may_open(hub: &Hub, id: SessionId, generation: Option<u64>, arm: bool) -> bool {
+    let typed = hub.human_input_of(id).map(|(seq, _)| seq);
+    let mut opening = hub.injection.opening.lock();
+    let Some((_, at)) = opening.get_mut(&id).filter(|(run, _)| Some(*run) == generation) else { return false };
+    match at {
+        Some(at) => *at == typed,
+        None if arm => { *at = Some(typed); true }
+        None => false,
+    }
 }
 
 /// Load agy's MCP servers (`/mcp`, then Esc) and open a new conversation (`/clear`), as
@@ -1213,8 +1236,13 @@ async fn open_conversation(hub: &Arc<Hub>, id: SessionId, generation: Option<u64
         }
         true
     }
-    if !(screen().is_some_and(|s| is_startup_screen(&s)) && box_is("")) {
-        tracing::info!(session = id, "not opening a new Antigravity conversation: the startup one is in use");
+    // Before every key: still this run, no dialog, the human hasn't typed since it was queued.
+    let clear_to_type = || may_open(hub, id, generation, false) && hub.session(id).is_some_and(|info| {
+        hub.drain_antigravity_callbacks(id);
+        screen().is_some_and(|s| !dialog_blocks_input(adapter, &s, info.state))
+    });
+    if !(screen().is_some_and(|s| is_startup_screen(&s)) && box_is("") && clear_to_type()) {
+        tracing::info!(session = id, "not opening a new Antigravity conversation: the startup one may be in use");
         return Ok(true);
     }
     // Typed, not pasted: agy opens its command menu on the text, and Enter runs the command.
@@ -1222,14 +1250,19 @@ async fn open_conversation(hub: &Arc<Hub>, id: SessionId, generation: Option<u64
     let cleared = || box_is("");
     let steps: [(&str, &(dyn Fn() -> bool + Sync)); 2] = [("/mcp", &loaded), ("/clear", &cleared)];
     for (command, done) in steps {
+        if !(box_is("") && clear_to_type()) { return Ok(true) }
         hub.write_input_generation(id, generation, command.as_bytes())?;
         if !until(&|| box_is(command), Duration::from_secs(3)).await {
             anyhow::bail!("Antigravity did not show `{command}` in its input box; check the terminal");
         }
+        if !clear_to_type() { return Ok(true) }
         hub.write_input_generation(id, generation, b"\r")?;
         let ok = until(done, Duration::from_secs(15)).await;
         if command == "/mcp" {
-            // Closed whether or not the servers showed as loaded: `/clear` needs the input box.
+            // Closed whether or not the servers showed as loaded (`/clear` needs the input box),
+            // but only while the panel is what's on screen.
+            let panel = screen().is_some_and(|s| s.lines.iter().any(|l| l.trim() == "MCP Servers"));
+            if !(panel && may_open(hub, id, generation, false)) { return Ok(true) }
             hub.write_input_generation(id, generation, &[0x1b])?;
             if !until(&|| box_is(""), Duration::from_secs(3)).await {
                 anyhow::bail!("Antigravity's MCP panel did not close; check the terminal");
@@ -1279,6 +1312,8 @@ fn kick(hub: Arc<Hub>, id: SessionId) {
         tokio::time::sleep(SETTLE).await;
         let is_ready = ready(&hub, id) && !hub.is_shutting_down() && !deferred(&hub, id, generation);
         let startup = hub.screen(id).is_some_and(|s| crate::adapters::antigravity::is_startup_screen(&s));
+        let opening = hub.injection.inner.lock().get(&id).is_some_and(|q| q.items.front().is_some_and(|i| i.new_conversation));
+        let may = opening && is_ready && startup && may_open(&hub, id, generation, true);
         // Session moves take this lock: a panel batch is checked against its task as it is taken.
         let selected = {
             let _op = hub.panels.operations.lock();
@@ -1288,9 +1323,9 @@ fn kick(hub: Arc<Hub>, id: SessionId) {
                 // A panel batch whose opener left its task returns to its panels (`panel_moves`).
                 q.items.retain(|item| item.panel.as_ref().is_none_or(|b| !unbound.contains(&b.id)));
                 // A fresh run's new conversation comes too late once its startup one was used.
-                if is_ready && !startup && q.items.front().is_some_and(|i| i.new_conversation) {
+                if is_ready && !may && q.items.front().is_some_and(|i| i.new_conversation) {
                     q.items.pop_front();
-                    tracing::info!(session = id, "not opening a new Antigravity conversation: the startup one was used");
+                    tracing::info!(session = id, "not opening a new Antigravity conversation: the startup one may be in use");
                 }
                 // A held handoff prompt keeps its place, and everything behind it waits.
                 let item = if is_ready && !q.items.front().is_some_and(held) { q.items.pop_front() } else { None };

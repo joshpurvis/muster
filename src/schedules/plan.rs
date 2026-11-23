@@ -123,35 +123,65 @@ pub struct Due {
     pub record: bool,
 }
 
-/// Is schedule `s` due at `now`, and what happens? `runs_today`: its runs that reached the agent
-/// in the last 24 hours; `last_reason`: the reason on its newest run.
-pub fn due(s: &Schedule, now: i64, settings: &Settings, quiet: &Quiet, f: &Facts, runs_today: u32, last_reason: Option<&str>) -> Option<Due> {
+/// The slot due now, how many slots at or before now there are since the schedule last ran (this
+/// one included), and its next slot after this.
+type Slots = (i64, u32, Option<i64>);
+
+/// The slot `due` acts on at `now` (the newest one at or before now). `Err`: its timing can't be
+/// read (the slot is its stored next run). None: nothing is due.
+fn slot_at(s: &Schedule, now: i64) -> Option<Result<Slots, String>> {
     let first = s.next_run?;
     // An agent's proposal never runs before the human approves it (it keeps no next run either).
     if first > now || s.waiting_approval() {
         return None;
     }
-    let trigger = s.when.is_trigger();
-    let (slot, count, next_run) = match &s.when {
-        When::Once { .. } | When::Note { .. } | When::Git { .. } | When::Github { .. } | When::Url { .. } | When::Files { .. } => (first, 1, None),
-        When::Cron { cron } => {
-            let parsed = cron::Cron::parse(cron).ok().zip(cron::zone(&s.tz).ok());
-            let Some((c, tz)) = parsed else {
-                // Unreadable now (a zone removed from the system): stop rather than spin.
-                return Some(Due { slot: first, count: 1, next_run: None, action: Action::Skip(format!("can't read its timing ({cron} in {})", s.tz)), record: true });
-            };
-            let (mut slot, mut count) = (first, 1u32);
-            while count < 100_000 {
-                match c.next_after(&tz, slot) {
-                    Some(n) if n <= now => {
-                        slot = n;
-                        count += 1;
+    Some(match &s.when {
+        When::Once { .. } | When::Note { .. } | When::Git { .. } | When::Github { .. } | When::Url { .. } | When::Files { .. } => Ok((first, 1, None)),
+        When::Cron { cron } => match cron::Cron::parse(cron).ok().zip(cron::zone(&s.tz).ok()) {
+            // Unreadable now (a zone removed from the system): stop rather than spin.
+            None => Err(format!("can't read its timing ({cron} in {})", s.tz)),
+            Some((c, tz)) => {
+                let (mut slot, mut count) = (first, 1u32);
+                while count < 100_000 {
+                    match c.next_after(&tz, slot) {
+                        Some(n) if n <= now => {
+                            slot = n;
+                            count += 1;
+                        }
+                        _ => break,
                     }
-                    _ => break,
                 }
+                Ok((slot, count, c.next_after(&tz, now)))
             }
-            (slot, count, c.next_after(&tz, now))
-        }
+        },
+    })
+}
+
+/// The slot schedule `s` would act on at `now` (None: nothing is due), for counting the runs
+/// on its day before calling `due`.
+pub fn due_slot(s: &Schedule, now: i64) -> Option<i64> {
+    match slot_at(s, now)? {
+        Ok((slot, ..)) => Some(slot),
+        Err(_) => s.next_run,
+    }
+}
+
+/// The calendar day, in schedule `s`'s time zone, that the daily cap counts slot `slot` toward:
+/// `[start, end)` in unix ms (a daylight-saving day is 23 or 25 hours long). A zone that can't be
+/// read counts in UTC.
+pub fn cap_day(s: &Schedule, slot: i64) -> (i64, i64) {
+    let tz = cron::zone(&s.tz).unwrap_or(TimeZone::UTC);
+    cron::day_bounds(&tz, slot).unwrap_or((slot, slot + DAY_MS))
+}
+
+/// Is schedule `s` due at `now`, and what happens? `runs_on_day`: its timed runs that reached
+/// the agent whose slots fall on the same calendar day (in its zone, `cap_day`) as the slot due
+/// now (`due_slot`); `last_reason`: the reason on its newest run.
+pub fn due(s: &Schedule, now: i64, settings: &Settings, quiet: &Quiet, f: &Facts, runs_on_day: u32, last_reason: Option<&str>) -> Option<Due> {
+    let trigger = s.when.is_trigger();
+    let (slot, count, next_run) = match slot_at(s, now)? {
+        Ok(x) => x,
+        Err(why) => return Some(Due { slot: s.next_run?, count: 1, next_run: None, action: Action::Skip(why), record: true }),
     };
     // A trigger's event runs whenever it can: never "missed", its quiet hours read now.
     let late = !trigger && now - slot > GRACE_MS;
@@ -190,13 +220,13 @@ pub fn due(s: &Schedule, now: i64, settings: &Settings, quiet: &Quiet, f: &Facts
         return skip(format!("quiet hours ({})", quiet.label), false);
     }
     if let Some(cap) = s.daily_cap
-        && runs_today >= cap
+        && runs_on_day >= cap
     {
         return Some(Due {
             slot,
             count,
             next_run,
-            action: Action::Refuse(cap_reason(cap)),
+            action: Action::Refuse(cap_reason(s, cap, runs_on_day, slot, now)),
             record: true,
         });
     }
@@ -210,15 +240,31 @@ pub fn due(s: &Schedule, now: i64, settings: &Settings, quiet: &Quiet, f: &Facts
     Some(Due { slot, count, next_run, action: Action::Fire(kind), record: true })
 }
 
-fn cap_reason(cap: u32) -> String {
-    format!("daily cap: {cap} runs in the last 24 hours")
+/// Why a run was refused at its daily cap: how often it already ran on its slot's day ("today",
+/// or the day a catch-up stands for) and the cap.
+fn cap_reason(s: &Schedule, cap: u32, runs: u32, slot: i64, now: i64) -> String {
+    let times = match runs {
+        1 => "once".to_string(),
+        2 => "twice".to_string(),
+        n => format!("{n} times"),
+    };
+    let day = cap_day(s, slot);
+    let when = if day == cap_day(s, now) {
+        "today".to_string()
+    } else {
+        let tz = cron::zone(&s.tz).unwrap_or(TimeZone::UTC);
+        format!("on {}", cron::format(&tz, slot, "%a %-d %b"))
+    };
+    format!("daily cap: it already ran {times} {when} (at most {cap} a day)")
 }
 
 /// Just before an automatic run is sent, and again right before its prompt is submitted (it may
 /// wait in the agent's prompt queue behind an unsent draft): the rules that may have changed
-/// meanwhile. `since_sent`: how long ago this schedule's previous message was submitted.
-/// `Some(Action::Skip | Action::Refuse)`: don't send.
-pub fn still_ok(s: &Schedule, now: i64, settings: &Settings, quiet: &Quiet, f: &Facts, runs_today: u32, since_sent: Option<i64>) -> Option<Action> {
+/// meanwhile. `slot`: the run's slot; `runs_on_day`: the schedule's other runs that reached the
+/// agent on that slot's day (`cap_day`); `since_sent`: how long ago this schedule's previous
+/// message was submitted. `Some(Action::Skip | Action::Refuse)`: don't send.
+#[allow(clippy::too_many_arguments)]
+pub fn still_ok(s: &Schedule, now: i64, settings: &Settings, quiet: &Quiet, f: &Facts, slot: i64, runs_on_day: u32, since_sent: Option<i64>) -> Option<Action> {
     if s.waiting_approval() {
         return Some(Action::Skip(WAITING.into()));
     }
@@ -235,9 +281,9 @@ pub fn still_ok(s: &Schedule, now: i64, settings: &Settings, quiet: &Quiet, f: &
         return Some(Action::Skip(format!("quiet hours ({})", quiet.label)));
     }
     if let Some(cap) = s.daily_cap
-        && runs_today >= cap
+        && runs_on_day >= cap
     {
-        return Some(Action::Refuse(cap_reason(cap)));
+        return Some(Action::Refuse(cap_reason(s, cap, runs_on_day, slot, now)));
     }
     // The floor by when messages were actually submitted: a run that went out late doesn't
     // let the next slot follow it within the 15 minutes.

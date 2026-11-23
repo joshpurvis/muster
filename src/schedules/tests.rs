@@ -125,7 +125,7 @@ fn pause_skip_next_quiet_hours_and_caps() {
     assert!(matches!(due(&daily, at(LONDON, "2026-10-19T02:00")).unwrap().action, Action::Skip(ref r) if r.starts_with("quiet")));
     let capped = Schedule { daily_cap: Some(2), ..s.clone() };
     let d = plan::due(&capped, now, &Settings::default(), &quiet_london(), &Facts::default(), 2, None).unwrap();
-    assert!(matches!(d.action, Action::Refuse(ref r) if r.contains("daily cap")));
+    assert_eq!(d.action, Action::Refuse("daily cap: it already ran twice today (at most 2 a day)".into()));
 }
 
 #[test]
@@ -207,7 +207,7 @@ fn a_catch_up_after_the_seven_days_is_expired() {
     let s = Schedule { renewed_at: made, ..cron_at("0 9 * * *", at(LONDON, "2026-10-18T09:00")) };
     let d = plan::due(&s, at(LONDON, "2026-10-19T12:00"), &Settings::default(), &quiet_london(), &claude, 0, None).unwrap();
     assert_eq!(d.action, Action::Skip(plan::EXPIRED.into()));
-    assert_eq!(plan::still_ok(&s, at(LONDON, "2026-10-19T12:00"), &Settings::default(), &quiet_london(), &claude, 0, None),
+    assert_eq!(plan::still_ok(&s, at(LONDON, "2026-10-19T12:00"), &Settings::default(), &quiet_london(), &claude, 0, 0, None),
         Some(Action::Skip(plan::EXPIRED.into())), "and a run still waiting when it expires");
 }
 
@@ -215,16 +215,17 @@ fn a_catch_up_after_the_seven_days_is_expired() {
 fn rules_are_checked_again_before_sending() {
     let s = cron_at("0 9 * * *", 0);
     let now = at(LONDON, "2026-10-19T09:30");
-    assert_eq!(plan::still_ok(&s, now, &Settings::default(), &quiet_london(), &Facts::default(), 0, None), None);
+    assert_eq!(plan::still_ok(&s, now, &Settings::default(), &quiet_london(), &Facts::default(), 0, 0, None), None);
     let paused_all = Settings { paused: true, ..Settings::default() };
-    assert_eq!(plan::still_ok(&s, now, &paused_all, &quiet_london(), &Facts::default(), 0, None), Some(Action::Skip(plan::PAUSED_ALL.into())));
+    assert_eq!(plan::still_ok(&s, now, &paused_all, &quiet_london(), &Facts::default(), 0, 0, None), Some(Action::Skip(plan::PAUSED_ALL.into())));
     let paused = Schedule { paused: true, ..s.clone() };
-    assert_eq!(plan::still_ok(&paused, now, &Settings::default(), &quiet_london(), &Facts::default(), 0, None), Some(Action::Skip(plan::PAUSED.into())));
+    assert_eq!(plan::still_ok(&paused, now, &Settings::default(), &quiet_london(), &Facts::default(), 0, 0, None), Some(Action::Skip(plan::PAUSED.into())));
     let quiet = Schedule { quiet_hours: true, ..s.clone() };
-    assert!(matches!(plan::still_ok(&quiet, at(LONDON, "2026-10-19T23:30"), &Settings::default(), &quiet_london(), &Facts::default(), 0, None),
+    assert!(matches!(plan::still_ok(&quiet, at(LONDON, "2026-10-19T23:30"), &Settings::default(), &quiet_london(), &Facts::default(), 0, 0, None),
         Some(Action::Skip(ref r)) if r.starts_with("quiet")));
     let capped = Schedule { daily_cap: Some(1), ..s };
-    assert!(matches!(plan::still_ok(&capped, now, &Settings::default(), &quiet_london(), &Facts::default(), 1, None), Some(Action::Refuse(_))));
+    assert_eq!(plan::still_ok(&capped, now, &Settings::default(), &quiet_london(), &Facts::default(), now, 1, None),
+        Some(Action::Refuse("daily cap: it already ran once today (at most 1 a day)".into())));
 }
 
 #[test]
@@ -232,9 +233,9 @@ fn the_floor_counts_from_when_the_last_prompt_went_out() {
     // The 09:00 run went out at 09:14:30; the 09:15 run would follow 30 s later.
     let s = cron_at("*/15 * * * *", 0);
     let now = at(LONDON, "2026-10-19T09:15");
-    assert!(matches!(plan::still_ok(&s, now, &Settings::default(), &quiet_london(), &Facts::default(), 0, Some(30_000)),
+    assert!(matches!(plan::still_ok(&s, now, &Settings::default(), &quiet_london(), &Facts::default(), 0, 0, Some(30_000)),
         Some(Action::Skip(ref r)) if r.starts_with("too soon after the previous run was sent")));
-    assert_eq!(plan::still_ok(&s, now, &Settings::default(), &quiet_london(), &Facts::default(), 0, Some(15 * plan::MINUTE_MS)), None);
+    assert_eq!(plan::still_ok(&s, now, &Settings::default(), &quiet_london(), &Facts::default(), 0, 0, Some(15 * plan::MINUTE_MS)), None);
 }
 
 #[test]
@@ -255,8 +256,8 @@ fn run_history_queries() {
     let (first, first_msg) = msg(RunKind::Scheduled, 10);
     msg(RunKind::Manual, 11);
     // Run now doesn't count toward the schedule's own daily cap.
-    assert_eq!(store.count_delivered_runs_since(id, 0, None).unwrap(), 1);
-    assert_eq!(store.count_delivered_runs_since(id, 0, Some(first_msg)).unwrap(), 0);
+    assert_eq!(store.count_delivered_runs_in(id, 0, 100, None).unwrap(), 1);
+    assert_eq!(store.count_delivered_runs_in(id, 0, 100, Some(first_msg)).unwrap(), 0);
     // 30 skips later, the newest run that sent a message is still found.
     for n in 0..30 {
         let skip = Run { id: 0, schedule_id: id, slot: 100 + n, kind: RunKind::Scheduled, started_at: 1, msg_id: None,

@@ -2600,14 +2600,16 @@ impl Store {
     }
 
     /// Timed runs of `schedule` (not Run now: the schedule's own cap is about its timing; the
-    /// agent's caps count every message) whose message was sent at or after `since` (unix ms on
-    /// the daemon's clock: the message's own time, not when the run was taken up), leaving out
-    /// message `except` (the one about to be submitted).
-    pub fn count_delivered_runs_since(&self, schedule: i64, since: i64, except: Option<i64>) -> anyhow::Result<u32> {
+    /// agent's caps count every message) that sent a message and whose slot is in `[from, to)`
+    /// (unix ms on the scheduler's clock: the day the run was for, not when its message went out,
+    /// so a run sent a little late, or a catch-up after midnight, counts toward its own day),
+    /// leaving out message `except` (the one about to be submitted).
+    pub fn count_delivered_runs_in(&self, schedule: i64, from: i64, to: i64, except: Option<i64>) -> anyhow::Result<u32> {
         let n: i64 = self.conn.lock().query_row(
             "SELECT COUNT(*) FROM schedule_runs r JOIN agent_messages m ON m.id = r.msg_id
-             WHERE r.schedule_id = ?1 AND m.created_at >= ?2 AND r.kind NOT IN ('manual', 'chain') AND (?3 IS NULL OR m.id != ?3)",
-            params![schedule, since, except],
+             WHERE r.schedule_id = ?1 AND r.slot >= ?2 AND r.slot < ?3 AND r.kind NOT IN ('manual', 'chain')
+               AND (?4 IS NULL OR m.id != ?4)",
+            params![schedule, from, to, except],
             |r| r.get(0),
         )?;
         Ok(n.max(0) as u32)

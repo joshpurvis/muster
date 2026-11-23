@@ -611,7 +611,7 @@ fn pruning_the_history_never_reopens_a_daily_cap() {
         r.outcome = Outcome::Refused;
         store.insert_run(&r).unwrap();
     }
-    assert_eq!(store.count_delivered_runs_since(id, crate::model::now_ms() - plan::DAY_MS, None).unwrap(), 1, "the delivered run is kept");
+    assert_eq!(store.count_delivered_runs_in(id, 0, plan::DAY_MS, None).unwrap(), 1, "the delivered run is kept");
     assert!(store.runs(id, None, 2000).unwrap().len() <= RUNS_KEEP + 1);
 }
 

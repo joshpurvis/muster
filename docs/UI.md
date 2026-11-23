@@ -909,8 +909,8 @@ sends only what changed (`schedule.settings.set`). The dialog scrolls in a short
   title, which makes that note), and "Skip quiet hours (23:00–07:00)" (follows the agent's
   default until changed).
 - More options (open in Edit when a cap, another time zone or a Then… step is set; a bad cap or
-  step shows its error under it while closed): Then… (below), at most N runs a day (empty: no cap; Run now
-  doesn't count) and the time zone (this browser's by default; 09:00 stays 09:00 across clock
+  step shows its error under it while closed): Then… (below), at most N runs a day (a calendar day in the
+  schedule's time zone; empty: no cap; Run now doesn't count) and the time zone (this browser's by default; 09:00 stays 09:00 across clock
   changes).
 - Ctrl+Enter creates or saves; Esc closes. Create (`schedule.create`) shows the sidebar's list if it was
   hidden and toasts the next run; Save sends only changed fields (`schedule.update`). The

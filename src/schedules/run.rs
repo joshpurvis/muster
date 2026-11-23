@@ -155,10 +155,13 @@ pub fn tick(hub: &Arc<Hub>, now: i64) -> Vec<Run> {
     start
 }
 
-/// Runs of `schedule` whose messages reached the agent in the last 24 hours (by the time each
-/// message was sent: the daemon's clock, which agent messages are stamped with).
-fn runs_today(hub: &Hub, schedule: i64) -> anyhow::Result<u32> {
-    hub.store().count_delivered_runs_since(schedule, now_ms() - plan::DAY_MS, None)
+/// Timed runs of `s` that reached the agent on the calendar day (in its zone) of slot `slot`,
+/// counted by their own slots and leaving out message `except`: what its daily cap counts. A run
+/// that went out a little after its slot, or a catch-up after midnight, counts toward the day it
+/// was for, so a daily schedule with a cap of 1 runs every day.
+pub(super) fn runs_on_day(hub: &Hub, s: &Schedule, slot: i64, except: Option<i64>) -> anyhow::Result<u32> {
+    let (from, to) = plan::cap_day(s, slot);
+    hub.store().count_delivered_runs_in(s.id, from, to, except)
 }
 
 /// Act on schedule `id`'s due slot: claim it (with its run row) and say whether to start it.
@@ -179,7 +182,10 @@ fn handle_due(hub: &Arc<Hub>, id: i64, now: i64, settings: &super::Settings, qui
         let mut g = sched.inner.lock();
         let Some(s) = g.list.get(&id).cloned() else { return Ok(None) };
         let last = hub.store().runs(id, None, 10)?.into_iter().find(|r| r.kind != RunKind::Chain);
-        let today = runs_today(hub, id)?;
+        let today = match plan::due_slot(&s, now) {
+            Some(slot) if s.daily_cap.is_some() => runs_on_day(hub, &s, slot, None)?,
+            _ => 0,
+        };
         let Some(mut due) = plan::due(&s, now, settings, quiet, f, today, last.as_ref().and_then(|r| r.reason.as_deref())) else {
             return Ok(None);
         };
@@ -393,12 +399,12 @@ async fn execute(hub: &Arc<Hub>, mut run: Run) -> anyhow::Result<()> {
         if run.kind != RunKind::Manual {
             let settings = sched.settings();
             // A step belongs to its run: the schedule's daily cap and floor were the run's.
-            let (today, since) = if step { (0, None) } else { (runs_today(hub, s.id)?, s.last_sent.map(|t| now_ms() - t)) };
+            let (today, since) = if step { (0, None) } else { (runs_on_day(hub, &s, run.slot, None)?, s.last_sent.map(|t| now_ms() - t)) };
             let f = match hub.agents().by_id(s.agent_id) {
                 Some(own) => super::facts_for(hub, &own, &s),
                 None => facts(hub, &agent),
             };
-            match plan::still_ok(&s, sched.now(), &settings, &quiet_of(&settings), &f, today, since) {
+            match plan::still_ok(&s, sched.now(), &settings, &quiet_of(&settings), &f, run.slot, today, since) {
                 Some(Action::Skip(why)) => return finish(hub, &s, &mut run, Outcome::Skipped, Some(why)),
                 Some(Action::Refuse(why)) => return finish(hub, &s, &mut run, Outcome::Refused, Some(why)),
                 _ => {}

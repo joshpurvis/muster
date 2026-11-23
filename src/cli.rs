@@ -836,7 +836,7 @@ pub enum ScheduleCmd {
         #[arg(long)] note: Option<String>,
         /// Skip runs in the quiet hours (default: on for Claude subscription agents).
         #[arg(long, value_parser = ["on", "off"])] quiet_hours: Option<String>,
-        /// At most N runs reach the agent per 24 hours.
+        /// At most N runs reach the agent per calendar day, in the schedule's time zone.
         #[arg(long)] max_per_day: Option<u32>,
         /// Create it paused.
         #[arg(long)] paused: bool,

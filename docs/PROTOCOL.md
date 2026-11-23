@@ -604,7 +604,7 @@ type ScheduleSettings = { paused: boolean /* "Pause all schedules" */; quiet_sta
 | Method | Params | Result |
 |---|---|---|
 | `schedule.list` | `{agent?}` | `{schedules: Schedule[], settings: ScheduleSettings}` |
-| `schedule.create` | `{agent, prompt, when: WhenInput, name?, tz? = local zone, missed? = "auto", conversation? = "continue", notify? = "on_failure", note?: {id} \| {title}, quiet_hours?, daily_cap?, paused? = false, from_session?}` | `Schedule`. Refused when the agent doesn't accept the `schedule` origin (a Claude agent only does if the human ticked Schedule, with its warning). `name` defaults to the prompt's first line (60 bytes). `note: {title}` uses the note with that title (case-insensitive) or makes one. `quiet_hours` defaults on for a Claude agent on its subscription, off for Codex and OpenRouter agents. `daily_cap`: runs that reach the agent per 24 hours (1–200, `null` or 0: none). A cron line may not run more often than every 15 minutes; a one-off must be in the future and at most a year ahead. Prompt up to 16 KB; 200 schedules in all. |
+| `schedule.create` | `{agent, prompt, when: WhenInput, name?, tz? = local zone, missed? = "auto", conversation? = "continue", notify? = "on_failure", note?: {id} \| {title}, quiet_hours?, daily_cap?, paused? = false, from_session?}` | `Schedule`. Refused when the agent doesn't accept the `schedule` origin (a Claude agent only does if the human ticked Schedule, with its warning). `name` defaults to the prompt's first line (60 bytes). `note: {title}` uses the note with that title (case-insensitive) or makes one. `quiet_hours` defaults on for a Claude agent on its subscription, off for Codex and OpenRouter agents. `daily_cap`: runs that reach the agent per calendar day in the schedule's `tz`, each counted toward the day of its slot (1–200, `null` or 0: none). A cron line may not run more often than every 15 minutes; a one-off must be in the future and at most a year ahead. Prompt up to 16 KB; 200 schedules in all. |
 | `schedule.update` | `{id, ...any create field but agent}` | `Schedule`. A `when` or `tz` that fires at other times recomputes the next run and clears Skip next; the same timing written differently (`@daily` for `0 0 * * *`) changes nothing. `note: null` and `daily_cap: null` clear them. |
 | `schedule.remove` | `{id, waiting? = false}` | `{removed: id}`; its runs go too. Removing an agent removes its schedules. `waiting` (the window's Dismiss): remove it only while it still waits for approval, decided under the removal's lock; once approved or changed it is refused ("…so it stays"). |
 | `schedule.pause` | `{id, on? = true}` | `Schedule`. Paused, its slots are recorded once as `skipped: paused` and pass. |
@@ -680,7 +680,12 @@ notice and a desktop notification on failure (blocked, no reply, ended, timed ou
 failed), on every outcome (`always`), or never. A backend restart picks up unfinished runs: one
 already sent waits for its reply again; one whose message was recorded but never typed and is in
 no prompt queue (the backend stopped in between) is `failed`; one still in line goes back in line
-until its hour is up. The daily caps count a run by when its message was sent. The newest 500 runs
+until its hour is up. A schedule's own daily cap counts the runs that reached the agent by the
+calendar day of their slots in the schedule's time zone (a run sent a little after its slot, or a
+catch-up after midnight, counts toward the day it was for; a daylight-saving day is 23 or 25 hours),
+and refuses with `daily cap: it already ran once today (at most 1 a day)` (or `on Sun 22 Nov` for a
+catch-up of an earlier day). The agent's caps count a message by when it was sent, over any 24 hours.
+The newest 500 runs
 per schedule are kept, whichever way they were made.
 
 **Caps.** Besides the 200-a-day cap, each agent takes at most `unattended_cap` (default 24)

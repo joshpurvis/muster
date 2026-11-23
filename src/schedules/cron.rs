@@ -359,6 +359,16 @@ pub fn minute_of_day(tz: &TimeZone, ms: i64) -> Option<u32> {
     Some(z.hour() as u32 * 60 + z.minute() as u32)
 }
 
+/// The calendar day `ms` falls on in `tz`, as `[start, end)` in unix ms: from that day's first
+/// instant to the next day's (23 or 25 hours on a daylight-saving day; where midnight doesn't
+/// exist, the day starts at its first moment).
+pub fn day_bounds(tz: &TimeZone, ms: i64) -> Option<(i64, i64)> {
+    let z = Timestamp::from_millisecond(ms).ok()?.to_zoned(tz.clone());
+    let start = z.start_of_day().ok()?;
+    let end = z.tomorrow().ok()?.start_of_day().ok()?;
+    Some((start.timestamp().as_millisecond(), end.timestamp().as_millisecond()))
+}
+
 /// `ms` in `tz` with a strftime pattern (e.g. `%Y-%m-%d %H:%M`).
 pub fn format(tz: &TimeZone, ms: i64, pattern: &str) -> String {
     match Timestamp::from_millisecond(ms) {
@@ -517,5 +527,19 @@ mod tests {
         assert_eq!(Cron::parse("*/15 * * * *").unwrap().min_gap_ms(&tz, from, 50), Some(15 * 60_000));
         assert_eq!(Cron::parse("0,5 9 * * *").unwrap().min_gap_ms(&tz, from, 50), Some(5 * 60_000));
         assert_eq!(Cron::parse("0 9 * * 1-5").unwrap().min_gap_ms(&tz, from, 20), Some(86_400_000));
+    }
+    #[test]
+    fn a_calendar_day_is_23_or_25_hours_on_daylight_saving_days() {
+        let london = TimeZone::get("Europe/London").unwrap();
+        let day = |tz: &TimeZone, at: &str| {
+            let (a, b) = day_bounds(tz, ms(tz, at)).unwrap();
+            (fmt(tz, a), (b - a) / 3_600_000)
+        };
+        assert_eq!(day(&london, "2026-11-22T09:30"), ("2026-11-22 00:00 GMT".to_string(), 24));
+        assert_eq!(day(&london, "2026-03-29T09:30"), ("2026-03-29 00:00 GMT".to_string(), 23));
+        assert_eq!(day(&london, "2026-10-25T23:30"), ("2026-10-25 00:00 BST".to_string(), 25));
+        // Where clocks skip midnight (Chile in September), the day starts at 01:00.
+        let santiago = TimeZone::get("America/Santiago").unwrap();
+        assert_eq!(day(&santiago, "2026-09-06T09:30"), ("2026-09-06 01:00 -03".to_string(), 23));
     }
 }

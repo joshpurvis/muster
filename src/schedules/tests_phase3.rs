@@ -59,7 +59,7 @@ fn a_proposal_never_runs_until_the_human_approves_it() {
     assert!(set_skip(&f.hub, id, true, None).is_err());
     update(&f.hub, serde_json::from_value(json!({"id": id, "when": {"kind": "cron", "cron": "0 17 * * 5"}})).unwrap()).unwrap();
     assert!(f.hub.schedules.get(id).unwrap().next_run.is_none(), "the human's edit keeps it waiting");
-    assert!(matches!(plan::still_ok(&s, 0, &Settings::default(), &super::quiet_london(), &Facts::default(), 0, None), Some(Action::Skip(_))));
+    assert!(matches!(plan::still_ok(&s, 0, &Settings::default(), &super::quiet_london(), &Facts::default(), 0, 0, None), Some(Action::Skip(_))));
     // Approved: it runs like any schedule, from now on.
     let j = approve(&f.hub, id, None).unwrap();
     assert_eq!(j["status"], "active");

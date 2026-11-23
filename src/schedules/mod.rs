@@ -376,7 +376,8 @@ pub struct Schedule {
     pub note_id: Option<NoteId>,
     /// Runs in the quiet hours (settings) are skipped.
     pub quiet_hours: bool,
-    /// At most this many runs reach the agent per rolling 24 hours.
+    /// At most this many timed runs reach the agent per calendar day in `tz`, each counted
+    /// toward the day of its slot (`plan::cap_day`).
     pub daily_cap: Option<u32>,
     pub paused: bool,
     /// "Skip next": this slot is skipped when it comes.
@@ -2072,11 +2073,11 @@ pub fn submit_gate(hub: &Hub, source: &crate::agents::Source, commit: bool) -> O
             (0, None)
         } else {
             (
-                hub.store().count_delivered_runs_since(s.id, now_ms() - plan::DAY_MS, Some(msg)).unwrap_or(0),
+                run::runs_on_day(hub, &s, r.slot, Some(msg)).unwrap_or(0),
                 s.last_sent.map(|t| now_ms() - t),
             )
         };
-        if let Some(a) = plan::still_ok(&s, hub.schedules.now(), &settings, &quiet_of(&settings), &facts_for(hub, &agent, &s), today, since) {
+        if let Some(a) = plan::still_ok(&s, hub.schedules.now(), &settings, &quiet_of(&settings), &facts_for(hub, &agent, &s), r.slot, today, since) {
             return Some(a);
         }
         // A note trigger's prompt goes only while its note still allows triggers.

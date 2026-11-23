@@ -908,7 +908,32 @@ export interface WindowPrefs {
   revision?: number;
 }
 
+/** A closed tab (src/model.rs `EndedSession`), for "Archived sessions" (docs/UI.md). */
+export interface EndedSession {
+  id: SessionId;
+  channel_id: ChannelId;
+  /** The channel's name now, else as it was when the tab closed. */
+  channel_name: string;
+  /** The channel is archived (or gone). */
+  channel_archived: boolean;
+  kind: SessionKind;
+  name: string;
+  title: string | null;
+  cwd: string;
+  account_profile_id: number | null;
+  /** The named agent whose session it was. */
+  agent: string | null;
+  /** The CLI's own conversation id (Claude's session id, Codex's thread). */
+  conversation: string | null;
+  /** null: still running when the tab closed (closing stopped it). */
+  exit_code: number | null;
+  created_at: number;
+  ended_at: number;
+}
+
 export interface HelloResult {
+  /** How many closed tabs "Archived sessions" lists; absent from older backends. */
+  ended_sessions?: number;
   addons?: import("./addons.ts").Addon[];
   addon_revision?: string;
   metrics_enabled?: boolean;

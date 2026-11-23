@@ -50,6 +50,7 @@ import { menuClosedAt, menuOpener } from "./Menu.tsx";
 import { CommunicationDialog } from "./Communication.tsx";
 import { ScheduleDialog, ScheduleSettingsDialog } from "./Schedules.tsx";
 import { AccountProfilesDialog, ProfilePill, ProfileUsage } from "./AccountProfiles.tsx";
+import { EndedSessionsDialog } from "./EndedSessions.tsx";
 import { UpdateBanner } from "./UpdateBanner.tsx";
 import { runningText } from "../updates.ts";
 import { agentStatus } from "../agents.ts";
@@ -186,6 +187,8 @@ export function Overlays() {
       return <RenameWindow />;
     case "notes":
       return <NotesDialog />;
+    case "ended_sessions":
+      return <EndedSessionsDialog Modal={Modal} />;
     case "shell":
       return <ShellDialog />;
     case "addons":

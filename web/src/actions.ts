@@ -443,6 +443,11 @@ export function openNotesList() {
   overlay.value = { kind: "notes" };
 }
 
+/** "Archived sessions": every closed tab, newest first. */
+export function openEndedSessions() {
+  overlay.value = { kind: "ended_sessions" };
+}
+
 /** Delete note `id` for good, after the app's confirm. */
 export function deleteNoteAsk(id: number, after?: () => void) {
   const n = notes.value.get(id);

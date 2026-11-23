@@ -209,6 +209,19 @@ const workspaces: any[] = [];
 const channels: any[] = [];
 const sessions = new Map<number, Session>();
 const events: any[] = [];
+/** Closed tabs for "Archived sessions" (src/model.rs `EndedSession`), newest first. */
+const ended: any[] = [];
+function endSession(s: Session) {
+  const c = channels.find((x) => x.id === s.channel_id);
+  ended.unshift({
+    id: s.id, channel_id: s.channel_id, channel_name: c?.name ?? "", channel_archived: !c || !!c.archived,
+    kind: s.kind, name: s.name, title: s.title, cwd: s.cwd, account_profile_id: (s as any).account_profile_id ?? null,
+    agent: agentList.find((a) => a.session_id === s.id)?.name ?? null,
+    conversation: s.kind === "shell" ? null : crypto.randomUUID(), exit_code: (s as any).exit_code ?? null,
+    created_at: (s as any).created_at ?? now(), ended_at: now(),
+  });
+  ended.splice(1000);
+}
 const procs = new Map<
   number,
   { child: Deno.ChildProcess; writer: WritableStreamDefaultWriter<Uint8Array> }
@@ -1486,6 +1499,44 @@ async function agentMethod(method: string, p: any): Promise<unknown> {
       files.set(path, p.text);
       return { path, size: p.text.length };
     }
+    // Dev only: invented closed tabs over the last days, in the channels open now and in an
+    // archived one, for "Archived sessions" screenshots.
+    case "mock.ended_seed": {
+      const live = channels.filter((c) => !c.archived);
+      // Today's rows close minutes before now (never in the future); older days at fixed times.
+      const at = (daysAgo: number, h: number, m: number) => {
+        if (daysAgo === 0) return now() - (h * 60 + m) * 60_000 / 12;
+        const d = new Date();
+        d.setDate(d.getDate() - daysAgo);
+        d.setHours(h, m, 0, 0);
+        return d.getTime();
+      };
+      const rows: [number, string, Kind, string | null, number | null, number, number, number, number][] = [
+        // channel (index into live, -1: archived), name, kind, title, profile, days ago, h, m, minutes ran
+        [0, "fix the login redirect", "claude", "Fixing login redirect", 1, 0, 11, 42, 48],
+        [1, "dev server", "shell", null, null, 0, 10, 5, 190],
+        [-1, "release notes draft", "claude", "Drafting release notes", 2, 0, 9, 18, 35],
+        [1, "test sweep", "codex", "Running the test sweep", null, 1, 17, 50, 22],
+        [0, "review the cart page", "claude", null, 1, 1, 15, 3, 64],
+        [-1, "logs", "shell", null, null, 1, 9, 30, 400],
+        [1, "rename the config keys", "claude", "Renaming config keys", 2, 3, 14, 12, 18],
+        [0, "dependency bumps", "codex", null, null, 9, 16, 40, 12],
+      ];
+      let id = 9000 + ended.length;
+      for (const [ci, name, kind, title, profile, days, h, m, ran] of rows) {
+        const c = ci >= 0 ? live[ci % Math.max(1, live.length)] : null;
+        const end = at(days, h, m);
+        ended.push({
+          id: id++, channel_id: c?.id ?? 900, channel_name: c?.name ?? "gamma", channel_archived: !c,
+          kind, name, title, cwd: `${HOME}/projects/${ci < 0 ? "demo-docs" : ci === 0 ? "demo-shop" : "demo-api"}`,
+          account_profile_id: kind === "claude" ? profile : null, agent: null,
+          conversation: kind === "shell" ? null : crypto.randomUUID(), exit_code: kind === "shell" && ci < 0 ? 0 : null,
+          created_at: end - ran * 60_000, ended_at: end,
+        });
+      }
+      ended.sort((a, b) => b.ended_at - a.ended_at || b.id - a.id);
+      return { count: ended.length };
+    }
     // Dev only: an agent proposes a schedule that waits for the human's Approve (the sidebar's
     // Needs you box; src/schedules/agent.rs `propose_schedule`).
     case "mock.propose":
@@ -1774,6 +1825,7 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
         addons: ws && deviceClients.has(ws) ? undefined : addons,
         addon_revision: ws && deviceClients.has(ws) ? undefined : addonRevision,
         notes: [...notes.keys()].map(getNote).map(noteSummary),
+        ended_sessions: ended.length,
         windows,
         home: HOME,
         default_shell: "/bin/bash",
@@ -2104,6 +2156,13 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
       upsert(s);
       return s;
     }
+    case "session.ended_list": {
+      const live = new Map(channels.map((c) => [c.id, c]));
+      return ended.slice(0, Math.max(1, Math.min(1000, p.limit ?? 500))).map((e) => {
+        const c = live.get(e.channel_id);
+        return { ...e, channel_name: c?.name ?? e.channel_name, channel_archived: !c || !!c.archived };
+      });
+    }
     case "session.remove":
     case "session.remove_now": {
       const s = sessions.get(p.id);
@@ -2113,6 +2172,7 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
       if (method === "session.remove" && agentList.some((a) => a.session_id === s.id)) {
         return { hidden: true, session: await handle("session.hide", { id: s.id }) };
       }
+      endSession(s);
       kill(p.id);
       sessions.delete(p.id);
       broadcast("session_removed", { id: p.id });

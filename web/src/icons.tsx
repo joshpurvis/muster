@@ -105,6 +105,20 @@ export const IconPanel = (p: P) => (
     <path d="M3 8h18M7 12h10M7 16h7" />
   </Svg>
 );
+/** Archived sessions: a box with a lid (Lucide "archive"). */
+export const IconArchive = (p: P) => (
+  <Svg {...p}>
+    <rect x="2" y="3" width="20" height="5" rx="1" />
+    <path d="M4 8v11a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8M10 12h4" />
+  </Svg>
+);
+/** Copy to the clipboard (Lucide "copy"). */
+export const IconCopy = (p: P) => (
+  <Svg {...p}>
+    <rect x="9" y="9" width="13" height="13" rx="2" />
+    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+  </Svg>
+);
 /** A note: a page with a folded corner and lines. */
 export const IconNote = (p: P) => (
   <Svg {...p}>

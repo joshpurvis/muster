@@ -33,6 +33,7 @@ import { needsHuman } from "./types.ts";
 import { rpc } from "./rpc.ts";
 import { sessionSizeChanged } from "./terms.ts";
 import { applyNoteRemoved, applyNotesHello, applyNoteUpsert, notes, notesSupported, restoreDrafts } from "./notes.ts";
+import { endedRevision, endedSupported } from "./ended.ts";
 import { applyQuestion, loadQuestions, openQuestionCount, questionsSupported, refreshForMessage } from "./questions.ts";
 import { applyPr, loadPrs, minuteClock, prs, prsSupported, worthShowing } from "./prs.ts";
 import { debounce, load, save } from "./util.ts";
@@ -482,6 +483,8 @@ export type Overlay =
   | { kind: "rename_window" }
   /** "Notes…": every note, open or closed (docs/UI.md "Notes"). */
   | { kind: "notes" }
+  /** "Archived sessions": every closed tab, newest first (docs/UI.md "Archived sessions"). */
+  | { kind: "ended_sessions" }
   /** "Shell for new terminals…": the shell new shell tabs run. */
   | { kind: "shell" }
   /** "Cache warning…": the cold prompt cache bar and each provider's cache lifetime. */
@@ -952,6 +955,7 @@ export function applyHello(h: HelloResult) {
     addons.value = h.addons ?? [];
     addonRevision.value = h.addon_revision ?? "";
     applyNotesHello(h.notes);
+    endedSupported.value = typeof h.ended_sessions === "number";
     helloEpoch.value++;
     for (const id of prev.keys()) {
       if (!sessions.value.has(id)) { for (const f of removedSessionListeners) f(id); }
@@ -1046,6 +1050,8 @@ export function applyEvent(ev: ServerEvent) {
     }
     case "session_removed": {
       versions.bump(ev.data.id);
+      // A closed tab joins "Archived sessions": an open list reloads.
+      endedRevision.value++;
       if (!sessions.value.has(ev.data.id)) break;
       const m = new Map(sessions.value);
       m.delete(ev.data.id);

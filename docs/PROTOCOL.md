@@ -1218,7 +1218,13 @@ includes `AGY_CLI_DISABLE_AUTO_UPDATE=true`, `AGY_CLI_HIDE_ACCOUNT_INFO=true` an
 `AGY_CLI_OSC7501=off`. Antigravity uses its own login. Its catalog suggests eight Gemini
 model IDs with the effort built into the ID. A custom model or explicit effort is also accepted.
 
-The private settings file contains only a title command, `muster hook antigravity state`.
+The private settings file holds a title command, `muster hook antigravity state`, and, when
+Muster's MCP server is supplied, a `permissions.allow` list: the user's own allow rules from
+`~/.gemini/antigravity-cli/settings.json` plus `mcp(muster/*)`, so Muster's tools (and no other
+server's) run without an approval prompt in every mode, as for Claude. agy 1.5.13 replaces the
+user's `permissions.allow` list with the one in `--settings` for the session (checked 23 Nov
+2026; its `ask` and `deny` lists still apply and still win), which is why the user's rules are
+copied in. They are read at each launch; a missing or malformed file adds none.
 The helper forwards only a validated `agent_state`, boolean `tool_confirmation_pending`
 and a valid conversation ID as `session_id`. It drops account and usage fields before
 the durable inbox or HTTP transport. The `state` event updates the tab and supplies
@@ -1228,12 +1234,22 @@ Visible dialogs take precedence. A trust or settings dialog needs an answer in t
 
 Muster supplies its bearer-authenticated MCP server through a private
 `antigravity-workspace/.agents/mcp_config.json` in the session directory. Set
-`MUSTER_ANTIGRAVITY_MCP=0` on the daemon to omit that folder. A named agent working in a
-project also gets its `memory/` directory as an added directory.
+`MUSTER_ANTIGRAVITY_MCP=0` on the daemon to omit that folder (and the allow rule). A named
+agent working in a project also gets its `memory/` directory as an added directory.
+
+agy 1.5.13 loads MCP tools lazily: the model gets each server's tool names, a schema file per
+tool that it reads without a prompt, and one generic `call_mcp_tool` (ServerName, ToolName,
+Arguments), not a tool per MCP tool; plan mode keeps it. agy reads rules from an added
+directory, so the same private workspace holds `.agents/AGENTS.md`: Muster's tools are on
+server `muster`, called with `call_mcp_tool`, and a muster message is answered with `reply`
+(agy's callbacks carry no final message). An Antigravity agent's generated persona says the
+same; one written before this is updated once at its next start.
 
 On 23 Nov 2026, a signed-in check with agy 1.5.13 verified the title callback, hidden account
-information, conversation resume and command approval. The MCP panel listed the connected
-server and its tools. The model had no MCP tools available on the tested account. Older backends interpret
+information, conversation resume and command approval. A second check that day, in a real
+Muster tab on a Neon model, verified that an `ask_agent` to an Antigravity agent gets its
+answer through `reply`, and that the agent can call `note_append` and `post_question`, with no
+approval prompt. Older backends interpret
 an Antigravity session as a shell and an Antigravity agent as Codex. Avoid downgrading while
 these records exist.
 

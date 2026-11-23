@@ -68,7 +68,7 @@ session only, never in the user's global config. Every session has `MUSTER_URL` 
   `-c 'mcp_servers.muster.tool_timeout_sec=1900'`.
   Raise `tool_timeout_sec`, because Codex's default tool timeout (about 60 s) would cut off
   `wait_for_state`.
-- **Antigravity CLI.** Muster adds a private workspace containing `.agents/mcp_config.json`. Discovery through `--add-dir` still needs a live check on agy 1.5.13. See PROTOCOL.md, “Antigravity”.
+- **Antigravity CLI.** Muster adds a private workspace (`--add-dir`) containing `.agents/mcp_config.json` and an `.agents/AGENTS.md` that tells the model to call Muster's tools through agy's `call_mcp_tool` (server `muster`), and allows `mcp(muster/*)` in the session's private settings, beside the user's own allow rules. See PROTOCOL.md, “Antigravity”.
 - **Anything else:** POST JSON-RPC with the bearer header, as below.
 
 ```sh
@@ -769,7 +769,7 @@ never lost to an agent's write: the editor merges it onto the newer revision (do
 ### Agents
 
 An Antigravity agent answers an `ask_agent` message with the `reply` tool and the
-message ID. Its status callback carries no final message. An ask without an explicit
+message ID, called through agy's `call_mcp_tool`. Its status callback carries no final message. An ask without an explicit
 reply can return the terminal tail as `unattributed_output`.
 
 A named agent (PLAN.md §10) is a persistent agent session with a home dir, its own tab and a

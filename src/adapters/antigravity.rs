@@ -61,9 +61,63 @@ pub fn mode_args(mode: AntigravityMode) -> Vec<String> {
     ]
 }
 
-pub fn settings_json(bin: &Path) -> Value {
+/// Muster's own MCP tools, and only those, run without an approval prompt, as for Claude
+/// (`claude::MUSTER_TOOLS_RULE`). The user's ask and deny rules still come first in agy.
+pub const MUSTER_TOOLS_RULE: &str = "mcp(muster/*)";
+
+/// agy 1.5.13 gives the model no tool per MCP tool: it lists each server's tool names and one
+/// generic `call_mcp_tool`. Written as `.agents/AGENTS.md` in the private workspace, which agy
+/// reads as rules for every tab, a named agent's or not.
+pub const TOOLS_INSTRUCTION: &str = "# Muster\n\n\
+This session runs in a Muster tab. Muster's tools (`reply`, `ask_agent`, `tell_agent`, `list_agents`, `whoami`, \
+`note_read`, `note_append`, `post_question` and the others listed for the server) are on the MCP server `muster`. \
+Call them with `call_mcp_tool`: ServerName `muster`, ToolName the tool's name, Arguments its arguments (read the \
+tool's schema file first, as your MCP instructions describe).\n\n\
+A prompt that starts with `[muster msg <id> from <sender> origin=<origin> hop=<n>]` came from another agent or \
+session through Muster, not from the human typing. Antigravity doesn't pass your final message back to the sender, \
+so answer it with the `reply` tool (`msg_id` from the header) once you have the answer: one reply per message.\n";
+
+/// agy's own settings file, whose `permissions.allow` rules a session keeps.
+pub fn user_settings_file() -> std::path::PathBuf {
+    crate::paths::home_dir().join(".gemini/antigravity-cli/settings.json")
+}
+
+/// The user's `permissions.allow` rules. Checked with agy 1.5.13: a `permissions.allow` list in
+/// `--settings` replaces that list for the session (its `ask` and `deny` lists still apply), so
+/// Muster adds its rule to the user's rather than in their place. A missing, unreadable or
+/// malformed file gives none (agy reports a malformed one itself).
+pub(crate) fn user_allow_rules(file: &Path) -> Vec<String> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let read = || -> Option<Value> {
+        let file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(file).ok()?;
+        if !file.metadata().ok()?.is_file() {
+            return None;
+        }
+        let mut data = Vec::new();
+        file.take(4 << 20).read_to_end(&mut data).ok()?;
+        serde_json::from_slice(&data).ok()
+    };
+    read()
+        .and_then(|v| v.pointer("/permissions/allow").and_then(Value::as_array).cloned())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|r| r.as_str().map(str::to_string))
+        .collect()
+}
+
+/// The session's private settings: the title callback, and with `allow` the user's allow rules
+/// plus `MUSTER_TOOLS_RULE`.
+pub fn settings_json(bin: &Path, allow: Option<Vec<String>>) -> Value {
     let bin = claude::sh_quote(&bin.to_string_lossy());
-    json!({"title":{"type":"command","command":format!("{bin} hook antigravity state")}})
+    let mut v = json!({"title":{"type":"command","command":format!("{bin} hook antigravity state")}});
+    if let Some(mut rules) = allow {
+        if !rules.iter().any(|r| r == MUSTER_TOOLS_RULE) {
+            rules.push(MUSTER_TOOLS_RULE.into());
+        }
+        v["permissions"] = json!({ "allow": rules });
+    }
+    v
 }
 
 pub fn mcp_json(url: &str, token: &str) -> Value {
@@ -90,7 +144,7 @@ fn prepare_workspace(ctx: &SpawnCtx) -> anyhow::Result<std::path::PathBuf> {
     use std::os::unix::fs::DirBuilderExt;
     let workspace = ctx.session_dir.join("antigravity-workspace");
     let config = workspace.join(".agents");
-    for path in [&workspace, &config, &config.join("mcp_config.json")] {
+    for path in [&workspace, &config, &config.join("mcp_config.json"), &config.join("AGENTS.md")] {
         crate::agents::refuse_symlink(path)?;
     }
     let stage = ctx
@@ -103,6 +157,7 @@ fn prepare_workspace(ctx: &SpawnCtx) -> anyhow::Result<std::path::PathBuf> {
             &stage.join(".agents/mcp_config.json"),
             &serde_json::to_vec_pretty(&server)?,
         )?;
+        crate::paths::write_private(&stage.join(".agents/AGENTS.md"), TOOLS_INSTRUCTION.as_bytes())?;
         match std::fs::remove_dir_all(&workspace) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
             _ => {}
@@ -117,14 +172,15 @@ fn prepare_workspace(ctx: &SpawnCtx) -> anyhow::Result<std::path::PathBuf> {
     Ok(workspace)
 }
 
-fn launch(ctx: &SpawnCtx, settings: bool, mcp: bool) -> anyhow::Result<CommandSpec> {
+fn launch(ctx: &SpawnCtx, settings: bool, mcp: bool, user_settings: &Path) -> anyhow::Result<CommandSpec> {
     let mut args = Vec::new();
     if settings {
         let file = ctx.session_dir.join("antigravity-settings.json");
         crate::agents::refuse_symlink(&file)?;
+        let allow = mcp.then(|| user_allow_rules(user_settings));
         crate::paths::write_private(
             &file,
-            &serde_json::to_vec_pretty(&settings_json(&ctx.muster_bin))?,
+            &serde_json::to_vec_pretty(&settings_json(&ctx.muster_bin, allow))?,
         )?;
         args.push(format!("--settings={}", file.display()));
         // The first callback matters even if it repeats the last state of the previous run.
@@ -268,6 +324,7 @@ impl Adapter for AntigravityAdapter {
             ctx,
             on("MUSTER_ANTIGRAVITY_SETTINGS"),
             on("MUSTER_ANTIGRAVITY_MCP"),
+            &user_settings_file(),
         )
     }
 
@@ -602,6 +659,8 @@ mod tests {
     fn launch_files_flags_and_resumed_prompts() {
         let dir = std::env::temp_dir().join(format!("muster-agy-{:x}", rand::random::<u64>()));
         crate::paths::ensure_private_dir(&dir).unwrap();
+        // Outside the session dir, which must start empty.
+        let user = std::env::temp_dir().join(format!("muster-agy-user-{:x}.json", rand::random::<u64>()));
         let mut ctx = SpawnCtx {
             session_dir: dir.clone(),
             cwd: dir.clone(),
@@ -624,7 +683,7 @@ mod tests {
             ),
         ] {
             ctx.permissions.antigravity_mode = mode;
-            let spec = launch(&ctx, false, false).unwrap();
+            let spec = launch(&ctx, false, false, &user).unwrap();
             assert_eq!(
                 spec.args,
                 [flag, "--model", "demo", "--prompt-interactive=read alpha"]
@@ -637,11 +696,14 @@ mod tests {
         let mcp = workspace.join(".agents/mcp_config.json");
         let settings = format!("--settings={}", file.display());
         let add_dir = format!("--add-dir={}", workspace.display());
-        assert_eq!(launch(&ctx, true, false).unwrap().args[0], settings);
+        assert_eq!(launch(&ctx, true, false, &user).unwrap().args[0], settings);
         assert!(!workspace.exists());
-        assert_eq!(launch(&ctx, false, true).unwrap().args[0], add_dir);
+        let read = |p| serde_json::from_slice::<Value>(&std::fs::read(p).unwrap()).unwrap();
+        // Without Muster's MCP server there is no rule for it, and the user's list is untouched.
+        assert!(read(&file).get("permissions").is_none());
+        assert_eq!(launch(&ctx, false, true, &user).unwrap().args[0], add_dir);
         ctx.extra_args = vec!["--conversation".into(), "conv-demo".into()];
-        let spec = launch(&ctx, true, true).unwrap();
+        let spec = launch(&ctx, true, true, &user).unwrap();
         assert_eq!(spec.program, "agy");
         assert!(!spec.consumed_initial_prompt);
         assert_eq!(
@@ -657,17 +719,19 @@ mod tests {
         assert_eq!(spec.env["AGY_CLI_DISABLE_AUTO_UPDATE"], "true");
         assert_eq!(spec.env["AGY_CLI_HIDE_ACCOUNT_INFO"], "true");
         assert_eq!(spec.env["AGY_CLI_OSC7501"], "off");
-        let read = |p| serde_json::from_slice::<Value>(&std::fs::read(p).unwrap()).unwrap();
+        let title = json!({"type":"command","command":"'/tmp/demo app/muster' hook antigravity state"});
+        // No user settings file: Muster's rule alone.
+        assert_eq!(read(&file), json!({"title": title, "permissions": {"allow": [MUSTER_TOOLS_RULE]}}));
         assert_eq!(
-            read(&file),
-            json!({"title":{"type":"command","command":"'/tmp/demo app/muster' hook antigravity state"}})
+            std::fs::read_to_string(workspace.join(".agents/AGENTS.md")).unwrap(),
+            TOOLS_INSTRUCTION
         );
         assert_eq!(
             read(&mcp),
             json!({"mcpServers":{"muster":{"serverUrl":"http://127.0.0.1:1234/mcp",
             "headers":{"Authorization":"Bearer demo-token"}, "timeoutSeconds":1900}}})
         );
-        for p in [&file, &mcp, &workspace, &workspace.join(".agents")] {
+        for p in [&file, &mcp, &workspace, &workspace.join(".agents"), &workspace.join(".agents/AGENTS.md")] {
             assert_eq!(
                 std::fs::metadata(p).unwrap().permissions().mode() & 0o077,
                 0
@@ -677,16 +741,47 @@ mod tests {
         let other = dir.join("fixture");
         std::fs::create_dir(&other).unwrap();
         std::os::unix::fs::symlink(&other, workspace.join(".agents")).unwrap();
-        assert!(launch(&ctx, false, true).is_err());
+        assert!(launch(&ctx, false, true, &user).is_err());
         assert_eq!(std::fs::read_dir(other).unwrap().count(), 0);
         std::fs::remove_file(workspace.join(".agents")).unwrap();
         std::fs::write(workspace.join("old-run"), "fixture").unwrap();
-        launch(&ctx, false, true).unwrap();
+        launch(&ctx, false, true, &user).unwrap();
         assert!(!workspace.join("old-run").exists());
         std::fs::remove_file(&mcp).unwrap();
         std::os::unix::fs::symlink(dir.join("absent"), &mcp).unwrap();
-        assert!(launch(&ctx, false, true).is_err());
+        assert!(launch(&ctx, false, true, &user).is_err());
         assert!(!dir.join("absent").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_users_allow_rules_are_kept_beside_muster_tools() {
+        let dir = std::env::temp_dir().join(format!("muster-agy-rules-{:x}", rand::random::<u64>()));
+        crate::paths::ensure_private_dir(&dir).unwrap();
+        let file = dir.join("settings.json");
+        let rules = |text: &str| {
+            std::fs::write(&file, text).unwrap();
+            settings_json(Path::new("muster"), Some(user_allow_rules(&file)))["permissions"].clone()
+        };
+        // The shape agy 1.5.13 documents and reads; ask and deny stay in the user's file only.
+        assert_eq!(
+            rules(r#"{"model":"demo","permissions":{"allow":["command(git status)","mcp(linter/*)"],"deny":["command(sudo)"]}}"#),
+            json!({"allow": ["command(git status)", "mcp(linter/*)", MUSTER_TOOLS_RULE]})
+        );
+        assert_eq!(rules(r#"{"permissions":{"allow":["mcp(muster/*)"]}}"#), json!({"allow": [MUSTER_TOOLS_RULE]}));
+        for other in ["", "not json", "[]", r#"{"permissions":{"allow":"command(git)"}}"#, r#"{"permissions":null}"#] {
+            assert_eq!(rules(other), json!({"allow": [MUSTER_TOOLS_RULE]}), "{other:?}");
+        }
+        assert_eq!(rules(r#"{"permissions":{"allow":[1,"read_url(example.com)"]}}"#), json!({"allow": ["read_url(example.com)", MUSTER_TOOLS_RULE]}));
+        std::fs::remove_file(&file).unwrap();
+        assert!(user_allow_rules(&file).is_empty());
+        // A folder or a FIFO in its place gives no rules and never blocks.
+        std::fs::create_dir(&file).unwrap();
+        assert!(user_allow_rules(&file).is_empty());
+        std::fs::remove_dir(&file).unwrap();
+        assert!(std::process::Command::new("mkfifo").arg(&file).status().unwrap().success());
+        assert!(user_allow_rules(&file).is_empty());
+        assert!(settings_json(Path::new("muster"), None).get("permissions").is_none());
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -390,6 +390,24 @@ pub const LEAD_SECTION: &str = "\n## Lead agent\n\n\
      (origin=webhook) keeps the usual rules, and no scheduled work, yours or what it reaches, can set \
      reminders or schedules.\n";
 
+/// How a Claude or Codex agent answers a muster message: its final message is the reply.
+const ANSWER_FINAL_MESSAGE: &str = "Answer it in your reply: your final message for that turn goes back to the \
+sender. If the answer needs longer (a long job), say so in that reply, and once you have it answer with the muster \
+MCP tool `reply` (`msg_id` from the header): one reply per message, delivered to the sender.";
+
+/// Antigravity's callbacks carry no final message, so only the `reply` tool answers, and agy
+/// 1.5.13 reaches Muster's tools through its generic `call_mcp_tool` (src/adapters/antigravity.rs).
+pub(crate) const ANSWER_ANTIGRAVITY: &str = "Antigravity doesn't pass your final message back, so answer it \
+with the muster tool `reply` (`msg_id` from the header), called through `call_mcp_tool` with ServerName `muster`, \
+once you have the answer: one reply per message, delivered to the sender.";
+
+/// What an Antigravity agent's generated persona said before Muster's tools worked there
+/// (`update_antigravity_answer`).
+const OLD_ANSWER_ANTIGRAVITY: &str = "Answer it in your reply: If the muster MCP tools are available to you, \
+answer such a prompt with the muster tool `reply`. If the answer needs longer (a long job), say so in that reply, \
+and once you have it answer with the muster MCP tool `reply` (`msg_id` from the header): one reply per message, \
+delivered to the sender.";
+
 pub fn persona_text(name: &str, kind: SessionKind, persona: &str) -> String {
     let persona = persona.trim();
     format!(
@@ -403,10 +421,7 @@ pub fn persona_text(name: &str, kind: SessionKind, persona: &str) -> String {
          ## Links\n\n{links}\n\n\
          ## Messages\n\n\
          A prompt that starts with `[muster msg <id> from <sender> origin=<origin> hop=<n>]` came from \
-         another agent or session through muster, not from the human typing. Answer it in your reply: \
-         {reply} If the answer needs longer (a long \
-         job), say so in that reply, and once you have it answer with the muster MCP tool `reply` \
-         (`msg_id` from the header): one reply per message, delivered to the sender. To ask other \
+         another agent or session through muster, not from the human typing. {answer} To ask other \
          agents, use the muster MCP tools `list_agents` and `ask_agent`.{quiet}\n\n\
          ## Schedules\n\n\
          To follow something up later yourself (\"check CI again in 20 minutes\"), use `set_reminder`: a \
@@ -414,9 +429,7 @@ pub fn persona_text(name: &str, kind: SessionKind, persona: &str) -> String {
          `propose_schedule`: the human approves it in Muster's sidebar before it runs. `list_schedules` \
          shows yours. Neither works while you handle scheduled or triggered work.\n",
         kind = kind.as_str(),
-        reply = if kind == SessionKind::Antigravity {
-            "If the muster MCP tools are available to you, answer such a prompt with the muster tool `reply`."
-        } else { "your final message for that turn goes back to the sender." },
+        answer = if kind == SessionKind::Antigravity { ANSWER_ANTIGRAVITY } else { ANSWER_FINAL_MESSAGE },
         resume = " resumes your conversation when you restart",
         links = crate::links::INSTRUCTION,
         // Only Claude sessions take messages that wait for the next turn (src/quiet.rs).
@@ -643,6 +656,25 @@ fn add_quiet_sentence(path: &Path) {
     let next = format!("{} {QUIET_INSTRUCTION}{}", &text[..at], &text[at..]);
     if let Err(e) = refuse_symlink(path).and_then(|()| Ok(paths::write_private(path, next.as_bytes())?)) {
         tracing::warn!("adding the quiet message sentence to {}: {e:#}", path.display());
+    }
+}
+
+/// An Antigravity agent made before Muster's tools worked there was told to use `reply` only
+/// "if the muster MCP tools are available". At its next start Muster replaces that answer with
+/// `ANSWER_ANTIGRAVITY` once, in the "## Messages" section of a file it generated
+/// (`add_quiet_sentence`'s rules); a file changed there by hand is left alone. Best effort.
+fn update_antigravity_answer(path: &Path) {
+    let Ok(text) = std::fs::read_to_string(path) else { return };
+    if !text.contains("a persistent muster agent") {
+        return;
+    }
+    let Some(start) = text.rfind("\n## Messages\n").map(|i| i + 1) else { return };
+    let end = text[start + 1..].find("\n## ").map_or(text.len(), |i| start + 1 + i);
+    let Some(i) = text[start..end].find(OLD_ANSWER_ANTIGRAVITY) else { return };
+    let at = start + i;
+    let next = format!("{}{ANSWER_ANTIGRAVITY}{}", &text[..at], &text[at + OLD_ANSWER_ANTIGRAVITY.len()..]);
+    if let Err(e) = refuse_symlink(path).and_then(|()| Ok(paths::write_private(path, next.as_bytes())?)) {
+        tracing::warn!("updating the reply sentence in {}: {e:#}", path.display());
     }
 }
 
@@ -2456,6 +2488,9 @@ async fn start_once(hub: &Arc<Hub>, name: &str, fresh: bool, window: Option<Wind
             add_links_section(&persona);
             if agent.kind == SessionKind::Claude {
                 add_quiet_sentence(&persona);
+            }
+            if agent.kind == SessionKind::Antigravity {
+                update_antigravity_answer(&persona);
             }
         }
         Err(e) => anyhow::bail!("can't read {}: {e}", persona.display()),
@@ -4945,6 +4980,36 @@ mod tests {
         let codex = persona_text("cody", SessionKind::Codex, "Builds.");
         assert!(!codex.contains("tell_agent") && !codex.contains("wake=false"), "{codex}");
         assert!(codex.contains(&format!("{MESSAGES_END}\n\n## Schedules")), "{codex}");
+    }
+
+    #[test]
+    fn an_antigravity_persona_answers_with_the_reply_tool_and_older_ones_are_updated_once() {
+        let now = persona_text("gem", SessionKind::Antigravity, "Writes.");
+        let section = &now[now.find("## Messages").unwrap()..now.find("## Schedules").unwrap()];
+        assert!(section.contains(&format!("not from the human typing. {ANSWER_ANTIGRAVITY} {MESSAGES_END}\n\n")), "{section}");
+        assert!(section.contains("call_mcp_tool") && !section.contains("final message for that turn goes back"));
+        let codex = persona_text("cody", SessionKind::Codex, "Builds.");
+        assert!(codex.contains(ANSWER_FINAL_MESSAGE) && !codex.contains("call_mcp_tool"), "{codex}");
+        let dir = scratch("agy-answer");
+        let p = dir.join("AGENTS.md");
+        let old = now.replace(ANSWER_ANTIGRAVITY, OLD_ANSWER_ANTIGRAVITY);
+        assert_ne!(old, now);
+        std::fs::write(&p, &old).unwrap();
+        update_antigravity_answer(&p);
+        let once = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(once, now, "back to what Muster writes now");
+        update_antigravity_answer(&p);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), once, "only once");
+        // The old sentence quoted in the human's persona, or a hand-written file, is left alone.
+        let quoted = old.replace("## Persona\n\nWrites.", &format!("## Persona\n\nWrites. Quote: {OLD_ANSWER_ANTIGRAVITY}"));
+        std::fs::write(&p, &quoted).unwrap();
+        update_antigravity_answer(&p);
+        let got = std::fs::read_to_string(&p).unwrap();
+        assert!(got.contains(&format!("Quote: {OLD_ANSWER_ANTIGRAVITY}")) && got.contains(ANSWER_ANTIGRAVITY), "{got}");
+        let hand = format!("# Mine\n\n## Messages\n\n{OLD_ANSWER_ANTIGRAVITY}\n");
+        std::fs::write(&p, &hand).unwrap();
+        update_antigravity_answer(&p);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), hand);
     }
 
     #[test]

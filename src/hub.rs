@@ -3495,6 +3495,8 @@ impl Hub {
             crate::openrouter::Provider::Subscription => None,
         };
         let queued_prompt = prompt.filter(|_| !spec.consumed_initial_prompt).zip(source);
+        let new_conversation = info.kind == SessionKind::Antigravity && !continues
+            && crate::adapters::antigravity::opens_new_conversation(&spec.args);
         let mut env: BTreeMap<String, String> = BTreeMap::new();
         env.insert("MUSTER".into(), "1".into());
         env.insert("MUSTER_SESSION_ID".into(), id.to_string());
@@ -3587,6 +3589,11 @@ impl Hub {
                     let _ = self.store.update_session(&previous);
                     return Err(error);
                 }
+            }
+            // Ahead of the prompts just queued, so they reach a conversation with Muster's tools.
+            if new_conversation && let Err(error) = crate::inject::prepare_new_conversation(self, id, generation) {
+                let _ = self.store.update_session(&previous);
+                return Err(error);
             }
             let mut records = self.terminal_records.lock();
             if let Err(error) = self.store.save_terminal(id, &record) {

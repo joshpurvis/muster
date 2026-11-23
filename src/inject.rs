@@ -89,6 +89,10 @@ struct Item {
     /// `panel`: an older backend after a rollback types it as an ordinary prompt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     handoff: Option<HandoffPart>,
+    /// Antigravity's `/clear` ahead of a fresh run's first prompt (`prepare_new_conversation`).
+    /// Skipped when false; an older backend types it as an ordinary prompt.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    new_conversation: bool,
 }
 
 /// The two prompts of a self handoff, queued together (`enqueue_handoff`).
@@ -257,6 +261,11 @@ pub struct Queues {
     /// In memory only: prompts from other agents or schedules a fresh start did not keep
     /// (`drop_queue`), to be returned to their senders as refused (`return_unsent`).
     returns: Mutex<Vec<Item>>,
+    /// In memory only: each fresh Antigravity run's new-conversation step
+    /// (`prepare_new_conversation`): its run, and the human's last keystroke when the run was
+    /// first ready for it (a trust dialog answered before that is fine). A step with no record
+    /// (queued before a backend restart) is dropped.
+    opening: Mutex<HashMap<SessionId, (u64, Option<Option<u64>>)>>,
 }
 
 impl Queues {
@@ -279,7 +288,7 @@ impl Queues {
             }
         }
         store.save_runtime("prompt-queues", &queues)?;
-        Ok(Self { inner: Mutex::new(queues), store: store.clone(), retry_at: Mutex::new(HashMap::new()), view_noticed: Mutex::default(), stalls: Mutex::default(), returns: Mutex::default() })
+        Ok(Self { inner: Mutex::new(queues), store: store.clone(), retry_at: Mutex::new(HashMap::new()), view_noticed: Mutex::default(), stalls: Mutex::default(), returns: Mutex::default(), opening: Mutex::default() })
     }
 
     fn edit<T>(&self, id: SessionId, change: impl FnOnce(&mut SessQ) -> T) -> anyhow::Result<T> {
@@ -352,8 +361,9 @@ fn queue_len(hub: &Hub, id: SessionId) -> u32 {
     hub.injection.inner.lock().get(&id).map(waiting).unwrap_or(0)
 }
 
+/// Prompts waiting, as the human sees them: Muster's own new-conversation step isn't one.
 fn waiting(q: &SessQ) -> u32 {
-    q.items.len() as u32 + u32::from(q.active.is_some())
+    q.items.iter().chain(q.active.as_ref().map(|a| &a.item)).filter(|i| !i.new_conversation).count() as u32
 }
 
 fn sync_queued(hub: &Hub, id: SessionId) {
@@ -408,7 +418,7 @@ pub(crate) fn enqueue_handoff(hub: &Arc<Hub>, id: SessionId, generation: Option<
     anyhow::ensure!(!hub.is_shutting_down(), "application backend is stopping");
     anyhow::ensure!(is_live(hub, id), "session {id} is not running");
     let item = |text: &str, part| Item { generation, text: text.into(), clear_first: false, attempts: 0,
-        draft_noticed: false, source, panel: None, handoff: Some(part) };
+        draft_noticed: false, source, panel: None, handoff: Some(part), new_conversation: false };
     let current = hub.pty_generation(id);
     hub.injection.edit(id, |q| {
         anyhow::ensure!(current == generation, "the terminal run changed");
@@ -883,7 +893,7 @@ pub async fn send(
         draft_noticed: false,
         source,
         panel: None,
-        handoff: None,
+        handoff: None, new_conversation: false,
     };
 
     if mode == SendMode::Interrupt {
@@ -899,7 +909,8 @@ pub async fn send(
             rebase(q, generation);
             join_parked(hub, q, &item)?;
             // Never ahead of a held self-handoff prompt: the new conversation reads it first.
-            let at = q.items.iter().take_while(|i| held(i)).count();
+            // Nor ahead of a fresh Antigravity run's new-conversation step.
+            let at = q.items.iter().take_while(|i| held(i) || i.new_conversation).count();
             q.items.insert(at, item);
             Ok(q.items.len() as u32)
         })??;
@@ -1089,7 +1100,7 @@ pub fn enqueue_panels(hub: &Arc<Hub>, id: SessionId, panels: &[(crate::model::Pa
     // Human-origin at hop 0, as a `Chain`: older backends can still read this queue.
     let source = crate::agents::Source::Chain(crate::agents::Prov { origin: crate::agents::Origin::Human, hop: 0, msg_id: None });
     let item = Item { generation, text: text.clone(), clear_first: false, attempts: 0, draft_noticed: false,
-        source, panel: Some(batch), handoff: None };
+        source, panel: Some(batch), handoff: None, new_conversation: false };
     hub.injection.edit(id, |queue| {
         rebase(queue, generation);
         queue.items.push_back(item);
@@ -1168,13 +1179,100 @@ impl Drop for Unfinished {
 pub(crate) fn prepare_initial(hub: &Hub, id: SessionId, generation: u64, text: String,
     source: crate::agents::Source) -> anyhow::Result<()> {
     let item = Item { generation: Some(generation), text, clear_first: false, attempts: 0,
-        draft_noticed: false, source, panel: None, handoff: None };
+        draft_noticed: false, source, panel: None, handoff: None, new_conversation: false };
     hub.injection.edit(id, |q| {
         // The start's own prompt goes ahead of prompts carried over from the previous run.
         let carried = q.carry;
         rebase(q, Some(generation));
         if carried { q.items.push_front(item) } else { q.items.push_back(item) }
     })
+}
+
+/// A fresh Antigravity run first opens a new conversation, ahead of every other prompt
+/// (`open_conversation`): agy 1.5.13 loads MCP servers only when a turn starts or `/mcp` opens,
+/// and a conversation opened before they loaded never gets their tools (checked 23 Nov 2026:
+/// the startup one never has them, one opened after `/mcp` or a resumed one does). Done only
+/// while that startup conversation is still empty (`is_startup_screen`): once a turn shows,
+/// someone used it and the step is dropped.
+pub(crate) fn prepare_new_conversation(hub: &Hub, id: SessionId, generation: u64) -> anyhow::Result<()> {
+    let item = Item { generation: Some(generation), text: "/clear".into(), clear_first: false, attempts: 0,
+        draft_noticed: false, source: crate::agents::Source::Human, panel: None, handoff: None, new_conversation: true };
+    hub.injection.edit(id, |q| {
+        // A queue parked by a fresh start stays parked until this run is confirmed (`adopt`).
+        if !parked(q) { rebase(q, Some(generation)); }
+        q.items.retain(|i| !i.new_conversation);
+        q.items.push_front(item);
+    })?;
+    hub.injection.opening.lock().insert(id, (generation, None));
+    Ok(())
+}
+
+/// The new-conversation step of run `generation` may still go: this backend queued it for
+/// this run, and the human hasn't typed in the tab since the run was first ready for it.
+/// `arm`: record that moment now if it isn't yet (the run is ready, on its startup screen).
+fn may_open(hub: &Hub, id: SessionId, generation: Option<u64>, arm: bool) -> bool {
+    let typed = hub.human_input_of(id).map(|(seq, _)| seq);
+    let mut opening = hub.injection.opening.lock();
+    let Some((_, at)) = opening.get_mut(&id).filter(|(run, _)| Some(*run) == generation) else { return false };
+    match at {
+        Some(at) => *at == typed,
+        None if arm => { *at = Some(typed); true }
+        None => false,
+    }
+}
+
+/// Load agy's MCP servers (`/mcp`, then Esc) and open a new conversation (`/clear`), as
+/// `prepare_new_conversation` describes. It starts only on an unused startup screen with an
+/// empty input box; a draft, a dialog or a used conversation ends it untyped (true: done).
+async fn open_conversation(hub: &Arc<Hub>, id: SessionId, generation: Option<u64>, adapter: &dyn Adapter) -> anyhow::Result<bool> {
+    use crate::adapters::antigravity::{is_startup_screen, mcp_panel_loaded};
+    let screen = || hub.screen(id);
+    let box_is = |text: &str| screen().is_some_and(|s| adapter.composer_text(&s).as_deref() == Some(text));
+    async fn until(check: &(dyn Fn() -> bool + Sync), limit: Duration) -> bool {
+        let start = std::time::Instant::now();
+        while !check() {
+            if start.elapsed() >= limit { return false }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        true
+    }
+    // Before every key: still this run, no dialog, the human hasn't typed since it was queued.
+    let clear_to_type = || may_open(hub, id, generation, false) && hub.session(id).is_some_and(|info| {
+        hub.drain_antigravity_callbacks(id);
+        screen().is_some_and(|s| !dialog_blocks_input(adapter, &s, info.state))
+    });
+    if !(screen().is_some_and(|s| is_startup_screen(&s)) && box_is("") && clear_to_type()) {
+        tracing::info!(session = id, "not opening a new Antigravity conversation: the startup one may be in use");
+        return Ok(true);
+    }
+    // Typed, not pasted: agy opens its command menu on the text, and Enter runs the command.
+    let loaded = || screen().is_some_and(|s| mcp_panel_loaded(&s));
+    let cleared = || box_is("");
+    let steps: [(&str, &(dyn Fn() -> bool + Sync)); 2] = [("/mcp", &loaded), ("/clear", &cleared)];
+    for (command, done) in steps {
+        if !(box_is("") && clear_to_type()) { return Ok(true) }
+        hub.write_input_generation(id, generation, command.as_bytes())?;
+        if !until(&|| box_is(command), Duration::from_secs(3)).await {
+            anyhow::bail!("Antigravity did not show `{command}` in its input box; check the terminal");
+        }
+        if !clear_to_type() { return Ok(true) }
+        hub.write_input_generation(id, generation, b"\r")?;
+        let ok = until(done, Duration::from_secs(15)).await;
+        if command == "/mcp" {
+            // Closed whether or not the servers showed as loaded (`/clear` needs the input box),
+            // but only while the panel is what's on screen.
+            let panel = screen().is_some_and(|s| s.lines.iter().any(|l| l.trim() == "MCP Servers"));
+            if !(panel && may_open(hub, id, generation, false)) { return Ok(true) }
+            hub.write_input_generation(id, generation, &[0x1b])?;
+            if !until(&|| box_is(""), Duration::from_secs(3)).await {
+                anyhow::bail!("Antigravity's MCP panel did not close; check the terminal");
+            }
+            if !ok { tracing::warn!(session = id, "Antigravity's MCP panel showed no loaded muster server"); }
+        } else if !ok {
+            anyhow::bail!("Antigravity did not start a new conversation; check the terminal");
+        }
+    }
+    Ok(true)
 }
 
 /// The launch carrying a prepared initial prompt was acknowledged.
@@ -1213,6 +1311,9 @@ fn kick(hub: Arc<Hub>, id: SessionId) {
     tokio::spawn(async move {
         tokio::time::sleep(SETTLE).await;
         let is_ready = ready(&hub, id) && !hub.is_shutting_down() && !deferred(&hub, id, generation);
+        let startup = hub.screen(id).is_some_and(|s| crate::adapters::antigravity::is_startup_screen(&s));
+        let opening = hub.injection.inner.lock().get(&id).is_some_and(|q| q.items.front().is_some_and(|i| i.new_conversation));
+        let may = opening && is_ready && startup && may_open(&hub, id, generation, true);
         // Session moves take this lock: a panel batch is checked against its task as it is taken.
         let selected = {
             let _op = hub.panels.operations.lock();
@@ -1221,6 +1322,11 @@ fn kick(hub: Arc<Hub>, id: SessionId) {
                 if q.generation != generation { return None }
                 // A panel batch whose opener left its task returns to its panels (`panel_moves`).
                 q.items.retain(|item| item.panel.as_ref().is_none_or(|b| !unbound.contains(&b.id)));
+                // A fresh run's new conversation comes too late once its startup one was used.
+                if is_ready && !may && q.items.front().is_some_and(|i| i.new_conversation) {
+                    q.items.pop_front();
+                    tracing::info!(session = id, "not opening a new Antigravity conversation: the startup one may be in use");
+                }
                 // A held handoff prompt keeps its place, and everything behind it waits.
                 let item = if is_ready && !q.items.front().is_some_and(held) { q.items.pop_front() } else { None };
                 if let Some(item) = &item {
@@ -1608,6 +1714,9 @@ async fn deliver(hub: &Arc<Hub>, id: SessionId, mut item: Item) -> anyhow::Resul
     if let Some(why) = unsafe_to_type(hub, id, adapter, generation) {
         tracing::debug!(session = id, "not typing: {why}");
         return requeue(item);
+    }
+    if item.new_conversation {
+        return open_conversation(hub, id, generation, adapter).await;
     }
     // A schedule's prompt that may no longer go (paused, expired, removed, timed out while it
     // waited here) is taken back, never typed (src/schedules/ `submit_gate`).
@@ -2051,7 +2160,7 @@ mod tests {
 
     fn plain(generation: u64, text: &str) -> Item {
         Item { generation: Some(generation), text: text.into(), clear_first: false, attempts: 0, draft_noticed: false,
-            source: crate::agents::Source::Human, panel: None, handoff: None }
+            source: crate::agents::Source::Human, panel: None, handoff: None, new_conversation: false }
     }
 
     /// Issue #24: an idle agent's queue stopped for hours. Claude Code turns terminal focus
@@ -2152,6 +2261,17 @@ mod tests {
         assert!(!q.carry && q.generation == Some(6));
         assert_eq!(q.items.iter().map(|i| i.text.as_str()).collect::<Vec<_>>(), ["read memory/ first", "msg 11", "answer Q3: a", "msg 13", "msg 14"]);
         assert!(q.items.iter().all(|i| i.generation == Some(6)));
+        // A fresh Antigravity run opens a new conversation ahead of all of them, once.
+        prepare_new_conversation(&hub, 1, 6).unwrap();
+        prepare_new_conversation(&hub, 1, 6).unwrap();
+        let q = hub.injection.inner.lock().get(&1).cloned().unwrap();
+        assert_eq!(q.items.iter().map(|i| i.text.as_str()).collect::<Vec<_>>(), ["/clear", "read memory/ first", "msg 11", "answer Q3: a", "msg 13", "msg 14"]);
+        assert!(q.items[0].new_conversation && q.items.iter().skip(1).all(|i| !i.new_conversation));
+        assert_eq!(waiting(&q), 5, "Muster's own step is not a waiting prompt");
+        // Saved with the queue; ordinary prompts keep their old format.
+        let reloaded = Queues::load(hub.store()).unwrap();
+        assert!(reloaded.inner.lock()[&1].items[0].new_conversation);
+        assert!(!serde_json::to_string(&q.items[1]).unwrap().contains("new_conversation"));
     }
 
     /// Without a fresh start an exit drops the queue as before. A fresh start whose new run
@@ -2210,7 +2330,7 @@ mod tests {
             clear_first: false,
             attempts: 1,
             draft_noticed: false,
-            source: crate::agents::Source::Human, panel: None, handoff: None,
+            source: crate::agents::Source::Human, panel: None, handoff: None, new_conversation: false,
         };
         let store = crate::store::Store::open_memory().unwrap();
         let queues = Queues::load(&store).unwrap();
@@ -2230,7 +2350,7 @@ mod tests {
             let store = crate::store::Store::open_memory().unwrap();
             let queues = Queues::load(&store).unwrap();
             let item = Item { generation: Some(7), text: "run-once".into(), clear_first: false, attempts: 1,
-                draft_noticed: false, source: crate::agents::Source::Human, panel: None, handoff: None };
+                draft_noticed: false, source: crate::agents::Source::Human, panel: None, handoff: None, new_conversation: false };
             queues.edit(1, |q| {
                 q.busy = true;
                 q.generation = Some(7);
@@ -2269,12 +2389,12 @@ mod tests {
         queues.edit(1, |q| q.generation = Some(2)).unwrap();
         queues.requeue(1, Item { generation: Some(1), text: "obsolete".into(),
             clear_first: false, attempts: 1, draft_noticed: false,
-            source: crate::agents::Source::Human, panel: None, handoff: None }).unwrap();
+            source: crate::agents::Source::Human, panel: None, handoff: None, new_conversation: false }).unwrap();
         assert!(queues.inner.lock()[&1].items.is_empty());
         queues.remove(1).unwrap();
         queues.requeue(1, Item { generation: Some(1), text: "removed".into(),
             clear_first: false, attempts: 1, draft_noticed: false,
-            source: crate::agents::Source::Human, panel: None, handoff: None }).unwrap();
+            source: crate::agents::Source::Human, panel: None, handoff: None, new_conversation: false }).unwrap();
         assert!(queues.inner.lock().is_empty(), "late tasks cannot recreate deleted queues");
     }
 
@@ -2283,7 +2403,7 @@ mod tests {
         let store = crate::store::Store::open_memory().unwrap();
         let queues = Queues::load(&store).unwrap();
         let item = Item { generation: Some(1), text: "later".into(), clear_first: false, attempts: 0,
-            draft_noticed: false, source: crate::agents::Source::Human, panel: None, handoff: None };
+            draft_noticed: false, source: crate::agents::Source::Human, panel: None, handoff: None, new_conversation: false };
         queues.edit(1, |q| { q.generation = Some(1); q.items.push_back(item.clone()); }).unwrap();
         let count = || waiting(&queues.inner.lock()[&1]);
         assert_eq!(count(), 1);
@@ -2333,7 +2453,7 @@ mod tests {
     fn panel_item(events: Vec<PanelEvent>, fetch: Vec<i64>) -> Item {
         Item { generation: Some(1), text: "[panel]".into(), clear_first: false, attempts: 0, draft_noticed: false,
             source: crate::agents::Source::Chain(crate::agents::Prov { origin: crate::agents::Origin::Human, hop: 0, msg_id: None }),
-            panel: Some(PanelBatch { id: rand::random(), channel_id: 1, events, fetch }), handoff: None }
+            panel: Some(PanelBatch { id: rand::random(), channel_id: 1, events, fetch }), handoff: None, new_conversation: false }
     }
 
     fn ids(store: &crate::store::Store, panel: &Panel) -> Vec<i64> {
@@ -2470,7 +2590,7 @@ mod tests {
         let hub = hub_fixture();
         let chain = |msg| crate::agents::Source::Chain(crate::agents::Prov { origin: crate::agents::Origin::Human, hop: 0, msg_id: Some(msg) });
         let item = |text: &str, source| Item { generation: None, text: text.into(), clear_first: false, attempts: 0,
-            draft_noticed: false, source, panel: None, handoff: None };
+            draft_noticed: false, source, panel: None, handoff: None, new_conversation: false };
         hub.injection.edit(1, |q| {
             q.active = Some(Active { item: item("[muster msg 7] typing", chain(7)), stage: Stage::Typing });
             q.items.extend([item("[muster msg 8] waiting", chain(8)), item("[muster msg 9] typed, requeued", chain(9)),
@@ -2495,7 +2615,7 @@ mod tests {
     fn a_self_handoff_holds_the_queue_and_settles_after_a_restart() {
         let hub = hub_fixture();
         let item = |text: &str, handoff| Item { generation: None, text: text.into(), clear_first: false, attempts: 0,
-            draft_noticed: false, source: crate::agents::Source::Human, panel: None, handoff };
+            draft_noticed: false, source: crate::agents::Source::Human, panel: None, handoff, new_conversation: false };
         let texts = |hub: &Hub| hub.injection.inner.lock()[&1].items.iter().map(|i| i.text.clone()).collect::<Vec<_>>();
         hub.injection.edit(1, |q| {
             q.active = Some(Active { item: item("/clear", Some(HandoffPart::Clear)), stage: Stage::Typing });

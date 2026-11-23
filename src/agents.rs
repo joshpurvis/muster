@@ -1,12 +1,13 @@
 //! Agents (PLAN.md §10): persistent named agent sessions other agents (or the human) can ask
 //! things and get replies from, and the provenance (origin, hop) every session carries.
 //!
-//! An agent is a stored record (`agents` table) plus at most one muster session at a time: a claude
-//! or codex agent whose cwd is the agent's home dir (`<data>/agents/<name>/`, with a CLAUDE.md or
+//! An agent is a stored record (`agents` table) plus at most one muster session at a time: a Claude,
+//! Codex or Antigravity agent whose cwd is the agent's home dir (`<data>/agents/<name>/`, with a CLAUDE.md or
 //! AGENTS.md written from its persona and a `memory/` dir), in the agent's own tab (channel,
 //! stored on the record) in the "agents" workspace (`<data>/agents`). Agents resume their
 //! conversation: Claude with `--resume <id>` (the id from the SessionStart hook), Codex with
-//! `codex resume … <id>` (the thread id from its turn-complete notify).
+//! `codex resume … <id>` (the thread id from its turn-complete notify), Antigravity with
+//! `--conversation <id>` (from its state callback).
 //!
 //! Provenance: every session has the origin (`human`, `schedule`, `webhook`) and hop of the
 //! message it is handling ("prov", runtime only). It is set when muster actually types an
@@ -111,7 +112,7 @@ impl TryFrom<String> for Origin {
 /// terms are unclear about unattended use); Codex agents also take scheduled and webhook work.
 pub fn default_accepts(kind: SessionKind) -> Vec<Origin> {
     match kind {
-        SessionKind::Claude => vec![Origin::Human],
+        SessionKind::Claude | SessionKind::Antigravity => vec![Origin::Human],
         _ => vec![Origin::Human, Origin::Schedule, Origin::Webhook],
     }
 }
@@ -361,7 +362,7 @@ pub fn home_dir_for(name: &str) -> PathBuf {
 pub fn persona_file(kind: SessionKind) -> &'static str {
     match kind {
         SessionKind::Claude => "CLAUDE.md",
-        _ => "AGENTS.md",
+        SessionKind::Codex | SessionKind::Antigravity | SessionKind::Shell => "AGENTS.md",
     }
 }
 
@@ -403,7 +404,7 @@ pub fn persona_text(name: &str, kind: SessionKind, persona: &str) -> String {
          ## Messages\n\n\
          A prompt that starts with `[muster msg <id> from <sender> origin=<origin> hop=<n>]` came from \
          another agent or session through muster, not from the human typing. Answer it in your reply: \
-         your final message for that turn goes back to the sender. If the answer needs longer (a long \
+         {reply} If the answer needs longer (a long \
          job), say so in that reply, and once you have it answer with the muster MCP tool `reply` \
          (`msg_id` from the header): one reply per message, delivered to the sender. To ask other \
          agents, use the muster MCP tools `list_agents` and `ask_agent`.{quiet}\n\n\
@@ -413,6 +414,9 @@ pub fn persona_text(name: &str, kind: SessionKind, persona: &str) -> String {
          `propose_schedule`: the human approves it in Muster's sidebar before it runs. `list_schedules` \
          shows yours. Neither works while you handle scheduled or triggered work.\n",
         kind = kind.as_str(),
+        reply = if kind == SessionKind::Antigravity {
+            "Muster cannot read your final message here: always answer such a prompt with the muster MCP tool `reply`."
+        } else { "your final message for that turn goes back to the sender." },
         resume = " resumes your conversation when you restart",
         links = crate::links::INSTRUCTION,
         // Only Claude sessions take messages that wait for the next turn (src/quiet.rs).
@@ -815,7 +819,7 @@ pub fn agent_args(
         }
     }
     match kind {
-        SessionKind::Claude => {
+        SessionKind::Claude | SessionKind::Antigravity => {
             if let Some(m) = model {
                 out.extend(["--model".to_string(), m.to_string()]);
             }
@@ -823,7 +827,8 @@ pub fn agent_args(
                 out.extend(["--effort".to_string(), e.to_string()]);
             }
             if let Some(r) = resume.filter(|r| valid_resume_id(r)) {
-                out.extend(["--resume".to_string(), r.to_string()]);
+                let flag = if kind == SessionKind::Antigravity { "--conversation" } else { "--resume" };
+                out.extend([flag.to_string(), r.to_string()]);
             }
         }
         SessionKind::Codex => {
@@ -837,7 +842,7 @@ pub fn agent_args(
             // (`Hub::codex_resume`), so stored arguments stay readable by older backends.
             let _ = resume;
         }
-        SessionKind::Shell => anyhow::bail!("agents are claude or codex agents"),
+        SessionKind::Shell => anyhow::bail!("agents are claude, codex or antigravity agents"),
     }
     crate::adapters::check_extra_args(kind, &out)?;
     Ok(out)
@@ -848,12 +853,16 @@ pub fn agent_args(
 /// a named agent's restarts into the conversation it last used. Its other arguments are kept.
 /// (A Codex tab's thread is kept outside its arguments: `Hub::codex_resume`.)
 pub fn with_resume(kind: SessionKind, args: &[String], id: Option<&str>) -> anyhow::Result<Vec<String>> {
-    anyhow::ensure!(kind == SessionKind::Claude, "only Claude tabs resume through their arguments");
-    anyhow::ensure!(id.is_none_or(valid_resume_id), "not a Claude conversation id: {id:?}");
+    let flag = match kind {
+        SessionKind::Claude => "--resume",
+        SessionKind::Antigravity => "--conversation",
+        _ => anyhow::bail!("only Claude and Antigravity tabs resume through their arguments"),
+    };
+    anyhow::ensure!(id.is_none_or(valid_resume_id), "not a conversation id: {id:?}");
     let mut out = Vec::new();
     for (long, values) in crate::adapters::parse_extra_args(kind, args)? {
         match (long, values.as_slice()) {
-            ("--resume" | "--continue", _) => {}
+            ("--resume" | "--conversation" | "--continue", _) => {}
             (_, [v]) => out.push(format!("{long}={v}")),
             (_, values) => {
                 out.push(long.to_string());
@@ -862,7 +871,7 @@ pub fn with_resume(kind: SessionKind, args: &[String], id: Option<&str>) -> anyh
         }
     }
     if let Some(id) = id {
-        out.extend(["--resume".to_string(), id.to_string()]);
+        out.extend([flag.to_string(), id.to_string()]);
     }
     crate::adapters::check_extra_args(kind, &out)?;
     Ok(out)
@@ -882,7 +891,7 @@ pub fn valid_resume_id(s: &str) -> bool {
 /// (`Hub::conversation_after_hook`), passed in `HookSession::thread`.
 pub fn resume_id_from_hook(kind: SessionKind, event: &str, payload: &Value) -> Option<String> {
     let key = match (kind, event) {
-        (SessionKind::Claude, "SessionStart") => "session_id",
+        (SessionKind::Claude, "SessionStart") | (SessionKind::Antigravity, "state") => "session_id",
         (SessionKind::Codex, "notify") if !crate::adapters::codex::is_title_generation(payload) => "thread-id",
         _ => return None,
     };
@@ -894,6 +903,8 @@ pub fn resume_id_from_hook(kind: SessionKind, event: &str, payload: &Value) -> O
 /// `last-assistant-message` (agent-turn-complete, not its title request) or Stop hook.
 pub fn reply_from_hook(kind: SessionKind, event: &str, payload: &Value) -> Option<String> {
     let text = match (kind, event) {
+        // Its title callback carries no final message.
+        (SessionKind::Antigravity, _) => return None,
         (SessionKind::Claude | SessionKind::Codex, "Stop") => payload.get("last_assistant_message"),
         (SessionKind::Codex, "notify") => {
             if payload.get("type").and_then(|v| v.as_str()) != Some("agent-turn-complete")
@@ -1789,7 +1800,7 @@ pub fn check_provider(hub: &Hub, kind: SessionKind, provider: Provider, model: O
     if provider != Provider::OpenRouter {
         return Ok(());
     }
-    anyhow::ensure!(kind != SessionKind::Shell, "only Claude and Codex agents can run on OpenRouter");
+    anyhow::ensure!(matches!(kind, SessionKind::Claude | SessionKind::Codex), "only Claude and Codex sessions can run on OpenRouter");
     anyhow::ensure!(
         kind != SessionKind::Codex || model.is_some_and(|m| !m.trim().is_empty()),
         "a Codex agent on OpenRouter needs a model, with its vendor (e.g. openai/gpt-6.1-sol)"
@@ -1873,7 +1884,7 @@ pub fn create(hub: &Hub, req: NewAgent) -> anyhow::Result<Agent> {
             home_dir: home.to_string_lossy().into_owned(),
             working_location,
             reset_on_next_start: false, handoff: None,
-            permissions: req.permissions.map(Into::into).unwrap_or_default(),
+            permissions: req.permissions.map(|p| p.onto(Permissions::default())).unwrap_or_default(),
             accepts_origins: accepts,
             channel_id: None,
             session_id: None,
@@ -1986,8 +1997,8 @@ pub fn update(hub: &Hub, req: AgentUpdate, outside: bool) -> anyhow::Result<Agen
 fn check_tools_up_front(a: &Agent, by_owner: bool) -> anyhow::Result<()> {
     anyhow::ensure!(
         a.kind == SessionKind::Claude,
-        "loading message tools up front is for Claude agents only: {} is a Codex agent, whose tools load as they always do",
-        a.name
+        "loading message tools up front is for Claude agents only: {} uses {}, whose tools load as they always do",
+        a.name, a.kind.label()
     );
     anyhow::ensure!(
         by_owner,
@@ -2007,9 +2018,9 @@ fn check_tools_up_front(a: &Agent, by_owner: bool) -> anyhow::Result<()> {
 fn check_lead(a: &Agent, by_owner: bool) -> anyhow::Result<()> {
     anyhow::ensure!(
         a.kind == SessionKind::Claude,
-        "only Claude agents can be lead agents: {} is a Codex agent, and scheduled or triggered work it handles stays \
+        "only Claude agents can be lead agents: {} uses {}, and scheduled or triggered work it handles stays \
          under the origin rules",
-        a.name
+        a.name, a.kind.label()
     );
     anyhow::ensure!(
         by_owner,
@@ -2112,7 +2123,7 @@ pub fn update_switch(hub: &Hub, req: AgentUpdate, outside: bool) -> anyhow::Resu
         next.autostart = a;
     }
     if let Some(p) = req.permissions {
-        next.permissions = p.into();
+        next.permissions = p.onto(next.permissions);
     }
     if let Some(m) = req.sleep_after_min {
         next.sleep_after_min = crate::sleep::check_after(Some(m))?;
@@ -2253,6 +2264,7 @@ pub fn reach_profile(agent: &Agent, session_channel: Option<&Channel>, own: Opti
                 Permissions {
                     codex_sandbox: q.codex_sandbox.max(c.permissions.codex_sandbox),
                     claude_mode: q.claude_mode.max(c.permissions.claude_mode),
+                    antigravity_mode: q.antigravity_mode.max(c.permissions.antigravity_mode),
                 },
             ),
         });
@@ -2453,7 +2465,7 @@ async fn start_once(hub: &Arc<Hub>, name: &str, fresh: bool, window: Option<Wind
 /// saved thread. Read from what the launch will actually do, not from why.
 fn starts_new_conversation(agent: &Agent, args: &[String]) -> bool {
     match agent.kind {
-        SessionKind::Claude => !crate::cache::continues_conversation(agent.kind, args),
+        SessionKind::Claude | SessionKind::Antigravity => !crate::cache::continues_conversation(agent.kind, args),
         _ => !agent.resume_id.as_deref().is_some_and(valid_resume_id),
     }
 }
@@ -2571,6 +2583,7 @@ pub fn configure_project_command(agent: &Agent, cwd: &str, permissions: Permissi
             }
             args
         },
+        SessionKind::Antigravity => vec![format!("--add-dir={}", home.display())],
         SessionKind::Shell => vec![],
     };
     let at = spec.args.iter().position(|a| a == "--").unwrap_or(spec.args.len());
@@ -3788,7 +3801,13 @@ pub fn model_catalog() -> Value {
         ],
         efforts: vec!["low", "medium", "high", "xhigh", "max", "ultra"],
     };
-    json!({ "claude": claude, "codex": codex })
+    let antigravity = KindModels {
+        models: ["gemini-4-neon-high", "gemini-4-neon-xhigh", "gemini-4-neon-medium",
+            "gemini-4-carbon-high", "gemini-4-argon-high", "gemini-4-hydrogen-high",
+            "gemini-pro-orchestrator", "gemini-3.8-flash-high"].into_iter().map(|id| m(id, None)).collect(),
+        efforts: vec![],
+    };
+    json!({ "claude": claude, "codex": codex, "antigravity": antigravity })
 }
 
 // ----- templates -----
@@ -4350,6 +4369,26 @@ mod tests {
 
     /// A start reads as a new conversation from what it launches: Claude without `--resume`,
     /// Codex without a saved thread.
+    #[test]
+    fn antigravity_agent_arguments_and_permissions() {
+        let kind = SessionKind::Antigravity;
+        let args = agent_args(kind, Some("demo"), Some("high"), Some("abc")).unwrap();
+        assert_eq!(args, ["--model", "demo", "--effort", "high", "--conversation", "abc"]);
+        assert!(crate::cache::continues_conversation(kind, &args));
+        assert_eq!(with_resume(kind, &args, None).unwrap(), ["--model=demo", "--effort=high"]);
+        assert_eq!(resume_id_from_hook(kind, "state", &json!({"session_id":"abc"})).as_deref(), Some("abc"));
+        assert_eq!(reply_from_hook(kind, "state", &json!({"last_assistant_message":"alpha"})), None);
+        assert_eq!(default_accepts(kind), [Origin::Human]);
+        let old = json!({"claude_mode":"plan","codex_sandbox":"read_only"});
+        let stored: Permissions = serde_json::from_value(old.clone()).unwrap();
+        let input: PermissionsInput = serde_json::from_value(old).unwrap();
+        assert_eq!(stored.antigravity_mode, AntigravityMode::Auto);
+        let wide = Permissions { antigravity_mode: AntigravityMode::FullAccess, ..stored };
+        assert_eq!(input.onto(wide), wide);
+        assert!(wide.is_elevated() && wide.exceeds_for(&stored, kind));
+        assert!(!wide.exceeds_for(&stored, SessionKind::Codex));
+    }
+
     #[test]
     fn a_start_is_a_new_conversation_only_without_a_resume() {
         let claude = Agent { resume_id: Some("0f7e3c1a-58b2-4d0e-9a6c-2b1d4e5f6a7b".into()), ..agent(SessionKind::Claude) };

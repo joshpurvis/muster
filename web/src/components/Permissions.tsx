@@ -6,9 +6,9 @@ import { useLayoutEffect, useRef, useState } from "preact/hooks";
 import { channelById, overlay, sessionsByChannel, workspaceById } from "../state.ts";
 import { taskLabel } from "../model.ts";
 import * as A from "../actions.ts";
-import type { Channel, ClaudeMode, CodexSandbox, Permissions } from "../types.ts";
+import type { AntigravityMode, Channel, ClaudeMode, CodexSandbox, Permissions } from "../types.ts";
 import { DEFAULT_PERMISSIONS } from "../types.ts";
-import { IconCodex, IconGlobe, IconShield, IconShieldAlert, IconSpark } from "../icons.tsx";
+import { IconAntigravity, IconCodex, IconGlobe, IconShield, IconShieldAlert, IconSpark } from "../icons.tsx";
 import { Spinner } from "./common.tsx";
 import { cx } from "../util.ts";
 
@@ -74,31 +74,43 @@ export const CLAUDE_OPTS: Opt<ClaudeMode>[] = [
   },
 ];
 
+export const ANTIGRAVITY_OPTS: Opt<AntigravityMode>[] = [
+  { v: "plan", label: "Plan", short: "plan", hint: "Reads and plans. No edits." },
+  { v: "accept_edits", label: "Accept edits", short: "accept edits",
+    hint: "Edits files in the tab's folder without asking. Asks before commands." },
+  { v: "auto", label: "Auto", short: "auto",
+    hint: "Edits and safe commands run without asking, inside Antigravity's sandbox (its default)." },
+  { v: "full_access", label: "Full access", short: "full access", hint: "Never asks.",
+    danger: "No prompts: Antigravity can run anything your user can." },
+];
+
 export function perms(c: Channel | undefined | null): Permissions {
   return { ...DEFAULT_PERMISSIONS, ...(c?.permissions ?? {}) };
 }
 
+const antigravityOpt = (v: AntigravityMode) => ANTIGRAVITY_OPTS.find((o) => o.v === v) ?? ANTIGRAVITY_OPTS[2];
 const codexOpt = (v: CodexSandbox) => CODEX_OPTS.find((o) => o.v === v) ?? CODEX_OPTS[1];
 const claudeOpt = (v: ClaudeMode) => CLAUDE_OPTS.find((o) => o.v === v) ?? CLAUDE_OPTS[1];
 
 /** "Codex: workspace + network · Claude: default" */
 export function summary(p: Permissions): string {
-  return `Codex: ${codexOpt(p.codex_sandbox).short} · Claude: ${claudeOpt(p.claude_mode).short}`;
+  return `Codex: ${codexOpt(p.codex_sandbox).short} · Claude: ${claudeOpt(p.claude_mode).short}` +
+    (antigravityOpt(p.antigravity_mode).v === "auto" ? "" : ` · ${kindSummary(p, "antigravity")}`);
 }
 
 export function isDefault(p: Permissions): boolean {
   return p.codex_sandbox === DEFAULT_PERMISSIONS.codex_sandbox &&
-    p.claude_mode === DEFAULT_PERMISSIONS.claude_mode;
+    p.claude_mode === DEFAULT_PERMISSIONS.claude_mode && p.antigravity_mode === DEFAULT_PERMISSIONS.antigravity_mode;
 }
 
 /** More permissive than the defaults (read only / plan are less). */
 export function isElevated(p: Permissions): boolean {
   return p.codex_sandbox === "workspace_write_network" || p.codex_sandbox === "full_access" ||
-    p.claude_mode === "accept_edits" || p.claude_mode === "bypass";
+    p.claude_mode === "accept_edits" || p.claude_mode === "bypass" || p.antigravity_mode === "full_access";
 }
 
 export function isDangerous(p: Permissions): boolean {
-  return p.codex_sandbox === "full_access" || p.claude_mode === "bypass";
+  return p.codex_sandbox === "full_access" || p.claude_mode === "bypass" || p.antigravity_mode === "full_access";
 }
 
 function Seg<T extends string>(
@@ -152,17 +164,17 @@ function Seg<T extends string>(
   );
 }
 
-/** The two segmented controls (`only`: just the one that applies, for a named agent's tab). */
+/** The segmented controls (`only`: just the one that applies, for a named agent's tab). */
 export function PermissionFields(
   { value, onChange, only }: {
     value: Permissions;
     onChange: (p: Permissions) => void;
-    only?: "codex" | "claude";
+    only?: "codex" | "claude" | "antigravity";
   },
 ) {
   return (
     <div class="perm-fields">
-      {only !== "claude" && (
+      {(!only || only === "codex") && (
         <Seg
           label="Codex sandbox"
           icon={<IconCodex size={13} />}
@@ -171,7 +183,7 @@ export function PermissionFields(
           onChange={(v) => onChange({ ...value, codex_sandbox: v })}
         />
       )}
-      {only !== "codex" && (
+      {(!only || only === "claude") && (
         <Seg
           label="Claude permission mode"
           icon={<IconSpark size={13} />}
@@ -180,12 +192,22 @@ export function PermissionFields(
           onChange={(v) => onChange({ ...value, claude_mode: v })}
         />
       )}
+      {(!only || only === "antigravity") && (
+        <Seg
+          label="Antigravity mode"
+          icon={<IconAntigravity size={13} />}
+          opts={ANTIGRAVITY_OPTS}
+          value={value.antigravity_mode}
+          onChange={(v) => onChange({ ...value, antigravity_mode: v })}
+        />
+      )}
     </div>
   );
 }
 
-/** "Claude: plan" / "Codex: read only": the half of the summary that applies to `kind`. */
-export function kindSummary(p: Permissions, kind: "codex" | "claude"): string {
+/** "Claude: plan" / "Codex: read only": the setting that applies to `kind`. */
+export function kindSummary(p: Permissions, kind: "codex" | "claude" | "antigravity"): string {
+  if (kind === "antigravity") return `Antigravity: ${antigravityOpt(p.antigravity_mode).short}`;
   return kind === "codex"
     ? `Codex: ${codexOpt(p.codex_sandbox).short}`
     : `Claude: ${claudeOpt(p.claude_mode).short}`;
@@ -197,22 +219,16 @@ export function kindSummary(p: Permissions, kind: "codex" | "claude"): string {
 export function PermissionsPill(
   { value, only, open, onToggle, controls }: {
     value: Permissions;
-    only?: "codex" | "claude";
+    only?: "codex" | "claude" | "antigravity";
     open: boolean;
     onToggle: (open: boolean) => void;
     /** Id of the panel it opens. */
     controls: string;
   },
 ) {
-  const changed = only
-    ? (only === "codex"
-      ? value.codex_sandbox !== DEFAULT_PERMISSIONS.codex_sandbox
-      : value.claude_mode !== DEFAULT_PERMISSIONS.claude_mode)
-    : !isDefault(value);
-  const text = !changed ? "Permissions" : only ? kindSummary(value, only)
-    : value.codex_sandbox === DEFAULT_PERMISSIONS.codex_sandbox ? kindSummary(value, "claude")
-    : value.claude_mode === DEFAULT_PERMISSIONS.claude_mode ? kindSummary(value, "codex")
-    : summary(value);
+  const kinds = only ? [only] : (["codex", "claude", "antigravity"] as const);
+  const changed = kinds.filter((k) => kindSummary(value, k) !== kindSummary(DEFAULT_PERMISSIONS, k));
+  const text = changed.length ? changed.map((k) => kindSummary(value, k)).join(" · ") : "Permissions";
   return (
     <button
       type="button"
@@ -237,7 +253,7 @@ export function PermissionsPanel(
   { value, onChange, only, note, id }: {
     value: Permissions;
     onChange: (p: Permissions) => void;
-    only?: "codex" | "claude";
+    only?: "codex" | "claude" | "antigravity";
     note?: string;
     id: string;
   },
@@ -271,11 +287,13 @@ export function PermissionsDialog(
   useLayoutEffect(() => first.current?.querySelector<HTMLElement>(".seg-btn.on")?.focus(), []);
   if (!c) return null;
   const before = perms(c);
-  const changed = before.codex_sandbox !== value.codex_sandbox || before.claude_mode !== value.claude_mode;
+  const changed = before.codex_sandbox !== value.codex_sandbox || before.claude_mode !== value.claude_mode ||
+    before.antigravity_mode !== value.antigravity_mode;
   const running = (sessionsByChannel.value.get(c.id) ?? []).filter((s) =>
     s.state !== "exited" &&
     ((s.kind === "codex" && before.codex_sandbox !== value.codex_sandbox) ||
-      (s.kind === "claude" && before.claude_mode !== value.claude_mode))
+      (s.kind === "claude" && before.claude_mode !== value.claude_mode) ||
+      (s.kind === "antigravity" && before.antigravity_mode !== value.antigravity_mode))
   );
   const save = async () => {
     if (!changed) return close();

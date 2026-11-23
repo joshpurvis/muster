@@ -660,6 +660,10 @@ button.sl-item:hover {
   color: #d9a07a;
 }
 
+.kind-antigravity, .ap-kind-antigravity {
+  color: #b79cff;
+}
+
 .kind-codex {
   color: #7fb7ff;
 }
@@ -670,6 +674,11 @@ button.sl-item:hover {
 
 :root[data-theme="light"] .kind-claude {
   color: #b86b3c;
+}
+
+:root[data-theme="light"] .kind-antigravity,
+:root[data-theme="light"] .ap-kind-antigravity {
+  color: #6b4fd0;
 }
 
 :root[data-theme="light"] .kind-codex {
@@ -2879,7 +2888,7 @@ legend {
 }
 
 .welcome-card.empty-window {
-  max-width: 560px;
+  max-width: 720px;
   width: 100%;
 }
 

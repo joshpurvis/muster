@@ -11,7 +11,7 @@ import { type Channel, DEFAULT_PERMISSIONS, type Permissions } from "../types.ts
 
 const trimSlash = (p: string) => p.replace(/\/+$/, "") || "/";
 const samePermissions = (a: Permissions, b: Permissions) =>
-  a.codex_sandbox === b.codex_sandbox && a.claude_mode === b.claude_mode;
+  a.codex_sandbox === b.codex_sandbox && a.claude_mode === b.claude_mode && a.antigravity_mode === b.antigravity_mode;
 
 export interface FolderJoin {
   /** The dialog's name; blank matches any channel in the folder. */

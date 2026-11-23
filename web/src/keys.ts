@@ -258,6 +258,13 @@ export const commands: Command[] = [
     enabled: hasTab,
   },
   {
+    id: "new-antigravity",
+    title: "New Antigravity in this task",
+    group: "Tab",
+    run: () => A.spawnHere("antigravity"),
+    enabled: hasTab,
+  },
+  {
     id: "move-tab-left",
     title: "Move tab left",
     group: "Tab",

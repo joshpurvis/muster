@@ -59,7 +59,7 @@ const agent = (over: Partial<Agent> = {}): Agent => ({
   model: null,
   effort: null,
   persona: "",
-  permissions: { codex_sandbox: "workspace_write", claude_mode: "default" },
+  permissions: { codex_sandbox: "workspace_write", claude_mode: "default", antigravity_mode: "auto" },
   accepts_origins: ["human"],
   autostart: false,
   home_dir: "/d/agents/ada",
@@ -275,6 +275,7 @@ Deno.test("model and effort selects: Default, listed, custom; a kind switch drop
 Deno.test("efforts per model: a model's own list, else the CLI's; a model change drops what it lacks", () => {
   const all = ["low", "high", "ultra"];
   const c: ModelCatalog = {
+    antigravity: { models: [{ id: "gemini-4-neon-high", note: null, efforts: null }], efforts: [] },
     claude: { models: [{ id: "opus", note: null, efforts: null }], efforts: ["low", "max"] },
     codex: {
       models: [{ id: "sol", note: null, efforts: null }, {
@@ -337,10 +338,13 @@ Deno.test("OpenRouter: prices, context, listed models and the Codex model rule",
     "",
   ]);
   const catalog: ModelCatalog = {
+    antigravity: { models: [{ id: "gemini-4-neon-high", note: null, efforts: null }], efforts: [] },
     claude: { models: [{ id: "opus", note: null, efforts: null }], efforts: [] },
     codex: { models: [{ id: "gpt-6-sol", note: null, efforts: null }], efforts: [] },
   };
   const or = [orModel("anthropic/claude-sonnet-5.5")];
+  assertEquals(listedModels("subscription", "antigravity", catalog, or), ["gemini-4-neon-high"]);
+  assertEquals(effortsFor(catalog, "antigravity", "gemini-4-neon-high"), []);
   assertEquals(listedModels("subscription", "claude", catalog, or), ["opus"]);
   assertEquals(listedModels("openrouter", "codex", catalog, or), ["anthropic/claude-sonnet-5.5"]);
   assertEquals(listedModels("subscription", "codex", null, or), []);

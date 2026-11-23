@@ -1,0 +1,6 @@
+  Open alpha.txt.
+  The file contains one line.
+
+  Auto mode: edits & safe commands auto-approved (shift+tab to cycle)
+
+  ? for shortcuts                                   auto

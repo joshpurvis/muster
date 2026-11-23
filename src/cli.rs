@@ -83,7 +83,7 @@ impl Sess {
         self.state != "exited"
     }
     fn is_agent(&self) -> bool {
-        self.kind == "claude" || self.kind == "codex"
+        matches!(self.kind.as_str(), "claude" | "codex" | "antigravity")
     }
     fn from_value(v: Value) -> Option<Sess> {
         let mut s: Sess = serde_json::from_value(v.clone()).ok()?;
@@ -2588,6 +2588,7 @@ pub struct AgentOpts {
     pub lead: Option<bool>,
     pub claude_mode: Option<String>,
     pub codex_sandbox: Option<String>,
+    pub antigravity_mode: Option<String>,
 }
 
 /// `--sleep-after`: `off`, minutes (`45`), or a duration in minutes or hours (`90m`, `2h`).
@@ -2654,14 +2655,15 @@ impl AgentOpts {
         {
             set("from_session", json!(id));
         }
-        if self.claude_mode.is_some() || self.codex_sandbox.is_some() {
-            set(
-                "permissions",
-                json!({
-                    "claude_mode": self.claude_mode.as_deref().or(base["claude_mode"].as_str()).unwrap_or("default"),
-                    "codex_sandbox": self.codex_sandbox.as_deref().or(base["codex_sandbox"].as_str()).unwrap_or("workspace_write"),
-                }),
-            );
+        if self.claude_mode.is_some() || self.codex_sandbox.is_some() || self.antigravity_mode.is_some() {
+            let mut permissions = json!({
+                "claude_mode": self.claude_mode.as_deref().or(base["claude_mode"].as_str()).unwrap_or("default"),
+                "codex_sandbox": self.codex_sandbox.as_deref().or(base["codex_sandbox"].as_str()).unwrap_or("workspace_write"),
+            });
+            if let Some(mode) = &self.antigravity_mode {
+                permissions["antigravity_mode"] = json!(mode.replace('-', "_"));
+            }
+            set("permissions", permissions);
         }
         Ok(p)
     }
@@ -2703,7 +2705,8 @@ pub fn agent_new(d: &Discovery, o: AgentOpts) -> anyhow::Result<()> {
 
 /// `muster agent edit`.
 pub fn agent_edit(d: &Discovery, o: AgentOpts) -> anyhow::Result<()> {
-    let base = if o.claude_mode.is_some() != o.codex_sandbox.is_some() {
+    let base = if (o.claude_mode.is_some() || o.codex_sandbox.is_some() || o.antigravity_mode.is_some())
+        && (o.claude_mode.is_none() || o.codex_sandbox.is_none()) {
         let list = client::rpc(d, "agent.list", json!({}))?;
         list.as_array()
             .and_then(|l| l.iter().find(|a| a["name"].as_str().is_some_and(|n| n.eq_ignore_ascii_case(&o.name))))
@@ -3021,7 +3024,7 @@ mod tests {
         let opts = |lead: Option<bool>| AgentOpts {
             profile: None, switch: SwitchOpts::default(), provider: None, name: "alpha".into(), kind: None, model: None,
             effort: None, persona: None, accepts: None, autostart: None, sleep_after: None, self_handoff: None,
-            tools_up_front: None, lead, claude_mode: None, codex_sandbox: None,
+            tools_up_front: None, lead, claude_mode: None, codex_sandbox: None, antigravity_mode: None,
         };
         assert_eq!(opts(Some(true)).params(&json!({})).unwrap()["lead"], true);
         assert_eq!(opts(Some(false)).params(&json!({})).unwrap()["lead"], false);

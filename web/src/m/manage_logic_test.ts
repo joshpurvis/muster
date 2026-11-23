@@ -59,6 +59,7 @@ Deno.test("a named agent is known from the daemon's list (by its own name), or f
 });
 
 Deno.test("closing a named agent's tab says it keeps running; any other tab says it stops", () => {
+  has(restartConfirm(session({ kind: "antigravity", state: "working" }))!.body.join(" "), "Antigravity is working");
   const agent = closeConfirm(session({}), "scout", channel({}), true);
   has(agent.title, "scout's tab");
   has(agent.body.join(" "), "scout is a named agent");

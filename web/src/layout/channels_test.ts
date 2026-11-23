@@ -138,7 +138,7 @@ Deno.test("sidebar preferences are window-wide, validated and survive channel re
 Deno.test("a new channel in an open folder joins it, across accounts", () => {
   const ch = (id: number, cwd: string, extra: Partial<Channel> = {}) =>
     ({ id, name: "muster", cwd, owns_worktree: false, archived: false, ...extra }) as Channel;
-  const elevated = { codex_sandbox: "full_access", claude_mode: "bypass" } as const;
+  const elevated = { codex_sandbox: "full_access", claude_mode: "bypass", antigravity_mode: "auto" } as const;
   const list = [
     ch(1, "/p/muster/.wt/feature", { owns_worktree: true }),
     ch(2, "/p/other"),
@@ -162,8 +162,9 @@ Deno.test("a new channel in an open folder joins it, across accounts", () => {
   equal(folderChannel(list, "/p/muster", { prefer: 5 })?.id, 3);
   equal(folderChannel([list[4]], "/p/muster"), undefined);
   equal(folderChannel([list[4]], "/p/muster", { permissions: elevated })?.id, 5);
+  equal(folderChannel([list[4]], "/p/muster", { permissions: { ...elevated, antigravity_mode: "plan" } }), undefined);
   equal(folderChannel([list[4]], "/p/muster", { anyPermissions: true })?.id, 5);
-  equal(folderChannel(list, "/p/muster", { permissions: { codex_sandbox: "read_only", claude_mode: "plan" } }), undefined);
+  equal(folderChannel(list, "/p/muster", { permissions: { codex_sandbox: "read_only", claude_mode: "plan", antigravity_mode: "auto" } }), undefined);
 });
 
 Deno.test("drawer shells stay outside tiles across reconciliation and reload", () => {

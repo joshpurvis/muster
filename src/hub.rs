@@ -157,7 +157,7 @@ pub struct CreateChannel {
 }
 
 fn de_permissions<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Permissions>, D::Error> {
-    Ok(Option::<PermissionsInput>::deserialize(d)?.map(Into::into))
+    Ok(Option::<PermissionsInput>::deserialize(d)?.map(|p| p.onto(Permissions::default())))
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2048,7 +2048,7 @@ impl Hub {
             let t = g.titles.entry(cid).or_default();
             let slot = match info.kind {
                 SessionKind::Shell => &mut t.shell,
-                SessionKind::Claude | SessionKind::Codex => &mut t.agent,
+                SessionKind::Claude | SessionKind::Codex | SessionKind::Antigravity => &mut t.agent,
             };
             if slot.as_deref() == Some(clean.as_str()) {
                 return;
@@ -3060,10 +3060,14 @@ impl Hub {
     /// Set a channel's agent permission profile (human only: the UI / RPC; never MCP). Applies
     /// to sessions started or restarted afterwards.
     pub fn set_permissions(&self, id: ChannelId, permissions: Permissions) -> anyhow::Result<Channel> {
+        self.change_permissions(id, |_| permissions)
+    }
+
+    pub fn change_permissions(&self, id: ChannelId, change: impl FnOnce(Permissions) -> Permissions) -> anyhow::Result<Channel> {
         if self.channel(id).is_some_and(|c| c.archived) {
             anyhow::bail!("channel {id} is archived");
         }
-        self.update_channel(id, true, |c| c.permissions = permissions)
+        self.update_channel(id, true, |c| c.permissions = change(c.permissions))
     }
 
     pub fn set_layout(&self, id: ChannelId, layout: serde_json::Value) -> anyhow::Result<()> {
@@ -3427,6 +3431,7 @@ impl Hub {
         let provider = self.session_provider(id);
         let openrouter = match provider {
             crate::openrouter::Provider::OpenRouter => {
+                anyhow::ensure!(info.kind != SessionKind::Antigravity, "only Claude and Codex sessions can run on OpenRouter");
                 let key = self.openrouter_key().cloned().ok_or_else(crate::openrouter::missing_key_error)?;
                 if info.kind == SessionKind::Codex {
                     // Muster's own provider settings, ahead of the stored (allowlisted) args
@@ -3678,7 +3683,7 @@ impl Hub {
             let mut g = self.inner.lock();
             let Some(e) = g.sessions.get_mut(&id).filter(|e| e.generation == generation) else { return Ok(false) };
             match e.info.kind {
-                SessionKind::Claude if crate::cache::continues_conversation(e.info.kind, &e.extra_args) => {
+                SessionKind::Claude | SessionKind::Antigravity if crate::cache::continues_conversation(e.info.kind, &e.extra_args) => {
                     let next = crate::agents::with_resume(e.info.kind, &e.extra_args, None)?;
                     self.store.set_session_extra_args(id, &next)?;
                     e.extra_args = next;
@@ -4516,9 +4521,11 @@ impl Hub {
                     runtime.thread = change.thread.clone();
                 } else {
                     runtime.extra_args = change.args.clone();
-                    runtime.tab_thread = change.thread.clone().map(|thread| thread.map(|thread|
+                    if info.kind != SessionKind::Antigravity {
+                        runtime.tab_thread = change.thread.clone().map(|thread| thread.map(|thread|
                         crate::store::CodexThread { thread, generation: entry.generation }))
-                        .filter(|next| *next != entry.codex_thread);
+                            .filter(|next| *next != entry.codex_thread);
+                    }
                 }
             }
             // State/count/grace and reply attribution all commit with the cursor.
@@ -4792,6 +4799,17 @@ fn conversation_after_hook(kind: SessionKind, conversation: Option<&str>, sure: 
             };
             out.thread = next;
         }
+        SessionKind::Antigravity => {
+            if event == "state" && let Some(id) = reported {
+                out.conversation = Some(id.to_string());
+                out.sure = true;
+                out.args = match crate::agents::with_resume(kind, args, Some(id)) {
+                    Ok(next) => (next != args).then_some(next),
+                    Err(error) => { tracing::warn!("keeping the conversation to resume: {error:#}"); None }
+                };
+                out.thread = Some(Some(id.to_string()));
+            }
+        }
         SessionKind::Codex => {
             let finished = crate::agents::resume_id_from_hook(kind, event, payload);
             if event == "SessionStart" && let Some(started) = reported {
@@ -4967,7 +4985,7 @@ fn titles_of(g: &Inner, cid: ChannelId) -> Titles {
         if let Some(clean) = e.usable_title.clone() {
             match e.info.kind {
                 SessionKind::Shell => t.shell = Some(clean),
-                SessionKind::Claude | SessionKind::Codex => t.agent = Some(clean),
+                SessionKind::Claude | SessionKind::Codex | SessionKind::Antigravity => t.agent = Some(clean),
             }
         }
     }
@@ -5009,7 +5027,7 @@ pub fn clean_title(title: &str, kind: SessionKind) -> Option<String> {
         return None;
     }
     let lower = t.to_lowercase();
-    const PROGRAMS: &[&str] = &["claude", "claude code", "codex", "codex cli"];
+    const PROGRAMS: &[&str] = &["claude", "claude code", "codex", "codex cli", "antigravity", "antigravity cli", "agy"];
     const SHELLS: &[&str] = &["sh", "bash", "zsh", "fish", "dash", "ksh", "nu", "tcsh"];
     if PROGRAMS.contains(&lower.as_str())
         || lower == kind.as_str()
@@ -5191,6 +5209,21 @@ pub fn derive_name(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn antigravity_state_replaces_the_tab_conversation() {
+        let kind = SessionKind::Antigravity;
+        let payload = serde_json::json!({"session_id":"conv-demo"});
+        for args in [vec![], vec!["--conversation=previous".into()]] {
+            let change = conversation_after_hook(kind, None, false, &args, "state", &payload);
+            assert_eq!(change.args.unwrap(), ["--conversation", "conv-demo"]);
+            assert_eq!(change.thread, Some(Some("conv-demo".into())));
+            assert!(change.sure);
+        }
+        let other = conversation_after_hook(kind, Some("old"), false, &[], "Stop", &payload);
+        assert_eq!(other.conversation.as_deref(), Some("old"));
+        assert!(other.args.is_none() && other.thread.is_none());
+    }
 
     #[test]
     fn interactive_terminal_does_not_inherit_reload_commands_color_overrides() {

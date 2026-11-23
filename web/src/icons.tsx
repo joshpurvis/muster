@@ -129,6 +129,12 @@ export const IconSpark = (p: P) => (
     <path d="M12 3v4M12 17v4M3 12h4M17 12h4M5.6 5.6l2.8 2.8M15.6 15.6l2.8 2.8M5.6 18.4l2.8-2.8M15.6 8.4l2.8-2.8" />
   </Svg>
 );
+export const IconAntigravity = (p: P) => (
+  <Svg {...p}>
+    <path d="M5 20 12 4l7 16" />
+    <path d="M8.5 13h7" />
+  </Svg>
+);
 export const IconCodex = (p: P) => (
   <Svg {...p}>
     <path d="m8 7-5 5 5 5" />
@@ -210,6 +216,7 @@ export const IconAgents = (p: P) => (
 import type { SessionKind } from "./types.ts";
 export function KindIcon({ kind, size = 14 }: { kind: SessionKind; size?: number }) {
   if (kind === "claude") return <IconSpark size={size} class="kind-claude" />;
+  if (kind === "antigravity") return <IconAntigravity size={size} class="kind-antigravity" />;
   if (kind === "codex") return <IconCodex size={size} class="kind-codex" />;
   return <IconTerminal size={size} class="kind-shell" />;
 }

@@ -68,6 +68,7 @@ session only, never in the user's global config. Every session has `MUSTER_URL` 
   `-c 'mcp_servers.muster.tool_timeout_sec=1900'`.
   Raise `tool_timeout_sec`, because Codex's default tool timeout (about 60 s) would cut off
   `wait_for_state`.
+- **Antigravity CLI.** Muster adds a private workspace containing `.agents/mcp_config.json`. Discovery through `--add-dir` still needs a live check on agy 1.5.13. See PROTOCOL.md, “Antigravity”.
 - **Anything else:** POST JSON-RPC with the bearer header, as below.
 
 ```sh
@@ -88,7 +89,7 @@ and targets in them are refused.
 | `whoami` | — | Caller session, cwd, channel (id, name, branch, base branch, cwd, `permissions`), workspace (id, name, path), spawn budget, `policy: {shell_commands, other_workspaces}`. |
 | `list_channels` | — | Non-archived channels: id, name, workspace, cwd, branch, base_branch, `permissions`, `state` (aggregate), `sessions`, `live_sessions`. |
 | `list_sessions` | `channel_id?` | All sessions (including exited): id, channel_id, kind, name, state, detail, state_since_ms, queued, quiet_waiting (quiet messages waiting for a later turn, see "Quiet messages" below), parent_id, title, exit_code, is_me, `link`, `mention` (see "Links" below). With `queued` above 0 also `queue_waits`: why those prompts are not typed yet, in plain words, or null when the next is about to be typed (docs/PROTOCOL.md `session.queue`, `waiting`). |
-| `spawn_session` (alias `spawn_agent`, its old name: still accepted, not listed) | `kind` (`claude`\|`codex`\|`shell`), `prompt?`, `name?`, `model?`, `effort?`, `args?: string[]`, `channel_id?` **or** `new_channel?: {name?, worktree? = true, base?}` | New session (`parent_id` = caller) plus its channel. Default: caller's channel. The new session is a tab in the caller's window. `new_channel` is created in the caller's workspace, in the caller's window (else its channel's), with the caller's channel's permission profile. Without a `name` it is auto-named like any unnamed channel (docs/PROTOCOL.md), usually from the agent's title or the `prompt`. Unlike `channel.create`, `worktree` defaults to `true` here, so parallel agents don't share a checkout. `kind: shell` with a `prompt` or any `args` is refused unless shell commands are allowed (arguments to a shell are a command too). `model`/`effort` become `--model`/`--effort` (claude) or `-m`/`-c model_reasoning_effort=` (codex); `args` are extra CLI arguments; all of them go through the agent-argument allowlist (docs/PROTOCOL.md, "Channel permissions"), so they can't widen the profile. |
+| `spawn_session` (alias `spawn_agent`, its old name: still accepted, not listed) | `kind` (`claude`\|`codex`\|`antigravity`\|`shell`), `prompt?`, `name?`, `model?`, `effort?`, `args?: string[]`, `channel_id?` **or** `new_channel?: {name?, worktree? = true, base?}` | New session (`parent_id` = caller) plus its channel. Default: caller's channel. The new session is a tab in the caller's window. `new_channel` is created in the caller's workspace, in the caller's window (else its channel's), with the caller's channel's permission profile. Without a `name` it is auto-named like any unnamed channel (docs/PROTOCOL.md), usually from the agent's title or the `prompt`. Unlike `channel.create`, `worktree` defaults to `true` here, so parallel agents don't share a checkout. `kind: shell` with a `prompt` or any `args` is refused unless shell commands are allowed (arguments to a shell are a command too). `model`/`effort` become `--model`/`--effort` (claude) or `-m`/`-c model_reasoning_effort=` (codex); `args` are extra CLI arguments; all of them go through the agent-argument allowlist (docs/PROTOCOL.md, "Channel permissions"), so they can't widen the profile. |
 | `send_message` | `session_id`, `text`, `interrupt? = false`, `wake? = true` | `{delivered, queued, sent_at_ms}`. Goes through the injection queue (`inject::send`, `from = "session:<caller>"`). With `wake: false` it is kept for the session's next turn that can take it instead (`{session_id, quiet_id, wake: false, status: "waiting", note, sent_at_ms}`; Claude sessions only, not with `interrupt`; see "Quiet messages" below). A named agent's session is refused: it takes messages through `ask_agent`, or `tell_agent` for a note that doesn't need an answer. Like any first prompt, it names an auto-named channel. Shell targets are refused unless shell commands are allowed; when allowed, the text is preceded by a line clear (Ctrl-E Ctrl-U) so it doesn't append to a half-typed command. |
 | `read_screen` | `session_id` | `[session N (kind) state=S]` header, then the visible screen. |
 | `get_recent_output` | `session_id`, `lines? = 100` (max 2000) | Last N lines, ANSI stripped. |
@@ -102,6 +103,10 @@ and targets in them are refused.
 | `start_fresh` | `file` (absolute, or relative to the caller's working directory; at most 4096 bytes) | `{status: "waiting", file, note}`. A named Claude agent the human promoted asks for its own fresh start; see "Self handoff" below. Only ever for the caller itself (no target argument). Refused (and recorded in its tab's timeline) when the caller isn't a named agent, isn't promoted (the error says how the human grants it), is a Codex agent (not supported yet), already has a request waiting, started fresh less than 30 minutes ago, or the file doesn't exist, isn't a regular file, or lies outside its home folder and working directory once symlinks are resolved. Counts toward the per-minute post rate limit. |
 
 `whoami` also returns `agent` (the caller's agent name, or null) and `origin: {origin, hop}`.
+
+For `spawn_session` with `kind: "antigravity"`, the extra arguments are `--model`,
+`--effort`, `--continue` (or `-c`) and `--conversation`. For example, pass
+`"model": "gemini-4-neon-high"`. The channel supplies the execution mode.
 
 ### Links
 
@@ -763,6 +768,10 @@ never lost to an agent's write: the editor merges it onto the newer revision (do
 
 ### Agents
 
+An Antigravity agent answers an `ask_agent` message with the `reply` tool and the
+message ID. Its status callback carries no final message. An ask without an explicit
+reply can return the terminal tail as `unattributed_output`.
+
 A named agent (PLAN.md §10) is a persistent agent session with a home dir, its own tab and a
 resumed conversation (the first pass called them bots). The envelope's sender label is the caller's agent name, else `session:<id>`.
 
@@ -859,7 +868,7 @@ long job finishes: it says so in that turn's reply, then calls `reply {msg_id, t
   |---|---|---|
   | An ask still waiting for that message (`ask_agent`, `muster ask`, `agent.ask`) | It returns the text as its `reply` (it re-checks every second; after 30 s untaken, e.g. the ask was cancelled, the next row applies: `WAITER_MAX`). Only a reply that brings no origin the question's chain didn't have, and is no deeper in the chain than an answer in the question's own turn (one hop past it); any other goes as the next row says. | `returned` |
   | A named agent | A new agent message: `[muster msg <new id> from <replier> origin=<o> hop=<n>]`, then `Late reply to your message <id> ("<first line of the question>"):` and the text, with `reply_to` = the message answered. Through `agents::send_checked`: the asker's accepted origins, the hop limit, the daily and unattended caps, the OpenRouter spend caps, the injection queue; a stopped agent is started as for any message. A refusal is logged like any refused message. | `delivered` (`delivered_as`), else `refused` |
-  | Another Claude or Codex session (live) | Typed in through its injection queue after `[muster reply to msg <id> from <replier> origin=<o> hop=<n>]` (no message row of its own, so not an envelope the agents' attribution acts on); the session takes the reply's origin and hop. A Claude session takes only `human`-origin replies (`send_message`'s rule). | `delivered` (`session_id`), else `refused` |
+  | Another Claude, Codex or Antigravity session (live) | Typed in through its injection queue after `[muster reply to msg <id> from <replier> origin=<o> hop=<n>]` (no message row of its own, so not an envelope the agents' attribution acts on); the session takes the reply's origin and hop. A Claude session takes only `human`-origin replies (`send_message`'s rule). | `delivered` (`session_id`), else `refused` |
   | The human (a client, `muster ask` outside a session or in a shell tab), or a schedule | Shown in the sidebar's message log (the message's entry gets a `late reply` chip; its overlay shows the text and how it was delivered); a desktop notification when the human asked. | `shown` |
   | An agent since removed, a session that ended | Kept in the log only. | `undelivered` |
 
@@ -1362,7 +1371,8 @@ Each ends with the card's number, when and by whom it was posted, the commit, wh
 
 Each channel has a permission profile the human sets in the UI (`channel.set_permissions`, see
 PROTOCOL.md): `codex_sandbox` (`read_only`, `workspace_write`, `workspace_write_network`,
-`full_access`) and `claude_mode` (`default`, `accept_edits`, `plan`, `bypass`). Every agent in
+`full_access`) and `claude_mode` (`default`, `accept_edits`, `plan`, `bypass`), plus `antigravity_mode`
+(ordered `plan < accept_edits < auto < full_access`). Every agent in
 the channel starts with it, including ones spawned through MCP:
 
 - `spawn_session` always uses the target channel's profile. It has no argument to ask for more
@@ -1376,7 +1386,7 @@ the channel starts with it, including ones spawned through MCP:
 - A `new_channel` created through `spawn_session` gets the **caller's** channel profile, never
   more (and never the defaults if the caller has less).
 - `whoami` and `list_channels` show each channel's `permissions` as
-  `{codex_sandbox, claude_mode, codex_flags, claude_permission_mode, set_by}`, so an agent knows
+  `{codex_sandbox, claude_mode, antigravity_mode, codex_flags, claude_permission_mode, antigravity_flags, set_by}`, so an agent knows
   whether a child could, say, reach the network before it spawns one. If a task needs more, the
   agent should ask the human to change the channel's permissions (or post to the channel).
 - The profile is not a sandbox around muster itself: see "Limits" under "Channel permissions"
@@ -1424,7 +1434,7 @@ Default `states`: `idle, needs_approval, asking_question, error, stuck, exited`,
 | Other workspaces | Off by default, see below. |
 | `post_to_channel` rate | **30 per 60 s** per caller |
 | Self-messaging | Refused (`session_id` == caller; `ask_agent` of the caller's own agent) |
-| Agent origins | `ask_agent` is refused unless the agent's `accepts_origins` contains the message's origin. Defaults: Claude agents `human`; Codex agents `human`, `schedule`, `webhook`. A Claude session that isn't a named agent takes `human` only: `send_message` to one, or `spawn_session` of `kind: claude`, from a non-human chain is refused. `lead` (scheduled work a lead agent passed on) is taken like `human` in both, but never as keys or as a message that waits for a later turn (see "Lead agents"). |
+| Agent origins | `ask_agent` is refused unless the agent's `accepts_origins` contains the message's origin. Defaults: Claude and Antigravity agents `human`; Codex agents `human`, `schedule`, `webhook`. A Claude session that isn't a named agent takes `human` only: `send_message` to one, or `spawn_session` of `kind: claude`, from a non-human chain is refused. `lead` (scheduled work a lead agent passed on) is taken like `human` in both, but never as keys or as a message that waits for a later turn (see "Lead agents"). |
 | Agent hops | Max hop **8** (`guard::MAX_AGENT_HOPS`); a message from the human or a trigger is hop 0. A lead agent's messages count too, and the limit also holds for what reaches a plain session (`send_message`, a spawned session's start, keys, a reply typed in: `guard::check_hop`). |
 | Agent daily cap | **200** messages delivered to one agent per rolling 24 hours, any origin (`guard::AGENT_DAILY_PROMPT_CAP`; counted from `agent_messages`, so it survives restarts, and re-checked in the same transaction as the insert, so concurrent asks over MCP and the CLI can't overshoot). |
 | Agent messages | Only through `ask_agent` and `tell_agent`: `send_message` to an agent's session is refused. `ask_agent` shares `send_message`'s rate limit, size limit, text cleaning, `!` rule and permission-widening check, against the widest of the agent session's current tab and the agent's own tab (its profile before it has one). An agent only ever runs in its own tab (stored on the agent), never a same-named one. |

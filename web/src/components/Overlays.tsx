@@ -35,7 +35,7 @@ import { folderChannel } from "../layout/channels.ts";
 import * as A from "../actions.ts";
 import { type Command, commands } from "../keys.ts";
 import { Kbd, SessionDot, Spinner, StateDot } from "./common.tsx";
-import { IconBranch, IconCheck, IconCodex, IconFolder, IconNote, IconPanel, IconPlus, IconSpark, IconTerminal, IconTrash, IconX } from "../icons.tsx";
+import { IconAntigravity, IconBranch, IconCheck, IconCodex, IconFolder, IconNote, IconPanel, IconPlus, IconSpark, IconTerminal, IconTrash, IconX } from "../icons.tsx";
 import { noteTab, panelTab } from "../layout/tree.ts";
 import { authorName, notes, searchNotes } from "../notes.ts";
 import { ago } from "../agents.ts";
@@ -592,6 +592,7 @@ const AGENTS: { k: SessionKind; label: string; icon: ComponentChildren }[] = [
   { k: "claude", label: "Claude", icon: <IconSpark size={14} /> },
   { k: "codex", label: "Codex", icon: <IconCodex size={14} /> },
   { k: "shell", label: "Shell", icon: <IconTerminal size={14} /> },
+  { k: "antigravity", label: "Antigravity", icon: <IconAntigravity size={14} /> },
 ];
 
 function NewTab({ worktree: wtInit, cwd }: { worktree?: boolean; cwd?: string }) {
@@ -643,7 +644,7 @@ function NewTab({ worktree: wtInit, cwd }: { worktree?: boolean; cwd?: string })
         base: worktree ? base.trim() || undefined : undefined,
         agent,
         account_profile: agent === "claude" ? profile : undefined,
-        prompt: agent === "claude" || agent === "codex" ? prompt.trim() || undefined : undefined,
+        prompt: agent !== "none" && agent !== "shell" ? prompt.trim() || undefined : undefined,
         permissions,
       });
       overlay.value = null;
@@ -722,7 +723,7 @@ function NewTab({ worktree: wtInit, cwd }: { worktree?: boolean; cwd?: string })
               onInput={(e) => setName((e.target as HTMLInputElement).value)}
             />
           </div>
-          {(agent === "claude" || agent === "codex") && (
+          {(agent !== "none" && agent !== "shell") && (
             <textarea
               class="quiet-input prompt-input"
               rows={3}

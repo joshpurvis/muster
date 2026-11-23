@@ -146,7 +146,7 @@ for (const signal of ["SIGTERM", "SIGINT"] as const) Deno.addSignalListener(sign
   setTimeout(() => Deno.exit(0), 500);
 });
 
-type Kind = "claude" | "codex" | "shell";
+type Kind = "claude" | "codex" | "antigravity" | "shell";
 interface Session {
   id: number;
   channel_id: number;
@@ -201,7 +201,7 @@ const windowPrefs = {
 function coldAt(s: Session): number | null {
   const key = s.kind + (s.provider === "openrouter" ? "_openrouter" : s.kind === "codex" ? "_chatgpt" : "");
   // 0 never goes cold (Codex logged in with ChatGPT, by default).
-  s.cache_ttl_min = windowPrefs.cache_warn && s.kind !== "shell" ? windowPrefs.cache_ttl[key] : null;
+  s.cache_ttl_min = windowPrefs.cache_warn && s.kind !== "shell" ? windowPrefs.cache_ttl[key] ?? null : null;
   if (!s.cache_ttl_min || s.last_turn_at == null) return null;
   return s.last_turn_at + s.cache_ttl_min * 60_000;
 }
@@ -587,12 +587,12 @@ function kill(sid: number) {
 interface MockAgent {
   id: number;
   name: string;
-  kind: "claude" | "codex";
+  kind: "claude" | "codex" | "antigravity";
   provider: "subscription" | "openrouter";
   model: string | null;
   effort: string | null;
   persona: string;
-  permissions: { codex_sandbox: string; claude_mode: string };
+  permissions: { codex_sandbox: string; claude_mode: string; antigravity_mode: string };
   accepts_origins: string[];
   autostart: boolean;
   home_dir: string;
@@ -610,7 +610,7 @@ interface MockAgent {
   lead: boolean;
 }
 
-const DEFAULT_PERMS = { codex_sandbox: "workspace_write", claude_mode: "default" };
+const DEFAULT_PERMS = { codex_sandbox: "workspace_write", claude_mode: "default", antigravity_mode: "auto" };
 // A short copy of `agent.models` (the real lists live in src/agents.rs `model_catalog`).
 const AGENT_MODELS = {
   claude: {
@@ -621,6 +621,12 @@ const AGENT_MODELS = {
       { id: "haiku", note: "latest Haiku", efforts: null },
     ],
     efforts: ["low", "medium", "high", "xhigh", "max"],
+  },
+  antigravity: {
+    models: ["gemini-4-neon-high", "gemini-4-neon-xhigh", "gemini-4-neon-medium", "gemini-4-carbon-high",
+      "gemini-4-argon-high", "gemini-4-hydrogen-high", "gemini-pro-orchestrator", "gemini-3.8-flash-high"]
+      .map((id) => ({ id, note: null, efforts: null })),
+    efforts: [],
   },
   codex: {
     models: [
@@ -668,7 +674,7 @@ const AGENT_TEMPLATES = [
     effort: null,
     persona:
       'You answer questions by reading files and searching the web. Every claim carries its source. You run in plan mode: end each answer with a short "For memory/" list.',
-    permissions: { codex_sandbox: "workspace_write", claude_mode: "plan" },
+    permissions: { ...DEFAULT_PERMS, claude_mode: "plan" },
     accepts: ["human"],
     autostart: false,
   },
@@ -682,7 +688,7 @@ const AGENT_TEMPLATES = [
     effort: null,
     persona:
       "You review the diffs or files you are asked about. Report findings ranked by severity (P1, P2, P3), each with the file and line and the smallest fix.",
-    permissions: { codex_sandbox: "read_only", claude_mode: "default" },
+    permissions: { ...DEFAULT_PERMS, codex_sandbox: "read_only" },
     accepts: ["human"],
     autostart: false,
   },
@@ -710,7 +716,7 @@ const AGENT_TEMPLATES = [
     effort: null,
     persona:
       "You run routine jobs when asked, by a person, a schedule or a webhook. Post a short result to your channel with post_to_channel and keep a log in memory/log.md.",
-    permissions: { codex_sandbox: "workspace_write", claude_mode: "default" },
+    permissions: { codex_sandbox: "workspace_write", claude_mode: "default", antigravity_mode: "auto" },
     accepts: ["human", "schedule", "webhook"],
     autostart: true,
   },
@@ -727,7 +733,7 @@ function newAgent(p: any): MockAgent {
   if (agentList.some((a) => a.name.toLowerCase() === name.toLowerCase())) {
     throw new Error(`an agent named ${name} already exists`);
   }
-  const kind = p.kind === "codex" ? "codex" : "claude";
+  const kind = p.kind === "antigravity" ? "antigravity" : p.kind === "codex" ? "codex" : "claude";
   const provider = p.provider === "openrouter" ? "openrouter" : "subscription";
   checkProvider(kind, provider, p.model ?? null, true);
   const a: MockAgent = {
@@ -738,8 +744,8 @@ function newAgent(p: any): MockAgent {
     model: p.model || null,
     effort: p.effort || null,
     persona: p.persona ?? "",
-    permissions: p.permissions ?? { ...DEFAULT_PERMS },
-    accepts_origins: p.accepts ?? (kind === "claude" ? ["human"] : ["human", "schedule", "webhook"]),
+    permissions: { ...DEFAULT_PERMS, ...p.permissions },
+    accepts_origins: p.accepts ?? (kind === "codex" ? ["human", "schedule", "webhook"] : ["human"]),
     autostart: !!p.autostart,
     home_dir: `${HOME}/.local/share/muster/agents/${name.toLowerCase()}`,
     channel_id: null,
@@ -816,6 +822,7 @@ const OR_MODELS = [
 
 function checkProvider(kind: string, provider: string, model: string | null, needKey: boolean) {
   if (provider !== "openrouter") return;
+  if (kind === "antigravity") throw new Error("only Claude and Codex sessions can run on OpenRouter");
   if (kind === "codex" && !model?.trim()) {
     throw new Error("a Codex agent on OpenRouter needs a model, with its vendor (e.g. openai/gpt-6.1-sol)");
   }
@@ -907,6 +914,7 @@ const sched = scheduleMock({
 // with a weekday summary (mixed history) and a paused hourly check, and a Claude subscription
 // agent that opted in to scheduled work, whose schedule expires tomorrow.
 {
+  newAgent({ name: "demo-gemini", kind: "antigravity", model: "gemini-4-neon-high" });
   const worker = newAgent({ ...AGENT_TEMPLATES[5], autostart: false });
   const digest = newAgent({
     name: "digest",
@@ -1160,7 +1168,7 @@ function noteAuthor(from: number | undefined): NoteAuthor {
   if (from !== undefined && !s) throw new Error("calling session no longer exists");
   if (!s || s.kind === "shell") return { kind: "human", name: null, session_id: s?.id ?? null };
   const c = channels.find((x) => x.id === s.channel_id);
-  const kind = s.kind === "claude" ? "Claude" : "Codex";
+  const kind = s.kind === "antigravity" ? "Antigravity" : s.kind === "claude" ? "Claude" : "Codex";
   return { kind: "agent", name: c ? `${kind} (${c.name})` : kind, session_id: s.id };
 }
 
@@ -1316,15 +1324,15 @@ async function agentMethod(method: string, p: any): Promise<unknown> {
       if ("persona" in p) a.persona = p.persona;
       if ("autostart" in p) a.autostart = !!p.autostart;
       if ("self_handoff" in p) {
-        if (p.self_handoff && a.kind !== "claude") throw new Error("self handoff isn't supported for Codex agents yet");
+        if (p.self_handoff && a.kind !== "claude") throw new Error("only Claude agents support self handoff");
         a.self_handoff = !!p.self_handoff;
       }
       if ("tools_up_front" in p) a.tools_up_front = !!p.tools_up_front;
       if ("lead" in p) {
-        if (p.lead && a.kind !== "claude") throw new Error(`only Claude agents can be lead agents: ${a.name} is a Codex agent`);
+        if (p.lead && a.kind !== "claude") throw new Error(`only Claude agents can be lead agents: ${a.name} uses ${a.kind}`);
         a.lead = !!p.lead;
       }
-      if ("permissions" in p) a.permissions = p.permissions;
+      if ("permissions" in p) a.permissions = { ...a.permissions, ...p.permissions };
       if ("accepts" in p) {
         if (!Array.isArray(p.accepts) || !p.accepts.length || p.accepts.some((o: string) => !["human", "schedule", "webhook"].includes(o))) {
           throw new Error("accepts needs at least one origin (human, schedule, webhook)");
@@ -1964,7 +1972,7 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
         created_at: now(),
         last_read_at: now(),
         sort_order: channels.length,
-        permissions: p.permissions ?? { codex_sandbox: "workspace_write", claude_mode: "default" },
+        permissions: { ...DEFAULT_PERMS, ...p.permissions },
       };
       channels.push(c);
       if (p.window_id != null && !winById(p.window_id)) throw new Error(`no such window: ${p.window_id}`);
@@ -1981,7 +1989,7 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
     case "channel.set_permissions": {
       const c = channels.find((c) => c.id === p.id);
       if (!c) throw new Error(`no such channel: ${p.id}`);
-      c.permissions = p.permissions;
+      c.permissions = { ...c.permissions, ...p.permissions };
       broadcast("channel_upserted", c);
       return c;
     }

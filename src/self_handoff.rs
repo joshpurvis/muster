@@ -142,7 +142,7 @@ pub fn grant_how(name: &str) -> String {
 pub fn check_grant(a: &Agent, by_owner: bool) -> anyhow::Result<()> {
     anyhow::ensure!(
         a.kind == SessionKind::Claude,
-        "self handoff isn't supported for Codex agents yet: only a Claude agent can be given it"
+        "only Claude agents support self handoff"
     );
     anyhow::ensure!(
         by_owner,
@@ -217,7 +217,7 @@ pub fn check_request(agent: Option<&Agent>, session: &SessionInfo, file: &str, n
             .into());
     };
     if a.kind != SessionKind::Claude {
-        return Err("self handoff isn't supported for Codex agents yet".into());
+        return Err("only Claude agents support self handoff".into());
     }
     if !a.self_handoff {
         return Err(format!(
@@ -662,7 +662,7 @@ mod tests {
         assert!(no.contains("isn't allowed") && no.contains("--self-handoff on") && no.contains("Edit agent"), "{no}");
         // A Codex agent (never promoted: it can't be) hears "not supported yet", not how to grant it.
         let codex = ok(&Agent { kind: SessionKind::Codex, self_handoff: false, ..a.clone() }, &s, "memory/handoff.md").unwrap_err();
-        assert!(codex.contains("isn't supported for Codex agents yet"), "{codex}");
+        assert!(codex.contains("only Claude agents support self handoff"), "{codex}");
         assert!(ok(&a, &session(&home, AgentState::Exited), "memory/handoff.md").is_err());
 
         // The file: missing, empty, a directory, outside home and cwd, a symlink out of home.
@@ -698,7 +698,7 @@ mod tests {
         let e = check_grant(&a, false).unwrap_err().to_string();
         assert!(e.contains("only the human") && e.contains("inside a Muster session"), "{e}");
         let e = check_grant(&Agent { kind: SessionKind::Codex, ..a }, true).unwrap_err().to_string();
-        assert!(e.contains("Codex"), "{e}");
+        assert!(e.contains("only Claude agents support self handoff"), "{e}");
         std::fs::remove_dir_all(root).unwrap();
     }
 

@@ -24,6 +24,7 @@ const ENV = {
   HOME: `${BASE}/home`, MUSTER_URL: "", MUSTER_TOKEN: "", MUSTER_BIN: "",
   MUSTER_SESSION_ID: "", MUSTER_CHANNEL_ID: "", MUSTER_RUN: "",
   PATH: `${BASE}/bin:/usr/bin:/bin`, MUSTER_CODEX_HOOKS: "0",
+  MUSTER_ANTIGRAVITY_SETTINGS: "1", MUSTER_ANTIGRAVITY_MCP: "1",
   // No desktop notifications from the test daemon (schedule alerts would reach the real desktop).
   MUSTER_NO_NOTIFY: "1",
 };
@@ -210,7 +211,7 @@ async function rawHttp(req: string): Promise<string> {
 /** A fake CLI's launch: its arguments on the first line, then the provider variables it got
  * (only those that are set), in `<BASE>/launch-<cli>-<session id>`. */
 const LAUNCH_VARS =
-  "ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY ANTHROPIC_DEFAULT_SONNET_MODEL OPENROUTER_API_KEY MUSTER_PROVIDER CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST CLAUDE_CODE_SUBPROCESS_ENV_SCRUB";
+  "ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY ANTHROPIC_DEFAULT_SONNET_MODEL OPENROUTER_API_KEY MUSTER_PROVIDER CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST CLAUDE_CODE_SUBPROCESS_ENV_SCRUB AGY_CLI_DISABLE_AUTO_UPDATE AGY_CLI_HIDE_ACCOUNT_INFO AGY_CLI_OSC7501";
 const LAUNCH_DUMP = (cli: string) =>
   `{ printf 'ARGS'; printf ' %s' "$@"; printf '\\n'; for v in ${LAUNCH_VARS}; do if [ -n "\${!v+set}" ]; then printf '%s=%s\\n' "$v" "\${!v}"; fi; done; } > '${BASE}/launch-${cli}-'"$MUSTER_SESSION_ID"`;
 
@@ -219,6 +220,15 @@ async function main() {
   // to resume the thread "stale-thread", it fails the way Codex does for a thread it doesn't
   // have (guess: exit 1 before its TUI and hooks start).
   await Deno.mkdir(`${BASE}/bin`, { recursive: true });
+  // Install this before starting the daemon. The smoke PATH also contains the system binaries.
+  await Deno.writeTextFile(`${BASE}/bin/agy`, `#!/bin/bash
+${LAUNCH_DUMP("agy")}
+printf '%s' "$MUSTER_TOKEN" > '${BASE}/agy-token-'"$MUSTER_SESSION_ID"
+stty -echo -icanon min 1 time 0
+printf '\\033[2J\\033[999;1H  Auto mode: edits & safe commands auto-approved (shift+tab to cycle)\\r\\n\\r\\n  ? for shortcuts\\r\\n'
+exec tee '${BASE}/agy-input-'"$MUSTER_SESSION_ID" >/dev/null
+`);
+  await Deno.chmod(`${BASE}/bin/agy`, 0o700);
   await Deno.writeTextFile(`${BASE}/bin/codex`, `#!/bin/bash
 printf '%s' "$MUSTER_TOKEN" > '${BASE}/fake-token'
 printf '%s' "$MUSTER_TOKEN" > '${BASE}/fake-token-'"$MUSTER_SESSION_ID"
@@ -352,6 +362,7 @@ done
   const ws2 = await c.call("workspace.add", { path: REPO + "/" });
   ok(ws2.id === ws.id, "workspace.add is idempotent");
 
+  await antigravityTab(c);
   const plain = await c.call("channel.create", { workspace_id: ws.id, name: "no tree" });
   ok(!plain.owns_worktree && plain.cwd === ws.path && plain.branch === "main", "worktree is off by default");
   await c.call("channel.archive", { id: plain.id, remove_worktree: false });
@@ -1176,6 +1187,19 @@ done
   await c.call("agent.remove", { name: "cody" });
   ok((await c.call("agent.list")).length === 0 && await exists(`${DATA}/agents/ada/CLAUDE.md`), "agent.remove keeps the home dir");
 
+  for (const [field, value, why] of [
+    ["account_profile", "default", "only supported for Claude"], ["provider", "openrouter", "only Claude and Codex"],
+  ]) {
+    const message = await c.call("agent.create", { name: "demo-gemini", kind: "antigravity", [field]: value })
+      .then(() => "", (e) => String(e));
+    ok(message.includes(why), `Antigravity agent refuses ${field}`);
+  }
+  const demo = await c.call("agent.create", { name: "demo-gemini", kind: "antigravity" });
+  ok(demo.accepts_origins.join() === "human", "Antigravity defaults to human work");
+  const demoRun = await c.call("agent.start", { name: demo.name });
+  ok((await launchOf("agy", demoRun.session.id)).args.includes("--mode=auto"), "named Antigravity agent starts");
+  await c.call("agent.remove", { name: demo.name });
+
   // A named agent's closed tab is hidden, not stopped (the fake Codex stands in for the agent).
   await c.call("agent.create", { name: "bg", kind: "codex" });
   const started = await c.call("agent.start", { name: "bg" });
@@ -1815,6 +1839,50 @@ async function questionsForHuman(c: Client, d: Daemon, mcp: (token: string, name
   w.close();
   await c.call("agent.remove", { name: "writer" });
   await c.call("agent.remove", { name: "lead" });
+}
+
+async function antigravityTab(c: Client) {
+  const first = await cli(["new", REPO, "--kind", "antigravity"], ENV);
+  const id = Number(dec.decode(first.stdout).trim());
+  ok(first.success && id > 0, "new --kind antigravity opens a tab");
+  const launch = await launchOf("agy", id);
+  ok(launch.args.includes("--settings=") && launch.args.includes("--add-dir=") && launch.args.includes("--mode=auto"),
+    "Antigravity gets per-tab files and auto mode");
+  ok(launch.env.AGY_CLI_DISABLE_AUTO_UPDATE === "true" && launch.env.AGY_CLI_HIDE_ACCOUNT_INFO === "true" &&
+    launch.env.AGY_CLI_OSC7501 === "off", "Antigravity launch environment");
+  const wait = async (state: string) => {
+    const result = await c.call("session.wait", { id, until: [state], timeout_ms: 5000 });
+    ok(result.matched && result.session.state === state, `Antigravity reaches ${state}`);
+    return result.session;
+  };
+  const session = await wait("idle");
+  const token = await Deno.readTextFile(`${BASE}/agy-token-${id}`);
+  for (const state of ["working", "idle"]) {
+    const helper = new Deno.Command(BIN, {
+      args: ["hook", "antigravity", "state"],
+      env: { ...ENV, MUSTER_TOKEN: token, MUSTER_SESSION_ID: String(id), MUSTER_URL: `http://127.0.0.1:${PORT}`,
+        MUSTER_HOOK_DB: `${DATA}/hook-inbox.sqlite` },
+      stdin: "piped", stdout: "piped", stderr: "piped",
+    }).spawn();
+    const writer = helper.stdin.getWriter();
+    await writer.write(enc.encode(JSON.stringify({ agent_state: state, conversation_id: "conv-demo-1", email: "someone@example.invalid" })));
+    await writer.close();
+    const output = await helper.output();
+    ok(output.success && output.stdout.length === 0 && output.stderr.length === 0, "silent Antigravity callback");
+    await wait(state);
+  }
+  await c.call("channel.set_permissions", { id: session.channel_id, permissions: {
+    codex_sandbox: "workspace_write", claude_mode: "default", antigravity_mode: "full_access",
+  } });
+  await Deno.remove(`${BASE}/launch-agy-${id}`);
+  await c.call("session.restart", { id });
+  const resumed = (await launchOf("agy", id)).args;
+  ok(resumed.includes("--dangerously-skip-permissions") && !resumed.includes("--mode=") &&
+    resumed.includes("--conversation conv-demo-1"), "Antigravity restarts with the new mode and saved conversation");
+  for (const dir of [DATA, RUNTIME]) {
+    ok(!(await filesContaining(dir, "example.invalid")).length, "Antigravity callback email never reaches disk");
+  }
+  await c.call("channel.archive", { id: session.channel_id, remove_worktree: false });
 }
 
 /** The fake CLI's launch record for session `id` (waits until it is written). */

@@ -871,6 +871,7 @@ async fn permissions_are_shown_and_inherited_never_raised() {
     let elevated = Permissions {
         codex_sandbox: CodexSandbox::WorkspaceWriteNetwork,
         claude_mode: ClaudeMode::AcceptEdits,
+        antigravity_mode: crate::model::AntigravityMode::FullAccess,
     };
     m.d.lock().channels.get_mut(&10).unwrap().permissions = elevated;
     // Other channel in the workspace, with the defaults.
@@ -882,6 +883,8 @@ async fn permissions_are_shown_and_inherited_never_raised() {
     let p = &v["channel"]["permissions"];
     assert_eq!(p["codex_sandbox"], "workspace_write_network");
     assert_eq!(p["claude_mode"], "accept_edits");
+    assert_eq!(p["antigravity_mode"], "full_access");
+    assert_eq!(p["antigravity_flags"], "--dangerously-skip-permissions");
     assert_eq!(
         p["codex_flags"],
         "--sandbox workspace-write -c sandbox_workspace_write.network_access=true"
@@ -965,7 +968,7 @@ async fn permissions_are_shown_and_inherited_never_raised() {
     assert_eq!(m.d.lock().channels[&id].permissions, Permissions::default());
     // Nor by using a more permissive sibling channel: spawning into it, or messaging an agent
     // that runs there, is refused for the kinds it would elevate.
-    for kind in ["codex", "claude"] {
+    for kind in ["codex", "claude", "antigravity"] {
         let (t, err) = call_as(
             &st,
             "tok30",

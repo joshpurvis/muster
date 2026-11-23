@@ -64,7 +64,7 @@ pub fn author(hub: &Hub, from_session: Option<SessionId>) -> anyhow::Result<Note
         return Ok(NoteAuthor { kind: "human".into(), name: None, session_id: Some(id) });
     }
     let name = hub.agents().by_session(id).map(|a| a.name).unwrap_or_else(|| {
-        let kind = if s.kind == SessionKind::Claude { "Claude" } else { "Codex" };
+        let kind = s.kind.label();
         match hub.channel(s.channel_id) {
             Some(c) if !c.name.is_empty() => format!("{kind} ({})", c.name),
             _ => kind.to_string(),

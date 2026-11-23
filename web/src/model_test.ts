@@ -28,6 +28,7 @@ import {
   windowParam,
 } from "./model.ts";
 import type { AgentState, Channel, SessionInfo, Win } from "./types.ts";
+import { DEFAULT_PERMISSIONS, KIND_LABEL } from "./types.ts";
 import { newerPrefs } from "./model.ts";
 
 function assertEquals<T>(actual: T, expected: T, msg?: string) {
@@ -35,6 +36,11 @@ function assertEquals<T>(actual: T, expected: T, msg?: string) {
   const e = JSON.stringify(expected);
   if (a !== e) throw new Error(`${msg ?? "assertEquals"}\n  actual:   ${a}\n  expected: ${e}`);
 }
+
+Deno.test("Antigravity has its own tab label and defaults to auto mode", () => {
+  assertEquals(KIND_LABEL.antigravity, "Antigravity");
+  assertEquals(DEFAULT_PERMISSIONS.antigravity_mode, "auto");
+});
 
 function ch(id: number, extra: Partial<Channel> = {}): Channel {
   return {

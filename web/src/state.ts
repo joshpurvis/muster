@@ -402,7 +402,7 @@ export const unread = computed(() => {
 export interface Prefs {
   fontSize: number;
   theme: "system" | "dark" | "light";
-  lastAgent: "claude" | "codex" | "shell" | "none";
+  lastAgent: "claude" | "codex" | "shell" | "antigravity" | "none";
   /** Jump recency keys ("s:<id>", "f:<path>"), most recent first. */
   recent: string[];
   /** Folders new tabs were opened in, most recent first. */

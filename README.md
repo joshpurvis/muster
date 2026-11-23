@@ -1,6 +1,6 @@
 # Muster
 
-Muster is a Linux desktop app for running several coding agents at once. Claude Code, Codex and
+Muster is a Linux desktop app for running several coding agents at once. Claude Code, Codex, Antigravity and
 plain shells run side by side in real terminals, and Muster shows you which of them is waiting
 for you.
 
@@ -107,7 +107,7 @@ reach the agent without any script.
 
 ## Quick start
 
-You need Linux, a Rust toolchain, [Deno](https://deno.com), and the `claude` or `codex` CLI
+You need Linux, a Rust toolchain, [Deno](https://deno.com), and the `claude`, `codex` or `agy` CLI
 installed and logged in. The native window needs webkit2gtk-4.1; without it, build the browser
 version and Muster opens in Chromium, Chrome or Brave instead.
 
@@ -117,7 +117,7 @@ install -m755 target/release/muster target/release/muster-terminal-host ~/.local
 muster                    # starts the daemon in the background and opens a window
 ```
 
-The first window asks for a folder. Type one (Tab completes), then pick Claude, Codex or Shell.
+The first window asks for a folder. Type one (Tab completes), then pick Claude, Codex, Shell or Antigravity (keys 1–4).
 From there:
 
 | Keys | What it does |
@@ -161,6 +161,7 @@ is found it falls back to `xdg-open`.
 muster ls                                # ID  WIN  TAB  NAME  KIND  STATE  FOR  DETAIL
 muster new ~/src/app --prompt "fix the flaky test"   # prints the new session id
 muster new . --kind codex -- -m gpt-6.2-sol          # args after -- go to the agent CLI
+muster new . --kind antigravity -- --model gemini-4-neon-high
 muster send fix-auth "run the tests" --wait          # prompt, then wait until it settles
 muster read fix-auth -n 100              # last 100 lines of output, plain text
 muster wait 12 --until needs_human       # block until it needs you (exit 124 on timeout)

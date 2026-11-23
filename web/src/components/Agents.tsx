@@ -80,13 +80,12 @@ import {
   IconBranch,
   IconChevron,
   IconChevronDown,
-  IconCodex,
+  KindIcon,
   IconCpu,
   IconFolder,
   IconGauge,
   IconPlus,
   IconShieldAlert,
-  IconSpark,
   IconX,
 } from "../icons.tsx";
 import { cx } from "../util.ts";
@@ -366,7 +365,7 @@ function CustomPick(
 }
 
 const modelPicks = (c: ModelCatalog | null, kind: Agent["kind"]): Pick[] =>
-  (c?.[kind].models ?? []).map((m) => ({ value: m.id, label: m.note ? `${m.id} · ${m.note}` : m.id }));
+  (c?.[kind]?.models ?? []).map((m) => ({ value: m.id, label: m.note ? `${m.id} · ${m.note}` : m.id }));
 const effortPicks = (c: ModelCatalog | null, kind: Agent["kind"], model: string): Pick[] =>
   effortsFor(c, kind, model).map((e) => ({ value: e, label: e }));
 
@@ -719,8 +718,9 @@ export function AgentDialog(
    * nothing changes). */
   const setKind = (k: Agent["kind"]) => {
     if (k === d.kind) return;
-    const model = keepForKind(d.model, listedModels(d.provider, k, catalog, orModels));
-    set({ kind: k, model, effort: keepForKind(d.effort, effortsFor(catalog, k, model)) });
+    const provider = k === "antigravity" ? "subscription" : d.provider;
+    const model = keepForKind(d.model, listedModels(provider, k, catalog, orModels));
+    set({ kind: k, provider, model, effort: keepForKind(d.effort, effortsFor(catalog, k, model)) });
     setCustom({ model: false, effort: false });
   };
   /** Switching provider keeps the model only when the other list has it (an OpenRouter id means
@@ -750,6 +750,7 @@ export function AgentDialog(
   const taken = agents.value.filter((a) => a.id !== agent?.id).map((a) => a.name);
   const nErr = editing ? null : nameError(d.name, taken);
   const warn = unattendedWarning(d.kind, d.accepts);
+  const showEffort = catalog ? effortsFor(catalog, d.kind, d.model).length > 0 : d.kind !== "antigravity";
   const orBlocked = needsModel(d.provider, d.kind, d.model);
   const sleepMin = d.sleep ? parseSleepAfter(d.sleepAfter) : 0;
   const locationChanged = !!agent && JSON.stringify(d.working_location) !== JSON.stringify(agent.working_location ?? { mode: "home" });
@@ -991,7 +992,7 @@ export function AgentDialog(
                 }}
               />
               <div class="seg seg-kind" role="radiogroup" aria-label="Agent CLI">
-                {(["claude", "codex"] as const).map((k) => (
+                {(["claude", "codex", "antigravity"] as const).map((k) => (
                   <button
                     key={k}
                     type="button"
@@ -1000,7 +1001,7 @@ export function AgentDialog(
                     class={cx("seg-btn", d.kind === k && "on")}
                     onClick={() => setKind(k)}
                   >
-                    {k === "claude" ? <IconSpark size={13} /> : <IconCodex size={13} />} {KIND_LABEL[k]}
+                    <KindIcon kind={k} size={13} /> {KIND_LABEL[k]}
                   </button>
                 ))}
               </div>
@@ -1035,7 +1036,7 @@ export function AgentDialog(
                 onChange={setModel}
               />
             )}
-            <PickField
+            {showEffort && <PickField
               label="Effort"
               icon={<IconGauge size={13} />}
               value={d.effort}
@@ -1047,7 +1048,7 @@ export function AgentDialog(
                 set({ effort });
                 setCustom((c) => ({ ...c, effort: on }));
               }}
-            />
+            />}
             {d.kind === "claude" && (
               <ProfilePill
                 value={profileChoice}
@@ -1121,12 +1122,12 @@ export function AgentDialog(
             <CustomPick
               label="Custom model"
               value={d.model}
-              placeholder={d.kind === "claude" ? "a model id, e.g. claude-opus-5-5" : "a model id"}
+              placeholder={d.kind === "antigravity" ? "e.g. gemini-4-neon-high" : d.kind === "claude" ? "a model id, e.g. claude-opus-5-5" : "a model id"}
               focusTyped={focusModel}
               onChange={(v) => setModel(v, true)}
             />
           )}
-          {choiceOf(d.effort, effortPicks(catalog, d.kind, d.model).map((p) => p.value), custom.effort) === CUSTOM && (
+          {showEffort && choiceOf(d.effort, effortPicks(catalog, d.kind, d.model).map((p) => p.value), custom.effort) === CUSTOM && (
             <CustomPick
               label="Custom effort"
               value={d.effort}
@@ -1333,14 +1334,14 @@ export function AgentDialog(
                 <span class="field-label" id="agent-provider-label">Provider</span>
                 <div class="seg" role="radiogroup" aria-labelledby="agent-provider-label">
                   {(["subscription", "openrouter"] as const).map((p) => {
-                    const off = p === "openrouter" && !or.key_present && d.provider !== "openrouter";
+                    const off = p === "openrouter" && (d.kind === "antigravity" || (!or.key_present && d.provider !== "openrouter"));
                     return (
                       <button
                         key={p}
                         type="button"
                         role="radio"
                         aria-checked={d.provider === p}
-                        aria-describedby={off ? "agent-provider-hint" : undefined}
+                        aria-describedby={off && d.kind !== "antigravity" ? "agent-provider-hint" : undefined}
                         disabled={off}
                         data-provider={p}
                         class={cx("seg-btn", d.provider === p && "on")}
@@ -1353,7 +1354,7 @@ export function AgentDialog(
                 </div>
               </div>
             )}
-            {or && d.provider !== "openrouter" && !or.key_present && keyHint}
+            {or && d.kind !== "antigravity" && d.provider !== "openrouter" && !or.key_present && keyHint}
             <label class="toggle">
               <input
                 type="checkbox"

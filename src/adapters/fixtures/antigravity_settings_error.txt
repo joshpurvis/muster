@@ -1,0 +1,5 @@
+Settings Error
+Unable to read settings.json
+  1. Exit and fix manually
+  2. Continue with defaults this session
+  3. Overwrite the file with defaults

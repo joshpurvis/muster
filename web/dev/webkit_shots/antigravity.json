@@ -1,0 +1,26 @@
+[
+  {
+    "until": "globalThis.__muster?.windowId?.value != null && document.querySelectorAll('.launch-btn').length === 4",
+    "settle": 0.5
+  },
+  {
+    "js": "const input = document.querySelector('.empty-window input'); input.value = '/tmp'; input.dispatchEvent(new Event('input', {bubbles:true}));",
+    "settle": 0.3,
+    "shot": "launcher"
+  },
+  {
+    "js": "document.querySelectorAll('.launch-btn')[3].click();",
+    "until": "globalThis.__muster.focusedSession.value?.kind === 'antigravity' && document.querySelector('.tab[data-tab-sid]')",
+    "settle": 0.4
+  },
+  {
+    "js": "document.querySelector('.tab[data-tab-sid]').dispatchEvent(new MouseEvent('contextmenu', {bubbles:true, clientX:320, clientY:80}));",
+    "until": "document.querySelector('[role=menuitem]')"
+  },
+  {
+    "js": "[...document.querySelectorAll('[role=menuitem]')].find(b => b.textContent.includes('Permissions')).click();",
+    "until": "document.querySelector('[role=radiogroup][aria-label=\"Antigravity mode\"]')",
+    "settle": 0.4,
+    "shot": "permissions"
+  }
+]

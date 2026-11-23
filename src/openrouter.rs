@@ -250,7 +250,7 @@ pub fn apply_session_env(kind: SessionKind, key: &ApiKey, env: &mut BTreeMap<Str
             env.insert(ENV_KEY.into(), key.expose().into());
             vec![ENV_KEY.to_string()]
         }
-        SessionKind::Shell => anyhow::bail!("only Claude and Codex sessions can run on OpenRouter"),
+        SessionKind::Shell | SessionKind::Antigravity => anyhow::bail!("only Claude and Codex sessions can run on OpenRouter"),
     };
     env.insert(MARKER.into(), MARKER_VALUE.into());
     Ok(injected)

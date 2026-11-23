@@ -8,7 +8,7 @@ import { errorText, notify, ready, selected, sessions } from "./store.ts";
 import { Icon } from "./ui.tsx";
 import "./manage.css";
 
-const KINDS: SessionKind[] = ["claude", "codex", "shell"];
+const KINDS: SessionKind[] = ["claude", "codex", "shell", "antigravity"];
 const OTHER = -1;
 
 /** The topbar's "+" (manage only). */

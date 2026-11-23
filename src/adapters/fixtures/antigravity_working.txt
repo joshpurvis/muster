@@ -1,0 +1,4 @@
+  Read alpha.txt
+  Thinking... (12s)
+
+  esc to cancel

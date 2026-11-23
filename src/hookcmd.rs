@@ -11,6 +11,9 @@
 //! - Body: the hook's JSON payload: the argv payload if given (Codex `notify` appends it as the
 //!   last argument), else stdin (Claude and Codex hooks). Oversized strings are truncated so a
 //!   huge tool result doesn't bloat the event log.
+//! - Antigravity's title callback accepts only `state`. Its stdin includes account data.
+//!   Only validated state, approval status and conversation id may reach either transport.
+//!   The title command has no stdout.
 //! - Also sends `X-Muster-Agent: <agent>` (informational only).
 //!
 //! Host-managed runs use `$MUSTER_HOOK_DB`: append to the application-owned durable inbox
@@ -73,7 +76,18 @@ pub fn run(agent: &str, event: &str, payload_arg: Option<String>) -> i32 {
         Some(p) => p.into_bytes(),
         None => read_stdin(),
     };
-    let mut body = shrink_payload(&raw);
+    let Some(mut body) = callback_body(agent, event, &raw) else { return 0 };
+    let last = (agent == "antigravity").then(|| {
+        let id = std::env::var("MUSTER_SESSION_ID").ok()?.parse().ok()?;
+        Some(crate::paths::session_dir(id).join(crate::adapters::antigravity::LAST_STATE))
+    }).flatten();
+    if last.as_ref().is_some_and(|p| std::fs::read(p).ok().as_ref() == Some(&body)) {
+        return 0;
+    }
+    let remember = last.map(|path| {
+        let reduced = body.clone();
+        move || { let _ = crate::paths::write_private(&path, &reduced); }
+    });
     if agent == "claude" && event == "UserPromptSubmit" {
         body = quiet_messages(&url, &token, agent, body, &mut std::io::stdout());
     }
@@ -89,6 +103,8 @@ pub fn run(agent: &str, event: &str, payload_arg: Option<String>) -> i32 {
         if let Err(error) = saved {
             // No HTTP fallback: an uncertain durable write must not become a duplicate.
             eprintln!("muster hook: callback could not be saved: {error:#}");
+        } else if let Some(remember) = remember {
+            remember();
         }
         return 0;
     }
@@ -103,6 +119,9 @@ pub fn run(agent: &str, event: &str, payload_arg: Option<String>) -> i32 {
     let r = rx
         .recv_timeout(OVERALL)
         .unwrap_or_else(|_| Err("timed out".into()));
+    if matches!(r, Ok(200..=299)) && let Some(remember) = remember {
+        remember();
+    }
     if let Err(e) = r
         && std::env::var_os("MUSTER_HOOK_DEBUG").is_some()
     {
@@ -233,6 +252,35 @@ pub(crate) fn read_stdin() -> Vec<u8> {
         let _ = tx.send(buf);
     });
     rx.recv_timeout(STDIN_WAIT).unwrap_or_default()
+}
+
+fn callback_body(agent: &str, event: &str, raw: &[u8]) -> Option<Vec<u8>> {
+    if agent == "antigravity" {
+        return if event == "state" { antigravity_state(raw) } else { None };
+    }
+    Some(shrink_payload(raw))
+}
+
+/// Build a fresh object before logging, saving or forwarding anything. The raw payload
+/// includes the signed-in email, quota and workspace details, and may acquire more fields.
+fn antigravity_state(raw: &[u8]) -> Option<Vec<u8>> {
+    use serde_json::{Map, Value};
+    let input: Map<String, Value> = serde_json::from_slice(raw).ok()?;
+    let mut state = Map::new();
+    if let Some(s) = input.get("agent_state").and_then(Value::as_str)
+        && !s.is_empty() && s.len() <= 32 && s.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
+    {
+        state.insert("agent_state".into(), s.into());
+    }
+    if let Some(pending) = input.get("tool_confirmation_pending").and_then(Value::as_bool) {
+        state.insert("tool_confirmation_pending".into(), pending.into());
+    }
+    if let Some(id) = input.get("conversation_id").or_else(|| input.get("session_id")).and_then(Value::as_str)
+        && crate::agents::valid_resume_id(id)
+    {
+        state.insert("session_id".into(), id.into());
+    }
+    serde_json::to_vec(&state).ok()
 }
 
 /// Parse as JSON and truncate long strings; non-JSON input is sent as a JSON string.
@@ -385,6 +433,36 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
     use std::net::TcpListener;
+
+    #[test]
+    fn antigravity_state_only_forwards_allowed_fields() {
+        use serde_json::{Value, json};
+        let raw = json!({
+            "email": "someone@example.invalid", "plan_tier": "sample", "quota": 42,
+            "cwd": "/demo-app", "unknown": {"account": "someone@example.invalid"},
+            "agent_state": "tool_use", "tool_confirmation_pending": false,
+            "conversation_id": "conv-demo-1", "session_id": "older"
+        });
+        let bytes = callback_body("antigravity", "state", &serde_json::to_vec(&raw).unwrap()).unwrap();
+        let wire = std::str::from_utf8(&bytes).unwrap();
+        assert!(!wire.contains("email") && !wire.contains("example.invalid"));
+        assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), json!({
+            "agent_state":"tool_use", "tool_confirmation_pending":false, "session_id":"conv-demo-1"
+        }));
+    }
+
+    #[test]
+    fn antigravity_state_rejects_invalid_values_and_other_events() {
+        for raw in [br#"{"agent_state":"bad@state","conversation_id":"--evil","tool_confirmation_pending":1}"#.as_slice(),
+                    br#"{"agent_state":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#] {
+            assert_eq!(callback_body("antigravity", "state", raw).unwrap(), b"{}");
+        }
+        assert_eq!(callback_body("antigravity", "state", b"[]"), None);
+        assert_eq!(callback_body("antigravity", "state", b"invalid"), None);
+        assert_eq!(callback_body("antigravity", "other", b"{}"), None);
+        assert_eq!(callback_body("antigravity", "state", br#"{"session_id":"conv-demo-2"}"#).unwrap(),
+                   br#"{"session_id":"conv-demo-2"}"#);
+    }
 
     #[test]
     fn url_parsing() {

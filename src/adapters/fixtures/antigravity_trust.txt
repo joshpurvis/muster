@@ -1,0 +1,6 @@
+Accessing workspace:
+/home/user/demo-app
+Do you trust the contents of this project?
+Antigravity CLI requires permission to read, edit, and execute files here.
+> 1. Yes, I trust this folder
+  2. No, exit

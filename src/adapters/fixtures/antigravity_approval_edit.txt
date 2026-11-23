@@ -1,0 +1,3 @@
+Accept this file edit?
+> 1. Yes, accept this change
+  2. No, reject this change

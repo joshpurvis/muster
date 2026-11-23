@@ -95,9 +95,31 @@ try {
     check(await a.eval(`!!document.querySelector('.empty-controls .jump-btn')`), "Jump in the empty window");
     check(await a.eval(`!document.querySelector('.win-split')`), "no split buttons without tabs");
     await shot(a, "01-empty-window");
-    await a.eval(`(() => { const i = document.querySelector('.empty-window input');
+    const setFolder = () => a.eval(`(() => { const i = document.querySelector('.empty-window input');
       const set = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
       set.call(i, ${JSON.stringify(repo)}); i.dispatchEvent(new Event('input', { bubbles: true })); })()`);
+    await setFolder();
+    if (!real) {
+      check(await a.eval(`document.querySelectorAll('.empty-window .launch-btn').length`) === 4, "four launcher choices");
+      await a.eval(`document.querySelector('.welcome.empty').focus()`);
+      await a.key("4");
+      await a.wait(`${M}.windowSessions.value.some(s => s.kind === "antigravity")`, 8000);
+      const demo = await a.eval(`${M}.windowSessions.value.find(s => s.kind === "antigravity").channel_id`);
+      await a.click(".tab[data-tab-sid]", { button: "right" });
+      await a.eval(`[...document.querySelectorAll('[role=menuitem]')].find(b => b.textContent.includes('Permissions')).click()`);
+      const mode = '[role=radiogroup][aria-label="Antigravity mode"]';
+      await a.wait(`document.querySelector('${mode} [aria-checked=true]')?.textContent.trim() === 'Auto'`);
+      await a.click(`${mode} .seg-danger`);
+      await a.wait(`document.querySelector('.perm-dlg .perm-warn')?.textContent.includes('Antigravity')`);
+      await a.click(".perm-dlg [type=submit]");
+      await a.wait(`!document.querySelector('.perm-dlg')`);
+      const channel = (await R(a, "hello", {})).channels.find((ch: any) => ch.id === demo);
+      check(channel.permissions.antigravity_mode === "full_access", "Antigravity permission row saves");
+      await R(a, "channel.archive", { id: demo, remove_worktree: false });
+      await a.wait(`!!document.querySelector('.empty-window')`);
+      await setFolder();
+      ok("launcher key 4 starts the mock Antigravity tab");
+    }
     await a.click(".empty-window .launch-btn:nth-child(3)");
     await a.wait(`${M}.windowSessions.value.length === 1 && !!document.querySelector('.pane .xterm')`, 8000);
     ok("empty window: folder + Shell opened the first tab");

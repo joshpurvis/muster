@@ -914,7 +914,7 @@ export function spawnHere(kind: SessionKind) {
   if (c) spawn(c.id, kind, { type: "tab" });
 }
 
-/** Alt+N: pick a kind for a new terminal in the focused tab's task (1/2/3, Enter repeats last). */
+/** Alt+N: pick a kind for a new terminal in the focused tab's task (1–4, Enter repeats last). */
 export async function spawnPicker() {
   const c = focusedTask.value;
   const l = layout.value;
@@ -936,7 +936,7 @@ export async function spawnPicker() {
       ...spawnMenuItems((k) => spawn(c.id, k, { type: "tab", group })),
     ],
     minWidth: 200,
-    select: 1 + ["claude", "codex", "shell"].indexOf(lastKind()),
+    select: 1 + ["claude", "codex", "shell", "antigravity"].indexOf(lastKind()),
     onClose: () => focusActiveTerminalSoon(),
   });
 }

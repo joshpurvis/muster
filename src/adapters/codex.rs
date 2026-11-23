@@ -631,6 +631,7 @@ mod tests {
             permissions: Permissions {
                 codex_sandbox: sandbox,
                 claude_mode: ClaudeMode::Bypass,
+                ..Permissions::default()
             },
             resume: None,
         }

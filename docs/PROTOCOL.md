@@ -133,7 +133,7 @@ All ids are numbers. Types (`Workspace`, `Channel`, `SessionInfo`, `Event`) are 
 | `channel.rename` | `{id, name}` | `Channel` (sets `auto_named: false`; renames a muster-owned worktree branch without upstream to `muster/<slug>`) |
 | `channel.archive` | `{id, remove_worktree: bool}` | `{}` (kills sessions; emits `channel_removed`). With `remove_worktree`, refused (error, nothing closed) while a running or starting session in another channel has its cwd inside this worktree (it was moved out, see `session.move`); if one moves out while the close runs, the worktree is kept and a notice says why. From that re-check until the delete finishes, the directory is reserved: starting or restarting a session whose cwd is inside it fails. |
 | `channel.close_if_empty` | `{id}` | `{closed: bool}`. Archives the channel (keeping any worktree) only if it has no sessions, checked and marked in one step, so a session spawned or moved into it meanwhile is never closed with it. |
-| `channel.set_permissions` | `{id, permissions: {codex_sandbox, claude_mode}}` (both required) | `Channel` (emits `channel_upserted`). Human only: the MCP server has no way to call it. Applies to sessions started or restarted afterwards; running sessions keep the permissions they started with. |
+| `channel.set_permissions` | `{id, permissions: {codex_sandbox, claude_mode, antigravity_mode?}}` (first two required) | `Channel` (emits `channel_upserted`). Human only: the MCP server has no way to call it. Applies to sessions started or restarted afterwards; running sessions keep the permissions they started with. |
 | `channel.set_layout` | `{id, layout}` | `{}` (opaque JSON; no event echo to avoid fights) |
 | `channel.mark_read` | `{id, at?}` | `{}` (`last_read_at` = max(current, `at` or now); `at` is capped at now) |
 | `channel.reorder` | `{ids: []}` | `{}` |
@@ -172,10 +172,10 @@ All ids are numbers. Types (`Workspace`, `Channel`, `SessionInfo`, `Event`) are 
 | `window.raise` | `{id}` | `{raised: bool}`. Asks the window manager to focus the OS window titled `muster · <name>`: `hyprctl dispatch focuswindow title:^(...)$` when `HYPRLAND_INSTANCE_SIGNATURE` is set, `swaymsg '[title="^...$"] focus'` when `SWAYSOCK` is set, else `wmctrl -F -a <title>` or `xdotool search --name ^...$ windowactivate` on X11 (`DISPLAY`). `false` when no helper worked or no connection holds the window; clients then pull the tab instead. |
 | `session.wait` | `{id, until?: string[], timeout_ms? = 600000, after_ms?}` | `{session: SessionInfo, matched: bool, timed_out: bool}`. Returns as soon as the state is in `until` (default `["idle","needs_approval","asking_question","error","stuck","exited"]`). `until` may also contain `needs_human` (any `needs_human()` state) and `done` (= `idle`); unknown names are an error. Returns immediately when already matching. If the session exits while waiting for other states: `matched: false, timed_out: false`. Max timeout 1 h. `after_ms` (unix ms, e.g. taken just before a `session.send`) applies MCP `wait_for_state`'s staleness rules (docs/MCP.md): a state entered before it doesn't count, and an `idle` from before it only counts once no state change showed up for 15 s. |
 | `session.input` | `{id, data, keys? = false, from_session?}` | `{}` raw bytes (UTF-8 string, escapes already applied) written to the PTY, like a keyboard `0x02` frame. Without `from_session` (and from a shell with no provenance) it counts as the human's input for provenance; from an agent session (`muster keys` passes `$MUSTER_SESSION_ID`) it doesn't, and is refused for a Claude target while that agent is on a non-human chain. With `keys: true`, unmodified cursor keys (`CSI A`–`D`, `CSI H`, `CSI F`) are sent as `SS3` while the terminal is in application cursor mode, as a keyboard would. Refused while the session's input is interrupted (see `0x02`). |
-| `agent.create` | `{name, kind? = "claude", provider? = "subscription", model?, effort?, persona?, accepts?: ("human"\|"schedule"\|"webhook")[], permissions?: Permissions, autostart? = false, sleep_after_min?}` | `Agent` (below). Names: 1-40 letters, digits, `-`, `_`, unique case-insensitively. Creates `<data>/agents/<lowercase name>/` (0700) with `memory/` and `CLAUDE.md` / `AGENTS.md` from the persona; a symbolic link at any of those paths is refused and the persona file is opened with `O_NOFOLLOW`. `model`/`effort` must be one plain word (no leading `-`) and go through the agent-argument allowlist. Default `accepts`: `["human"]` for claude, all three for codex. `permissions` (both fields): the profile its tab gets (default: the defaults). `provider: "openrouter"` runs it on OpenRouter (see "OpenRouter"): refused while the backend has no key, and for Codex without a `model`. Emits `agent_upserted`. |
+| `agent.create` | `{name, kind? = "claude", provider? = "subscription", model?, effort?, persona?, accepts?: ("human"\|"schedule"\|"webhook")[], permissions?: Permissions, autostart? = false, sleep_after_min?}` | `Agent` (below). Names: 1-40 letters, digits, `-`, `_`, unique case-insensitively. Creates `<data>/agents/<lowercase name>/` (0700) with `memory/` and `CLAUDE.md` / `AGENTS.md` from the persona; a symbolic link at any of those paths is refused and the persona file is opened with `O_NOFOLLOW`. `model`/`effort` must be one plain word (no leading `-`) and go through the agent-argument allowlist. Default `accepts`: `["human"]` for claude and antigravity, all three for codex. `permissions` (see Channel permissions): the profile its tab gets (default: the defaults). `provider: "openrouter"` runs it on OpenRouter (see "OpenRouter"): available for Claude and Codex with a backend key, and Codex requires a `model`. Emits `agent_upserted`. |
 | `agent.update` | `{name, provider?, model?, effort?, persona?, accepts?, autostart?, permissions?, sleep_after_min?, account_profile?, now?, save_notes?, handoff_reason?, self_handoff?, tools_up_front?, lead?, from_session?}` | `Agent`, plus `switch` after a move to another account (see "Moving a named agent to another account" under Claude profiles). `sleep_after_min`: sleep after this many idle minutes, 5 to 10080; `0` turns sleeping off (see "Sleep and wake"). `self_handoff`: let a Claude agent start itself fresh from a handoff file (see "Self handoff"); `true` only from the human: a click in Muster's window, or `/api/rpc` with the client token, no `from_session` (`muster agent edit --self-handoff` passes `$MUSTER_SESSION_ID`), on a connection whose program descends from no session's process and runs in no session's own control group (`rpc::owner_terminal`; the check `schedule.approve` makes of a window, which now also looks at control groups); refused for Codex agents. `false` works from anywhere. `tools_up_front`: a Claude agent's sessions get Muster's seven message tools in the prompt from the start instead of through Claude Code's tool search (docs/MCP.md "Message tools up front"); from its next start. `true` only from the human, as for `self_handoff` (`muster agent edit --tools-up-front` passes `$MUSTER_SESSION_ID`), and refused for Codex agents; `false` works from anywhere. `lead`: make a Claude agent a lead agent, whose messages and spawns in a turn a reminder or schedule started go as origin `lead`, taken like the human's (docs/MCP.md "Lead agents"); at once. `true` only from the human, as for `self_handoff` (`muster agent edit --lead` passes `$MUSTER_SESSION_ID`), and refused for Codex agents; `false` works from anywhere. The persona file is rewritten when it or `lead` changes. Absent fields stay; an empty `model`/`effort` clears it; unknown fields (`kind`, `name`) are refused. A new persona rewrites the persona file (memory/ untouched); a new profile is also set on the agent's tab. Provider, model, effort and permissions apply from its next start. Switching to `openrouter` needs the key (editing an agent already there doesn't); a Codex agent there keeps needing a model. From outside Muster's window, widening its unattended work is refused ("Held" under Schedules). Emits `agent_upserted`. |
 | `agent.templates` | `{}` | `Template[]` (below): Blank, Orchestrator, Researcher, Reviewer, PR reviewer, Background worker, for the New agent dialog. |
-| `agent.models` | `{}` | `{claude: KindModels, codex: KindModels}` (below): the models and effort levels the agent dialog offers per CLI. A curated list in `src/agents.rs` (`model_catalog`), not read from the CLIs; any other one-word value is still accepted by `agent.create` / `agent.update`. |
+| `agent.models` | `{}` | `{claude: KindModels, codex: KindModels, antigravity: KindModels}` (below): the models and effort levels the agent dialog offers per CLI. A curated list in `src/agents.rs` (`model_catalog`), not read from the CLIs; any other one-word value is still accepted by `agent.create` / `agent.update`. |
 | `openrouter.models` | `{}` | `{key_present, models: OpenRouterModel[], fetched_at, stale, error}`: OpenRouter's models a coding agent can use, for the agent dialog (see "OpenRouter"). No device scope. |
 | `agent.messages` | `{agent?, before?, limit? = 50 (max 200)}` | `{messages: AgentMessage[], more: bool}`, newest first: messages to `agent` (else every agent) with id below `before`. |
 | `agent.memory.list` | `{name}` | `{dir, files: [{path, size, modified}]}`: files under the agent's `memory/` (at most 500; links skipped), `/`-separated relative paths. |
@@ -185,14 +185,14 @@ All ids are numbers. Types (`Workspace`, `Channel`, `SessionInfo`, `Event`) are 
 | `agent.memory.delete` | `{name, path}` | `{path}`. Removes one regular file under `memory/` (same path rules and walk as a read); a folder or a link is refused. |
 | `agent.list` | `{}` | `Agent[]`; an agent with prompts waiting also has `queued` (how many) and `queue_waits` (why, as `session.queue`'s `waiting`). |
 | `agent.remove` | `{name}` | `{removed: Agent}`. Removes its session too; the home dir stays. Emits `agent_removed`. |
-| `agent.start` | `{name, fresh? = false, window_id?}` | `{agent: Agent, session: SessionInfo, started, woke, new_conversation, provider_pending, queued_prompts}` (`woke`: the agent was asleep and this start woke it; `new_conversation`: this start launched a new conversation (`fresh`, a pending account move, or no saved conversation to resume), so no old one is re-read; `queued_prompts`: prompts waiting to be typed into it now; `provider_pending`: the running process keeps the provider it started with, not the agent's saved one; see "OpenRouter"). The live session, else its exited one restarted with fresh agent args (`--resume <id>` for Claude), else a new session (cwd = home dir) in the agent's own channel (created once, named after the agent, in the "agents" workspace `<data>/agents`, and stored as the agent's `channel_id`; never an existing channel found by name). `fresh` forgets the conversation id and restarts the process (also a live one) without `--resume`; the human's prompts that waited to be typed into a live one (messages, question answers) are kept and typed into the new conversation once it is ready, after its own first prompt, also across a failed launch or a backend restart (a prompt being typed at that moment isn't resent; panel events go back to their panels; messages from other agents or schedules go back to their senders as refused, since the restart may change the agent's permissions, and one sent while the old run is stopping is refused: "the agent is being started fresh; send it again once it runs"). A run started later without them (a retried start after a failed launch) takes them on its first queue check. `window_id` (must exist): where a new tab goes (an agent's sidebar row passes its window). A hidden agent tab stays hidden (also when it is restarted): the client shows it with `session.set_window`. Starts are serialized. Emits `agent_upserted`. |
+| `agent.start` | `{name, fresh? = false, window_id?}` | `{agent: Agent, session: SessionInfo, started, woke, new_conversation, provider_pending, queued_prompts}` (`woke`: the agent was asleep and this start woke it; `new_conversation`: this start launched a new conversation (`fresh`, a pending account move, or no saved conversation to resume), so no old one is re-read; `queued_prompts`: prompts waiting to be typed into it now; `provider_pending`: the running process keeps the provider it started with, not the agent's saved one; see "OpenRouter"). The live session, else its exited one restarted with fresh agent args (`--resume <id>` for Claude, `--conversation <id>` for Antigravity), else a new session (cwd = home dir) in the agent's own channel (created once, named after the agent, in the "agents" workspace `<data>/agents`, and stored as the agent's `channel_id`; never an existing channel found by name). `fresh` forgets the conversation id and restarts the process (also a live one) without `--resume`; the human's prompts that waited to be typed into a live one (messages, question answers) are kept and typed into the new conversation once it is ready, after its own first prompt, also across a failed launch or a backend restart (a prompt being typed at that moment isn't resent; panel events go back to their panels; messages from other agents or schedules go back to their senders as refused, since the restart may change the agent's permissions, and one sent while the old run is stopping is refused: "the agent is being started fresh; send it again once it runs"). A run started later without them (a retried start after a failed launch) takes them on its first queue check. `window_id` (must exist): where a new tab goes (an agent's sidebar row passes its window). A hidden agent tab stays hidden (also when it is restarted): the client shows it with `session.set_window`. Starts are serialized. Emits `agent_upserted`. |
 | `agent.sleep` | `{name}` | `Agent`. Puts an idle agent to sleep now (see "Sleep and wake"): refused, with the reason, while it isn't running, is working, waiting for approval or a question, in a turn, has prompts waiting (the refusal says why they wait, as `session.queue`'s `waiting`) or a message on its way, has text in its input box, or before its conversation id is known. Already asleep: returns it unchanged. Client token only. Emits `agent_upserted`. |
 | `agent.ask` | `{agent, text, timeout_ms? = 600000 (1000..1800000), from_session?}` | The MCP `ask_agent` result (docs/MCP.md). `from_session` (`muster ask` passes `$MUSTER_SESSION_ID`): an agent session's ask runs MCP `ask_agent` as that session (its provenance, permission check, rate limit, audit); a shell session's carries that shell's provenance; without it the caller is the human (`human`, hop 0). No parameter sets the origin: schedule runs go through the same daemon-internal path with origin `schedule` (see "Schedules"). Refused (error) by the origin rule, hop limit or daily cap; a refused message is recorded with the reason (`agent_message`). |
 | `session.output` | `{id, lines? = 200}` | `{lines: string[]}` the last `lines` lines of scrollback plus screen as plain text (ANSI stripped), oldest first, without trailing blank lines. Max 10000. Exited sessions are read from output.log. |
 
 ```ts
 type Origin = "human" | "lead" /* scheduled work a lead agent passed on (docs/MCP.md "Lead agents"); never in accepts_origins */ | "schedule" | "webhook" | `addon:${string}`;
-type Agent = { id: number; name: string; kind: "claude" | "codex"; provider: "subscription" | "openrouter";
+type Agent = { id: number; name: string; kind: "claude" | "codex" | "antigravity"; provider: "subscription" | "openrouter";
              model: string | null; effort: string | null;
              persona: string; permissions: Permissions /* its tab's, when muster creates it */;
              accepts_origins: Origin[]; autostart: boolean; home_dir: string; session_id: number | null;
@@ -227,7 +227,7 @@ type QuietState = { state: "waiting" | "shown" | "expired" | "dropped";
              reason?: string /* "dropped" only: why it was never shown, e.g. the session ended before its next turn */;
              msg?: number /* the carrying agent message (a named agent asked) */; to?: string /* that agent's name */;
              session?: number /* the session it waits for (a plain session asked; no agent message) */ };
-type Template = { id: string; label: string; about: string; name: string; kind: "claude" | "codex";
+type Template = { id: string; label: string; about: string; name: string; kind: "claude" | "codex" | "antigravity";
              model: string | null; effort: string | null; persona: string; permissions: Permissions;
              accepts: Origin[]; autostart: boolean };
 type KindModels = { models: { id: string /* passed to --model / -m */; note: string | null;
@@ -473,7 +473,7 @@ every later change with its text from `note_upserted`. `version` orders records 
 | `note.set_triggers` | `{id, on, from_session?}` | `Note`. "Allow triggers" (see "Schedules", Phase 2): the only way `triggers` changes. Refused from an agent's session or a shell an agent drives; no MCP tool. `on: true` only from a click in Muster's window (see "Schedules", Phase 3, "Held"); `off` from anywhere. |
 
 `from_session` (the CLI passes `$MUSTER_SESSION_ID`) says who wrote: a shell tab, or no
-`from_session`, is the human. An agent's session (Claude or Codex) makes `updated_by` that agent
+`from_session`, is the human. An agent's session (Claude, Codex or Antigravity) makes `updated_by` that agent
 (a named agent's name, else `Claude (task name)` / `Codex (task name)`), and its `note.create`,
 `note.write` and `note.append` run as its MCP `note_write` / `note_append`: the same rate limit
 (shared with posts and panel updates) and the same audit event. Text is plain: CRLF and CR become
@@ -993,10 +993,10 @@ lowest-id window, else a new window `1`.
 
 **Auto naming.** A channel created without a name gets `auto_named: true` and `name` = the folder's
 base name. While `auto_named`, the daemon re-derives `name` (emitting `channel_upserted` only on
-change), in priority order: (1) the latest OSC title of an agent (claude/codex) session in the
+change), in priority order: (1) the latest OSC title of an agent session in the
 channel, cleaned: leading non-alphanumeric glyphs (spinners like `✳ ⠂ ⠐ ·`) and surrounding
 whitespace stripped, ignored when empty, when it equals (case-insensitively) `claude`,
-`claude code`, `codex`, `codex cli`, or the kind name (for shells also a shell's name: `sh`,
+`claude code`, `codex`, `codex cli`, `agy`, `antigravity cli`, or the kind name (for shells also a shell's name: `sh`,
 `bash`, `zsh`, `fish`, `dash`, `ksh`, `nu`, `tcsh`), when it looks like a path (starts with
 `/` or `~`) or a `user@host` prompt; (2) the first prompt sent to the channel (`channel.create`
 `prompt` or `session.send`/MCP `send_message` to one of its sessions): its first line, first 6
@@ -1204,9 +1204,41 @@ channel by channel id, `questionsAt` where it was last put, for channels without
 - `muster ls` shows each session's own `window_id`; `muster move <target> --window N` calls
   `session.set_window`.
 
+## Antigravity
+
+Session kinds are `claude`, `codex`, `shell` and `antigravity`. In the tab's folder, Muster launches
+
+```text
+agy --settings=<session>/antigravity-settings.json --add-dir=<session>/antigravity-workspace <mode> [extra args] [--prompt-interactive=<prompt>]
+```
+
+The extra arguments allowed are `--model`, `--effort`, `--continue` (also `-c`) and
+`--conversation`. A resumed launch receives its initial prompt once idle. The environment
+includes `AGY_CLI_DISABLE_AUTO_UPDATE=true`, `AGY_CLI_HIDE_ACCOUNT_INFO=true` and
+`AGY_CLI_OSC7501=off`. Antigravity uses its own login. Its catalog suggests eight Gemini
+model IDs with the effort built into the ID. A custom model or explicit effort is also accepted.
+
+The private settings file supplies a title command, `muster hook antigravity state`.
+The helper forwards only a validated `agent_state`, boolean `tool_confirmation_pending`
+and a valid conversation ID as `session_id`. It drops account and usage fields before
+the durable inbox or HTTP transport. The `state` event updates the tab and supplies
+the ID for `--conversation` on restart. Set `MUSTER_ANTIGRAVITY_SETTINGS=0` on the
+daemon for screen detection alone. A trust or settings dialog needs an answer in the terminal.
+
+Muster supplies its bearer-authenticated MCP server through a private
+`antigravity-workspace/.agents/mcp_config.json` in the session directory. Set
+`MUSTER_ANTIGRAVITY_MCP=0` on the daemon to omit that folder. A named agent working in a
+project also gets its home as an added directory for `AGENTS.md` and `memory/`.
+
+The flags and screen markers come from agy 1.5.13 help and strings. The title callback,
+account display setting, MCP discovery in an added folder, model availability, project persona
+discovery and approval keystrokes still need a signed-in check. Older backends interpret
+an Antigravity session as a shell and an Antigravity agent as Codex. Avoid downgrading while
+these records exist.
+
 ## Channel permissions
 
-Every `Channel` has `permissions: {codex_sandbox, claude_mode}`, a profile the human picks per
+Every `Channel` has `permissions: {codex_sandbox, claude_mode, antigravity_mode}`, a profile the human picks per
 channel. The daemon maps it to CLI flags whenever a session's process starts (spawn and
 restart), for every agent in the channel, including agents spawned through MCP:
 
@@ -1224,6 +1256,13 @@ restart), for every agent in the channel, including agents spawned through MCP:
 | `plan` | `--permission-mode plan` |
 | `bypass` | `--permission-mode bypassPermissions` |
 
+| `antigravity_mode` | Antigravity flag |
+|---|---|
+| `plan` | `--mode=plan` |
+| `accept_edits` | `--mode=accept-edits` |
+| `auto` (default) | `--mode=auto` |
+| `full_access` | `--dangerously-skip-permissions` |
+
 Codex's flags are always passed, so its channel profile (not a `sandbox_mode` or
 `network_access` in the user's own config) decides how a Codex session starts. Claude's
 `default` profile passes no mode flag, so the user's own `permissions.defaultMode` applies
@@ -1239,7 +1278,7 @@ approval dialog is on its screen, never from that hook. See the
 [Codex CLI reference](https://learn.chatgpt.com/docs/developer-commands?surface=cli) and
 [sandbox configuration](https://learn.chatgpt.com/docs/sandboxing).
 The user's `extra_args` for a session (`session.spawn`, `channel.create` for its first agent,
-MCP `spawn_session` `model`/`effort`/`args`) come after these flags, and since both CLIs let a
+MCP `spawn_session` `model`/`effort`/`args`) come after these flags, and since a CLI can let a
 later flag win they are checked against an **allowlist** (also again on every restart):
 Claude `--model`, `--effort`, `--fallback-model`, `--append-system-prompt`, `-c/--continue`,
 `-r/--resume [id]`, `--verbose`, `-d/--debug [filter]`; Codex `-m/--model`, `-c/--config`
@@ -1257,8 +1296,8 @@ Claude sessions also get `permissions.allow: ["mcp__muster"]` in their per-sessi
 file, so calls to muster's own MCP tools skip Claude Code's `auto`-mode safety classifier
 (about 1.5-4 s per call otherwise). Muster's own guardrails still apply to those tools.
 Channels created before this existed have the defaults (store migration v3). `permissions` in
-`channel.create` and `channel.set_permissions` must name both fields (a partial profile is
-rejected, so it can't silently reset the other half).
+`channel.create` and `channel.set_permissions` must name `codex_sandbox` and `claude_mode`. Older clients may omit
+`antigravity_mode`. Creation and old stored profiles default to `auto`. An update keeps the current value.
 
 Limits: the profile bounds what muster starts agents with; it is not a boundary against the
 agents themselves. Codex's workspace-write sandbox can still read the whole disk, including

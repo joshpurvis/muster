@@ -1,0 +1,6 @@
+  touch beta.txt
+
+Run this command?
+> 1. Yes, run command
+  2. Yes, and always allow for commands that start with touch
+  3. No, deny

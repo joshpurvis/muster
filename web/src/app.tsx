@@ -214,9 +214,9 @@ rpc.start();
 
 // ---------- components ----------
 
-const KINDS: SessionKind[] = ["claude", "codex", "shell"];
+const KINDS: SessionKind[] = ["claude", "codex", "shell", "antigravity"];
 
-/** A window with no tabs: pick a folder and what to run (keys 1 2 3). The first tab starts a
+/** A window with no tabs: pick a folder and what to run (keys 1–4). The first tab starts a
  * group. */
 function EmptyWindow() {
   const home = meta.value.home;
@@ -246,7 +246,7 @@ function EmptyWindow() {
       onKeyDown={(e) => {
         if (e.altKey || e.ctrlKey || e.metaKey) return;
         if ((e.target as HTMLElement).closest("input")) return;
-        const i = ["1", "2", "3"].indexOf(e.key);
+        const i = ["1", "2", "3", "4"].indexOf(e.key);
         if (i >= 0) {
           e.preventDefault();
           pick(KINDS[i]);

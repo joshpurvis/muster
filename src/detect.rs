@@ -208,6 +208,15 @@ fn evaluate_inner(
 
     let adapter = adapter_for(info.kind);
     let detected = adapter.detect_from_screen(screen, current);
+    // A lost end-of-turn callback must not strand the queue. A Working-looking panel
+    // has no corresponding override for an idle callback.
+    if callback.is_some_and(|u| u.state == Working)
+        && detected.as_ref().is_some_and(|u| u.state == Idle)
+        && adapter.composer_text(screen).is_some()
+        && now - t.changed_at >= 5000
+    {
+        return Some((StateUpdate::new(Idle), StateSource::Timer));
+    }
     let detected = match callback {
         Some(base) => Some(detected.filter(|u| crate::adapters::antigravity::is_screen_dialog(u.state, u.detail.as_deref()))
             .unwrap_or_else(|| base.clone())),
@@ -255,6 +264,19 @@ fn evaluate_inner(
 mod tests {
     use super::*;
     use crate::adapters::tui::testutil::snap;
+
+    #[test]
+    fn antigravity_stable_composer_recovers_a_dropped_idle_callback() {
+        let info = info(SessionKind::Antigravity, AgentState::Working, 0);
+        let working = StateUpdate::new(AgentState::Working);
+        let mut screen = snap(include_str!("adapters/fixtures/antigravity_idle_auto.txt"));
+        let mut t = Track::default();
+        for now in [1000, 5999] {
+            screen.last_output_at = now; // Repainting the same composer does not restart the timer.
+            assert!(evaluate_inner(&info, &screen, Some(&working), &mut t, now).is_none());
+        }
+        assert_eq!(evaluate_inner(&info, &screen, Some(&working), &mut t, 6000).unwrap().0.state, AgentState::Idle);
+    }
 
     #[test]
     fn antigravity_new_request_replaces_same_state_detail() {

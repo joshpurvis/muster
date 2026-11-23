@@ -1015,6 +1015,9 @@ struct Attributions {
     /// Last callback underneath a visible Antigravity dialog, committed with the inbox cursor.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     antigravity_states: HashMap<SessionId, (u64, StateUpdate)>,
+    /// A session drain can apply its status ahead of unrelated rows in the shared inbox.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    antigravity_cursors: HashMap<SessionId, crate::store::HookCursor>,
     /// When the human last had a prompt of their own taken in by each named agent (agent id ->
     /// Unix ms), whichever tab it ran in: typed at its input box, or sent from a terminal or the
     /// window as the human's (`on_delivered` with `Source::Human`). Messages from agents,
@@ -1596,6 +1599,7 @@ impl Registry {
             state.delivered.retain(|_, (session, _)| *session != id);
             state.quiet_pending.remove(&id);
             state.antigravity_states.remove(&id);
+            state.antigravity_cursors.remove(&id);
         }) {
             tracing::warn!(session = id, "forgetting attribution: {error:#}");
         }
@@ -1627,6 +1631,16 @@ impl Registry {
             }
         }
         let mut next = g.runtime.clone();
+        // Never advance the shared cursor past other sessions' callbacks. Both the ordered
+        // worker and the targeted reader use this watermark, committed with the resume id.
+        let cursor = if info.kind == SessionKind::Antigravity && let Some(c) = cursor {
+            if next.antigravity_cursors.get(&info.id).is_some_and(|saved|
+                saved.instance == c.instance && saved.sequence >= c.sequence) {
+                return Ok(HookEffects { duplicate: true, ..Default::default() });
+            }
+            next.antigravity_cursors.insert(info.id, c.clone());
+            None
+        } else { cursor };
         let mut stamp = g.human_stamps.get(&info.id).copied();
         let named = g.agents.values().find(|a| a.session_id == Some(info.id)).map(|a| a.id);
         // The run the hook came from (quiet messages are offered to, and confirmed by, one run).

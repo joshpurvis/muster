@@ -232,24 +232,33 @@ function EmptyLauncher({ pick, children }: { pick?: (kind: SessionKind) => void;
   }}>{children}</div>;
 }
 
+function useLauncherPick(start: (kind: SessionKind) => Promise<unknown>) {
+  const pending = useRef(false);
+  return async (kind: SessionKind) => {
+    if (pending.current) return;
+    pending.current = true;
+    try {
+      await start(kind);
+    } finally {
+      pending.current = false;
+    }
+  };
+}
+
 /** A window with no tabs: pick a folder and what to run (keys 1–4). The first tab starts a
  * group. */
 function EmptyWindow() {
   const home = meta.value.home;
   const [folder, setFolder] = useState(() => tildify(A.defaultFolder(), home));
-  const [busy, setBusy] = useState(false);
   const first = !workspaces.value.length;
-  const pick = async (k: SessionKind) => {
-    if (busy || !folder.trim()) return;
-    setBusy(true);
+  const pick = useLauncherPick(async (k) => {
+    if (!folder.trim()) return;
     try {
       await A.createTab({ path: folder.trim(), agent: k, worktree: false });
     } catch (e) {
       toast("error", `Couldn't open a tab: ${e instanceof Error ? e.message : e}`);
-    } finally {
-      setBusy(false);
     }
-  };
+  });
   return (
     <EmptyLauncher pick={pick}>
       <div class="empty-controls">
@@ -286,13 +295,13 @@ function EmptyWindow() {
 
 function EmptyChannel() {
   const c = activeChannel.value;
-  const pick = c ? (kind: SessionKind) => A.spawn(c.id, kind) : undefined;
-  return <EmptyLauncher pick={pick}>
+  const pick = useLauncherPick(async (kind) => { if (c) await A.spawn(c.id, kind); });
+  return <EmptyLauncher pick={c ? pick : undefined}>
     <div class="empty-controls"><WindowControls empty /></div>
     <div class="welcome-card empty-channel">
       <h1>{c?.name ?? "Notes"}</h1>
       <p>{c ? "Open a terminal or note to start working in this channel." : "Open a note or create a channel for your project."}</p>
-      {c && pick && <>
+      {c && <>
         <div class="empty-channel-path">{tildify(c.cwd, meta.value.home)}</div>
         <LaunchButtons pick={pick} last={prefs.value.lastAgent} />
       </>}

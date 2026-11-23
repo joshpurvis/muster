@@ -161,6 +161,10 @@ export function storedPermissions(saved?: Partial<Permissions>): Permissions {
   };
 }
 
+export function approvalParams(s: Pick<SessionInfo, "id" | "state_seq" | "state_since">, decision: Decision) {
+  return { id: s.id, decision, state_seq: s.state_seq, state_since: s.state_since };
+}
+
 export interface SessionInfo {
   account_profile_id?: number | null;
   id: SessionId;

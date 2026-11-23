@@ -7,13 +7,21 @@ import {
   parseTabPlace, placeBeside, placeOf, putAt, QUESTIONS_TAB, reconcile, removeSession, sameGeneralPlace,
   type TabPlace,
 } from "./tree.ts";
-import { type Channel, DEFAULT_PERMISSIONS, type Permissions, storedPermissions } from "../types.ts";
+import { type Channel, DEFAULT_PERMISSIONS, type Permissions, type SessionKind, storedPermissions } from "../types.ts";
 
 const trimSlash = (p: string) => p.replace(/\/+$/, "") || "/";
-const samePermissions = (a: Permissions, b: Permissions) =>
-  a.codex_sandbox === b.codex_sandbox && a.claude_mode === b.claude_mode && a.antigravity_mode === b.antigravity_mode;
+function samePermissions(a: Permissions, b: Permissions, kind?: SessionKind | "none"): boolean {
+  switch (kind) {
+    case "claude": return a.claude_mode === b.claude_mode;
+    case "codex": return a.codex_sandbox === b.codex_sandbox;
+    case "antigravity": return a.antigravity_mode === b.antigravity_mode;
+    case "shell": return true;
+    default: return a.codex_sandbox === b.codex_sandbox && a.claude_mode === b.claude_mode && a.antigravity_mode === b.antigravity_mode;
+  }
+}
 
 export interface FolderJoin {
+  kind?: SessionKind | "none";
   /** The dialog's name; blank matches any channel in the folder. */
   name?: string;
   /** The permissions the new session would get; omitted means the defaults. */
@@ -39,7 +47,7 @@ export function folderChannel(list: Channel[], path: string, o: FolderJoin = {})
   const perms = o.permissions ?? DEFAULT_PERMISSIONS;
   const matches = list.filter((c) => !c.archived && trimSlash(c.cwd) === want &&
     (!named || named === c.name) && (o.live?.(c.id) ?? true) &&
-    (o.anyPermissions || samePermissions(perms, storedPermissions(c.permissions))));
+    (o.anyPermissions || samePermissions(perms, storedPermissions(c.permissions), o.kind)));
   return matches.find((c) => c.id === o.prefer) ?? matches[0];
 }
 

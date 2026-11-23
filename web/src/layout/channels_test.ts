@@ -152,6 +152,10 @@ Deno.test("a new channel in an open folder joins it, across accounts", () => {
   equal(folderChannel(list, "/p/muster", { name: "scratch" }), undefined);
   equal(folderChannel(list, "/p/muster/.wt"), undefined);
   equal(folderChannel([ch(6, "/p/muster", { archived: true })], "/p/muster"), undefined);
+  const legacy = ch(7, "/demo", { permissions: JSON.parse('{"codex_sandbox":"workspace_write","claude_mode":"default"}') });
+  equal(folderChannel([legacy], "/demo", { kind: "claude" })?.id, 7);
+  equal(folderChannel([legacy], "/demo", { kind: "antigravity" }), undefined);
+  equal(folderChannel([list[4]], "/p/muster", { kind: "claude" }), undefined);
   // The selected channel wins among matches; a channel with no sessions is never joined.
   equal(folderChannel(list, "/p/muster", { prefer: 4 })?.id, 4);
   equal(folderChannel(list, "/p/muster", { prefer: 2 })?.id, 3);

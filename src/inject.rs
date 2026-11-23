@@ -1518,35 +1518,43 @@ fn write_prompt_input(hub: &Hub, id: SessionId, generation: Option<u64>, adapter
     let write = || {
         if let PromptKey::Submit(Some(item)) = key {
             let now = crate::model::now_ms();
-            if adapter.kind() == SessionKind::Antigravity {
-                hub.note_delivery_at_boundary(id, generation, item.source, now)?;
-            } else {
-                hub.note_prompt_delivery(id, generation, item.source, now)?;
-            }
+            hub.note_prompt_delivery(id, generation, item.source, now)?;
             if let crate::agents::Source::Chain(prov) = item.source
                 && let Some(idle) = hub.cache_cold(id, now)
             {
                 hub.note_cold_send(id, prov, item.panel.is_some(), &delivery_identity(item), idle);
             }
             mark_stage(hub, id, generation, Stage::Submitting)?;
+        } else if matches!(key, PromptKey::Paste) {
+            mark_stage(hub, id, generation, Stage::Typing)?;
+        }
+        // Attribution and queue bookkeeping may have taken time since the screen check.
+        if adapter.kind() == SessionKind::Antigravity && matches!(key, PromptKey::Paste | PromptKey::Submit(Some(_))) {
+            hub.drain_antigravity_callbacks(id);
+            if !hub.session(id).is_some_and(|s| adapter.is_ready(s.state)) { return Ok(false); }
         }
         hub.write_input_generation(id, generation, bytes)?;
         Ok(true)
     };
     if adapter.kind() == SessionKind::Antigravity {
-        return hub.input_boundary(|| {
-            let Some(info) = hub.session(id) else { return Ok(false) };
-            let Some(screen) = hub.screen(id) else { return Ok(false) };
-            if dialog_blocks_input(adapter, &screen, info.state) { return Ok(false); }
-            let ready = match key {
-                PromptKey::Interrupt => info.state == AgentState::Working || info.state == AgentState::Stuck,
-                PromptKey::Paste => adapter.is_ready(info.state) && adapter.composer_text(&screen).is_some_and(|s| s.trim().is_empty()),
-                PromptKey::Submit(_) => adapter.is_ready(info.state) && adapter.composer_text(&screen).is_some(),
-            };
-            if !ready { return Ok(false); }
-            write()
-        });
+        return write_antigravity_input(hub, id, adapter, key, || hub.screen(id), write);
     }
+    write()
+}
+
+fn write_antigravity_input(hub: &Hub, id: SessionId, adapter: &dyn Adapter, key: PromptKey<'_>,
+    read_screen: impl FnOnce() -> Option<crate::adapters::ScreenSnapshot>,
+    write: impl FnOnce() -> anyhow::Result<bool>) -> anyhow::Result<bool> {
+    let Some(screen) = read_screen() else { return Ok(false) };
+    hub.drain_antigravity_callbacks(id);
+    let Some(info) = hub.session(id) else { return Ok(false) };
+    if dialog_blocks_input(adapter, &screen, info.state) { return Ok(false); }
+    let ready = match key {
+        PromptKey::Interrupt => matches!(info.state, AgentState::Working | AgentState::Stuck),
+        PromptKey::Paste => adapter.is_ready(info.state) && adapter.composer_text(&screen).is_some_and(|s| s.trim().is_empty()),
+        PromptKey::Submit(_) => adapter.is_ready(info.state) && adapter.composer_text(&screen).is_some(),
+    };
+    if !ready { return Ok(false); }
     write()
 }
 
@@ -1645,7 +1653,6 @@ async fn deliver(hub: &Arc<Hub>, id: SessionId, mut item: Item) -> anyhow::Resul
             }
         }
     }
-    item.attempts += 1;
 
     // 2. Type, pause, submit.
     // A shell's encoding follows the shell this run started, not the shell preference now.
@@ -1662,8 +1669,8 @@ async fn deliver(hub: &Arc<Hub>, id: SessionId, mut item: Item) -> anyhow::Resul
             mark_stage(hub, id, generation, Stage::Selected)?;
             return Ok(false);
         }
-        mark_stage(hub, id, generation, Stage::Typing)?;
         if !write_prompt_input(hub, id, generation, adapter, &bytes, PromptKey::Paste)? { return requeue(item); }
+        item.attempts += 1;
     }
     hub.injection.edit(id, |q| {
         if q.generation == generation { q.last_sent = Some(item.text.clone()); }
@@ -1864,8 +1871,13 @@ pub fn approve(
     // make sure the screen they were chosen from is still the one on display: the detector
     // lags the screen, so a new prompt can be up before `state_seq` moves.
     hub.claim_prompt(id, seen.0, seen.1)?;
-    if (seen.0.is_some() || info.kind == SessionKind::Antigravity) && hub.screen(id).is_none_or(|now| now.lines != screen.lines) {
-        anyhow::bail!("stale: session {id}'s screen changed while answering; check it again");
+    if seen.0.is_some() || info.kind == SessionKind::Antigravity {
+        let unchanged = hub.screen(id).is_some_and(|now| {
+            now.lines == screen.lines || (info.kind == SessionKind::Antigravity
+                && adapter.detect_from_screen(&now, info.state) == adapter.detect_from_screen(&screen, info.state)
+                && adapter.approve_bytes(decision, &now).as_ref() == Some(&bytes))
+        });
+        anyhow::ensure!(unchanged, "stale: session {id}'s screen changed while answering; check it again");
     }
     hub.write_input_generation(id, generation, &bytes)?;
     hub.log_event(
@@ -1953,6 +1965,38 @@ pub fn spawn_tasks(hub: Arc<Hub>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn antigravity_another_sessions_callback_during_paste_does_not_park_the_prompt() {
+        let hub = hub_fixture();
+        hub.test_unconfirmed_launch(1, true, "");
+        hub.edit_session_for_test(1, |s| { s.kind = SessionKind::Antigravity; s.state = AgentState::Idle; });
+        let dir = std::env::temp_dir().join(crate::paths::random_token());
+        let path = dir.join("hooks.sqlite");
+        hub.hook_inbox_path.set(path.clone()).unwrap();
+        *hub.callback_inbox.lock() = Some(crate::hook_inbox::Inbox::open(&path).unwrap());
+        let mut writer = crate::hook_inbox::Inbox::open(&path).unwrap();
+        let pasted = write_antigravity_input(&hub, 1, adapter_for(SessionKind::Antigravity), PromptKey::Paste, || {
+            writer.enqueue("another-session", "state", br#"{"agent_state":"idle"}"#).unwrap();
+            Some(crate::adapters::tui::testutil::snap(include_str!("adapters/fixtures/antigravity_idle_auto.txt")))
+        }, || Ok(true)).unwrap();
+        assert!(pasted);
+        assert_eq!(writer.next(None).unwrap().unwrap().token, "another-session");
+        // An approval committed for this run during the screen read blocks either key,
+        // even while the background consumer is busy processing an unrelated callback.
+        let consumer = hub.callback_inbox.lock();
+        for key in [PromptKey::Paste, PromptKey::Submit(None)] {
+            let wrote = write_antigravity_input(&hub, 1, adapter_for(SessionKind::Antigravity), key, || {
+                writer.enqueue("run-token", "state", br#"{"tool_confirmation_pending":true}"#).unwrap();
+                Some(crate::adapters::tui::testutil::snap(include_str!("adapters/fixtures/antigravity_idle_auto.txt")))
+            }, || panic!("input into an approval")).unwrap();
+            assert!(!wrote);
+            assert_eq!(hub.session(1).unwrap().state, AgentState::NeedsApproval);
+        }
+        drop(consumer);
+        drop((writer, hub));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn antigravity_pending_callback_blocks_enter_without_a_menu() {

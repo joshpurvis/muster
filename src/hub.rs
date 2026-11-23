@@ -384,6 +384,8 @@ pub(crate) struct HumanInputQueue {
     seq: std::sync::atomic::AtomicU64,
     /// Per session, the first and last sequence number of its uncommitted keystrokes.
     pending: Mutex<BTreeMap<SessionId, (u64, u64)>>,
+    /// Order the marker worker and a targeted delivery without locking hook inserts.
+    committing: Mutex<()>,
     wake: parking_lot::Condvar,
     /// Per session, the sequence number and time of its newest keystroke (memory only): a
     /// schedule's fresh restart never wipes what the human is typing (`human_input_of`).
@@ -494,7 +496,9 @@ pub struct Hub {
     generation_floor: u64,
     terminal_records: Mutex<BTreeMap<SessionId, StoredTerminal>>,
     retire_signalled: Mutex<BTreeSet<RunId>>,
-    /// Serializes inbox consumption and input attribution. The host never sees it.
+    /// Independent WAL readers can check one Antigravity run while the ordered consumer is busy.
+    pub(crate) hook_inbox_path: std::sync::OnceLock<PathBuf>,
+    /// Serializes ordered inbox consumption and input attribution.
     pub(crate) callback_inbox: Mutex<Option<crate::hook_inbox::Inbox>>,
     /// Sessions that received human keystrokes whose attribution marker is not committed
     /// yet (`note_human_input`). Keystrokes only add to it; markers are taken and committed
@@ -900,21 +904,7 @@ impl Hub {
             let background = hook.as_ref().map_or_else(Default::default, |saved| saved.background.clone());
             info.background = background.running();
             let last_hook_at = hook.as_ref().map_or(0, |saved| saved.last_hook_at);
-            let antigravity_callback = if info.kind == SessionKind::Antigravity && last_hook_at != 0 {
-                let base = agents.antigravity_callback(info.id, generation).unwrap_or_else(|| {
-                    // A pre-upgrade run may have persisted a screen dialog. Its helper saved
-                    // the reduced callback that it will otherwise never send again.
-                    let last = crate::adapters::antigravity::read_last_state(&paths::session_dir(info.id).join(crate::adapters::antigravity::LAST_STATE));
-                    last.and_then(|bytes| serde_json::from_slice(&bytes).ok())
-                        .and_then(|payload| adapter_for(info.kind).on_hook("state", &payload)).unwrap_or_else(|| {
-                            if previous_state.state == AgentState::AskingQuestion { StateUpdate::new(AgentState::Starting) }
-                            else { previous_state }
-                        })
-                });
-                info.state = base.state;
-                info.state_detail = base.detail.clone();
-                Some(base)
-            } else { None };
+            let antigravity_callback = recover_antigravity_callback(&mut info, previous_state, &agents, generation, last_hook_at != 0);
             let (conversation, conversation_sure) = match hook {
                 Some(saved) => (saved.conversation, saved.conversation_sure),
                 // No hook from this run yet: a Codex run that resumed a thread has that one as
@@ -1025,6 +1015,7 @@ impl Hub {
             terminal_records: Mutex::new(terminal_records),
             retire_signalled: Mutex::new(BTreeSet::new()),
             callback_inbox: Mutex::new(None),
+            hook_inbox_path: Default::default(),
             human_input: Arc::default(),
             input_handles: Mutex::new(input_handles),
             interruptions_pending: Arc::default(),
@@ -1472,7 +1463,8 @@ impl Hub {
         let entry = g.sessions.get(&id)?;
         let terminal = entry.pty.as_ref()?;
         (terminal.generation == entry.generation && terminal.is_alive())
-            .then(|| (entry.info.clone(), terminal.clone(), entry.antigravity_callback.clone()))
+            .then(|| (entry.info.clone(), terminal.clone(), entry.antigravity_callback.as_ref().map(|base|
+                antigravity_timed_callback(base, now_ms() - entry.last_hook_at))))
     }
 
     // ----- session I/O -----
@@ -1525,6 +1517,7 @@ impl Hub {
 
     /// Only call inside `input_boundary`.
     fn commit_human_input(&self) -> anyhow::Result<()> {
+        let _commit = self.human_input.committing.lock();
         let pending = self.human_input.take();
         if pending.is_empty() {
             return Ok(());
@@ -1542,11 +1535,24 @@ impl Hub {
 
     pub(crate) fn note_prompt_delivery(&self, id: SessionId, generation: Option<u64>,
         source: crate::agents::Source, now: i64) -> anyhow::Result<()> {
-        self.input_boundary(|| self.note_delivery_at_boundary(id, generation, source, now))
+        let record = || self.record_prompt_delivery(id, generation, source, now);
+        if self.session(id).is_some_and(|s| s.kind == SessionKind::Antigravity) {
+            // Delivery supersedes this session's earlier human-input marker. A keystroke
+            // arriving after we take it stays pending for the next turn.
+            let _commit = self.human_input.committing.lock();
+            let earlier = self.human_input.pending.lock().remove(&id);
+            let result = record();
+            if result.is_err() && let Some(mark) = earlier {
+                self.human_input.restore(BTreeMap::from([(id, mark)]));
+            }
+            result
+        } else {
+            self.input_boundary(record)
+        }
     }
 
-    /// Commit attribution after the callback inbox has been drained and while inserts are blocked.
-    pub(crate) fn note_delivery_at_boundary(&self, id: SessionId, generation: Option<u64>,
+    /// Commit delivery attribution for the checked terminal generation.
+    fn record_prompt_delivery(&self, id: SessionId, generation: Option<u64>,
         source: crate::agents::Source, now: i64) -> anyhow::Result<()> {
         {
             let g = self.inner.lock();
@@ -1832,12 +1838,18 @@ impl Hub {
             if source == StateSource::Hook {
                 e.last_hook_at = now;
             }
+            if source == StateSource::Timer && update.state == AgentState::Idle
+                && e.antigravity_callback.as_ref().is_some_and(|base| base.state == AgentState::Working)
+                && now - e.last_hook_at >= HOOK_GRACE_MS
+            {
+                e.antigravity_callback = Some(update.clone());
+            }
             let update = if let Some(base) = &e.antigravity_callback
                 && matches!(source, StateSource::Screen | StateSource::Timer)
                 && !crate::adapters::antigravity::is_screen_dialog(update.state, update.detail.as_deref())
                 && !(update.state == AgentState::Stuck && base.state == AgentState::Working)
             {
-                base.clone()
+                antigravity_timed_callback(base, now - e.last_hook_at)
             } else {
                 if source == StateSource::Screen && e.antigravity_callback.is_none()
                     && now - e.last_hook_at < HOOK_GRACE_MS
@@ -3862,15 +3874,29 @@ impl Hub {
         r
     }
 
-    fn prepare_restart_args(&self, id: SessionId) -> anyhow::Result<()> {
-        // The stopped run may have committed a newer conversation while it was exiting.
-        // Fresh starts have already fenced it, so draining cannot restore a forgotten id.
-        self.input_boundary(|| {
-            if let Some(args) = crate::agents::restart_args(&self.agents, id) {
-                self.set_session_extra_args(id, args?)?;
+    pub(crate) fn drain_antigravity_callbacks(&self, id: SessionId) {
+        let Some(path) = self.hook_inbox_path.get() else { return };
+        let Some(token) = self.terminal_records.lock().get(&id).filter(|r| !r.retired)
+            .map(|r| r.token.clone()) else { return };
+        let result = crate::hook_inbox::session_hooks(path, &token).and_then(|hooks| {
+            for hook in hooks {
+                self.handle_hook_checkpoint(&token, &hook.event, hook.payload, Some(&hook.cursor), u64::MAX, hook.captured_at, Some(id))?;
             }
             Ok(())
-        })
+        });
+        if let Err(error) = result {
+            tracing::warn!(session = id, "reading pending Antigravity state: {error:#}");
+        }
+    }
+
+    fn prepare_restart_args(&self, id: SessionId) -> anyhow::Result<()> {
+        if self.session(id).is_some_and(|s| s.kind == SessionKind::Antigravity) {
+            self.drain_antigravity_callbacks(id);
+        }
+        if let Some(args) = crate::agents::restart_args(&self.agents, id) {
+            self.set_session_extra_args(id, args?)?;
+        }
+        Ok(())
     }
 
     async fn restart_inner(self: &Arc<Self>, id: SessionId, location: Option<(ChannelId, String)>) -> anyhow::Result<SessionInfo> {
@@ -4476,7 +4502,7 @@ impl Hub {
     /// marker only if some of that input came before it arrived, so a later keystroke can
     /// never lower the provenance of an earlier, agent-delivered turn.
     pub fn handle_hook_at(&self, token: &str, event: &str, payload: serde_json::Value, arrival: u64) -> anyhow::Result<()> {
-        self.input_boundary(|| self.handle_hook_checkpoint(token, event, payload, None, arrival, None))
+        self.input_boundary(|| self.handle_hook_checkpoint(token, event, payload, None, arrival, None, None))
     }
 
     /// `captured_at`: when the helper saved it (unix ms; None from older helpers).
@@ -4484,11 +4510,11 @@ impl Hub {
         cursor: &crate::store::HookCursor, captured_at: Option<i64>) -> anyhow::Result<()> {
         // Spooled callbacks are ordered against markers by the inbox itself: a marker is
         // committed only after every earlier insert was drained, with inserts blocked.
-        self.handle_hook_checkpoint(token, event, payload, Some(cursor), u64::MAX, captured_at)
+        self.handle_hook_checkpoint(token, event, payload, Some(cursor), u64::MAX, captured_at, None)
     }
 
     fn handle_hook_checkpoint(&self, token: &str, event: &str, payload: serde_json::Value,
-        cursor: Option<&crate::store::HookCursor>, arrival: u64, captured_at: Option<i64>) -> anyhow::Result<()> {
+        cursor: Option<&crate::store::HookCursor>, arrival: u64, captured_at: Option<i64>, target: Option<SessionId>) -> anyhow::Result<()> {
         // Spool callbacks from a process that exited during an outage may still contain
         // its final reply. Accept only the recorded current run, never a previous generation.
         let recorded = cursor.and_then(|_| self.terminal_records.lock().iter()
@@ -4500,6 +4526,7 @@ impl Hub {
                 recorded.filter(|(id, generation)| g.sessions.get(id).is_some_and(|entry| entry.generation == *generation))
                     .map(|(id, _)| id)
             } else { g.tokens.get(token).copied() };
+            if target.is_some() && id != target { return Ok(()); }
             let entry = id.and_then(|id| g.sessions.get_mut(&id));
             let Some(entry) = entry else {
                 if let Some(cursor) = cursor {
@@ -4529,9 +4556,16 @@ impl Hub {
             // A sub-agent's turn ending says nothing about the session's own state.
             if info.state != AgentState::Exited && !change.child {
                 let mut update = adapter_for(info.kind).on_hook(event, &payload);
-                if info.kind == SessionKind::Antigravity && event == "state" {
-                    last_hook_at = now;
+                let antigravity_status = info.kind == SessionKind::Antigravity && event == "state";
+                if antigravity_status {
+                    let authenticating = Some(crate::adapters::antigravity::AUTHENTICATING);
+                    let same_auth = callback.as_ref().and_then(|u| u.detail.as_deref()) == authenticating
+                        && update.as_ref().and_then(|u| u.detail.as_deref()) == authenticating;
+                    if !same_auth { last_hook_at = captured_at.unwrap_or(now).min(now); }
                     let visible = crate::adapters::antigravity::is_screen_dialog(info.state, info.state_detail.as_deref());
+                    if update.is_none() && callback.as_ref().and_then(|u| u.detail.as_deref()) == Some(crate::adapters::antigravity::AUTHENTICATING) {
+                        update = Some(StateUpdate::new(AgentState::Starting));
+                    }
                     if let Some(base) = &update {
                         callback = Some(base.clone());
                     } else if callback.is_none() {
@@ -4539,10 +4573,10 @@ impl Hub {
                             else { StateUpdate { state: info.state, detail: info.state_detail.clone() } });
                     }
                     // Keep the visible request's identity until the screen actually changes.
-                    if visible { update = None; }
+                    update = if visible { None } else { update.map(|base| antigravity_timed_callback(&base, now - last_hook_at)) };
                 }
                 if let Some(update) = update {
-                    last_hook_at = now;
+                    if !antigravity_status { last_hook_at = now; }
                     if info.state != update.state || info.state_detail != update.detail {
                         info.state_seq = self.state_seq.next()?;
                         if info.kind == SessionKind::Antigravity && update.state == AgentState::NeedsApproval {
@@ -5216,6 +5250,26 @@ fn recover_session_state(info: &mut SessionInfo, status: Option<&muster_terminal
         info.queued = 0;
     }
     false
+}
+
+fn antigravity_timed_callback(base: &StateUpdate, age: i64) -> StateUpdate {
+    use crate::adapters::antigravity::{AUTHENTICATING, SIGN_IN};
+    if base.detail.as_deref() == Some(AUTHENTICATING) && age > 15_000 {
+        StateUpdate::with(AgentState::AskingQuestion, SIGN_IN)
+    } else { base.clone() }
+}
+
+fn recover_antigravity_callback(info: &mut SessionInfo, previous_state: StateUpdate,
+    agents: &crate::agents::Registry, generation: u64, has_hook: bool) -> Option<StateUpdate> {
+    if info.kind != SessionKind::Antigravity || info.state == AgentState::Exited || !has_hook { return None; }
+    let base = agents.antigravity_callback(info.id, generation).or_else(|| {
+        let last = crate::adapters::antigravity::read_last_state(&paths::session_dir(info.id).join(crate::adapters::antigravity::LAST_STATE))?;
+        adapter_for(info.kind).on_hook("state", &serde_json::from_slice(&last).ok()?)
+    }).unwrap_or(previous_state);
+    if matches!(base.state, AgentState::AskingQuestion | AgentState::NeedsApproval | AgentState::Exited) { return None; }
+    info.state = base.state;
+    info.state_detail = base.detail.clone();
+    Some(base)
 }
 
 /// Only a host's explicit per-run rejection proves that a launch did not start.
@@ -7238,6 +7292,73 @@ mod tests {
     }
 
     #[test]
+    fn antigravity_authentication_timeout_yields_to_trust_and_clears_on_idle() {
+        use crate::adapters::antigravity::{AUTHENTICATING, SIGN_IN};
+        let hub = move_fixture();
+        hub.edit_session_for_test(2, |s| { s.kind = SessionKind::Antigravity; s.state = AgentState::Starting; });
+        hub.inner.lock().tokens.insert("fixture".into(), 2);
+        let status = |state| hub.handle_hook("fixture", "state", serde_json::json!({"agent_state":state})).unwrap();
+        status("authenticating");
+        let base = hub.inner.lock().sessions[&2].antigravity_callback.clone().unwrap();
+        assert_eq!(base.detail.as_deref(), Some(AUTHENTICATING));
+        assert_eq!(antigravity_timed_callback(&base, 15_000), base);
+        let hint = antigravity_timed_callback(&base, 15_001);
+        assert_eq!(hint, StateUpdate::with(AgentState::AskingQuestion, SIGN_IN));
+        hub.inner.lock().sessions.get_mut(&2).unwrap().last_hook_at = now_ms() - 16_000;
+        hub.set_state_checked(2, hint, StateSource::Screen, None);
+        status("authenticating");
+        assert_eq!(hub.session(2).unwrap().state_detail.as_deref(), Some(SIGN_IN));
+        let trust = adapter_for(SessionKind::Antigravity).detect_from_screen(
+            &crate::adapters::tui::testutil::snap(include_str!("adapters/fixtures/antigravity_trust.txt")), AgentState::Starting).unwrap();
+        hub.set_state_checked(2, trust.clone(), StateSource::Screen, None);
+        status("authenticating");
+        assert_eq!(hub.session(2).unwrap().state_detail, trust.detail);
+        status("idle");
+        hub.set_state_checked(2, StateUpdate::new(AgentState::Idle), StateSource::Screen, None);
+        assert_eq!(hub.session(2).unwrap().state, AgentState::Idle);
+    }
+
+    #[test]
+    fn antigravity_startup_never_revives_a_dead_run_or_saved_dialog() {
+        let hub = move_fixture();
+        let mut info = hub.session(2).unwrap();
+        info.kind = SessionKind::Antigravity;
+        for saved in [AgentState::NeedsApproval, AgentState::AskingQuestion, AgentState::Idle, AgentState::Working] {
+            for recovered in [AgentState::Working, AgentState::Exited] {
+                info.state = recovered;
+                info.state_detail = Some("recovered".into());
+                let base = recover_antigravity_callback(&mut info, StateUpdate::new(saved), &hub.agents, 0, true);
+                if recovered == AgentState::Exited || matches!(saved, AgentState::NeedsApproval | AgentState::AskingQuestion) {
+                    assert_eq!(info.state, recovered);
+                    assert!(base.is_none());
+                } else {
+                    assert_eq!(info.state, saved);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn antigravity_restart_ignores_another_sessions_arriving_callback() {
+        let hub = move_fixture();
+        let dir = std::env::temp_dir().join(paths::random_token());
+        let path = dir.join("hooks.sqlite");
+        remember_launch(&hub, false);
+        hub.edit_session_for_test(1, |s| s.kind = SessionKind::Antigravity);
+        hub.hook_inbox_path.set(path.clone()).unwrap();
+        *hub.callback_inbox.lock() = Some(crate::hook_inbox::Inbox::open(&path).unwrap());
+        let writer = rusqlite::Connection::open(&path).unwrap();
+        // The helper has inserted its callback and still owns the write lock.
+        writer.execute_batch("BEGIN IMMEDIATE; INSERT INTO hooks(token,event,payload)
+            VALUES ('another-session','state','{}')").unwrap();
+        hub.prepare_restart_args(1).unwrap();
+        writer.execute_batch("COMMIT").unwrap();
+        assert_eq!(hub.callback_inbox.lock().as_ref().unwrap().next(None).unwrap().unwrap().token, "another-session");
+        drop((writer, hub));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn antigravity_restart_reads_the_drained_conversation_unless_fenced() {
         let hub = agent_fixture();
         let directory = std::env::temp_dir().join(format!("muster-restart-{}", paths::random_token()));
@@ -7254,10 +7375,26 @@ mod tests {
             a.kind = SessionKind::Antigravity;
             a.resume_id = Some("alpha".into());
         }).unwrap();
+        inbox.enqueue("other-run", "Stop", b"{}").unwrap();
         inbox.enqueue("demo", "state", br#"{"agent_state":"idle","session_id":"beta"}"#).unwrap();
+        hub.hook_inbox_path.set(directory.join("hooks.sqlite")).unwrap();
         *hub.callback_inbox.lock() = Some(inbox);
         hub.prepare_restart_args(2).unwrap();
         assert_eq!(hub.inner.lock().sessions[&2].extra_args, ["--conversation", "beta"]);
+        {
+            let guard = hub.callback_inbox.lock();
+            let inbox = guard.as_ref().unwrap();
+            assert_eq!(inbox.next(None).unwrap().unwrap().token, "other-run");
+            assert!(hub.store.load_runtime::<crate::store::HookCursor>("hook-inbox-cursor").unwrap().is_none());
+            crate::hook_inbox::drain(&hub, inbox).unwrap();
+            assert!(inbox.next(None).unwrap().is_none());
+        }
+        // An unavailable inbox after the old process exited still uses its known conversation.
+        let moved = directory.with_extension("offline");
+        std::fs::rename(&directory, &moved).unwrap();
+        hub.prepare_restart_args(2).unwrap();
+        assert_eq!(hub.inner.lock().sessions[&2].extra_args, ["--conversation", "beta"]);
+        std::fs::rename(moved, &directory).unwrap();
         hub.fence_conversation(2);
         hub.agents.update(&hub.store, id, |a| a.resume_id = None).unwrap();
         hub.callback_inbox.lock().as_mut().unwrap().enqueue("demo", "state",
@@ -7331,10 +7468,19 @@ mod tests {
             &crate::adapters::tui::testutil::snap(screen), state).unwrap();
         assert!(!hub.set_state_checked(2, update, StateSource::Screen, None));
         assert_eq!(hub.session(2).unwrap().state, state);
+        if state == AgentState::Working {
+            let settled = StateUpdate::new(AgentState::Idle);
+            hub.inner.lock().sessions.get_mut(&2).unwrap().last_hook_at = now_ms();
+            assert!(!hub.set_state_checked(2, settled.clone(), StateSource::Timer, None));
+            hub.inner.lock().sessions.get_mut(&2).unwrap().last_hook_at = now_ms() - HOOK_GRACE_MS;
+            assert!(hub.set_state_checked(2, settled, StateSource::Timer, None));
+            assert!(!hub.set_state_checked(2, StateUpdate::new(state), StateSource::Screen, None));
+            assert_eq!(hub.session(2).unwrap().state, AgentState::Idle);
+        }
     }
 
     #[test]
-    fn antigravity_working_callback_beats_idle_screen() {
+    fn antigravity_working_callback_beats_an_unsettled_idle_screen() {
         antigravity_screen_after_callback("working", include_str!("adapters/fixtures/antigravity_idle_auto.txt"));
     }
 
@@ -7375,7 +7521,7 @@ mod tests {
         assert_eq!(last(&hub), Some(1), "the screen doesn't move a hooked session's clock");
         // A callback replayed after an outage counts from when it was captured.
         let captured = now_ms() - 90 * 60_000;
-        hub.handle_hook_checkpoint("cache-token", "Stop", serde_json::json!({}), None, u64::MAX, Some(captured)).unwrap();
+        hub.handle_hook_checkpoint("cache-token", "Stop", serde_json::json!({}), None, u64::MAX, Some(captured), None).unwrap();
         assert_eq!(last(&hub), Some(captured));
         assert!(hub.cache_cold(2, now_ms()).is_some(), "a turn that ended 90 min ago is cold");
     }

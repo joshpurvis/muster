@@ -124,6 +124,12 @@ function Seg<T extends string>(
 ) {
   const warningId = useId();
   const cur = opts.find((o) => o.v === value) ?? opts[0];
+  const message = useRef<HTMLSpanElement>(null);
+  const previous = useRef(value);
+  useLayoutEffect(() => {
+    if (value !== previous.current && cur.danger) message.current?.scrollIntoView({ block: "center" });
+    previous.current = value;
+  }, [value, cur.danger]);
   const move = (e: KeyboardEvent) => {
     const i = opts.findIndex((o) => o.v === value);
     const d = e.key === "ArrowRight" ? 1 : e.key === "ArrowLeft" ? -1 : 0;
@@ -155,13 +161,10 @@ function Seg<T extends string>(
           </button>
         ))}
       </div>
-      {cur.danger
-        ? (
-          <span id={warningId} class="perm-warn" role="note">
-            <IconShieldAlert size={13} /> {cur.danger}
-          </span>
-        )
-        : <span class="field-hint">{cur.hint}</span>}
+      <span ref={message} aria-live="polite" aria-atomic="true" id={warningId}
+        class={cur.danger ? "perm-warn" : "field-hint"}>
+        {cur.danger && <IconShieldAlert size={13} />} {cur.danger ?? cur.hint}
+      </span>
     </div>
   );
 }

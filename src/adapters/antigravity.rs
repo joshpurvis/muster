@@ -28,9 +28,12 @@ pub(crate) fn read_last_state(path: &Path) -> Option<Vec<u8>> {
 
 const PENDING: &str = "Antigravity is asking for approval";
 
-/// Only a visible dialog can override the run's latest state callback.
+pub(crate) const AUTHENTICATING: &str = "Antigravity is authenticating";
+pub(crate) const SIGN_IN: &str = "Antigravity may need a sign-in: check the terminal";
+
+/// The delayed sign-in hint is cleared by a callback; a visible dialog is cleared by the screen.
 pub(crate) fn is_screen_dialog(state: AgentState, detail: Option<&str>) -> bool {
-    state == AgentState::AskingQuestion
+    (state == AgentState::AskingQuestion && detail != Some(SIGN_IN))
         || (state == AgentState::NeedsApproval && detail.is_some_and(|d| d != PENDING))
 }
 
@@ -160,7 +163,7 @@ fn launch(ctx: &SpawnCtx, settings: bool, mcp: bool) -> anyhow::Result<CommandSp
 
 // The composer and modal content are separated from past turns by a solid rule.
 fn active_dialog_lines(lines: &[String]) -> &[String] {
-    tui::rfind(lines, tui::is_solid_rule).map_or(lines, |i| &lines[i + 1..])
+    tui::rfind(lines, |l| !l.starts_with(char::is_whitespace) && tui::is_solid_rule(l)).map_or(lines, |i| &lines[i + 1..])
 }
 
 fn manual_dialog(lines: &[String]) -> Option<&'static str> {
@@ -185,12 +188,12 @@ fn manual_dialog(lines: &[String]) -> Option<&'static str> {
 }
 
 struct ApprovalDialog {
-    title: String,
+    answerable: bool,
     detail: String,
     options: Vec<tui::MenuOption>,
 }
 
-fn approval_dialog(lines: &[String]) -> Option<ApprovalDialog> {
+fn approval_dialog(lines: &[String], cols: u16) -> Option<ApprovalDialog> {
     let q = tui::rfind(lines, |l| {
         let t = l.trim();
         APPROVAL_TITLES.contains(&t)
@@ -208,25 +211,48 @@ fn approval_dialog(lines: &[String]) -> Option<ApprovalDialog> {
     }
     let title = lines[q].trim();
     let before = &lines[..q];
-    let start = tui::rfind(before, |l| l.trim() == "Requesting permission for:");
-    let body = match start {
-        Some(i) => &before[i + 1..],
-        None if title == "Run this command?" => &before[..0],
-        None => before,
-    };
-    let body = body.join("\n");
+    const MARKER: &str = "Requesting permission for:";
+    let start = before.iter().position(|l| l.trim_end() == MARKER);
+    let body = start.map_or(before, |i| &before[i + 1..]);
+    let ambiguous = before.iter().filter(|l| l.trim() == MARKER).count() > 1;
+    let incomplete = (title.starts_with("Run this") && (start.is_none() || body.iter().all(|l| l.trim().is_empty())))
+        || body.iter().any(|l| {
+            let l = l.trim();
+            l.starts_with('…') || l.starts_with("...") || l.ends_with('…') || l.ends_with("...") || l.contains("(truncated)") || l.contains("… +")
+        });
+    // Snapshots trim the right margin. Preserve explicit command lines, fold a word
+    // that did not fit, and rejoin a token that ran all the way to the terminal edge.
+    let mut text = String::new();
+    for (i, row) in body.iter().enumerate() {
+        if i > 0 {
+            let used = body[i - 1].chars().count();
+            let word = row.split_whitespace().next().unwrap_or("").chars().count();
+            if used == usize::from(cols) && !row.starts_with(char::is_whitespace) {
+                // Hard wrap in the middle of a token.
+            } else if used + 1 + word > usize::from(cols) {
+                text.push(' ');
+            } else {
+                text.push('\n');
+            }
+        }
+        text.push_str(row.strip_prefix("   ").unwrap_or(row));
+    }
     let reason = lines[q + 1..]
         .iter()
         .find_map(|l| l.trim().strip_prefix("Reason: "));
-    let detail = if !body.trim().is_empty() {
-        format!("{title} {}", body.trim())
+    let detail = if ambiguous {
+        format!("{title} Multiple permission markers are visible. Check the full request in the terminal.")
+    } else if incomplete {
+        format!("{title} The command is cut off. Check the full request in the terminal.")
+    } else if !text.trim().is_empty() {
+        format!("{title} {}", text.trim())
     } else if let Some(reason) = reason {
         format!("{title} ({reason})")
     } else {
         title.to_string()
     };
     Some(ApprovalDialog {
-        title: title.into(),
+        answerable: !ambiguous && !incomplete && detail != title,
         detail,
         options,
     })
@@ -256,6 +282,7 @@ impl Adapter for AntigravityAdapter {
         Some(match payload["agent_state"].as_str()? {
             "working" | "thinking" | "tool_use" => StateUpdate::new(Working),
             "idle" => StateUpdate::new(Idle),
+            "authenticating" => StateUpdate::with(Starting, AUTHENTICATING),
             "error" => StateUpdate::with(Error, "Antigravity reported an error"),
             _ => return None,
         })
@@ -271,7 +298,7 @@ impl Adapter for AntigravityAdapter {
         if let Some(detail) = manual_dialog(dialog) {
             return Some(StateUpdate::with(AgentState::AskingQuestion, detail));
         }
-        if let Some(request) = approval_dialog(dialog) {
+        if let Some(request) = approval_dialog(dialog, screen.cols) {
             return Some(StateUpdate::with(AgentState::NeedsApproval, request.detail));
         }
         let tail_has = |n, hints: &[&str]| {
@@ -295,8 +322,8 @@ impl Adapter for AntigravityAdapter {
         if manual_dialog(dialog).is_some() {
             return None;
         }
-        let request = approval_dialog(dialog)?;
-        if request.detail == request.title {
+        let request = approval_dialog(dialog, screen.cols)?;
+        if !request.answerable {
             return None;
         }
         let opts = request.options;
@@ -319,12 +346,7 @@ impl Adapter for AntigravityAdapter {
         let lines = &screen.lines;
         let bottom = tui::rfind(lines, tui::is_solid_rule)?;
         // A panel can leave a complete, inactive composer visible above its controls.
-        if !lines[bottom + 1..]
-            .iter()
-            .any(|l| l.trim_start().starts_with("? for shortcuts"))
-        {
-            return None;
-        }
+        let footer = lines[bottom + 1..].iter().find_map(|l| l.trim_start().strip_prefix("? for shortcuts"))?;
         let top = tui::rfind(&lines[..bottom], tui::is_solid_rule)?;
         let (first, rest) = lines[top + 1..bottom].split_first()?;
         let first = if first.trim_end() == ">" {
@@ -337,12 +359,10 @@ impl Adapter for AntigravityAdapter {
             .collect::<Vec<_>>()
             .join("\n");
         let text = text.trim_end();
-        let placeholder = text.split_whitespace().collect::<Vec<_>>().join(" ");
-        if matches!(
-            placeholder.as_str(),
-            "Auto mode: edits & safe commands auto-approved (shift+tab to cycle)"
-                | "Plan mode: research & plan only (shift+tab to cycle)"
-        ) {
+        let mode = footer.split('·').next()?.trim();
+        if matches!((mode, text),
+            ("auto", "Auto mode: edits & safe commands auto-approved (shift+tab to cycle)") |
+            ("plan", "Plan mode: research & plan only (shift+tab to cycle)")) {
             return Some(String::new());
         }
         Some(text.to_string())
@@ -434,6 +454,40 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_or_ambiguous_approval_is_terminal_only() {
+        let cmd = include_str!("fixtures/antigravity_approval_command.txt");
+        for (screen, reason) in [
+            (cmd.replace("   touch beta.txt && ls", "   printf alpha\n   Requesting permission for:\n   ls"), "Multiple"),
+            (cmd.replace("Requesting permission for:", "  Requesting permission for:"), "cut off"),
+            (cmd.replace("   touch beta.txt && ls", "   ls…"), "cut off"),
+            (cmd.replace("Requesting permission for:", ""), "cut off"),
+            (cmd.replace("   touch beta.txt && ls", ""), "cut off"),
+        ] {
+            let screen = snap(&screen);
+            let update = AntigravityAdapter.detect_from_screen(&screen, AgentState::Idle).unwrap();
+            assert!(update.detail.unwrap().contains(reason));
+            for d in [Decision::Approve, Decision::ApproveAlways, Decision::Deny] {
+                assert!(AntigravityAdapter.approve_bytes(d, &screen).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn approval_identity_survives_a_phone_rewrap() {
+        let cmd = include_str!("fixtures/antigravity_approval_command.txt");
+        let request = |s: &ScreenSnapshot| AntigravityAdapter.detect_from_screen(s, AgentState::NeedsApproval).unwrap();
+        let wide = request(&snap(cmd));
+        for (cols, text) in [(18, "   touch beta.txt\n   && ls"), (12, "   touch bet\na.txt && ls")] {
+            let mut narrow = snap(&cmd.replace("   touch beta.txt && ls", text));
+            narrow.cols = cols;
+            assert_eq!(request(&narrow), wide);
+        }
+        assert_ne!(request(&snap(&cmd.replace("beta.txt", "alpha.txt"))), wide);
+        let multiline = snap(&cmd.replace("   touch beta.txt && ls", "   touch beta.txt\n   ls"));
+        assert_ne!(request(&multiline), request(&snap(&cmd.replace(" && ls", " ls"))));
+    }
+
+    #[test]
     fn screen_markers() {
         use AgentState::*;
         let idle = include_str!("fixtures/antigravity_idle_auto.txt");
@@ -465,7 +519,7 @@ mod tests {
         let placeholder = "Auto mode: edits & safe commands auto-approved (shift+tab to cycle)";
         for (row, expected) in [
             (placeholder, ""),
-            ("Plan mode: research & plan only (shift+tab to cycle)", ""),
+            ("Plan mode: research & plan only (shift+tab to cycle)", "Plan mode: research & plan only (shift+tab to cycle)"),
             (
                 "Auto mode: my draft (shift+tab to cycle)",
                 "Auto mode: my draft (shift+tab to cycle)",
@@ -480,6 +534,11 @@ mod tests {
                 Some(expected)
             );
         }
+        let plan = "Plan mode: research & plan only (shift+tab to cycle)";
+        let screen = snap(&idle.replace(placeholder, plan).replace("auto ·", "plan ·"));
+        assert_eq!(AntigravityAdapter.composer_text(&screen).as_deref(), Some(""));
+        let draft = placeholder.replace("edits &", "edits  &");
+        assert_eq!(AntigravityAdapter.composer_text(&snap(&idle.replace(placeholder, &draft))).as_deref(), Some(draft.as_str()));
         assert!(AntigravityAdapter.clear_input_bytes().is_none());
         let panel = snap(include_str!("fixtures/antigravity_mcp_panel.txt"));
         assert!(AntigravityAdapter.composer_text(&panel).is_none());
@@ -519,7 +578,7 @@ mod tests {
             ("tool_use", Some(Working)),
             ("idle", Some(Idle)),
             ("error", Some(Error)),
-            ("authenticating", None),
+            ("authenticating", Some(Starting)),
             ("initializing", None),
             ("reviewing", None),
             ("unknown", None),

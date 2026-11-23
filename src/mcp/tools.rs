@@ -133,16 +133,16 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "spawn_session",
             "Spawn session",
-            "Start a new agent (claude or codex) or shell session, recorded as your child. By default it starts in YOUR channel (same working directory). Pass channel_id to use another existing channel of your workspace, or new_channel to create a fresh channel (a new tab in your channel's window; by default with its own git worktree + branch, so parallel work doesn't collide; without a name it is named after the agent's task). A Claude child inherits the calling Claude session's account profile, including Default; otherwise the workspace default applies. The agent runs with the target channel's permission profile (Codex sandbox, Claude permission mode; see whoami/list_channels), which only the human can change; a new_channel gets your channel's profile. There is no way to request more: a channel_id whose profile would give this kind of agent more than your channel has is refused. The prompt, if given, is delivered once the agent is ready. A shell can't be given a prompt unless the human allowed it. A Claude session can't be started while you handle scheduled or triggered work (origin schedule or webhook), unless you are a lead agent handling scheduled work (not a trigger's). Returns immediately; use wait_for_state to wait for it. Limits: spawn depth 3, 32 live children per caller, 32 agent-spawned sessions in total, 10 spawns per 10 minutes per caller, 10 open agent-created channels.",
+            "Start a new agent (claude, codex or antigravity) or shell session, recorded as your child. By default it starts in YOUR channel (same working directory). Pass channel_id to use another existing channel of your workspace, or new_channel to create a fresh channel (a new tab in your channel's window; by default with its own git worktree + branch, so parallel work doesn't collide; without a name it is named after the agent's task). A Claude child inherits the calling Claude session's account profile, including Default; otherwise the workspace default applies. The agent runs with the target channel's permission profile (Codex sandbox, Claude permission mode, Antigravity mode; see whoami/list_channels), which only the human can change; a new_channel gets your channel's profile. There is no way to request more: a channel_id whose profile would give this kind of agent more than your channel has is refused. The prompt, if given, is delivered once the agent is ready. A shell can't be given a prompt unless the human allowed it. A Claude session can't be started while you handle scheduled or triggered work (origin schedule or webhook), unless you are a lead agent handling scheduled work (not a trigger's). Returns immediately; use wait_for_state to wait for it. Limits: spawn depth 3, 32 live children per caller, 32 agent-spawned sessions in total, 10 spawns per 10 minutes per caller, 10 open agent-created channels.",
             json!({
                 "type": "object",
                 "properties": {
-                    "kind": {"type": "string", "enum": ["claude", "codex", "shell"], "description": "What to run."},
+                    "kind": {"type": "string", "enum": ["claude", "codex", "antigravity", "shell"], "description": "What to run."},
                     "prompt": {"type": "string", "description": "Initial task for the agent (or command for a shell)."},
                     "name": {"type": "string", "description": "Display name for the session."},
-                    "model": {"type": "string", "description": "Model for the agent, e.g. 'sonnet' or 'opus' (claude), 'gpt-6.2-sol' (codex). Default: the CLI's own default."},
+                    "model": {"type": "string", "description": "Model for the agent, e.g. 'sonnet' or 'opus' (claude), 'gpt-6.2-sol' (codex), 'gemini-4-neon-high' (antigravity). Default: the CLI's own default."},
                     "effort": {"type": "string", "description": "Reasoning effort, e.g. 'low', 'medium', 'high' (claude --effort), 'xhigh' (codex model_reasoning_effort)."},
-                    "args": {"type": "array", "items": {"type": "string"}, "description": "Extra CLI arguments for the agent. Only an allowlist is accepted (claude: --model, --effort, --fallback-model, --append-system-prompt, --continue, --resume, --verbose, --debug; codex: -m, -c with model/model_reasoning_* keys, -i, --no-alt-screen); permissions always come from the channel's profile."},
+                    "args": {"type": "array", "items": {"type": "string"}, "description": "Extra CLI arguments for the agent. Only an allowlist is accepted (claude: --model, --effort, --fallback-model, --append-system-prompt, --continue, --resume, --verbose, --debug; codex: -m, -c with model/model_reasoning_* keys, -i, --no-alt-screen; antigravity: --model, --effort, --conversation, --continue/-c); permissions always come from the channel's profile."},
                     "channel_id": {"type": "integer", "description": "Existing channel to spawn in. Mutually exclusive with new_channel."},
                     "new_channel": {
                         "type": "object",
@@ -253,7 +253,7 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "list_agents",
             "List agents",
-            "List the named agents: persistent agents (claude or codex) with their own home folder, memory and resumed conversation, which you can ask things with ask_agent. Each has name, kind, model, accepts_origins (which message origins it takes: human, schedule, webhook), lead (a lead agent: scheduled work it sends or spawns goes as origin=lead, taken like the human's; only the human sets it), its session and state, and asleep (its process was stopped while idle: asking it wakes it, which re-reads its whole conversation unless a pending account move starts it in a new one, so only ask when you need it). Also returns your_origin: the origin and hop a message you send now would carry (lead for a lead agent handling scheduled work).",
+            "List the named agents: persistent agents (claude, codex or antigravity) with their own home folder, memory and resumed conversation, which you can ask things with ask_agent. Each has name, kind, model, accepts_origins (which message origins it takes: human, schedule, webhook), lead (a lead agent: scheduled work it sends or spawns goes as origin=lead, taken like the human's; only the human sets it), its session and state, and asleep (its process was stopped while idle: asking it wakes it, which re-reads its whole conversation unless a pending account move starts it in a new one, so only ask when you need it). Also returns your_origin: the origin and hop a message you send now would carry (lead for a lead agent handling scheduled work).",
             empty_schema(),
             true,
         ),
@@ -575,6 +575,8 @@ fn permissions_json(p: &Permissions) -> Value {
     json!({
         "codex_sandbox": p.codex_sandbox,
         "claude_mode": p.claude_mode,
+        "antigravity_mode": p.antigravity_mode,
+        "antigravity_flags": crate::adapters::antigravity::mode_args(p.antigravity_mode).join(" "),
         "codex_flags": codex.join(" "),
         "claude_permission_mode": crate::adapters::claude::permission_mode(p.claude_mode).unwrap_or("user default"),
         "set_by": "human (muster UI); agents can't change it",
@@ -826,7 +828,7 @@ pub(super) fn check_not_more_permissive<B: Backend>(
     target: &Channel,
     kind: SessionKind,
 ) -> Result<(), String> {
-    check_perms_not_wider(st, me, Some(target.id), &target.permissions, kind, &format!("channel {}", target.id))
+    check_perms_not_wider(st, me, &target.permissions, kind, &format!("channel {}", target.id))
 }
 
 /// `check_not_more_permissive` for a profile that may not have a channel yet (an agent that
@@ -834,7 +836,6 @@ pub(super) fn check_not_more_permissive<B: Backend>(
 fn check_perms_not_wider<B: Backend>(
     st: &McpState<B>,
     me: &SessionInfo,
-    target_channel: Option<ChannelId>,
     target: &Permissions,
     kind: SessionKind,
     what: &str,
@@ -844,11 +845,12 @@ fn check_perms_not_wider<B: Backend>(
         .channel(me.channel_id)
         .map(|c| c.permissions)
         .ok_or("your channel no longer exists")?;
-    if target_channel != Some(me.channel_id) && target.exceeds_for(&mine, kind) {
+    if target.exceeds_for(&mine, kind) {
         return Err(format!(
             "{what} lets {} do more than your channel does ({}); agents can't use another channel's permissions. {HOW_PERMS}",
             kind.as_str(),
             match kind {
+                SessionKind::Antigravity => format!("mode {:?} vs {:?}", target.antigravity_mode, mine.antigravity_mode),
                 SessionKind::Codex => format!("sandbox {:?} vs {:?}", target.codex_sandbox, mine.codex_sandbox),
                 _ => format!("mode {:?} vs {:?}", target.claude_mode, mine.claude_mode),
             }
@@ -1005,8 +1007,8 @@ fn agent_args(kind: SessionKind, a: &Args<'_>) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
     match (kind, model, effort) {
         (SessionKind::Shell, None, None) => {}
-        (SessionKind::Shell, _, _) => return Err("model and effort are for claude and codex agents".into()),
-        (SessionKind::Claude, m, e) => {
+        (SessionKind::Shell, _, _) => return Err("model and effort are for claude, codex and antigravity agents".into()),
+        (SessionKind::Claude | SessionKind::Antigravity, m, e) => {
             if let Some(m) = m {
                 out.extend(["--model".to_string(), m.to_string()]);
             }
@@ -1039,7 +1041,7 @@ fn agent_args(kind: SessionKind, a: &Args<'_>) -> Result<Vec<String>, String> {
 async fn spawn_session<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_>) -> TResult {
     let kind_s = a.req_str("kind")?;
     let kind = SessionKind::parse(kind_s)
-        .ok_or_else(|| format!("unknown kind `{kind_s}` (expected claude, codex or shell)"))?;
+        .ok_or_else(|| format!("unknown kind `{kind_s}` (expected claude, codex, antigravity or shell)"))?;
     let prompt = a
         .str("prompt")?
         .map(clean_text)
@@ -1564,8 +1566,8 @@ fn agent_send<B: Backend>(st: &McpState<B>, caller: SessionId, name: &str, text:
     // own tab (what its next restart gets), else the profile its tab will get.
     let session_ch = agent.session_id.and_then(|s| st.backend.session(s)).and_then(|s| st.backend.channel(s.channel_id));
     let own_ch = agent.channel_id.and_then(|c| st.backend.channel(c));
-    let (ch_id, perms) = crate::agents::reach_profile(&agent, session_ch.as_ref(), own_ch.as_ref());
-    check_perms_not_wider(st, &me, ch_id, &perms, agent.kind, &format!("agent {}'s tab", agent.name)).map_err(refused)?;
+    let (_, perms) = crate::agents::reach_profile(&agent, session_ch.as_ref(), own_ch.as_ref());
+    check_perms_not_wider(st, &me, &perms, agent.kind, &format!("agent {}'s tab", agent.name)).map_err(refused)?;
     let recent = st
         .backend
         .agent_messages_since(agent.id, now_ms() - guard::AGENT_CAP_WINDOW_MS);

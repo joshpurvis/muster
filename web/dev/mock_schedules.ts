@@ -9,7 +9,7 @@ import { localInput, zonedToMs } from "../src/schedules.ts";
 export interface SchedAgent {
   id: number;
   name: string;
-  kind: "claude" | "codex";
+  kind: "claude" | "codex" | "antigravity";
   provider: "subscription" | "openrouter";
   accepts_origins: string[];
 }

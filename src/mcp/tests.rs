@@ -866,11 +866,25 @@ async fn spawn_session_defaults_and_new_channel() {
 }
 
 #[tokio::test]
+async fn antigravity_inherits_legacy_plan_in_the_callers_channel() {
+    let (m, st) = state();
+    let stored = serde_json::from_value(json!({"codex_sandbox":"read_only","claude_mode":"default"})).unwrap();
+    m.d.lock().channels.get_mut(&10).unwrap().permissions = stored;
+    let (text, error) = call(&st, "spawn_session", json!({"kind":"antigravity"})).await;
+    assert!(!error, "{text}");
+    let channel_id = parse(&text)["session"]["channel_id"].as_i64().unwrap();
+    assert_eq!(channel_id, 10);
+    let profile = m.d.lock().channels[&channel_id].permissions;
+    assert_eq!(crate::adapters::antigravity::mode_args(profile.antigravity_mode), ["--mode=plan"]);
+}
+
+#[tokio::test]
 async fn permissions_are_shown_and_inherited_never_raised() {
     let (m, st) = state();
     let elevated = Permissions {
         codex_sandbox: CodexSandbox::WorkspaceWriteNetwork,
         claude_mode: ClaudeMode::AcceptEdits,
+        antigravity_mode: crate::model::AntigravityMode::FullAccess,
     };
     m.d.lock().channels.get_mut(&10).unwrap().permissions = elevated;
     // Other channel in the workspace, with the defaults.
@@ -882,6 +896,8 @@ async fn permissions_are_shown_and_inherited_never_raised() {
     let p = &v["channel"]["permissions"];
     assert_eq!(p["codex_sandbox"], "workspace_write_network");
     assert_eq!(p["claude_mode"], "accept_edits");
+    assert_eq!(p["antigravity_mode"], "full_access");
+    assert_eq!(p["antigravity_flags"], "--dangerously-skip-permissions");
     assert_eq!(
         p["codex_flags"],
         "--sandbox workspace-write -c sandbox_workspace_write.network_access=true"
@@ -965,7 +981,7 @@ async fn permissions_are_shown_and_inherited_never_raised() {
     assert_eq!(m.d.lock().channels[&id].permissions, Permissions::default());
     // Nor by using a more permissive sibling channel: spawning into it, or messaging an agent
     // that runs there, is refused for the kinds it would elevate.
-    for kind in ["codex", "claude"] {
+    for kind in ["codex", "claude", "antigravity"] {
         let (t, err) = call_as(
             &st,
             "tok30",

@@ -194,6 +194,25 @@ impl Inbox {
     }
 }
 
+/// Read this run's committed callbacks without joining the shared writer queue. The
+/// ordinary consumer removes the rows in order; the per-session checkpoint makes replay safe.
+pub fn session_hooks(path: &Path, token: &str) -> anyhow::Result<Vec<Hook>> {
+    let db = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    db.busy_timeout(Duration::ZERO)?;
+    let instance: String = db.query_row("SELECT value FROM inbox_meta WHERE key='instance'", [], |r| r.get(0))?;
+    let mut query = db.prepare("SELECT id,event,payload,captured_at FROM hooks WHERE token=?1 ORDER BY id")?;
+    let mut rows = query.query([token])?;
+    let mut hooks = Vec::new();
+    while let Some(row) = rows.next()? {
+        hooks.push(Hook {
+            cursor: HookCursor { instance: instance.clone(), sequence: row.get(0)? },
+            token: token.into(), event: row.get(1)?, payload: serde_json::from_str(&row.get::<_, String>(2)?)?,
+            captured_at: row.get(3)?,
+        });
+    }
+    Ok(hooks)
+}
+
 /// Process in insertion order. The application transaction advances the cursor with
 /// attribution before the inbox row is removed; a lost deletion is harmless on restart.
 pub fn drain(hub: &crate::hub::Hub, inbox: &Inbox) -> anyhow::Result<()> {
@@ -231,6 +250,8 @@ pub fn drain(hub: &crate::hub::Hub, inbox: &Inbox) -> anyhow::Result<()> {
 pub fn spawn(hub: &std::sync::Arc<crate::hub::Hub>, inbox: Inbox) -> anyhow::Result<()> {
     // Complete the bounded recovery batch before detectors, queue workers or autostart.
     let mut guard = hub.callback_inbox.lock();
+    hub.hook_inbox_path.set(PathBuf::from(inbox.connection.path().context("missing inbox path")?))
+        .map_err(|_| anyhow::anyhow!("callback inbox is already installed"))?;
     *guard = Some(inbox);
     let inbox = guard.as_ref().expect("installed callback inbox");
     while inbox

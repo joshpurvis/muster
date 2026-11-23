@@ -66,6 +66,7 @@ import {
   IconBranch,
   IconCheck,
   IconChevronDown,
+  IconAntigravity,
   IconCodex,
   IconMail,
   IconMaximize,
@@ -92,6 +93,7 @@ export function spawnMenuItems(onPick: (k: SessionKind) => void): MenuItem[] {
     { label: "Claude", icon: <IconSpark size={14} />, accel: "1", run: () => onPick("claude") },
     { label: "Codex", icon: <IconCodex size={14} />, accel: "2", run: () => onPick("codex") },
     { label: "Shell", icon: <IconTerminal size={14} />, accel: "3", run: () => onPick("shell") },
+    { label: "Antigravity", icon: <IconAntigravity size={14} />, accel: "4", run: () => onPick("antigravity") },
   ];
 }
 
@@ -1126,7 +1128,7 @@ function ExitedBar({ s }: { s: SessionInfo }) {
   );
 }
 
-/** Centered Claude / Codex / Shell picker (keys 1 2 3). */
+/** Centered terminal picker (keys 1–4). */
 export function LaunchButtons(
   { pick, last }: { pick: (k: SessionKind) => void; last: string },
 ) {
@@ -1134,6 +1136,7 @@ export function LaunchButtons(
     { k: "claude", icon: <IconSpark size={22} />, desc: "Claude Code agent", name: "Claude" },
     { k: "codex", icon: <IconCodex size={22} />, desc: "Codex CLI agent", name: "Codex" },
     { k: "shell", icon: <IconTerminal size={22} />, desc: "Plain shell", name: "Shell" },
+    { k: "antigravity", icon: <IconAntigravity size={22} />, desc: "Antigravity CLI agent", name: "Antigravity" },
   ];
   return (
     <div class="launcher-opts">

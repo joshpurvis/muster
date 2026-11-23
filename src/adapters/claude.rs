@@ -935,6 +935,7 @@ mod tests {
             c.permissions = Permissions {
                 codex_sandbox: CodexSandbox::FullAccess,
                 claude_mode: mode,
+                ..Permissions::default()
             };
             let a = ClaudeAdapter.command(&c).unwrap().args;
             let i = a.iter().position(|x| x == "--permission-mode").unwrap();

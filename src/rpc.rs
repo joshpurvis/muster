@@ -599,6 +599,9 @@ async fn dispatch_inner(hub: &Arc<Hub>, who: &Principal, method: &str, params: V
         }
 
         "channel.create" => {
+            if params["agent"] == "antigravity" && params["provider"] == "openrouter" {
+                return Err(RpcError("only Claude and Codex sessions can run on OpenRouter".into()));
+            }
             let mut p: CreateChannel = parse(params)?;
             p.prov = spawn_prov(hub, p.from_session, p.agent)?;
             to_value(hub.create_channel(p).await?)
@@ -625,7 +628,7 @@ async fn dispatch_inner(hub: &Arc<Hub>, who: &Principal, method: &str, params: V
                 permissions: PermissionsInput,
             }
             let p: P = parse(params)?;
-            to_value(hub.set_permissions(p.id, p.permissions.into())?)
+            to_value(hub.change_permissions(p.id, |current| p.permissions.onto(current))?)
         }
         "channel.set_layout" => {
             #[derive(Deserialize)]
@@ -689,6 +692,9 @@ async fn dispatch_inner(hub: &Arc<Hub>, who: &Principal, method: &str, params: V
         }
 
         "session.spawn" => {
+            if params["kind"] == "antigravity" && params["provider"] == "openrouter" {
+                return Err(RpcError("only Claude and Codex sessions can run on OpenRouter".into()));
+            }
             let mut p: SpawnSession = parse(params)?;
             p.prov = spawn_prov(hub, p.from_session, Some(p.kind))?;
             to_value(hub.spawn_session(p).await?)
@@ -2000,7 +2006,7 @@ fn spawn_prov(
 }
 
 /// An MCP tool's text result as the RPC result (JSON when it is JSON).
-/// `from_session` when it is an agent's (Claude or Codex) session: its note writes go through
+/// `from_session` when it is an agent's session: its note writes go through
 /// its MCP tools. A shell tab, or no session, writes as the human.
 fn agent_session(hub: &Hub, from: Option<SessionId>) -> Result<Option<SessionId>, RpcError> {
     Ok(if crate::notes::author(hub, from)?.kind == "agent" { from } else { None })
@@ -3746,7 +3752,7 @@ mod tests {
         }).unwrap();
         let e = dispatch_via(&hub, &Principal::Local, "agent.update", json!({"name": "rpc-cody", "self_handoff": true}), Via::Window)
             .await.map_err(|e| e.0).unwrap_err();
-        assert!(e.contains("Codex"), "{e}");
+        assert!(e.contains("only Claude agents support self handoff"), "{e}");
     }
 
     /// Tools up front: `http_call` runs the owner check for it alone too (the CLI's

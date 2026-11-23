@@ -5,7 +5,7 @@ device cookie auth, the proxied-request policy, scopes, `/m/` (sessions list, ap
 read-only terminal with touch scroll, pinch zoom and select/copy, floating composer,
 `follow`/`keep` size), suspend on background, and the replay economy: `attach_info`, `screen`
 and `delta` replays (a phone coming back gets only the output it missed), and pings both ways.
-A manage-scoped phone opens new tabs (folder, agent kind, optional first prompt and worktree,
+A manage-scoped phone opens new tabs (folder, choice of Claude, Codex, Shell or Antigravity, optional first prompt and worktree,
 `fs.complete` for typed folders) and restarts, stops, renames or closes a tab and renames or
 archives its task, from the session title's sheet; stop, close and archive ask first in plain
 words. Phone alerts go over Web Push (phase 2: src/push.rs, web/m/sw.js; tested against the RFC 8291

@@ -142,6 +142,7 @@ pub struct PanelEvent {
 pub enum SessionKind {
     Claude,
     Codex,
+    Antigravity,
     Shell,
 }
 
@@ -150,11 +151,21 @@ impl SessionKind {
         match self {
             SessionKind::Claude => "claude",
             SessionKind::Codex => "codex",
+            SessionKind::Antigravity => "antigravity",
             SessionKind::Shell => "shell",
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Claude => "Claude",
+            Self::Codex => "Codex",
+            Self::Antigravity => "Antigravity",
+            Self::Shell => "Shell",
         }
     }
     pub fn parse(s: &str) -> Option<Self> {
         match s {
+            "antigravity" => Some(Self::Antigravity),
             "claude" => Some(SessionKind::Claude),
             "codex" => Some(SessionKind::Codex),
             "shell" => Some(SessionKind::Shell),
@@ -212,7 +223,7 @@ pub enum StateSource {
     Daemon,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StateUpdate {
     pub state: AgentState,
     /// Short human text, e.g. "Bash: cargo test" or the question being asked.
@@ -330,29 +341,65 @@ pub enum ClaudeMode {
     Bypass,
 }
 
-/// Per-channel agent permission profile. Defaults match the CLIs' own defaults.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct Permissions {
-    #[serde(default)]
-    pub codex_sandbox: CodexSandbox,
-    #[serde(default)]
-    pub claude_mode: ClaudeMode,
+/// Antigravity execution modes, ordered least to most permissive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AntigravityMode {
+    Plan,
+    AcceptEdits,
+    #[default]
+    Auto,
+    FullAccess,
 }
 
-/// A complete profile as a client sends it (both fields required, so a partial update can't
-/// silently reset the other half to its default).
+/// Per-channel agent permission profile. Defaults match the CLIs' own defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(from = "StoredPermissions")]
+pub struct Permissions {
+    pub codex_sandbox: CodexSandbox,
+    pub claude_mode: ClaudeMode,
+    pub antigravity_mode: AntigravityMode,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct StoredPermissions {
+    codex_sandbox: CodexSandbox,
+    claude_mode: ClaudeMode,
+    antigravity_mode: Option<AntigravityMode>,
+}
+
+impl From<StoredPermissions> for Permissions {
+    fn from(saved: StoredPermissions) -> Self {
+        let restricted = saved.claude_mode == ClaudeMode::Plan || saved.codex_sandbox == CodexSandbox::ReadOnly;
+        Self {
+            codex_sandbox: saved.codex_sandbox,
+            claude_mode: saved.claude_mode,
+            antigravity_mode: saved.antigravity_mode.unwrap_or(if restricted {
+                AntigravityMode::Plan
+            } else {
+                AntigravityMode::AcceptEdits
+            }),
+        }
+    }
+}
+
+/// The original two fields are required. Older clients omit the Antigravity mode.
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PermissionsInput {
     pub codex_sandbox: CodexSandbox,
     pub claude_mode: ClaudeMode,
+    #[serde(default)]
+    pub antigravity_mode: Option<AntigravityMode>,
 }
 
-impl From<PermissionsInput> for Permissions {
-    fn from(p: PermissionsInput) -> Self {
+impl PermissionsInput {
+    pub fn onto(self, current: Permissions) -> Permissions {
         Permissions {
-            codex_sandbox: p.codex_sandbox,
-            claude_mode: p.claude_mode,
+            codex_sandbox: self.codex_sandbox,
+            claude_mode: self.claude_mode,
+            antigravity_mode: self.antigravity_mode.unwrap_or(current.antigravity_mode),
         }
     }
 }
@@ -363,6 +410,7 @@ impl Permissions {
     pub fn exceeds_for(&self, other: &Permissions, kind: SessionKind) -> bool {
         match kind {
             SessionKind::Codex => self.codex_sandbox > other.codex_sandbox,
+            SessionKind::Antigravity => self.antigravity_mode > other.antigravity_mode,
             SessionKind::Claude => self.claude_mode > other.claude_mode,
             SessionKind::Shell => false,
         }
@@ -375,6 +423,7 @@ impl Permissions {
             self.codex_sandbox,
             CodexSandbox::WorkspaceWriteNetwork | CodexSandbox::FullAccess
         ) || matches!(self.claude_mode, ClaudeMode::AcceptEdits | ClaudeMode::Bypass)
+            || self.antigravity_mode == AntigravityMode::FullAccess
     }
 }
 

@@ -1,6 +1,6 @@
 import { batch, computed, signal } from "@preact/signals";
 import { connStatus, rpc } from "../rpc.ts";
-import type { Channel, Decision, SessionInfo } from "../types.ts";
+import { approvalParams, type Channel, type Decision, type SessionInfo } from "../types.ts";
 import { load, save } from "../util.ts";
 import {
   type AttachInfo,
@@ -329,7 +329,7 @@ export async function act<T = unknown>(s: SessionInfo, method: string, params: o
   return await rpc.call<T>(method, { id: s.id, ...params });
 }
 export function approve(s: SessionInfo, decision: Decision, grid?: Grid) {
-  return act(s, "session.approve", { decision, state_seq: s.state_seq, state_since: s.state_since }, grid);
+  return act(s, "session.approve", approvalParams(s, decision), grid);
 }
 
 export function start() {

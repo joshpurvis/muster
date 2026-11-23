@@ -310,7 +310,7 @@ export function providerPendingNote(a: Agent, s: SessionInfo | undefined): strin
 
 /** Each CLI's own vendor comes first: Claude Code is built for Anthropic's models, Codex for
  * OpenAI's (others work through OpenRouter on a best-effort basis). */
-export const PREFERRED_VENDOR: Record<Agent["kind"], string> = { claude: "anthropic", codex: "openai" };
+export const PREFERRED_VENDOR: Record<Agent["kind"], string> = { claude: "anthropic", codex: "openai", antigravity: "google" };
 
 export interface VendorGroup {
   vendor: string;
@@ -366,7 +366,7 @@ export function listedModels(
 ): string[] {
   return provider === "openrouter"
     ? openrouter.map((m) => m.id)
-    : (catalog?.[kind].models ?? []).map((m) => m.id);
+    : (catalog?.[kind]?.models ?? []).map((m) => m.id);
 }
 
 /** Codex on OpenRouter has no usable default (its own model names lack the vendor prefix). */

@@ -6,7 +6,7 @@ export type WorkspaceId = number;
 export type ChannelId = number;
 export type SessionId = number;
 
-export type SessionKind = "claude" | "codex" | "shell";
+export type SessionKind = "claude" | "codex" | "antigravity" | "shell";
 
 /** A reference to a directory managed exclusively by Claude Code. */
 export interface AccountProfile {
@@ -135,17 +135,35 @@ export interface Win {
 }
 
 export type CodexSandbox = "read_only" | "workspace_write" | "workspace_write_network" | "full_access";
+export type AntigravityMode = "plan" | "accept_edits" | "auto" | "full_access";
 export type ClaudeMode = "default" | "accept_edits" | "plan" | "bypass";
 
 export interface Permissions {
   codex_sandbox: CodexSandbox;
   claude_mode: ClaudeMode;
+  antigravity_mode: AntigravityMode;
 }
 
 export const DEFAULT_PERMISSIONS: Permissions = {
   codex_sandbox: "workspace_write",
   claude_mode: "default",
+  antigravity_mode: "auto",
 };
+
+/** Older daemons return the stored two-kind profile. Match its migration on the backend. */
+export function storedPermissions(saved?: Partial<Permissions>): Permissions {
+  if (!saved) return { ...DEFAULT_PERMISSIONS };
+  return {
+    ...DEFAULT_PERMISSIONS,
+    ...saved,
+    antigravity_mode: saved.antigravity_mode ??
+      (saved.claude_mode === "plan" || saved.codex_sandbox === "read_only" ? "plan" : "accept_edits"),
+  };
+}
+
+export function approvalParams(s: Pick<SessionInfo, "id" | "state_seq" | "state_since">, decision: Decision) {
+  return { id: s.id, decision, state_seq: s.state_seq, state_since: s.state_since };
+}
 
 export interface SessionInfo {
   account_profile_id?: number | null;
@@ -263,7 +281,7 @@ export interface Agent {
   provider?: Provider;
   id: number;
   name: string;
-  kind: "claude" | "codex";
+  kind: "claude" | "codex" | "antigravity";
   model: string | null;
   effort: string | null;
   persona: string;
@@ -385,7 +403,7 @@ export interface AgentTemplate {
   label: string;
   about: string;
   name: string;
-  kind: "claude" | "codex";
+  kind: "claude" | "codex" | "antigravity";
   model: string | null;
   effort: string | null;
   persona: string;
@@ -400,7 +418,7 @@ export interface KindModels {
   models: { id: string; note: string | null; efforts: string[] | null }[];
   efforts: string[];
 }
-export type ModelCatalog = Record<"claude" | "codex", KindModels>;
+export type ModelCatalog = Record<"claude" | "codex" | "antigravity", KindModels>;
 
 /** One model from OpenRouter's public list (`openrouter.models`). */
 export interface OpenRouterModel {
@@ -1061,4 +1079,5 @@ export const KIND_LABEL: Record<SessionKind, string> = {
   claude: "Claude",
   codex: "Codex",
   shell: "Shell",
+  antigravity: "Antigravity",
 };

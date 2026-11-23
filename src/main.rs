@@ -315,7 +315,8 @@ Example: muster keys 12 esc text:/compact enter")]
     /// Open a new tab and start an agent in it; prints the new session id.
     #[command(after_help = "Arguments after `--` go to the agent CLI, after muster's permission flags:\n  \
 muster new . --kind codex --prompt \"hi\" -- -m gpt-6.2-sol -c model_reasoning_effort=xhigh\n  \
-muster new --kind claude -- --model haiku")]
+muster new --kind claude -- --model haiku\n  \
+muster new --kind antigravity -- --model gemini-4-neon-high")]
     New {
         /// Folder or repo (default: current directory).
         path: Option<PathBuf>,
@@ -323,7 +324,7 @@ muster new --kind claude -- --model haiku")]
         #[arg(long, value_name = "PROFILE")]
         profile: Option<String>,
         /// What to start in the tab (none: an empty tab). `--agent` is an older alias.
-        #[arg(long, alias = "agent", default_value = "claude", value_parser = ["claude", "codex", "shell", "none"])]
+        #[arg(long, alias = "agent", default_value = "claude", value_parser = ["claude", "codex", "shell", "antigravity", "none"])]
         kind: String,
         /// Work in a new worktree on branch muster/<tab>.
         #[arg(long)]
@@ -539,16 +540,16 @@ enum AgentCmd {
         /// moves it later).
         #[arg(long, value_name = "PROFILE")]
         profile: Option<String>,
-        #[arg(long, default_value = "claude", value_parser = ["claude", "codex"])]
+        #[arg(long, default_value = "claude", value_parser = ["claude", "codex", "antigravity"])]
         kind: String,
         /// Where the model runs: subscription (the CLI's own login) or openrouter (pay per
-        /// token with the backend's OPENROUTER_API_KEY; a Codex agent there needs --model).
+        /// token with the backend's OPENROUTER_API_KEY; Claude and Codex only, Codex needs --model).
         #[arg(long, value_name = "P", value_parser = ["subscription", "openrouter"])]
         provider: Option<String>,
         /// Model for the agent CLI.
         #[arg(long, value_name = "M")]
         model: Option<String>,
-        /// Reasoning effort (claude --effort, codex model_reasoning_effort).
+        /// Reasoning effort (claude / agy --effort, codex model_reasoning_effort).
         #[arg(long, value_name = "E")]
         effort: Option<String>,
         /// Who the agent is and what it does (written to its CLAUDE.md / AGENTS.md).
@@ -557,7 +558,7 @@ enum AgentCmd {
         /// Read the persona from a file.
         #[arg(long, value_name = "F")]
         persona_file: Option<PathBuf>,
-        /// Message origins it accepts (default: human for claude, human,schedule,webhook for codex).
+        /// Message origins it accepts (default: human for claude and antigravity, human,schedule,webhook for codex).
         #[arg(long, value_name = "ORIGINS")]
         accepts: Option<String>,
         /// Start it whenever the daemon starts.
@@ -595,7 +596,7 @@ enum AgentCmd {
         #[arg(long, value_name = "TEXT", requires = "profile")]
         reason: Option<String>,
         /// Where the model runs: subscription (the CLI's own login) or openrouter (pay per
-        /// token with the backend's OPENROUTER_API_KEY; a Codex agent there needs --model).
+        /// token with the backend's OPENROUTER_API_KEY; Claude and Codex only, Codex needs --model).
         #[arg(long, value_name = "P", value_parser = ["subscription", "openrouter"])]
         provider: Option<String>,
         /// Model for the agent CLI (empty: the CLI's default).
@@ -673,6 +674,9 @@ struct AgentPerms {
     /// Claude permission mode of its tab.
     #[arg(long, value_name = "MODE", value_parser = ["plan", "default", "accept_edits", "bypass"])]
     claude_mode: Option<String>,
+    /// Antigravity execution mode of its tab.
+    #[arg(long, value_name = "MODE", value_parser = ["plan", "accept-edits", "auto", "full-access"])]
+    antigravity_mode: Option<String>,
     /// Codex sandbox of its tab.
     #[arg(long, value_name = "SANDBOX", value_parser = ["read_only", "workspace_write", "workspace_write_network", "full_access"])]
     codex_sandbox: Option<String>,
@@ -874,6 +878,7 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
                     lead: None,
                     claude_mode: perms.claude_mode,
                     codex_sandbox: perms.codex_sandbox,
+                    antigravity_mode: perms.antigravity_mode,
                 },
             ),
             AgentCmd::Edit {
@@ -914,6 +919,7 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
                     lead: lead.map(|a| a == "on"),
                     claude_mode: perms.claude_mode,
                     codex_sandbox: perms.codex_sandbox,
+                    antigravity_mode: perms.antigravity_mode,
                 },
             ),
             AgentCmd::Ls { json } => cli::agent_ls(d, json),
@@ -2145,6 +2151,8 @@ mod tests {
         assert!(parse(&["agent", "edit", "ada", "--sleep-after", "2h"]).is_ok());
         assert!(parse(&["agent", "sleep", "ada"]).is_ok());
         assert!(parse(&["agent", "edit", "ada", "--claude-mode", "yolo"]).is_err());
+        assert!(parse(&["new", ".", "--kind", "antigravity"]).is_ok());
+        assert!(parse(&["agent", "new", "alpha", "--kind", "antigravity", "--antigravity-mode", "accept-edits"]).is_ok());
         assert!(parse(&["bot", "ls"]).is_err());
         // `muster new --kind`, with `--agent` still accepted.
         for flag in ["--kind", "--agent"] {

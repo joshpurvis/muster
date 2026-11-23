@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 use crate::model::{AgentState, Decision, Permissions, SessionId, SessionKind, StateUpdate};
 
+pub mod antigravity;
 pub mod claude;
 pub mod codex;
 pub mod shell;
@@ -59,6 +60,21 @@ pub fn resumed_in_launch(kind: SessionKind, args: &[String]) -> Option<Option<St
             }
             found
         }
+        SessionKind::Antigravity => {
+            let mut found = None;
+            let mut args = args.iter();
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--conversation" => found = Some(args.next().cloned()),
+                    "--continue" | "-c" => found = Some(None),
+                    "--model" | "--effort" => { args.next(); }
+                    _ => if let Some(id) = arg.strip_prefix("--conversation=") {
+                        found = Some(Some(id.to_string()));
+                    },
+                }
+            }
+            found
+        }
         SessionKind::Shell => None,
     }
 }
@@ -76,7 +92,8 @@ pub fn says_conversation_missing(kind: SessionKind, output: &str, id: Option<&st
     let phrase = match kind {
         SessionKind::Claude => "No conversation found",
         SessionKind::Codex => "No saved session found with ID",
-        SessionKind::Shell => return false,
+        // No stale-id text known for agy 1.5.13; it warns and continues.
+        SessionKind::Antigravity | SessionKind::Shell => return false,
     };
     let squeeze = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
     let (text, phrase) = (squeeze(output), squeeze(phrase));
@@ -116,6 +133,12 @@ const CLAUDE_ARGS: &[(&str, Option<char>, Val)] = &[
     ("--verbose", None, Val::None),
     ("--debug", Some('d'), Val::Opt),
 ];
+const ANTIGRAVITY_ARGS: &[(&str, Option<char>, Val)] = &[
+    ("--model", None, Val::One),
+    ("--effort", None, Val::One),
+    ("--continue", Some('c'), Val::None),
+    ("--conversation", None, Val::One),
+];
 const CODEX_ARGS: &[(&str, Option<char>, Val)] = &[
     ("--model", Some('m'), Val::One),
     ("--config", Some('c'), Val::One),
@@ -141,6 +164,7 @@ pub fn check_extra_args(kind: SessionKind, args: &[String]) -> anyhow::Result<()
 pub fn parse_extra_args<'a>(kind: SessionKind, args: &'a [String]) -> anyhow::Result<Vec<(&'static str, Vec<&'a str>)>> {
     let table = match kind {
         SessionKind::Claude => CLAUDE_ARGS,
+        SessionKind::Antigravity => ANTIGRAVITY_ARGS,
         SessionKind::Codex => CODEX_ARGS,
         SessionKind::Shell => return Ok(Vec::new()),
     };
@@ -208,6 +232,9 @@ pub fn parse_extra_args<'a>(kind: SessionKind, args: &'a [String]) -> anyhow::Re
                     );
                 }
             }
+        }
+        if kind == SessionKind::Antigravity && values.iter().any(|v| v.is_empty() || v.starts_with('-')) {
+            return Err(refuse(a));
         }
         out.push((long, values));
     }
@@ -295,6 +322,7 @@ pub trait Adapter: Send + Sync {
 
 pub fn adapter_for(kind: SessionKind) -> &'static dyn Adapter {
     match kind {
+        SessionKind::Antigravity => &antigravity::AntigravityAdapter,
         SessionKind::Claude => &claude::ClaudeAdapter,
         SessionKind::Codex => &codex::CodexAdapter,
         SessionKind::Shell => &shell::ShellAdapter,
@@ -373,6 +401,25 @@ mod tests {
         for bad in [&["--resume", "t-1"][..], &["--resume=t-1"]] {
             assert!(!check(Codex, bad), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn antigravity_extra_args_and_resume() {
+        use SessionKind::Antigravity;
+        for valid in [&["--model", "demo"][..], &["--effort", "high"], &["-c"], &["--continue"],
+            &["--conversation", "abc"], &["--conversation=abc"]] {
+            assert!(check(Antigravity, valid), "{valid:?}");
+        }
+        for invalid in [&["--mode", "auto"][..], &["--mode=plan"], &["--sandbox"], &["--dangerously-skip-permissions"],
+            &["--settings", "x"], &["--add-dir", "/"], &["-p", "x"], &["-i", "x"], &["--agent", "x"],
+            &["--model", "--dangerously-skip-permissions"]] {
+            assert!(!check(Antigravity, invalid), "{invalid:?}");
+        }
+        let resume = |args: &[&str]| resumed_in_launch(Antigravity, &args.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(resume(&["--continue", "--conversation=abc"]), Some(Some("abc".into())));
+        assert_eq!(resume(&["--conversation", "abc", "-c"]), Some(None));
+        assert_eq!(resume(&["--conversation", "abc"]), Some(Some("abc".into())));
+        assert_eq!(resume(&["--prompt-interactive=--continue"]), None);
     }
 
     #[test]

@@ -58,7 +58,7 @@ worth looking at). The user clicks Merge, and the agent runs `gh pr merge`.
   `@modelcontextprotocol/ext-apps`). Muster's built-in panels (image, chart, Markdown, diff
   review) are apps Muster ships; an agent can also write its own. One runtime, one security
   model, and agent-written apps also work in other hosts (Claude, ChatGPT, VS Code, Cursor).
-- **Muster is the host.** Claude Code and Codex are the MCP clients and render nothing. Muster
+- **Muster is the host.** Claude Code, Codex and Antigravity are MCP clients. Antigravity panel access depends on its discovery of the per-tab MCP server (see PROTOCOL.md, “Antigravity”). Muster
   is the MCP server they call and also the UI, so it renders the apps its own tools return.
   The spec does not cover a host that is not the model's client; the return path below is
   Muster's own.

@@ -169,7 +169,7 @@ const agent = (name: string, kind: Agent["kind"], accepts: Agent["accepts_origin
   model: null,
   effort: null,
   persona: "",
-  permissions: { codex_sandbox: "workspace_write", claude_mode: "default" },
+  permissions: { codex_sandbox: "workspace_write", claude_mode: "default", antigravity_mode: "auto" },
   accepts_origins: accepts,
   autostart: false,
   home_dir: "/tmp/" + name,

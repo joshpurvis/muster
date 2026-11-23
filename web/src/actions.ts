@@ -88,7 +88,7 @@ import { isAddonTab, noteId, noteTab, panelId, panelTab, PRS_TAB, QUESTIONS_TAB 
 import { prs, prsFilter, prsSupported, selectedPr, worthShowing } from "./prs.ts";
 import { openQuestionCount, questions, questionsFilter, questionsSupported, selectedQuestion } from "./questions.ts";
 import { flushAllDrafts, flushDraft, knowNote, notes, persistAllDrafts, unsavedNotes } from "./notes.ts";
-import type { HelloResult, Note } from "./types.ts";
+import { approvalParams, type HelloResult, type Note } from "./types.ts";
 import { inheritedProfile } from "./account_profiles.ts";
 import { isAsleep, pendingMove, providerPendingNote, restartShown, restartShownChanged, switchMessage, upsertMessage } from "./agents.ts";
 import type { MenuItem } from "./components/Menu.tsx";
@@ -587,6 +587,7 @@ export function focusActiveTerminalSoon() {
         else if (tab !== null && isAddonTab(tab)) document.querySelector<HTMLIFrameElement>(`iframe[data-addon-tab="${tab}"]`)?.focus();
         else if (tab === QUESTIONS_TAB) document.querySelector<HTMLElement>(".questions-view:not(.prs-view)")?.focus();
         else if (tab === PRS_TAB) document.querySelector<HTMLElement>(".prs-view")?.focus();
+        else if (tab === null) document.querySelector<HTMLElement>(".welcome.empty")?.focus();
       }
     })
   );
@@ -914,7 +915,7 @@ export function spawnHere(kind: SessionKind) {
   if (c) spawn(c.id, kind, { type: "tab" });
 }
 
-/** Alt+N: pick a kind for a new terminal in the focused tab's task (1/2/3, Enter repeats last). */
+/** Alt+N: pick a kind for a new terminal in the focused tab's task (1–4, Enter repeats last). */
 export async function spawnPicker() {
   const c = focusedTask.value;
   const l = layout.value;
@@ -936,7 +937,7 @@ export async function spawnPicker() {
       ...spawnMenuItems((k) => spawn(c.id, k, { type: "tab", group })),
     ],
     minWidth: 200,
-    select: 1 + ["claude", "codex", "shell"].indexOf(lastKind()),
+    select: 1 + ["claude", "codex", "shell", "antigravity"].indexOf(lastKind()),
     onClose: () => focusActiveTerminalSoon(),
   });
 }
@@ -1189,7 +1190,9 @@ export function endRename(r: Renaming, byKey: boolean) {
 }
 
 export function approve(sid: SessionId, decision: Decision) {
-  rpc.call("session.approve", { id: sid, decision })
+  const s = sessions.peek().get(sid);
+  if (!s) return;
+  rpc.call("session.approve", approvalParams(s, decision))
     .catch(fail(decision === "deny" ? "Deny failed" : "Approve failed")).catch(() => {});
 }
 
@@ -1251,7 +1254,7 @@ export async function createTab(req: NewTabReq): Promise<Channel> {
   // Same folder, no worktree: join the channel already open there, so sessions on different
   // Claude accounts share one channel's tabs and layout instead of splitting into siblings.
   const joined = req.worktree ? undefined
-    : folderChannel(windowChannels.peek(), ws.path, { name: req.name, permissions: req.permissions,
+    : folderChannel(windowChannels.peek(), ws.path, { kind: req.agent, name: req.name, permissions: req.permissions,
       prefer: startedIn, live: (id) => !!sessionsByChannel.peek().get(id)?.length });
   if (joined) {
     if (activeChannelId.peek() === startedIn) selectChannel(joined.id);

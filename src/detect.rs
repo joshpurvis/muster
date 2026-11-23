@@ -3,7 +3,7 @@
 //! Every 250ms, each live session whose output changed (and every 2s regardless) gets its
 //! screen parsed by the adapter's `detect_from_screen`; a differing state is applied with
 //! `StateSource::Screen` (the hub keeps fresh hook states from being overridden). Details from
-//! hooks are richer than the screen's, so a same-state screen result never replaces them.
+//! hooks are kept for Claude and Codex. Antigravity's screen supplies the visible request's identity.
 //!
 //! Stuck (agents only, `StateSource::Timer`): Working with no meaningful screen change for 10
 //! minutes. "Meaningful" ignores digits and spinner glyphs, so animated timers and token
@@ -84,7 +84,7 @@ pub fn spawn(hub: Arc<Hub>) {
             dirty |= previous_len != tracks.len();
             for id in ids {
                 let now = now_ms();
-                let Some((info, terminal)) = hub.detection_terminal(id) else { continue };
+                let Some((info, terminal, callback)) = hub.detection_terminal(id) else { continue };
                 let seq = terminal.seq();
                 let t = tracks.entry(id).or_default();
                 let before = t.progress();
@@ -106,7 +106,7 @@ pub fn spawn(hub: Arc<Hub>) {
                 t.last_eval = now;
                 let Some(screen) = terminal.screen() else { continue };
                 let before = t.progress();
-                match evaluate(&info, &screen, t, now) {
+                match evaluate(&info, &screen, callback.as_ref(), t, now) {
                     Verdict::Set(update, source) => {
                         hub.set_state_checked(id, update, source, Some(terminal.generation));
                     }
@@ -167,11 +167,12 @@ enum Verdict {
 }
 
 /// Decide the state change (if any) for one session. Pure apart from `t`, for tests.
-fn evaluate(info: &SessionInfo, screen: &ScreenSnapshot, t: &mut Track, now: i64) -> Verdict {
-    match evaluate_inner(info, screen, t, now) {
+fn evaluate(info: &SessionInfo, screen: &ScreenSnapshot, callback: Option<&StateUpdate>, t: &mut Track, now: i64) -> Verdict {
+    match evaluate_inner(info, screen, callback, t, now) {
         Some((u, StateSource::Screen | StateSource::Timer))
             if u.state == AgentState::Idle
                 && info.kind != SessionKind::Shell
+                && callback.is_none()
                 && now - screen.last_output_at < IDLE_SETTLE_MS =>
         {
             Verdict::Recheck
@@ -184,6 +185,7 @@ fn evaluate(info: &SessionInfo, screen: &ScreenSnapshot, t: &mut Track, now: i64
 fn evaluate_inner(
     info: &SessionInfo,
     screen: &ScreenSnapshot,
+    callback: Option<&StateUpdate>,
     t: &mut Track,
     now: i64,
 ) -> Option<(StateUpdate, StateSource)> {
@@ -206,6 +208,20 @@ fn evaluate_inner(
 
     let adapter = adapter_for(info.kind);
     let detected = adapter.detect_from_screen(screen, current);
+    // A lost end-of-turn callback must not strand the queue. A Working-looking panel
+    // has no corresponding override for an idle callback.
+    if callback.is_some_and(|u| u.state == Working)
+        && detected.as_ref().is_some_and(|u| u.state == Idle)
+        && adapter.composer_text(screen).is_some()
+        && now - t.changed_at >= 5000
+    {
+        return Some((StateUpdate::new(Idle), StateSource::Timer));
+    }
+    let detected = match callback {
+        Some(base) => Some(detected.filter(|u| crate::adapters::antigravity::is_screen_dialog(u.state, u.detail.as_deref()))
+            .unwrap_or_else(|| base.clone())),
+        None => detected,
+    };
 
     if current == Stuck {
         // The screen shows something other than an agent at work (idle, a dialog): go there.
@@ -228,7 +244,7 @@ fn evaluate_inner(
     }
 
     if let Some(u) = detected
-        && u.state != current
+        && (u.state != current || (info.kind == SessionKind::Antigravity && u.detail != info.state_detail))
     {
         return Some((u, StateSource::Screen));
     }
@@ -248,6 +264,38 @@ fn evaluate_inner(
 mod tests {
     use super::*;
     use crate::adapters::tui::testutil::snap;
+
+    #[test]
+    fn antigravity_stable_composer_recovers_a_dropped_idle_callback() {
+        let info = info(SessionKind::Antigravity, AgentState::Working, 0);
+        let working = StateUpdate::new(AgentState::Working);
+        let mut screen = snap(include_str!("adapters/fixtures/antigravity_idle_auto.txt"));
+        let mut t = Track::default();
+        for now in [1000, 5999] {
+            screen.last_output_at = now; // Repainting the same composer does not restart the timer.
+            assert!(evaluate_inner(&info, &screen, Some(&working), &mut t, now).is_none());
+        }
+        assert_eq!(evaluate_inner(&info, &screen, Some(&working), &mut t, 6000).unwrap().0.state, AgentState::Idle);
+    }
+
+    #[test]
+    fn antigravity_new_request_replaces_same_state_detail() {
+        let mut session = info(SessionKind::Antigravity, AgentState::NeedsApproval, 1);
+        session.state_detail = Some("Run this command? touch alpha.txt && ls".into());
+        let screen = snap(include_str!("adapters/fixtures/antigravity_approval_command.txt"));
+        let Verdict::Set(update, StateSource::Screen) = evaluate(&session, &screen, None, &mut Track::default(), 5000)
+            else { panic!("new request must invalidate the old approval") };
+        assert!(update.detail.unwrap().contains("touch beta.txt && ls"));
+    }
+
+    #[test]
+    fn antigravity_dialog_closes_to_callback_on_mcp_panel() {
+        let session = info(SessionKind::Antigravity, AgentState::AskingQuestion, 1);
+        let screen = snap(include_str!("adapters/fixtures/antigravity_mcp_panel.txt"));
+        let idle = StateUpdate::new(AgentState::Idle);
+        assert!(matches!(evaluate(&session, &screen, Some(&idle), &mut Track::default(), 10),
+            Verdict::Set(update, StateSource::Screen) if update == idle));
+    }
 
     #[test]
     fn process_cwd_checks_the_run_marker() {
@@ -330,6 +378,7 @@ mod tests {
         let r = evaluate_inner(
             &info(SessionKind::Claude, AgentState::Starting, 0),
             &idle,
+            None,
             &mut t,
             1000,
         );
@@ -339,6 +388,7 @@ mod tests {
             evaluate_inner(
                 &info(SessionKind::Claude, AgentState::Idle, 0),
                 &idle,
+                None,
                 &mut t,
                 2000
             )
@@ -353,11 +403,11 @@ mod tests {
         let mut t = Track::default();
         idle.last_output_at = 10_000;
         assert!(matches!(
-            evaluate(&w, &idle, &mut t, 10_500),
+            evaluate(&w, &idle, None, &mut t, 10_500),
             Verdict::Recheck
         ));
         assert!(matches!(
-            evaluate(&w, &idle, &mut t, 11_300),
+            evaluate(&w, &idle, None, &mut t, 11_300),
             Verdict::Set(
                 StateUpdate {
                     state: AgentState::Idle,
@@ -373,24 +423,24 @@ mod tests {
         let working = snap(include_str!("adapters/fixtures/claude_running_tool.txt"));
         let mut t = Track::default();
         let w = info(SessionKind::Claude, AgentState::Working, 0);
-        assert!(evaluate_inner(&w, &working, &mut t, 1_000).is_none());
+        assert!(evaluate_inner(&w, &working, None, &mut t, 1_000).is_none());
         // Spinner/timer animation only (digits + glyph) is not progress.
         let mut anim = working.clone();
         for l in anim.lines.iter_mut() {
             *l = l.replace("4s", "9s").replace('✶', "✻");
         }
-        assert!(evaluate_inner(&w, &anim, &mut t, 60_000).is_none());
-        let r = evaluate_inner(&w, &anim, &mut t, 1_000 + STUCK_AFTER_MS).unwrap();
+        assert!(evaluate_inner(&w, &anim, None, &mut t, 60_000).is_none());
+        let r = evaluate_inner(&w, &anim, None, &mut t, 1_000 + STUCK_AFTER_MS).unwrap();
         assert_eq!((r.0.state, r.1), (AgentState::Stuck, StateSource::Timer));
         let s = info(
             SessionKind::Claude,
             AgentState::Stuck,
             1_000 + STUCK_AFTER_MS,
         );
-        assert!(evaluate_inner(&s, &anim, &mut t, 2_000 + STUCK_AFTER_MS).is_none());
+        assert!(evaluate_inner(&s, &anim, None, &mut t, 2_000 + STUCK_AFTER_MS).is_none());
         let mut more = anim.clone();
         more.lines[3] = "● new output".into();
-        let r = evaluate_inner(&s, &more, &mut t, 3_000 + STUCK_AFTER_MS).unwrap();
+        let r = evaluate_inner(&s, &more, None, &mut t, 3_000 + STUCK_AFTER_MS).unwrap();
         assert_eq!((r.0.state, r.1), (AgentState::Working, StateSource::Timer));
     }
 
@@ -400,11 +450,11 @@ mod tests {
         let mut t = Track::default();
         let w = info(SessionKind::Claude, AgentState::Working, 0);
         assert!(matches!(
-            evaluate(&w, &working, &mut t, 1_000),
+            evaluate(&w, &working, None, &mut t, 1_000),
             Verdict::Keep
         ));
         let at = 1_000 + STUCK_AFTER_MS;
-        let r = evaluate(&w, &working, &mut t, at);
+        let r = evaluate(&w, &working, None, &mut t, at);
         assert!(
             matches!(
                 r,
@@ -423,11 +473,11 @@ mod tests {
         let mut idle = snap(include_str!("adapters/fixtures/claude_idle_done.txt"));
         idle.last_output_at = at + 1_000;
         assert!(matches!(
-            evaluate(&s, &idle, &mut t, at + 1_100),
+            evaluate(&s, &idle, None, &mut t, at + 1_100),
             Verdict::Recheck
         ));
         // Next tick: same screen (hash unchanged), output has settled -> Idle.
-        let r = evaluate(&s, &idle, &mut t, at + 1_000 + IDLE_SETTLE_MS + 50);
+        let r = evaluate(&s, &idle, None, &mut t, at + 1_000 + IDLE_SETTLE_MS + 50);
         assert!(
             matches!(
                 r,
@@ -454,7 +504,7 @@ mod tests {
             let store = crate::store::Store::open(&path).unwrap();
             let mut track = Track::default();
             track.for_generation(7, 1_000);
-            assert!(evaluate_inner(&info, &working, &mut track, 1_000).is_none());
+            assert!(evaluate_inner(&info, &working, None, &mut track, 1_000).is_none());
             track.seq = 42;
             track.last_eval = 1_000;
             store.save_runtime(CHECKPOINT, &HashMap::from([(info.id, track)])).unwrap();
@@ -464,11 +514,11 @@ mod tests {
         let track = tracks.get_mut(&info.id).unwrap();
         assert_eq!((track.seq, track.last_eval), (0, 0), "poll counters must restart");
         track.for_generation(7, STUCK_AFTER_MS);
-        let update = evaluate_inner(&info, &working, track, 1_000 + STUCK_AFTER_MS).unwrap();
+        let update = evaluate_inner(&info, &working, None, track, 1_000 + STUCK_AFTER_MS).unwrap();
         assert_eq!(update.0.state, AgentState::Stuck, "replacement keeps the progress clock");
         // The same screen in a new terminal must not inherit an old stuck timer.
         track.for_generation(8, 2_000 + STUCK_AFTER_MS);
-        assert!(evaluate_inner(&info, &working, track, 2_000 + STUCK_AFTER_MS).is_none());
+        assert!(evaluate_inner(&info, &working, None, track, 2_000 + STUCK_AFTER_MS).is_none());
         assert_eq!(track.changed_at, 2_000 + STUCK_AFTER_MS);
         drop(store);
         std::fs::remove_dir_all(directory).unwrap();
@@ -480,7 +530,7 @@ mod tests {
         s.foreground_busy = true;
         let mut t = Track::default();
         let w = info(SessionKind::Shell, AgentState::Working, 0);
-        assert!(evaluate_inner(&w, &s, &mut t, 1).is_none());
-        assert!(evaluate_inner(&w, &s, &mut t, STUCK_AFTER_MS * 3).is_none());
+        assert!(evaluate_inner(&w, &s, None, &mut t, 1).is_none());
+        assert!(evaluate_inner(&w, &s, None, &mut t, STUCK_AFTER_MS * 3).is_none());
     }
 }

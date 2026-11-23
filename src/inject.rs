@@ -24,7 +24,7 @@ use tokio::sync::broadcast::error::RecvError;
 
 use crate::adapters::{Adapter, adapter_for};
 use crate::hub::{Hub, ServerEvent};
-use crate::model::{AgentState, Decision, EventKind, SessionId};
+use crate::model::{AgentState, Decision, EventKind, SessionId, SessionKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -564,7 +564,10 @@ pub(crate) fn while_queue_idle<T>(hub: &Hub, id: SessionId, f: impl FnOnce() -> 
 
 /// Text sits in session `id`'s input box (a draft of the human's, as far as Muster can tell).
 pub(crate) fn has_draft(hub: &Hub, id: SessionId) -> bool {
-    hub.session(id).is_some_and(|s| composer(hub, id, adapter_for(s.kind)).is_some_and(|c| !c.trim().is_empty()))
+    hub.session(id).is_some_and(|s| match composer(hub, id, adapter_for(s.kind)) {
+        Some(text) => !text.trim().is_empty(),
+        None => s.kind == SessionKind::Antigravity,
+    })
 }
 
 /// Any text in session `id`'s input box, Claude's dim suggestion too: what `has_draft` reads as
@@ -886,7 +889,7 @@ pub async fn send(
     if mode == SendMode::Interrupt {
         let busy_now = !adapter.is_ready(info.state);
         if busy_now {
-            hub.write_input_generation(id, item.generation, &adapter.interrupt_bytes())?;
+            write_prompt_input(hub, id, item.generation, adapter, &adapter.interrupt_bytes(), PromptKey::Interrupt)?;
         }
         let generation = item.generation;
         // Read before the queue lock: a start holds the hub lock while it locks the queue.
@@ -1492,10 +1495,67 @@ fn unsafe_to_type(
 
 /// What on the screen itself forbids typing: a dialog, or another conversation in view.
 fn screen_unsafe(adapter: &dyn Adapter, screen: &crate::adapters::ScreenSnapshot, state: AgentState) -> Option<Unsafe> {
-    match adapter.detect_from_screen(screen, state).map(|u| u.state) {
-        Some(AgentState::NeedsApproval | AgentState::AskingQuestion) => Some(Unsafe::Dialog),
-        _ => adapter.other_view(screen).map(Unsafe::OtherView),
+    if dialog_blocks_input(adapter, screen, state) {
+        Some(Unsafe::Dialog)
+    } else if adapter.kind() == SessionKind::Antigravity && adapter.composer_text(screen).is_none() {
+        Some(Unsafe::Gone("the Antigravity input box is not visible"))
+    } else {
+        adapter.other_view(screen).map(Unsafe::OtherView)
     }
+}
+
+fn dialog_blocks_input(adapter: &dyn Adapter, screen: &crate::adapters::ScreenSnapshot, state: AgentState) -> bool {
+    (adapter.kind() == SessionKind::Antigravity && matches!(state, AgentState::NeedsApproval | AgentState::AskingQuestion))
+        || adapter.detect_from_screen(screen, state).is_some_and(|u| matches!(u.state, AgentState::NeedsApproval | AgentState::AskingQuestion))
+}
+
+#[derive(Clone, Copy)]
+enum PromptKey<'a> { Interrupt, Paste, Submit(Option<&'a Item>) }
+
+/// Order queued Antigravity input against even a pending, undrained state callback.
+fn write_prompt_input(hub: &Hub, id: SessionId, generation: Option<u64>, adapter: &dyn Adapter,
+    bytes: &[u8], key: PromptKey<'_>) -> anyhow::Result<bool> {
+    let write = || {
+        if let PromptKey::Submit(Some(item)) = key {
+            let now = crate::model::now_ms();
+            hub.note_prompt_delivery(id, generation, item.source, now)?;
+            if let crate::agents::Source::Chain(prov) = item.source
+                && let Some(idle) = hub.cache_cold(id, now)
+            {
+                hub.note_cold_send(id, prov, item.panel.is_some(), &delivery_identity(item), idle);
+            }
+            mark_stage(hub, id, generation, Stage::Submitting)?;
+        } else if matches!(key, PromptKey::Paste) {
+            mark_stage(hub, id, generation, Stage::Typing)?;
+        }
+        // Attribution and queue bookkeeping may have taken time since the screen check.
+        if adapter.kind() == SessionKind::Antigravity && matches!(key, PromptKey::Paste | PromptKey::Submit(Some(_))) {
+            hub.drain_antigravity_callbacks(id);
+            if !hub.session(id).is_some_and(|s| adapter.is_ready(s.state)) { return Ok(false); }
+        }
+        hub.write_input_generation(id, generation, bytes)?;
+        Ok(true)
+    };
+    if adapter.kind() == SessionKind::Antigravity {
+        return write_antigravity_input(hub, id, adapter, key, || hub.screen(id), write);
+    }
+    write()
+}
+
+fn write_antigravity_input(hub: &Hub, id: SessionId, adapter: &dyn Adapter, key: PromptKey<'_>,
+    read_screen: impl FnOnce() -> Option<crate::adapters::ScreenSnapshot>,
+    write: impl FnOnce() -> anyhow::Result<bool>) -> anyhow::Result<bool> {
+    let Some(screen) = read_screen() else { return Ok(false) };
+    hub.drain_antigravity_callbacks(id);
+    let Some(info) = hub.session(id) else { return Ok(false) };
+    if dialog_blocks_input(adapter, &screen, info.state) { return Ok(false); }
+    let ready = match key {
+        PromptKey::Interrupt => matches!(info.state, AgentState::Working | AgentState::Stuck),
+        PromptKey::Paste => adapter.is_ready(info.state) && adapter.composer_text(&screen).is_some_and(|s| s.trim().is_empty()),
+        PromptKey::Submit(_) => adapter.is_ready(info.state) && adapter.composer_text(&screen).is_some(),
+    };
+    if !ready { return Ok(false); }
+    write()
 }
 
 /// What to do after typing a prompt, before pressing Enter.
@@ -1593,7 +1653,6 @@ async fn deliver(hub: &Arc<Hub>, id: SessionId, mut item: Item) -> anyhow::Resul
             }
         }
     }
-    item.attempts += 1;
 
     // 2. Type, pause, submit.
     // A shell's encoding follows the shell this run started, not the shell preference now.
@@ -1610,8 +1669,8 @@ async fn deliver(hub: &Arc<Hub>, id: SessionId, mut item: Item) -> anyhow::Resul
             mark_stage(hub, id, generation, Stage::Selected)?;
             return Ok(false);
         }
-        mark_stage(hub, id, generation, Stage::Typing)?;
-        hub.write_input_generation(id, generation, &bytes)?;
+        if !write_prompt_input(hub, id, generation, adapter, &bytes, PromptKey::Paste)? { return requeue(item); }
+        item.attempts += 1;
     }
     hub.injection.edit(id, |q| {
         if q.generation == generation { q.last_sent = Some(item.text.clone()); }
@@ -1667,20 +1726,8 @@ async fn deliver(hub: &Arc<Hub>, id: SessionId, mut item: Item) -> anyhow::Resul
         {
             hub.spend.note_submitted(a.id);
         }
-        // The prompt runs from here on: the session now handles a message from `source`.
-        let now = crate::model::now_ms();
-        hub.note_prompt_delivery(id, generation, item.source, now)?;
-        // Muster's own sends (not the human's) into an agent whose cache has likely expired are
-        // recorded before Enter, so a crash after it can't leave one unmarked; never held back
-        // (src/cache.rs). A retry of the same delivery is recorded once.
-        if let crate::agents::Source::Chain(prov) = item.source
-            && let Some(idle) = hub.cache_cold(id, now)
-        {
-            hub.note_cold_send(id, prov, item.panel.is_some(), &delivery_identity(&item), idle);
-        }
-        mark_stage(hub, id, generation, Stage::Submitting)?;
         let seq_before = hub.output_seq(id);
-        hub.write_input_generation(id, generation, &adapter.submit_bytes())?;
+        if !write_prompt_input(hub, id, generation, adapter, &adapter.submit_bytes(), PromptKey::Submit(Some(&item)))? { return requeue(item); }
         // Enter reached the terminal: a self handoff's part counts as typed from here on.
         if let Some(part) = item.handoff {
             crate::self_handoff::submitting(hub, id, part);
@@ -1701,7 +1748,7 @@ async fn deliver(hub: &Arc<Hub>, id: SessionId, mut item: Item) -> anyhow::Resul
     tracing::debug!(session = id, "prompt not accepted yet; submitting again");
     mark_stage(hub, id, generation, Stage::Submitting)?;
     let seq_before = hub.output_seq(id);
-    hub.write_input_generation(id, generation, &adapter.submit_bytes())?;
+    if !write_prompt_input(hub, id, generation, adapter, &adapter.submit_bytes(), PromptKey::Submit(None))? { return Ok(true); }
     match accepted(hub, id, generation, adapter, &item.text, seq_before, VERIFY_RETRY_FOR).await {
         Outcome::Accepted => { crate::mcp::communication::accepted(hub, id, &item.text); return Ok(true); },
         Outcome::Gone => anyhow::bail!("the session exited"),
@@ -1814,12 +1861,23 @@ pub fn approve(
             info.state.as_str()
         );
     };
+    if info.kind == SessionKind::Antigravity && (seen.0.is_some() || seen.1.is_some()) {
+        let visible = adapter.detect_from_screen(&screen, info.state);
+        anyhow::ensure!(info.state == AgentState::NeedsApproval && visible.is_some_and(|u|
+            u.state == info.state && u.detail == info.state_detail),
+            "stale: session {id}'s visible request differs from the approval shown; check it again");
+    }
     // Claim only once the keys are chosen (a prompt muster can't answer isn't consumed), then
     // make sure the screen they were chosen from is still the one on display: the detector
     // lags the screen, so a new prompt can be up before `state_seq` moves.
     hub.claim_prompt(id, seen.0, seen.1)?;
-    if seen.0.is_some() && hub.screen(id).is_none_or(|now| now.lines != screen.lines) {
-        anyhow::bail!("stale: session {id}'s screen changed while answering; check it again");
+    if seen.0.is_some() || info.kind == SessionKind::Antigravity {
+        let unchanged = hub.screen(id).is_some_and(|now| {
+            now.lines == screen.lines || (info.kind == SessionKind::Antigravity
+                && adapter.detect_from_screen(&now, info.state) == adapter.detect_from_screen(&screen, info.state)
+                && adapter.approve_bytes(decision, &now).as_ref() == Some(&bytes))
+        });
+        anyhow::ensure!(unchanged, "stale: session {id}'s screen changed while answering; check it again");
     }
     hub.write_input_generation(id, generation, &bytes)?;
     hub.log_event(
@@ -1907,6 +1965,45 @@ pub fn spawn_tasks(hub: Arc<Hub>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn antigravity_another_sessions_callback_during_paste_does_not_park_the_prompt() {
+        let hub = hub_fixture();
+        hub.test_unconfirmed_launch(1, true, "");
+        hub.edit_session_for_test(1, |s| { s.kind = SessionKind::Antigravity; s.state = AgentState::Idle; });
+        let dir = std::env::temp_dir().join(crate::paths::random_token());
+        let path = dir.join("hooks.sqlite");
+        hub.hook_inbox_path.set(path.clone()).unwrap();
+        *hub.callback_inbox.lock() = Some(crate::hook_inbox::Inbox::open(&path).unwrap());
+        let mut writer = crate::hook_inbox::Inbox::open(&path).unwrap();
+        let pasted = write_antigravity_input(&hub, 1, adapter_for(SessionKind::Antigravity), PromptKey::Paste, || {
+            writer.enqueue("another-session", "state", br#"{"agent_state":"idle"}"#).unwrap();
+            Some(crate::adapters::tui::testutil::snap(include_str!("adapters/fixtures/antigravity_idle_auto.txt")))
+        }, || Ok(true)).unwrap();
+        assert!(pasted);
+        assert_eq!(writer.next(None).unwrap().unwrap().token, "another-session");
+        // An approval committed for this run during the screen read blocks either key,
+        // even while the background consumer is busy processing an unrelated callback.
+        let consumer = hub.callback_inbox.lock();
+        for key in [PromptKey::Paste, PromptKey::Submit(None)] {
+            let wrote = write_antigravity_input(&hub, 1, adapter_for(SessionKind::Antigravity), key, || {
+                writer.enqueue("run-token", "state", br#"{"tool_confirmation_pending":true}"#).unwrap();
+                Some(crate::adapters::tui::testutil::snap(include_str!("adapters/fixtures/antigravity_idle_auto.txt")))
+            }, || panic!("input into an approval")).unwrap();
+            assert!(!wrote);
+            assert_eq!(hub.session(1).unwrap().state, AgentState::NeedsApproval);
+        }
+        drop(consumer);
+        drop((writer, hub));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn antigravity_pending_callback_blocks_enter_without_a_menu() {
+        let adapter = adapter_for(crate::model::SessionKind::Antigravity);
+        let screen = crate::adapters::tui::testutil::snap("redrawing");
+        assert_eq!(screen_unsafe(adapter, &screen, AgentState::NeedsApproval), Some(Unsafe::Dialog));
+    }
 
     /// The reported bug: the human viewed the lead's subagent and a queued message for the lead
     /// was typed into it. Real Claude Code screens: subagent on screen (idle or working) blocks

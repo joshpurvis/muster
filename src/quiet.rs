@@ -1382,7 +1382,7 @@ mod tests {
             agents::update_switch(&hub, u, false)
         };
         let e = upd("gamma", true, true).unwrap_err().to_string();
-        assert!(e.contains("Claude agents only") && e.contains("gamma is a Codex agent"), "{e}");
+        assert!(e.contains("Claude agents only") && e.contains("gamma uses Codex"), "{e}");
         let e = upd("beta", true, false).unwrap_err().to_string();
         assert!(e.contains("only the human") && e.contains("--tools-up-front on"), "{e}");
         assert!(!hub.agents().get("beta").unwrap().tools_up_front);

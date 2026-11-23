@@ -1,7 +1,7 @@
 // What the phone's manage controls show and say (pure; see manage.ts for the calls).
 import type { Channel, SessionInfo, SessionKind, Workspace } from "../types.ts";
 
-export const KIND_LABEL: Record<SessionKind, string> = { claude: "Claude", codex: "Codex", shell: "Shell" };
+export const KIND_LABEL: Record<SessionKind, string> = { claude: "Claude", codex: "Codex", shell: "Shell", antigravity: "Antigravity" };
 
 /** Named agents' sessions (`hello.agent_sessions`): session id → the agent's name
  * (`hello.agent_names`), or null when the backend doesn't send names. */

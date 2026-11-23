@@ -111,7 +111,7 @@ impl CacheTtl {
             (SessionKind::Claude, Provider::Subscription) => Some(self.claude),
             (SessionKind::Codex, Provider::Subscription) => Some(self.codex_chatgpt),
             (SessionKind::Codex, Provider::OpenRouter) => Some(self.codex_openrouter),
-            (SessionKind::Shell, _) => None,
+            (SessionKind::Antigravity | SessionKind::Shell, _) => None,
         }
     }
 }
@@ -282,9 +282,9 @@ pub fn estimated_turn(info: &SessionInfo) -> Option<i64> {
 /// `--resume`/`--continue`, in every spelling the argument check accepts), so the cache clock
 /// carries on too. Any other start is a new, empty conversation.
 pub fn continues_conversation(kind: SessionKind, args: &[String]) -> bool {
-    kind == SessionKind::Claude
+    matches!(kind, SessionKind::Claude | SessionKind::Antigravity)
         && crate::adapters::parse_extra_args(kind, args)
-            .is_ok_and(|flags| flags.iter().any(|(long, _)| matches!(*long, "--resume" | "--continue")))
+            .is_ok_and(|flags| flags.iter().any(|(long, _)| matches!(*long, "--resume" | "--continue" | "--conversation")))
 }
 
 /// "1 h 20 m", "45 m", "2 h": an idle time for people.

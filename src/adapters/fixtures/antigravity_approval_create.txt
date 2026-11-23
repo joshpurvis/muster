@@ -1,6 +1,0 @@
-Create file
-src/alpha.txt
-+ hello
-Allow creation of this file?
-> 1. Yes, allow creation
-  2. No, deny creation

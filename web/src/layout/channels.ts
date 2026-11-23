@@ -7,7 +7,7 @@ import {
   parseTabPlace, placeBeside, placeOf, putAt, QUESTIONS_TAB, reconcile, removeSession, sameGeneralPlace,
   type TabPlace,
 } from "./tree.ts";
-import { type Channel, DEFAULT_PERMISSIONS, type Permissions } from "../types.ts";
+import { type Channel, DEFAULT_PERMISSIONS, type Permissions, storedPermissions } from "../types.ts";
 
 const trimSlash = (p: string) => p.replace(/\/+$/, "") || "/";
 const samePermissions = (a: Permissions, b: Permissions) =>
@@ -39,7 +39,7 @@ export function folderChannel(list: Channel[], path: string, o: FolderJoin = {})
   const perms = o.permissions ?? DEFAULT_PERMISSIONS;
   const matches = list.filter((c) => !c.archived && trimSlash(c.cwd) === want &&
     (!named || named === c.name) && (o.live?.(c.id) ?? true) &&
-    (o.anyPermissions || samePermissions(perms, { ...DEFAULT_PERMISSIONS, ...c.permissions })));
+    (o.anyPermissions || samePermissions(perms, storedPermissions(c.permissions))));
   return matches.find((c) => c.id === o.prefer) ?? matches[0];
 }
 

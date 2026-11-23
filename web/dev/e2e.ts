@@ -111,8 +111,15 @@ try {
       await a.wait(`document.querySelector('${mode} [aria-checked=true]')?.textContent.trim() === 'Auto'`);
       await a.click(`${mode} .seg-danger`);
       await a.wait(`document.querySelector('.perm-dlg .perm-warn')?.textContent.includes('Antigravity')`);
+      const warning = await a.eval(`document.querySelector('${mode} [aria-checked=true]').getAttribute('aria-describedby')`);
+      check(!!warning && await a.eval(`document.getElementById(${JSON.stringify(warning)})?.textContent.includes("Antigravity")`),
+        "Full access describes its warning");
+      await a.size(800, 450);
+      await a.wait(`(() => { const r = document.querySelector(".perm-dlg [type=submit]").getBoundingClientRect();
+        return document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2)?.closest("button")?.type === "submit"; })()`);
       await a.click(".perm-dlg [type=submit]");
       await a.wait(`!document.querySelector('.perm-dlg')`);
+      await a.size(1440, 900);
       const channel = (await R(a, "hello", {})).channels.find((ch: any) => ch.id === demo);
       check(channel.permissions.antigravity_mode === "full_access", "Antigravity permission row saves");
       await R(a, "channel.archive", { id: demo, remove_worktree: false });

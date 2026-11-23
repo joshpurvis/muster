@@ -828,7 +828,7 @@ pub(super) fn check_not_more_permissive<B: Backend>(
     target: &Channel,
     kind: SessionKind,
 ) -> Result<(), String> {
-    check_perms_not_wider(st, me, Some(target.id), &target.permissions, kind, &format!("channel {}", target.id))
+    check_perms_not_wider(st, me, &target.permissions, kind, &format!("channel {}", target.id))
 }
 
 /// `check_not_more_permissive` for a profile that may not have a channel yet (an agent that
@@ -836,7 +836,6 @@ pub(super) fn check_not_more_permissive<B: Backend>(
 fn check_perms_not_wider<B: Backend>(
     st: &McpState<B>,
     me: &SessionInfo,
-    target_channel: Option<ChannelId>,
     target: &Permissions,
     kind: SessionKind,
     what: &str,
@@ -846,7 +845,7 @@ fn check_perms_not_wider<B: Backend>(
         .channel(me.channel_id)
         .map(|c| c.permissions)
         .ok_or("your channel no longer exists")?;
-    if target_channel != Some(me.channel_id) && target.exceeds_for(&mine, kind) {
+    if target.exceeds_for(&mine, kind) {
         return Err(format!(
             "{what} lets {} do more than your channel does ({}); agents can't use another channel's permissions. {HOW_PERMS}",
             kind.as_str(),
@@ -1567,8 +1566,8 @@ fn agent_send<B: Backend>(st: &McpState<B>, caller: SessionId, name: &str, text:
     // own tab (what its next restart gets), else the profile its tab will get.
     let session_ch = agent.session_id.and_then(|s| st.backend.session(s)).and_then(|s| st.backend.channel(s.channel_id));
     let own_ch = agent.channel_id.and_then(|c| st.backend.channel(c));
-    let (ch_id, perms) = crate::agents::reach_profile(&agent, session_ch.as_ref(), own_ch.as_ref());
-    check_perms_not_wider(st, &me, ch_id, &perms, agent.kind, &format!("agent {}'s tab", agent.name)).map_err(refused)?;
+    let (_, perms) = crate::agents::reach_profile(&agent, session_ch.as_ref(), own_ch.as_ref());
+    check_perms_not_wider(st, &me, &perms, agent.kind, &format!("agent {}'s tab", agent.name)).map_err(refused)?;
     let recent = st
         .backend
         .agent_messages_since(agent.id, now_ms() - guard::AGENT_CAP_WINDOW_MS);

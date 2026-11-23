@@ -69,7 +69,7 @@ import type {
   ProfileChoice,
   Provider,
 } from "../types.ts";
-import { DEFAULT_PERMISSIONS, KIND_LABEL } from "../types.ts";
+import { DEFAULT_PERMISSIONS, KIND_LABEL, storedPermissions } from "../types.ts";
 import { Kbd, Spinner } from "./common.tsx";
 import { contextMenu } from "./Menu.tsx";
 import { PermissionsPanel, PermissionsPill } from "./Permissions.tsx";
@@ -566,7 +566,7 @@ function fromTemplate(t: AgentTemplate): Draft {
     model: t.model ?? "",
     effort: t.effort ?? "",
     persona: t.persona,
-    permissions: { ...DEFAULT_PERMISSIONS, ...t.permissions },
+    permissions: storedPermissions(t.permissions),
     accepts: [...t.accepts],
     autostart: t.autostart,
     sleep: false,
@@ -587,7 +587,7 @@ function fromAgent(a: Agent): Draft {
     model: a.model ?? "",
     effort: a.effort ?? "",
     persona: a.persona,
-    permissions: { ...DEFAULT_PERMISSIONS, ...a.permissions },
+    permissions: storedPermissions(a.permissions),
     accepts: [...a.accepts_origins],
     autostart: a.autostart,
     sleep: a.sleep_after_min != null,
@@ -686,7 +686,7 @@ export function AgentDialog(
   }, []);
   // Daemons without `agent.models` leave only Default and Custom… in the selects.
   useEffect(() => {
-    if (catalogCache) return;
+    if (catalogCache?.antigravity) return;
     rpc.call<ModelCatalog>("agent.models").then((c) => {
       catalogCache = c;
       setCatalog(c);

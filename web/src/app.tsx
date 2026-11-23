@@ -216,17 +216,29 @@ rpc.start();
 
 const KINDS: SessionKind[] = ["claude", "codex", "shell", "antigravity"];
 
+function EmptyLauncher({ pick, children }: { pick?: (kind: SessionKind) => void; children: preact.ComponentChildren }) {
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (document.activeElement === document.body || !document.activeElement) ref.current?.focus();
+  }, []);
+  return <div class="welcome empty" ref={ref} tabIndex={-1} onKeyDown={(e) => {
+    if (!pick || e.repeat || e.altKey || e.ctrlKey || e.metaKey ||
+      (e.target as HTMLElement).closest("input, textarea, select, [contenteditable=true]")) return;
+    const kind = KINDS.find((_, i) => String(i + 1) === e.key);
+    if (kind) {
+      e.preventDefault();
+      pick(kind);
+    }
+  }}>{children}</div>;
+}
+
 /** A window with no tabs: pick a folder and what to run (keys 1–4). The first tab starts a
  * group. */
 function EmptyWindow() {
   const home = meta.value.home;
   const [folder, setFolder] = useState(() => tildify(A.defaultFolder(), home));
   const [busy, setBusy] = useState(false);
-  const ref = useRef<HTMLDivElement>(null);
   const first = !workspaces.value.length;
-  useEffect(() => {
-    if (document.activeElement === document.body || !document.activeElement) ref.current?.focus();
-  }, []);
   const pick = async (k: SessionKind) => {
     if (busy || !folder.trim()) return;
     setBusy(true);
@@ -239,20 +251,7 @@ function EmptyWindow() {
     }
   };
   return (
-    <div
-      class="welcome empty"
-      ref={ref}
-      tabIndex={-1}
-      onKeyDown={(e) => {
-        if (e.altKey || e.ctrlKey || e.metaKey) return;
-        if ((e.target as HTMLElement).closest("input")) return;
-        const i = ["1", "2", "3", "4"].indexOf(e.key);
-        if (i >= 0) {
-          e.preventDefault();
-          pick(KINDS[i]);
-        }
-      }}
-    >
+    <EmptyLauncher pick={pick}>
       <div class="empty-controls">
         <WindowControls empty />
       </div>
@@ -281,27 +280,28 @@ function EmptyWindow() {
           </span>
         </div>
       </div>
-    </div>
+    </EmptyLauncher>
   );
 }
 
 function EmptyChannel() {
   const c = activeChannel.value;
-  return <div class="welcome empty">
+  const pick = c ? (kind: SessionKind) => A.spawn(c.id, kind) : undefined;
+  return <EmptyLauncher pick={pick}>
     <div class="empty-controls"><WindowControls empty /></div>
     <div class="welcome-card empty-channel">
       <h1>{c?.name ?? "Notes"}</h1>
       <p>{c ? "Open a terminal or note to start working in this channel." : "Open a note or create a channel for your project."}</p>
-      {c && <>
+      {c && pick && <>
         <div class="empty-channel-path">{tildify(c.cwd, meta.value.home)}</div>
-        <LaunchButtons pick={(kind) => A.spawn(c.id, kind)} last={prefs.value.lastAgent} />
+        <LaunchButtons pick={pick} last={prefs.value.lastAgent} />
       </>}
       <div class="empty-channel-actions">
         <button type="button" class="btn" onClick={() => A.newNote()}>New note</button>
         <button type="button" class="btn" onClick={() => A.newTabDialog()}>New channel…</button>
       </div>
     </div>
-  </div>;
+  </EmptyLauncher>;
 }
 
 /** After `daemon_stopping`: replaces whatever had focus (maybe a terminal), so it takes the

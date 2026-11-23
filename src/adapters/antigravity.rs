@@ -1,5 +1,4 @@
-//! Antigravity launch and status for agy 1.5.13. Verified against its local help and strings
-//! only. The fixtures are hand-written. No screen has been captured from a real session.
+//! Antigravity launch and status, verified against agy 1.5.13 screens on 23 Nov 2026.
 
 use super::{Adapter, CommandSpec, ScreenSnapshot, SpawnCtx, claude, resumed_in_launch, tui};
 use crate::model::{AgentState, AntigravityMode, Decision, SessionKind, StateUpdate};
@@ -9,10 +8,33 @@ use std::path::Path;
 pub struct AntigravityAdapter;
 pub(crate) const LAST_STATE: &str = "antigravity-state-last";
 
-const TRUST: &[&str] = &[
-    "Do you trust the contents of this project?",
-    "Yes, I trust this folder",
-];
+/// The helper writes at most three short fields. Ignore links, devices and oversized files
+/// when checking its deduplication record or adopting a run from an older backend.
+pub(crate) fn read_last_state(path: &Path) -> Option<Vec<u8>> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut data = Vec::new();
+    file.take(513).read_to_end(&mut data).ok()?;
+    (data.len() <= 512).then_some(data)
+}
+
+const PENDING: &str = "Antigravity is asking for approval";
+
+/// Only a visible dialog can override the run's latest state callback.
+pub(crate) fn is_screen_dialog(state: AgentState, detail: Option<&str>) -> bool {
+    state == AgentState::AskingQuestion
+        || (state == AgentState::NeedsApproval && detail.is_some_and(|d| d != PENDING))
+}
+
+const TRUST_TITLE: &str = "Do you trust the contents of this project?";
 const SETTINGS_ERROR: &str = "Settings Error";
 const APPROVAL_TITLES: &[&str] = &[
     "Run this command?",
@@ -59,13 +81,47 @@ fn on(var: &str) -> bool {
     )
 }
 
+/// Build the credential file outside the previously shared tree. Only publish the
+/// completed directory once the old run's entries have been checked and removed.
+fn prepare_workspace(ctx: &SpawnCtx) -> anyhow::Result<std::path::PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
+    let workspace = ctx.session_dir.join("antigravity-workspace");
+    let config = workspace.join(".agents");
+    for path in [&workspace, &config, &config.join("mcp_config.json")] {
+        crate::agents::refuse_symlink(path)?;
+    }
+    let stage = ctx
+        .session_dir
+        .join(format!(".antigravity-{:016x}", rand::random::<u64>()));
+    std::fs::DirBuilder::new().mode(0o700).create(&stage)?;
+    let install = || -> anyhow::Result<()> {
+        let server = mcp_json(&ctx.daemon_url, &ctx.session_token);
+        crate::paths::write_private(
+            &stage.join(".agents/mcp_config.json"),
+            &serde_json::to_vec_pretty(&server)?,
+        )?;
+        match std::fs::remove_dir_all(&workspace) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+            _ => {}
+        }
+        std::fs::rename(&stage, &workspace)?;
+        Ok(())
+    };
+    if let Err(e) = install() {
+        let _ = std::fs::remove_dir_all(stage);
+        return Err(e);
+    }
+    Ok(workspace)
+}
+
 fn launch(ctx: &SpawnCtx, settings: bool, mcp: bool) -> anyhow::Result<CommandSpec> {
     let mut args = Vec::new();
     if settings {
         let file = ctx.session_dir.join("antigravity-settings.json");
-        claude::write_private(
+        crate::agents::refuse_symlink(&file)?;
+        crate::paths::write_private(
             &file,
-            &serde_json::to_string_pretty(&settings_json(&ctx.muster_bin))?,
+            &serde_json::to_vec_pretty(&settings_json(&ctx.muster_bin))?,
         )?;
         args.push(format!("--settings={}", file.display()));
         // The first callback matters even if it repeats the last state of the previous run.
@@ -75,15 +131,7 @@ fn launch(ctx: &SpawnCtx, settings: bool, mcp: bool) -> anyhow::Result<CommandSp
         }
     }
     if mcp {
-        let workspace = ctx.session_dir.join("antigravity-workspace");
-        let config = workspace.join(".agents");
-        crate::paths::ensure_private_dir(&workspace)?;
-        crate::paths::ensure_private_dir(&config)?;
-        let server = mcp_json(&ctx.daemon_url, &ctx.session_token);
-        claude::write_private(
-            &config.join("mcp_config.json"),
-            &serde_json::to_string_pretty(&server)?,
-        )?;
+        let workspace = prepare_workspace(ctx)?;
         args.push(format!("--add-dir={}", workspace.display()));
     }
     args.extend(mode_args(ctx.permissions.antigravity_mode));
@@ -110,8 +158,20 @@ fn launch(ctx: &SpawnCtx, settings: bool, mcp: bool) -> anyhow::Result<CommandSp
     })
 }
 
+// The composer and modal content are separated from past turns by a solid rule.
+fn active_dialog_lines(lines: &[String]) -> &[String] {
+    tui::rfind(lines, tui::is_solid_rule).map_or(lines, |i| &lines[i + 1..])
+}
+
 fn manual_dialog(lines: &[String]) -> Option<&'static str> {
-    if lines.iter().any(|l| TRUST.iter().any(|s| l.contains(s))) {
+    if lines.iter().any(|l| l.trim() == TRUST_TITLE)
+        && lines
+            .iter()
+            .any(|l| l.trim_start_matches([' ', '>']) == "Yes, I trust this folder")
+        && lines
+            .iter()
+            .any(|l| l.contains("Navigate") && l.contains("enter Confirm"))
+    {
         Some("Antigravity asks whether to trust this folder: answer in the terminal")
     } else if lines.iter().any(|l| l.contains(SETTINGS_ERROR))
         && lines
@@ -124,7 +184,13 @@ fn manual_dialog(lines: &[String]) -> Option<&'static str> {
     }
 }
 
-fn approval_dialog(lines: &[String]) -> Option<(usize, Vec<tui::MenuOption>)> {
+struct ApprovalDialog {
+    title: String,
+    detail: String,
+    options: Vec<tui::MenuOption>,
+}
+
+fn approval_dialog(lines: &[String]) -> Option<ApprovalDialog> {
     let q = tui::rfind(lines, |l| {
         let t = l.trim();
         APPROVAL_TITLES.contains(&t)
@@ -134,8 +200,36 @@ fn approval_dialog(lines: &[String]) -> Option<(usize, Vec<tui::MenuOption>)> {
                     .any(|prefix| t.starts_with(prefix)))
     })?;
     let options = tui::options_in(lines, q + 1, q + 12);
-    (options.len() >= 2 && options.iter().any(|o| tui::is_yes_label(&o.label)))
-        .then_some((q, options))
+    if options.len() < 2
+        || !options.iter().any(|o| o.selected)
+        || !options.iter().any(|o| tui::is_yes_label(&o.label))
+    {
+        return None;
+    }
+    let title = lines[q].trim();
+    let before = &lines[..q];
+    let start = tui::rfind(before, |l| l.trim() == "Requesting permission for:");
+    let body = match start {
+        Some(i) => &before[i + 1..],
+        None if title == "Run this command?" => &before[..0],
+        None => before,
+    };
+    let body = body.join("\n");
+    let reason = lines[q + 1..]
+        .iter()
+        .find_map(|l| l.trim().strip_prefix("Reason: "));
+    let detail = if !body.trim().is_empty() {
+        format!("{title} {}", body.trim())
+    } else if let Some(reason) = reason {
+        format!("{title} ({reason})")
+    } else {
+        title.to_string()
+    };
+    Some(ApprovalDialog {
+        title: title.into(),
+        detail,
+        options,
+    })
 }
 
 impl Adapter for AntigravityAdapter {
@@ -157,19 +251,12 @@ impl Adapter for AntigravityAdapter {
             return None;
         }
         if payload["tool_confirmation_pending"] == true {
-            return Some(StateUpdate::with(
-                NeedsApproval,
-                "Antigravity is asking for approval",
-            ));
+            return Some(StateUpdate::with(NeedsApproval, PENDING));
         }
         Some(match payload["agent_state"].as_str()? {
             "working" | "thinking" | "tool_use" => StateUpdate::new(Working),
             "idle" => StateUpdate::new(Idle),
             "error" => StateUpdate::with(Error, "Antigravity reported an error"),
-            "authenticating" => StateUpdate::with(
-                AskingQuestion,
-                "Antigravity needs a sign-in: finish it in the terminal",
-            ),
             _ => return None,
         })
     }
@@ -180,23 +267,12 @@ impl Adapter for AntigravityAdapter {
         current: AgentState,
     ) -> Option<StateUpdate> {
         let lines = &screen.lines;
-        if let Some(detail) = manual_dialog(lines) {
+        let dialog = active_dialog_lines(lines);
+        if let Some(detail) = manual_dialog(dialog) {
             return Some(StateUpdate::with(AgentState::AskingQuestion, detail));
         }
-        if let Some((q, _)) = approval_dialog(lines) {
-            let mut detail = lines[q].trim().to_string();
-            if let Some(reason) = lines
-                .iter()
-                .skip(q + 1)
-                .take(3)
-                .find_map(|l| l.trim().strip_prefix("Reason: "))
-            {
-                detail.push_str(&format!(" ({reason})"));
-            }
-            return Some(StateUpdate::with(
-                AgentState::NeedsApproval,
-                tui::clip(&detail, 160),
-            ));
+        if let Some(request) = approval_dialog(dialog) {
+            return Some(StateUpdate::with(AgentState::NeedsApproval, request.detail));
         }
         let tail_has = |n, hints: &[&str]| {
             lines
@@ -215,13 +291,61 @@ impl Adapter for AntigravityAdapter {
     }
 
     fn approve_bytes(&self, decision: Decision, screen: &ScreenSnapshot) -> Option<Vec<u8>> {
-        if manual_dialog(&screen.lines).is_some() {
+        let dialog = active_dialog_lines(&screen.lines);
+        if manual_dialog(dialog).is_some() {
             return None;
         }
-        let (_, opts) = approval_dialog(&screen.lines)?;
+        let request = approval_dialog(dialog)?;
+        if request.detail == request.title {
+            return None;
+        }
+        let opts = request.options;
+        if decision == Decision::ApproveAlways {
+            return opts
+                .iter()
+                .find(|o| {
+                    o.digit == '2'
+                        && o.label
+                            .starts_with("Yes, and always allow in this conversation")
+                })
+                .map(|o| tui::option_keys(o, false));
+        }
         tui::choose(&opts, decision)
             .map(|o| tui::option_keys(o, false))
             .or_else(|| (decision == Decision::Deny).then(|| b"n".to_vec()))
+    }
+
+    fn composer_text(&self, screen: &ScreenSnapshot) -> Option<String> {
+        let lines = &screen.lines;
+        let bottom = tui::rfind(lines, tui::is_solid_rule)?;
+        // A panel can leave a complete, inactive composer visible above its controls.
+        if !lines[bottom + 1..]
+            .iter()
+            .any(|l| l.trim_start().starts_with("? for shortcuts"))
+        {
+            return None;
+        }
+        let top = tui::rfind(&lines[..bottom], tui::is_solid_rule)?;
+        let (first, rest) = lines[top + 1..bottom].split_first()?;
+        let first = if first.trim_end() == ">" {
+            ""
+        } else {
+            first.strip_prefix("> ")?
+        };
+        let text = std::iter::once(first)
+            .chain(rest.iter().map(|s| s.trim_end()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let text = text.trim_end();
+        let placeholder = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        if matches!(
+            placeholder.as_str(),
+            "Auto mode: edits & safe commands auto-approved (shift+tab to cycle)"
+                | "Plan mode: research & plan only (shift+tab to cycle)"
+        ) {
+            return Some(String::new());
+        }
+        Some(text.to_string())
     }
 
     fn interrupt_bytes(&self) -> Vec<u8> {
@@ -231,7 +355,6 @@ impl Adapter for AntigravityAdapter {
 
 #[cfg(test)]
 mod tests {
-    // Hand-written from 1.5.13 strings. Live check L4 replaces these with sanitised captures.
     use super::tui::testutil::snap;
     use super::*;
     use crate::model::Permissions;
@@ -240,9 +363,10 @@ mod tests {
     #[test]
     fn dialogs_require_an_explicit_choice() {
         use Decision::*;
+        // File prompts and settings errors were not in the captures. Exercise their known labels.
         for manual in [
             include_str!("fixtures/antigravity_trust.txt"),
-            include_str!("fixtures/antigravity_settings_error.txt"),
+            "Settings Error\nUnable to read settings.json\n1. Exit and fix manually\n2. Continue with defaults this session",
         ] {
             let screen = snap(manual);
             assert_eq!(
@@ -259,16 +383,16 @@ mod tests {
         for (text, deny, always) in [
             (
                 include_str!("fixtures/antigravity_approval_command.txt"),
-                b'3',
+                b'4',
                 Some(vec![b'2']),
             ),
             (
-                include_str!("fixtures/antigravity_approval_create.txt"),
+                "Create file\nsrc/alpha.txt\nAllow creation of this file?\n> 1. Yes, allow creation\n  2. No, deny creation",
                 b'2',
                 None,
             ),
             (
-                include_str!("fixtures/antigravity_approval_edit.txt"),
+                "src/alpha.txt\nAccept this file edit?\n> 1. Yes, accept this change\n  2. No, reject this change",
                 b'2',
                 None,
             ),
@@ -294,7 +418,7 @@ mod tests {
                 always
             );
         }
-        let no_deny = snap("Allow calling this tool?\nReason: read file\n1. Yes\n2. Yes, always");
+        let no_deny = snap("Allow calling this tool?\nReason: read file\n> 1. Yes\n2. Yes, always");
         assert_eq!(
             AntigravityAdapter.approve_bytes(Deny, &no_deny),
             Some(b"n".to_vec())
@@ -336,6 +460,57 @@ mod tests {
     }
 
     #[test]
+    fn composer_and_closed_dialogs() {
+        let idle = include_str!("fixtures/antigravity_idle_auto.txt");
+        let placeholder = "Auto mode: edits & safe commands auto-approved (shift+tab to cycle)";
+        for (row, expected) in [
+            (placeholder, ""),
+            ("Plan mode: research & plan only (shift+tab to cycle)", ""),
+            (
+                "Auto mode: my draft (shift+tab to cycle)",
+                "Auto mode: my draft (shift+tab to cycle)",
+            ),
+            ("alpha", "alpha"),
+            ("alpha\n  beta", "alpha\n  beta"),
+            ("", ""),
+        ] {
+            let screen = snap(&idle.replace(placeholder, row));
+            assert_eq!(
+                AntigravityAdapter.composer_text(&screen).as_deref(),
+                Some(expected)
+            );
+        }
+        assert!(AntigravityAdapter.clear_input_bytes().is_none());
+        let panel = snap(include_str!("fixtures/antigravity_mcp_panel.txt"));
+        assert!(AntigravityAdapter.composer_text(&panel).is_none());
+        let command = include_str!("fixtures/antigravity_approval_command.txt");
+        for closed in [
+            include_str!("fixtures/antigravity_approved.txt"),
+            include_str!("fixtures/antigravity_denied.txt"),
+        ] {
+            let screen = snap(&format!("{command}\n{closed}"));
+            assert_eq!(
+                AntigravityAdapter.composer_text(&screen).as_deref(),
+                Some("")
+            );
+            assert!(
+                AntigravityAdapter
+                    .approve_bytes(Decision::Approve, &screen)
+                    .is_none()
+            );
+        }
+        let persistent_only = command.replace(
+            "2. Yes, and always allow in this conversation",
+            "2. More details",
+        );
+        assert!(
+            AntigravityAdapter
+                .approve_bytes(Decision::ApproveAlways, &snap(&persistent_only))
+                .is_none()
+        );
+    }
+
+    #[test]
     fn callback_states() {
         use AgentState::*;
         for (status, state) in [
@@ -344,7 +519,7 @@ mod tests {
             ("tool_use", Some(Working)),
             ("idle", Some(Idle)),
             ("error", Some(Error)),
-            ("authenticating", Some(AskingQuestion)),
+            ("authenticating", None),
             ("initializing", None),
             ("reviewing", None),
             ("unknown", None),
@@ -439,6 +614,20 @@ mod tests {
                 0
             );
         }
+        std::fs::remove_dir_all(workspace.join(".agents")).unwrap();
+        let other = dir.join("fixture");
+        std::fs::create_dir(&other).unwrap();
+        std::os::unix::fs::symlink(&other, workspace.join(".agents")).unwrap();
+        assert!(launch(&ctx, false, true).is_err());
+        assert_eq!(std::fs::read_dir(other).unwrap().count(), 0);
+        std::fs::remove_file(workspace.join(".agents")).unwrap();
+        std::fs::write(workspace.join("old-run"), "fixture").unwrap();
+        launch(&ctx, false, true).unwrap();
+        assert!(!workspace.join("old-run").exists());
+        std::fs::remove_file(&mcp).unwrap();
+        std::os::unix::fs::symlink(dir.join("absent"), &mcp).unwrap();
+        assert!(launch(&ctx, false, true).is_err());
+        assert!(!dir.join("absent").exists());
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -345,6 +345,12 @@
   border-radius: 12px;
   background: var(--bg-2);
 }
+@media (max-width: 400px) {
+  .segmented {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
 .segmented button {
   flex: 1;
   min-height: 44px;

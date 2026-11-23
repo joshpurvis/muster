@@ -1,6 +1,15 @@
-  Open alpha.txt.
-  The file contains one line.
 
-  Auto mode: edits & safe commands auto-approved (shift+tab to cycle)
+      ▄▀▀▄        Antigravity CLI 1.5.13
+     ▀▀▀▀▀▀       Gemini 4 Neon (High)
+    ▀▀▀▀▀▀▀▀      /home/user/demo-app
+   ▄▀▀    ▀▀▄
+  ▄▀▀      ▀▀▄
 
-  ? for shortcuts                                   auto
+
+ ┃ Introducing Gemini 4 Neon
+ ┃ Our best balance of intelligence, cost, and latency. Get building today with Neon.
+ ┃ esc to dismiss
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+> Auto mode: edits & safe commands auto-approved (shift+tab to cycle)
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+? for shortcuts                                                                              auto · Gemini 4 Neon · high

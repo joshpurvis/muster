@@ -223,7 +223,7 @@ pub enum StateSource {
     Daemon,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StateUpdate {
     pub state: AgentState,
     /// Short human text, e.g. "Bash: cargo test" or the question being asked.
@@ -354,13 +354,34 @@ pub enum AntigravityMode {
 
 /// Per-channel agent permission profile. Defaults match the CLIs' own defaults.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(from = "StoredPermissions")]
 pub struct Permissions {
-    #[serde(default)]
     pub codex_sandbox: CodexSandbox,
-    #[serde(default)]
     pub claude_mode: ClaudeMode,
-    #[serde(default)]
     pub antigravity_mode: AntigravityMode,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct StoredPermissions {
+    codex_sandbox: CodexSandbox,
+    claude_mode: ClaudeMode,
+    antigravity_mode: Option<AntigravityMode>,
+}
+
+impl From<StoredPermissions> for Permissions {
+    fn from(saved: StoredPermissions) -> Self {
+        let restricted = saved.claude_mode == ClaudeMode::Plan || saved.codex_sandbox == CodexSandbox::ReadOnly;
+        Self {
+            codex_sandbox: saved.codex_sandbox,
+            claude_mode: saved.claude_mode,
+            antigravity_mode: saved.antigravity_mode.unwrap_or(if restricted {
+                AntigravityMode::Plan
+            } else {
+                AntigravityMode::AcceptEdits
+            }),
+        }
+    }
 }
 
 /// The original two fields are required. Older clients omit the Antigravity mode.

@@ -225,7 +225,7 @@ async function main() {
 ${LAUNCH_DUMP("agy")}
 printf '%s' "$MUSTER_TOKEN" > '${BASE}/agy-token-'"$MUSTER_SESSION_ID"
 stty -echo -icanon min 1 time 0
-printf '\\033[2J\\033[999;1H  Auto mode: edits & safe commands auto-approved (shift+tab to cycle)\\r\\n\\r\\n  ? for shortcuts\\r\\n'
+printf '\\033[2J\\033[999;1H────────────────────\\r\\n> Auto mode: edits & safe commands auto-approved (shift+tab to cycle)\\r\\n────────────────────\\r\\n? for shortcuts\\r\\n'
 exec tee '${BASE}/agy-input-'"$MUSTER_SESSION_ID" >/dev/null
 `);
   await Deno.chmod(`${BASE}/bin/agy`, 0o700);

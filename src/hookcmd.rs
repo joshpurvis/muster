@@ -81,7 +81,7 @@ pub fn run(agent: &str, event: &str, payload_arg: Option<String>) -> i32 {
         let id = std::env::var("MUSTER_SESSION_ID").ok()?.parse().ok()?;
         Some(crate::paths::session_dir(id).join(crate::adapters::antigravity::LAST_STATE))
     }).flatten();
-    if last.as_ref().is_some_and(|p| std::fs::read(p).ok().as_ref() == Some(&body)) {
+    if last.as_ref().is_some_and(|p| crate::adapters::antigravity::read_last_state(p).as_ref() == Some(&body)) {
         return 0;
     }
     let remember = last.map(|path| {
@@ -256,16 +256,19 @@ pub(crate) fn read_stdin() -> Vec<u8> {
 
 fn callback_body(agent: &str, event: &str, raw: &[u8]) -> Option<Vec<u8>> {
     if agent == "antigravity" {
-        return if event == "state" { antigravity_state(raw) } else { None };
+        return if event == "state" {
+            let value = serde_json::from_slice(raw).ok()?;
+            serde_json::to_vec(&antigravity_state(&value)?).ok()
+        } else { None };
     }
     Some(shrink_payload(raw))
 }
 
 /// Build a fresh object before logging, saving or forwarding anything. The raw payload
 /// includes the signed-in email, quota and workspace details, and may acquire more fields.
-fn antigravity_state(raw: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn antigravity_state(value: &serde_json::Value) -> Option<serde_json::Value> {
     use serde_json::{Map, Value};
-    let input: Map<String, Value> = serde_json::from_slice(raw).ok()?;
+    let input = value.as_object()?;
     let mut state = Map::new();
     if let Some(s) = input.get("agent_state").and_then(Value::as_str)
         && !s.is_empty() && s.len() <= 32 && s.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
@@ -280,7 +283,7 @@ fn antigravity_state(raw: &[u8]) -> Option<Vec<u8>> {
     {
         state.insert("session_id".into(), id.into());
     }
-    serde_json::to_vec(&state).ok()
+    Some(Value::Object(state))
 }
 
 /// Parse as JSON and truncate long strings; non-JSON input is sent as a JSON string.

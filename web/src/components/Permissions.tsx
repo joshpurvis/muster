@@ -2,12 +2,12 @@
 // one-line summary, and the badge a tab shows when it is more permissive than the defaults.
 // Only the human sets this; agents (MCP) can't.
 import type { ComponentChildren } from "preact";
-import { useLayoutEffect, useRef, useState } from "preact/hooks";
+import { useId, useLayoutEffect, useRef, useState } from "preact/hooks";
 import { channelById, overlay, sessionsByChannel, workspaceById } from "../state.ts";
 import { taskLabel } from "../model.ts";
 import * as A from "../actions.ts";
 import type { AntigravityMode, Channel, ClaudeMode, CodexSandbox, Permissions } from "../types.ts";
-import { DEFAULT_PERMISSIONS } from "../types.ts";
+import { DEFAULT_PERMISSIONS, storedPermissions } from "../types.ts";
 import { IconAntigravity, IconCodex, IconGlobe, IconShield, IconShieldAlert, IconSpark } from "../icons.tsx";
 import { Spinner } from "./common.tsx";
 import { cx } from "../util.ts";
@@ -79,13 +79,13 @@ export const ANTIGRAVITY_OPTS: Opt<AntigravityMode>[] = [
   { v: "accept_edits", label: "Accept edits", short: "accept edits",
     hint: "Edits files in the tab's folder without asking. Asks before commands." },
   { v: "auto", label: "Auto", short: "auto",
-    hint: "Edits and safe commands run without asking, inside Antigravity's sandbox (its default)." },
+    hint: "Edits and commands Antigravity judges safe run without asking; the rest ask. Antigravity's default." },
   { v: "full_access", label: "Full access", short: "full access", hint: "Never asks.",
     danger: "No prompts: Antigravity can run anything your user can." },
 ];
 
 export function perms(c: Channel | undefined | null): Permissions {
-  return { ...DEFAULT_PERMISSIONS, ...(c?.permissions ?? {}) };
+  return storedPermissions(c?.permissions);
 }
 
 const antigravityOpt = (v: AntigravityMode) => ANTIGRAVITY_OPTS.find((o) => o.v === v) ?? ANTIGRAVITY_OPTS[2];
@@ -122,6 +122,7 @@ function Seg<T extends string>(
     onChange: (v: T) => void;
   },
 ) {
+  const warningId = useId();
   const cur = opts.find((o) => o.v === value) ?? opts[0];
   const move = (e: KeyboardEvent) => {
     const i = opts.findIndex((o) => o.v === value);
@@ -144,6 +145,7 @@ function Seg<T extends string>(
             type="button"
             role="radio"
             aria-checked={o.v === value}
+            aria-describedby={o.v === value && o.danger ? warningId : undefined}
             tabIndex={o.v === value ? 0 : -1}
             class={cx("seg-btn", o.v === value && "on", o.danger && "seg-danger")}
             onClick={() => onChange(o.v)}
@@ -155,7 +157,7 @@ function Seg<T extends string>(
       </div>
       {cur.danger
         ? (
-          <span class="perm-warn" role="note">
+          <span id={warningId} class="perm-warn" role="note">
             <IconShieldAlert size={13} /> {cur.danger}
           </span>
         )
@@ -309,7 +311,7 @@ export function PermissionsDialog(
     }
   };
   return (
-    <Modal class="dialog dlg-calm perm-dlg" label="Tab permissions">
+    <Modal class="dialog dialog-scroll dlg-calm perm-dlg" label="Tab permissions">
       <form
         onSubmit={(e) => {
           e.preventDefault();

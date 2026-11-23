@@ -1119,6 +1119,7 @@ agents and shells rely on (Alt+M, Alt+B, Alt+F) are not app shortcuts. In text f
 Alt+letters and Alt+arrows are left alone. The setting **Terminal gets Alt keys** sends every
 Alt shortcut except Alt+Shift+… to a focused terminal. Ctrl+Shift+T/N are browser-reserved in
 Chromium `--app` mode, so there Alt+T and Alt+Shift+N are the reliable fallbacks.
+Enable **Terminal gets Alt keys** to use Antigravity’s Alt+J shortcut in its focused terminal.
 
 | Keys | Action |
 |---|---|

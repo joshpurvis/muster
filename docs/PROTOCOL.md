@@ -1218,21 +1218,22 @@ includes `AGY_CLI_DISABLE_AUTO_UPDATE=true`, `AGY_CLI_HIDE_ACCOUNT_INFO=true` an
 `AGY_CLI_OSC7501=off`. Antigravity uses its own login. Its catalog suggests eight Gemini
 model IDs with the effort built into the ID. A custom model or explicit effort is also accepted.
 
-The private settings file supplies a title command, `muster hook antigravity state`.
+The private settings file contains only a title command, `muster hook antigravity state`.
 The helper forwards only a validated `agent_state`, boolean `tool_confirmation_pending`
 and a valid conversation ID as `session_id`. It drops account and usage fields before
 the durable inbox or HTTP transport. The `state` event updates the tab and supplies
 the ID for `--conversation` on restart. Set `MUSTER_ANTIGRAVITY_SETTINGS=0` on the
-daemon for screen detection alone. A trust or settings dialog needs an answer in the terminal.
+daemon for screen detection alone. Once a callback arrives, it controls working and idle.
+Visible dialogs take precedence. A trust or settings dialog needs an answer in the terminal.
 
 Muster supplies its bearer-authenticated MCP server through a private
 `antigravity-workspace/.agents/mcp_config.json` in the session directory. Set
 `MUSTER_ANTIGRAVITY_MCP=0` on the daemon to omit that folder. A named agent working in a
-project also gets its home as an added directory for `AGENTS.md` and `memory/`.
+project also gets its `memory/` directory as an added directory.
 
-The flags and screen markers come from agy 1.5.13 help and strings. The title callback,
-account display setting, MCP discovery in an added folder, model availability, project persona
-discovery and approval keystrokes still need a signed-in check. Older backends interpret
+On 23 Nov 2026, a signed-in check with agy 1.5.13 verified the title callback, hidden account
+information, conversation resume and command approval. The MCP panel listed the connected
+server and its tools. The model had no MCP tools available on the tested account. Older backends interpret
 an Antigravity session as a shell and an Antigravity agent as Codex. Avoid downgrading while
 these records exist.
 
@@ -1297,7 +1298,8 @@ file, so calls to muster's own MCP tools skip Claude Code's `auto`-mode safety c
 (about 1.5-4 s per call otherwise). Muster's own guardrails still apply to those tools.
 Channels created before this existed have the defaults (store migration v3). `permissions` in
 `channel.create` and `channel.set_permissions` must name `codex_sandbox` and `claude_mode`. Older clients may omit
-`antigravity_mode`. Creation and old stored profiles default to `auto`. An update keeps the current value.
+`antigravity_mode`. New profiles default to `auto`. A stored profile missing the field uses `plan` if Claude uses
+`plan` or Codex uses `read_only`, and `accept_edits` otherwise. An update keeps the current value.
 
 Limits: the profile bounds what muster starts agents with; it is not a boundary against the
 agents themselves. Codex's workspace-write sandbox can still read the whole disk, including

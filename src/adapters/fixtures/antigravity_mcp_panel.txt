@@ -1,0 +1,17 @@
+      ▄▀▀▄        Antigravity CLI 1.5.13
+     ▀▀▀▀▀▀       Gemini 4 Neon (High)
+    ▀▀▀▀▀▀▀▀      /home/user/demo-app
+   ▄▀▀    ▀▀▄
+  ▄▀▀      ▀▀▄
+────────────────────────────────────────────────────────────
+> Show the tools available for demo-app.
+▸ Thought for 4s, 299 tokens
+  The tool list is empty.
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+>
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+MCP Servers
+Plugins (~/.gemini/config/plugins)
+>  ✓ muster  Tools: request_session, reply_session, session_messages, subscribe_channel, channel_updates, +37 more
+Keyboard: ↑/↓ Navigate  enter Actions  esc Exit
+                                                                                             auto · Gemini 4 Neon · high

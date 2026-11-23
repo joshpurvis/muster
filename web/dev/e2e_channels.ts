@@ -155,9 +155,11 @@ try {
 
   const empty = await create(a, "Scratch", "Empty");
   await a.wait(`!!document.querySelector('.empty-channel')`);
-  await a.click('.empty-channel .launch-btn:nth-child(3)');
+  await a.wait(`document.activeElement === document.querySelector(".welcome.empty")`);
+  await a.key("4");
   await a.wait(`!!document.querySelector('.pane .xterm')`);
   const only = await activeSid(a);
+  check(await a.eval(`${M}.sessions.value.get(${only}).kind === "antigravity"`), "key 4 opens Antigravity in the empty channel");
   await r(a, "session.remove", { id: only });
   await a.wait(`!!document.querySelector('.empty-channel')`);
   check(await current(a) === empty, "closing last tab preserves the channel");

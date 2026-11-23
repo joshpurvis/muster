@@ -587,6 +587,7 @@ export function focusActiveTerminalSoon() {
         else if (tab !== null && isAddonTab(tab)) document.querySelector<HTMLIFrameElement>(`iframe[data-addon-tab="${tab}"]`)?.focus();
         else if (tab === QUESTIONS_TAB) document.querySelector<HTMLElement>(".questions-view:not(.prs-view)")?.focus();
         else if (tab === PRS_TAB) document.querySelector<HTMLElement>(".prs-view")?.focus();
+        else if (tab === null) document.querySelector<HTMLElement>(".welcome.empty")?.focus();
       }
     })
   );

@@ -415,7 +415,7 @@ pub fn persona_text(name: &str, kind: SessionKind, persona: &str) -> String {
          shows yours. Neither works while you handle scheduled or triggered work.\n",
         kind = kind.as_str(),
         reply = if kind == SessionKind::Antigravity {
-            "Muster cannot read your final message here: always answer such a prompt with the muster MCP tool `reply`."
+            "If the muster MCP tools are available to you, answer such a prompt with the muster tool `reply`."
         } else { "your final message for that turn goes back to the sender." },
         resume = " resumes your conversation when you restart",
         links = crate::links::INSTRUCTION,
@@ -438,10 +438,10 @@ fn lstat(p: &Path) -> std::io::Result<Option<std::fs::Metadata>> {
 /// Agent homes are written by the daemon: refuse a symbolic link anywhere we write, so an agent (or
 /// anything else) can't point its home or persona file at another file and have muster write
 /// or truncate it. A path that can't be checked is refused too.
-fn refuse_symlink(p: &Path) -> anyhow::Result<()> {
+pub(crate) fn refuse_symlink(p: &Path) -> anyhow::Result<()> {
     match lstat(p) {
         Ok(Some(m)) if m.file_type().is_symlink() => {
-            anyhow::bail!("{} is a symbolic link; muster doesn't write through links in agent homes", p.display())
+            anyhow::bail!("{} is a symbolic link; muster doesn't write through links", p.display())
         }
         Ok(_) => Ok(()),
         Err(e) => anyhow::bail!("can't check {}: {e}", p.display()),
@@ -453,7 +453,7 @@ fn refuse_symlink(p: &Path) -> anyhow::Result<()> {
 fn ensure_home_dir(p: &Path) -> anyhow::Result<()> {
     match lstat(p) {
         Ok(Some(m)) if m.file_type().is_symlink() => {
-            anyhow::bail!("{} is a symbolic link; muster doesn't write through links in agent homes", p.display())
+            anyhow::bail!("{} is a symbolic link; muster doesn't write through links", p.display())
         }
         Ok(Some(m)) if !m.is_dir() => anyhow::bail!("{} is not a folder", p.display()),
         Ok(_) => {}
@@ -1012,6 +1012,9 @@ struct Attributions {
     active: HashMap<SessionId, i64>,
     delivered: HashMap<i64, (SessionId, i64)>,
     human_seen: HashSet<SessionId>,
+    /// Last callback underneath a visible Antigravity dialog, committed with the inbox cursor.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    antigravity_states: HashMap<SessionId, (u64, StateUpdate)>,
     /// When the human last had a prompt of their own taken in by each named agent (agent id ->
     /// Unix ms), whichever tab it ran in: typed at its input box, or sent from a terminal or the
     /// window as the human's (`on_delivered` with `Source::Human`). Messages from agents,
@@ -1580,6 +1583,11 @@ impl Registry {
         Ok(out)
     }
 
+    pub(crate) fn antigravity_callback(&self, id: SessionId, generation: u64) -> Option<StateUpdate> {
+        self.inner.lock().runtime.antigravity_states.get(&id)
+            .filter(|(run, _)| *run == generation).map(|(_, update)| update.clone())
+    }
+
     pub fn forget_session(&self, id: SessionId) {
         if let Err(error) = self.edit_runtime(|state| {
             state.prov.remove(&id);
@@ -1587,6 +1595,7 @@ impl Registry {
             state.human_seen.remove(&id);
             state.delivered.retain(|_, (session, _)| *session != id);
             state.quiet_pending.remove(&id);
+            state.antigravity_states.remove(&id);
         }) {
             tracing::warn!(session = id, "forgetting attribution: {error:#}");
         }
@@ -1600,7 +1609,7 @@ impl Registry {
 
     pub(crate) fn on_hook_checkpoint(&self, store: &Store, info: &SessionInfo, event: &str,
         payload: &Value, cursor: Option<&crate::store::HookCursor>) -> anyhow::Result<HookEffects> {
-        self.on_hook_session_checkpoint(store, info, event, payload, cursor, None, u64::MAX)
+        self.on_hook_session_checkpoint(store, info, event, payload, cursor, None, None, u64::MAX)
     }
 
     /// `arrival`: the human-input sequence number when the callback arrived (`u64::MAX` for
@@ -1609,7 +1618,7 @@ impl Registry {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_hook_session_checkpoint(&self, store: &Store, info: &SessionInfo, event: &str,
         payload: &Value, cursor: Option<&crate::store::HookCursor>,
-        session: Option<(&SessionInfo, &crate::store::HookSession)>, arrival: u64) -> anyhow::Result<HookEffects> {
+        session: Option<(&SessionInfo, &crate::store::HookSession)>, antigravity_callback: Option<&StateUpdate>, arrival: u64) -> anyhow::Result<HookEffects> {
         let mut g = self.inner.lock();
         if let Some(cursor) = cursor {
             if store.load_runtime::<crate::store::HookCursor>("hook-inbox-cursor")?
@@ -1622,6 +1631,9 @@ impl Registry {
         let named = g.agents.values().find(|a| a.session_id == Some(info.id)).map(|a| a.id);
         // The run the hook came from (quiet messages are offered to, and confirmed by, one run).
         let run = session.map_or(0, |(_, runtime)| runtime.generation);
+        if let Some(base) = antigravity_callback {
+            next.antigravity_states.insert(info.id, (run, base.clone()));
+        }
         let mut fx = HookEffects::default();
         if event == "UserPromptSubmit" {
             let prompt = payload.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
@@ -2162,9 +2174,13 @@ pub fn update_switch(hub: &Hub, req: AgentUpdate, outside: bool) -> anyhow::Resu
             r => r?,
         }
     }
+    let channel_patch = req.permissions.and_then(|patch| {
+        let c = next.channel_id.and_then(|id| hub.channel(id))?;
+        (!c.archived && patch.onto(c.permissions) != c.permissions).then_some((c.id, patch))
+    });
     // `now` alone changes nothing in the record: written back, it could restore a move a start
     // cleared meanwhile.
-    if serde_json::to_value(&next)? == serde_json::to_value(&cur)? {
+    if channel_patch.is_none() && serde_json::to_value(&next)? == serde_json::to_value(&cur)? {
         let save_notes = req.save_notes.unwrap_or(false);
         let switch = waiting.map(|h| Switch { name: cur.name.clone(), from: h.from, to: cur.account_profile_id, at: h.at, now: true, save_notes });
         return Ok((cur, switch));
@@ -2183,10 +2199,8 @@ pub fn update_switch(hub: &Hub, req: AgentUpdate, outside: bool) -> anyhow::Resu
         (None, Some(h)) => Some(Switch { name: next.name.clone(), from: h.from, to: cur.account_profile_id, at: h.at, now: true, save_notes }),
         (None, None) => None,
     };
-    if next.permissions != cur.permissions
-        && let Some(c) = next.channel_id.and_then(|c| hub.channel(c)).filter(|c| !c.archived)
-    {
-        hub.set_permissions(c.id, next.permissions)?;
+    if let Some((id, patch)) = channel_patch {
+        hub.change_permissions(id, |current| patch.onto(current))?;
     }
     publish(hub, &next);
     if next.provider != cur.provider || next.accepts_origins != cur.accepts_origins {
@@ -2280,7 +2294,7 @@ pub struct AgentSession {
     pub started: bool,
     /// The agent was asleep since then (Unix ms), and this call woke it (src/sleep.rs).
     pub woke: Option<i64>,
-    /// This call started a process in a new conversation (`starts_new_conversation`: Start
+    /// This call started a process in a new conversation (Start
     /// fresh, a pending account move, a first start), so no old conversation is re-read.
     pub new_conversation: bool,
 }
@@ -2411,7 +2425,6 @@ async fn start_once(hub: &Arc<Hub>, name: &str, fresh: bool, window: Option<Wind
         agent = hub.agents().reset_for_start(hub.store(), agent.id, &agent.working_location)?;
     }
     let args = agent_args(agent.kind, agent.model.as_deref(), agent.effort.as_deref(), agent.resume_id.as_deref())?;
-    let new_conversation = starts_new_conversation(&agent, &args);
     let home = PathBuf::from(&agent.home_dir);
     ensure_home(&home)?;
     prepare_handoff(hub, &agent)?;
@@ -2435,7 +2448,7 @@ async fn start_once(hub: &Arc<Hub>, name: &str, fresh: bool, window: Option<Wind
     let id = agent.id;
     let handoff = agent.handoff.as_ref().map(|h| h.at);
     let r = run_agent(hub, agent, fresh, window, args, woke).await.map(|mut s| {
-        s.new_conversation = new_conversation && s.started;
+        s.new_conversation = s.started && hub.launched_resume(s.session.id, s.agent.kind).is_none();
         s
     });
     let r = match (r, handoff) {
@@ -2460,16 +2473,6 @@ async fn start_once(hub: &Arc<Hub>, name: &str, fresh: bool, window: Option<Wind
     r
 }
 
-/// A start of `agent` with `args` begins a new conversation: Claude without `--resume` (Start
-/// fresh, a pending account move, a first start, or a saved id it can't use), Codex without a
-/// saved thread. Read from what the launch will actually do, not from why.
-fn starts_new_conversation(agent: &Agent, args: &[String]) -> bool {
-    match agent.kind {
-        SessionKind::Claude | SessionKind::Antigravity => !crate::cache::continues_conversation(agent.kind, args),
-        _ => !agent.resume_id.as_deref().is_some_and(valid_resume_id),
-    }
-}
-
 /// The run part of `start_locked`: restart the agent's exited session, else a new one in its tab.
 async fn run_agent(hub: &Arc<Hub>, mut agent: Agent, fresh: bool, window: Option<WindowId>, args: Vec<String>,
     woke: Option<i64>) -> anyhow::Result<AgentSession> {
@@ -2482,7 +2485,6 @@ async fn run_agent(hub: &Arc<Hub>, mut agent: Agent, fresh: bool, window: Option
         if live && !fresh {
             return Ok(AgentSession { agent, session: info, started: false, woke, new_conversation: false });
         }
-        hub.set_session_extra_args(sid, args)?;
         follow_account(hub, &agent, sid)?;
         // A fresh start of a running agent keeps the prompts still waiting to be typed: the new
         // conversation gets them once it is ready (src/inject.rs `carry_over`).
@@ -2491,7 +2493,7 @@ async fn run_agent(hub: &Arc<Hub>, mut agent: Agent, fresh: bool, window: Option
         if live { crate::inject::after_restart(hub, sid); }
         let session = restarted?;
         hub.agents().update(hub.store(), agent.id, |a| a.channel_id = Some(channel.id))?;
-        agent.channel_id = Some(channel.id);
+        agent = hub.agents().by_id(agent.id).ok_or_else(|| anyhow::anyhow!("agent removed during restart"))?;
         return Ok(AgentSession { agent, session, started: true, woke, new_conversation: false });
     }
     hub.agents().update(hub.store(), agent.id, |a| a.channel_id = Some(channel.id))?;
@@ -2583,7 +2585,7 @@ pub fn configure_project_command(agent: &Agent, cwd: &str, permissions: Permissi
             }
             args
         },
-        SessionKind::Antigravity => vec![format!("--add-dir={}", home.display())],
+        SessionKind::Antigravity => vec![format!("--add-dir={memory}")],
         SessionKind::Shell => vec![],
     };
     let at = spec.args.iter().position(|a| a == "--").unwrap_or(spec.args.len());
@@ -4382,7 +4384,16 @@ mod tests {
         let old = json!({"claude_mode":"plan","codex_sandbox":"read_only"});
         let stored: Permissions = serde_json::from_value(old.clone()).unwrap();
         let input: PermissionsInput = serde_json::from_value(old).unwrap();
-        assert_eq!(stored.antigravity_mode, AntigravityMode::Auto);
+        assert_eq!(stored.antigravity_mode, AntigravityMode::Plan);
+        for (legacy, mode) in [
+            (json!({"claude_mode":"plan"}), AntigravityMode::Plan),
+            (json!({"codex_sandbox":"read_only"}), AntigravityMode::Plan),
+            (json!({}), AntigravityMode::AcceptEdits),
+            (json!({"claude_mode":"plan","antigravity_mode":"auto"}), AntigravityMode::Auto),
+        ] {
+            assert_eq!(serde_json::from_value::<Permissions>(legacy).unwrap().antigravity_mode, mode);
+        }
+        assert_eq!(Permissions::default().antigravity_mode, AntigravityMode::Auto);
         let wide = Permissions { antigravity_mode: AntigravityMode::FullAccess, ..stored };
         assert_eq!(input.onto(wide), wide);
         assert!(wide.is_elevated() && wide.exceeds_for(&stored, kind));
@@ -4393,12 +4404,11 @@ mod tests {
     fn a_start_is_a_new_conversation_only_without_a_resume() {
         let claude = Agent { resume_id: Some("0f7e3c1a-58b2-4d0e-9a6c-2b1d4e5f6a7b".into()), ..agent(SessionKind::Claude) };
         let args = agent_args(SessionKind::Claude, None, None, claude.resume_id.as_deref()).unwrap();
-        assert!(!starts_new_conversation(&claude, &args));
+        assert!(crate::adapters::resumed_in_launch(claude.kind, &args).is_some());
         let fresh = Agent { resume_id: None, ..claude };
-        assert!(starts_new_conversation(&fresh, &agent_args(SessionKind::Claude, None, None, None).unwrap()));
-        let codex = Agent { resume_id: Some("thread-1".into()), ..agent(SessionKind::Codex) };
-        assert!(!starts_new_conversation(&codex, &[]));
-        assert!(starts_new_conversation(&Agent { resume_id: None, ..codex }, &[]));
+        assert!(crate::adapters::resumed_in_launch(fresh.kind, &agent_args(SessionKind::Claude, None, None, None).unwrap()).is_none());
+        assert!(crate::adapters::resumed_in_launch(SessionKind::Codex, &["resume".into(), "--".into(), "thread-1".into()]).is_some());
+        assert!(crate::adapters::resumed_in_launch(SessionKind::Codex, &[]).is_none());
     }
 
     /// ask_agent's note after a wake: a re-read only when the wake resumed the conversation.
@@ -5303,7 +5313,7 @@ mod tests {
     #[test]
     fn project_persona_keeps_memory_absolute_and_preserves_read_only_permissions() {
         let home = scratch("project-persona");
-        for kind in [SessionKind::Claude,SessionKind::Codex] {
+        for kind in [SessionKind::Claude, SessionKind::Codex, SessionKind::Antigravity] {
             let mut a = agent(kind); a.home_dir = home.to_string_lossy().into_owned();
             a.working_location = WorkingLocation::Main { workspace_id:1 };
             ensure_home(&home).unwrap();
@@ -5312,6 +5322,11 @@ mod tests {
             let perms = Permissions { codex_sandbox: CodexSandbox::ReadOnly, ..Default::default() };
             configure_project_command(&a,"/repo",perms,None,&mut spec).unwrap();
             assert_eq!(&spec.args[spec.args.len()-2..], &["--","original-prompt"]);
+            if kind == SessionKind::Antigravity {
+                assert_eq!(spec.args[..1], [format!("--add-dir={}", home.join("memory").display())]);
+                assert_eq!(spec.args.len(), 3);
+                continue;
+            }
             assert!(spec.args.iter().any(|s| s.contains("A persistent identity.") && s.contains(&a.home_dir)));
             if kind == SessionKind::Codex { assert!(!spec.args.iter().any(|a| a == "--add-dir")); }
             else { assert!(spec.args.contains(&home.join("memory").to_string_lossy().into_owned())); }

@@ -866,6 +866,19 @@ async fn spawn_session_defaults_and_new_channel() {
 }
 
 #[tokio::test]
+async fn antigravity_inherits_legacy_plan_in_the_callers_channel() {
+    let (m, st) = state();
+    let stored = serde_json::from_value(json!({"codex_sandbox":"read_only","claude_mode":"default"})).unwrap();
+    m.d.lock().channels.get_mut(&10).unwrap().permissions = stored;
+    let (text, error) = call(&st, "spawn_session", json!({"kind":"antigravity"})).await;
+    assert!(!error, "{text}");
+    let channel_id = parse(&text)["session"]["channel_id"].as_i64().unwrap();
+    assert_eq!(channel_id, 10);
+    let profile = m.d.lock().channels[&channel_id].permissions;
+    assert_eq!(crate::adapters::antigravity::mode_args(profile.antigravity_mode), ["--mode=plan"]);
+}
+
+#[tokio::test]
 async fn permissions_are_shown_and_inherited_never_raised() {
     let (m, st) = state();
     let elevated = Permissions {

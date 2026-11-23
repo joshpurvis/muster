@@ -556,3 +556,7 @@ mod phase2;
 // Phase 3: agents' proposals and reminders, the file-change trigger.
 #[path = "tests_phase3.rs"]
 mod phase3;
+
+// The daily cap counts calendar days in the schedule's zone.
+#[path = "tests_daily_cap.rs"]
+mod daily_cap;

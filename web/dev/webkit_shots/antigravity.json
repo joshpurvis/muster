@@ -10,12 +10,12 @@
   },
   {
     "js": "document.querySelectorAll('.launch-btn')[3].click();",
-    "until": "globalThis.__muster.focusedSession.value?.kind === 'antigravity' && document.querySelector('.tab[data-tab-sid]')",
+    "until": "globalThis.__muster.focusedSession.value?.kind === 'antigravity' && document.querySelector(`.tab[data-tab-sid=\"${globalThis.__muster.focusedSession.value.id}\"]`)",
     "settle": 0.4
   },
   {
-    "js": "document.querySelector('.tab[data-tab-sid]').dispatchEvent(new MouseEvent('contextmenu', {bubbles:true, clientX:320, clientY:80}));",
-    "until": "document.querySelector('[role=menuitem]')"
+    "js": "const t=document.querySelector(`.tab[data-tab-sid=\"${globalThis.__muster.focusedSession.value.id}\"]`); const r=t.getBoundingClientRect(); t.dispatchEvent(new MouseEvent('contextmenu', {bubbles:true, cancelable:true, clientX:r.left+r.width/2, clientY:r.top+r.height/2}));",
+    "until": "[...document.querySelectorAll('[role=menuitem]')].some(b => b.textContent.includes('Permissions'))"
   },
   {
     "js": "[...document.querySelectorAll('[role=menuitem]')].find(b => b.textContent.includes('Permissions')).click();",

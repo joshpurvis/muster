@@ -182,9 +182,10 @@ fn handle_due(hub: &Arc<Hub>, id: i64, now: i64, settings: &super::Settings, qui
         let mut g = sched.inner.lock();
         let Some(s) = g.list.get(&id).cloned() else { return Ok(None) };
         let last = hub.store().runs(id, None, 10)?.into_iter().find(|r| r.kind != RunKind::Chain);
-        let today = match plan::due_slot(&s, now) {
-            Some(slot) if s.daily_cap.is_some() => runs_on_day(hub, &s, slot, None)?,
-            _ => 0,
+        // Only a capped schedule looks for its slot twice (here and in `due`).
+        let today = match s.daily_cap.and_then(|_| plan::due_slot(&s, now)) {
+            Some(slot) => runs_on_day(hub, &s, slot, None)?,
+            None => 0,
         };
         let Some(mut due) = plan::due(&s, now, settings, quiet, f, today, last.as_ref().and_then(|r| r.reason.as_deref())) else {
             return Ok(None);

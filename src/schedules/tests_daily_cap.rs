@@ -3,6 +3,7 @@
 //! its slot yesterday still runs today, a second run on the same day is refused, daylight-saving
 //! days are as long as they are, and a catch-up counts toward the day it stands for.
 
+use super::super::plan;
 use super::super::*;
 use super::{Fixture, LONDON, at};
 use crate::agents::Origin;
@@ -44,13 +45,37 @@ fn daily(f: &Fixture, cron: &str, cap: u32) -> Schedule {
 fn a_daily_cap_of_one_runs_every_day_when_yesterdays_run_went_out_a_few_seconds_late() {
     let f = Fixture::new(at(LONDON, "2026-11-22T09:00"));
     let s = daily(&f, "30 9 * * *", 1);
-    // Yesterday's 09:30 run reached the agent at 09:30:05.
+    let today = at(LONDON, "2026-11-22T09:30");
+    // Yesterday's 09:30 run reached the agent at 09:30:05: 23 h 59 min 55.5 s before this tick.
+    f.set(today + 500);
     delivered(&f, &s, at(LONDON, "2026-11-21T09:30"), 5_000);
-    f.set(at(LONDON, "2026-11-22T09:30") + 500);
     let started = f.tick();
     let rs = f.runs(s.id);
     assert_eq!(started.len(), 1, "today's 09:30 run goes: {rs:?}");
     assert_eq!(started[0].kind, RunKind::Scheduled);
+    // The checks before sending and right before Enter count the same day the same way.
+    let s = f.hub.schedules.get(s.id).unwrap();
+    assert_eq!(super::super::run::runs_on_day(&f.hub, &s, today, None).unwrap(), 0);
+    let settings = f.hub.schedules.settings();
+    assert_eq!(plan::still_ok(&s, today + 2_000, &settings, &super::quiet_london(), &plan::Facts::default(), today, 0, None), None);
+}
+
+#[test]
+fn a_catch_up_on_the_next_day_counts_toward_the_slot_it_runs_not_the_one_it_missed() {
+    // 09:30 and 15:30, cap 1: the 21st's 09:30 ran; Muster was off from before 15:30 until 09:31
+    // on the 22nd. The slot acted on is the 22nd's 09:30, which still goes.
+    let f = Fixture::new(at(LONDON, "2026-11-21T09:00"));
+    let s = daily(&f, "30 9,15 * * *", 1);
+    f.set(at(LONDON, "2026-11-22T09:31"));
+    delivered(&f, &s, at(LONDON, "2026-11-21T09:30"), 5_000);
+    f.hub.schedules.edit(s.id, |x| {
+        x.next_run = Some(at(LONDON, "2026-11-21T15:30"));
+        x.last_fired = Some(at(LONDON, "2026-11-21T09:30"));
+        Ok(())
+    }).unwrap();
+    let started = f.tick();
+    assert_eq!(started.len(), 1, "the 22nd's 09:30 goes: {:?}", f.runs(s.id));
+    assert_eq!(started[0].slot, at(LONDON, "2026-11-22T09:30"));
 }
 
 #[test]
@@ -94,6 +119,17 @@ fn a_daylight_saving_day_is_one_calendar_day_however_long() {
     assert_eq!(last.outcome, Outcome::Refused, "{last:?}");
     f.set(at(LONDON, "2026-10-26T00:30") + 500);
     assert_eq!(f.tick().len(), 1, "the 26th is a new day");
+
+    // Late on the 25-hour day, past where "midnight plus 24 hours" would end it (23:00).
+    let f = Fixture::new(at(LONDON, "2026-10-25T23:00"));
+    let s = daily(&f, "15,45 23 * * *", 1);
+    f.set(at(LONDON, "2026-10-25T23:15") + 500);
+    assert_eq!(f.tick().len(), 1);
+    deliver_claimed(&f, &s, at(LONDON, "2026-10-25T23:15"), 0);
+    f.set(at(LONDON, "2026-10-25T23:45") + 500);
+    assert!(f.tick().is_empty());
+    let last = f.runs(s.id).into_iter().find(|r| r.slot == at(LONDON, "2026-10-25T23:45")).unwrap();
+    assert_eq!(last.outcome, Outcome::Refused, "{last:?}");
 }
 
 #[test]

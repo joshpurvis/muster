@@ -1833,9 +1833,10 @@ function MemoryTab(
                       listing(added.added.filter((a) => a.renamed).map((a) => a.from))
                     } already existed, so ${
                       added.added.filter((a) => a.renamed).length === 1 ? "it got" : "they got"
-                    } a number)`}. {agent.name} reads memory/ when a new conversation starts; to use{" "}
+                    } a number)`}. When a conversation starts, {agent.name} reads the memory/ files its persona
+                  names (all of them if it names none) and searches the rest when a task needs it; to use{" "}
                   {added.added.length === 1 ? "it" : "them"}{" "}
-                  in the current one, ask it in its tab to read memory/.
+                  now, ask it in its tab to read {added.added.length === 1 ? "it" : "them"}.
                 </p>
               )}
               {added.skipped.map((s, i) => <p key={i} class="mem-skipped">Skipped {s.name}: {s.why}.</p>)}
@@ -1856,7 +1857,8 @@ function MemoryTab(
             <p>
               Memory is {agent.name}'s notebook: the files in <code>memory/</code> in its folder. Its{" "}
               <code>{personaFile}</code>{" "}
-              tells it to read them when a conversation starts and to keep its own notes there.
+              tells it to keep its own notes there and, when a conversation starts, to read the files its persona
+              names (all of them if it names none), searching the rest when a task needs it.
             </p>
             <p>Seed it with what it should know, like project facts, a style guide or past decisions.</p>
             <div class="mem-intro-actions">

@@ -4025,14 +4025,46 @@ impl Hub {
         }
     }
 
-    /// Kill (if alive) and forget a session, including its scrollback.
+    /// Closed tabs, newest first (`Store::ended_sessions`).
+    pub fn ended_sessions(&self, limit: usize) -> anyhow::Result<Vec<EndedSession>> {
+        self.store.ended_sessions(limit)
+    }
+
+    pub fn ended_session_count(&self) -> anyhow::Result<usize> {
+        self.store.ended_session_count()
+    }
+
+    /// Kill (if alive) and forget a session, including its scrollback. A short record of it
+    /// (`EndedSession`, never its output) stays for the "Archived sessions" list.
     pub fn remove_session(&self, id: SessionId) -> anyhow::Result<()> {
+        // Before `inner`: the agents' own lock is never taken inside it here.
+        let agent = self.agents.by_session(id);
         let entry = {
             let mut g = self.inner.lock();
             anyhow::ensure!(g.sessions.contains_key(&id), "no such session: {id}");
+            // What the "Archived sessions" list keeps of it, saved with the removal.
+            let ended = {
+                let info = &g.sessions[&id].info;
+                EndedSession {
+                    id,
+                    channel_id: info.channel_id,
+                    channel_name: g.channels.get(&info.channel_id).map(|c| c.name.clone()).unwrap_or_default(),
+                    channel_archived: false,
+                    kind: info.kind,
+                    name: info.name.clone(),
+                    title: info.title.clone(),
+                    cwd: info.cwd.clone(),
+                    account_profile_id: info.account_profile_id,
+                    agent: agent.as_ref().map(|a| a.name.clone()),
+                    conversation: agent.as_ref().and_then(|a| a.resume_id.clone()),
+                    exit_code: info.exit_code,
+                    created_at: info.created_at,
+                    ended_at: now_ms(),
+                }
+            };
             let mut records = self.terminal_records.lock();
             let retired = records.get(&id).cloned().map(|mut record| { record.retired = true; record });
-            self.store.retire_session(id, retired.as_ref())?;
+            self.store.retire_session(id, retired.as_ref(), Some(&ended))?;
             if let Some(record) = retired {
                 records.insert(id, record);
             }
@@ -6300,6 +6332,35 @@ mod tests {
         hub.move_channel(1, 2, None).unwrap();
         assert!(hub.sessions().iter().all(|s| s.window_id == Some(2)));
         assert_eq!(drain(&mut rx), ["c1@w2", "s2@w2", "w1", "w2"]);
+    }
+
+    #[test]
+    fn closing_a_tab_keeps_a_record_for_archived_sessions() {
+        let hub = agent_fixture();
+        let mut rx = hub.subscribe();
+        hub.remove_session(1).unwrap();
+        hub.remove_session(2).unwrap();
+        let _ = drain(&mut rx);
+        let list = hub.ended_sessions(10).unwrap();
+        assert_eq!(list.iter().map(|e| e.id).collect::<Vec<_>>(), [2, 1], "newest first");
+        let c1 = hub.channel(1).unwrap();
+        assert!(list.iter().all(|e| e.channel_id == 1 && e.channel_name == c1.name && !e.channel_archived));
+        // Session 2 was the named agent's.
+        assert_eq!(list[0].agent.as_deref(), Some("ada"));
+        assert_eq!(list[1].agent, None);
+        assert!(list.iter().all(|e| e.ended_at > 0 && e.exit_code.is_none()));
+        assert_eq!(hub.ended_session_count().unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn archiving_a_channel_keeps_a_record_of_each_tab() {
+        let hub = move_fixture();
+        let before = hub.sessions().iter().filter(|s| s.channel_id == 1).count();
+        assert!(before > 0);
+        hub.archive_channel(1, false).await.unwrap();
+        let list = hub.ended_sessions(10).unwrap();
+        assert_eq!(list.len(), before);
+        assert!(list.iter().all(|e| e.channel_id == 1 && e.channel_archived));
     }
 
     #[test]

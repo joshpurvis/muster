@@ -689,12 +689,13 @@ fn update_antigravity_answer(path: &Path) {
 
 /// An agent made before named memory files was told to read all of `memory/` at every start. At
 /// its next start Muster replaces that sentence with `MEMORY_INSTRUCTION` once, in the
-/// "## Memory" section of a file it generated (`add_quiet_sentence`'s rules: the last such
+/// "## Memory" section of a file it generated (`add_quiet_sentence`'s rules, a "bot" file too: the last such
 /// heading, since the human's persona comes before it); a file changed there by hand is left
 /// alone. Best effort.
 fn update_memory_sentence(path: &Path) {
     let Ok(text) = std::fs::read_to_string(path) else { return };
-    if !text.contains("a persistent muster agent") {
+    // Files generated before agents were called agents say "bot" and carry the same paragraph.
+    if !text.contains("a persistent muster agent") && !text.contains("a persistent muster bot") {
         return;
     }
     let Some(start) = text.rfind("\n## Memory\n").map(|i| i + 1) else { return };
@@ -726,6 +727,28 @@ fn add_links_section(path: &Path) {
     if let Err(e) = refuse_symlink(path).and_then(|()| Ok(paths::write_private(path, next.as_bytes())?)) {
         tracing::warn!("adding the Links section to {}: {e:#}", path.display());
     }
+}
+
+/// The agent's persona file before a start or a restart of its tab: written when missing (one that
+/// can't be read is an error), else brought up to date once by the upgrades below.
+fn prepare_persona(home: &Path, agent: &Agent) -> anyhow::Result<()> {
+    let persona = home.join(persona_file(agent.kind));
+    match lstat(&persona) {
+        Ok(None) => write_persona(&persona, &persona_text_for(agent))?,
+        Ok(Some(_)) => {
+            refuse_symlink(&persona)?;
+            add_links_section(&persona);
+            update_memory_sentence(&persona);
+            if agent.kind == SessionKind::Claude {
+                add_quiet_sentence(&persona);
+            }
+            if agent.kind == SessionKind::Antigravity {
+                update_antigravity_answer(&persona);
+            }
+        }
+        Err(e) => anyhow::bail!("can't read {}: {e}", persona.display()),
+    }
+    Ok(())
 }
 
 /// The persona files in `home` name the current tools (`rename_old_tools`). Best effort.
@@ -2508,23 +2531,7 @@ async fn start_once(hub: &Arc<Hub>, name: &str, fresh: bool, window: Option<Wind
     let home = PathBuf::from(&agent.home_dir);
     ensure_home(&home)?;
     prepare_handoff(hub, &agent)?;
-    let persona = home.join(persona_file(agent.kind));
-    // Only a missing persona file is (re)written; one that can't be read is an error.
-    match lstat(&persona) {
-        Ok(None) => write_persona(&persona, &persona_text_for(&agent))?,
-        Ok(Some(_)) => {
-            refuse_symlink(&persona)?;
-            add_links_section(&persona);
-            update_memory_sentence(&persona);
-            if agent.kind == SessionKind::Claude {
-                add_quiet_sentence(&persona);
-            }
-            if agent.kind == SessionKind::Antigravity {
-                update_antigravity_answer(&persona);
-            }
-        }
-        Err(e) => anyhow::bail!("can't read {}: {e}", persona.display()),
-    }
+    prepare_persona(&home, &agent)?;
     // Awake from here on; a start below that fails puts an agent it was waking back to sleep
     // (src/sleep.rs `start_failed`), so its next message tries again.
     let woke = crate::sleep::on_start(hub, &agent)?;
@@ -2772,7 +2779,12 @@ pub async fn restart_session(hub: &Arc<Hub>, id: SessionId, expect: Option<&Rest
         hub.fence_conversation(id);
         agent = hub.agents().reset_for_start(hub.store(), agent.id, &agent.working_location)?;
     }
+    // As a start: the home is checked, and the persona file written or brought up to date, before
+    // the new process reads it.
+    let home = PathBuf::from(&agent.home_dir);
+    ensure_home(&home)?;
     prepare_handoff(hub, &agent)?;
+    prepare_persona(&home, &agent)?;
     follow_account(hub, &agent, id)?;
     let session = hub.restart_session_at(id, Some((channel.id, cwd))).await?;
     hub.agents().update(hub.store(), agent.id, |a| a.channel_id = Some(channel.id))?;
@@ -5030,10 +5042,30 @@ mod tests {
         std::fs::write(&p, &edited).unwrap();
         update_memory_sentence(&p);
         assert_eq!(std::fs::read_to_string(&p).unwrap(), edited);
+        // A persona from before agents were called agents gets it too.
+        let bot = format!("# tess\n\nYou are tess, a persistent muster bot (claude). This folder is your home.\n\n\
+            ## Persona\n\nTests.\n\n## Memory\n\n{OLD_MEMORY_INSTRUCTION}\n\n## Messages\n\nAnswer.\n");
+        std::fs::write(&p, &bot).unwrap();
+        update_memory_sentence(&p);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), bot.replace(OLD_MEMORY_INSTRUCTION, MEMORY_INSTRUCTION));
         let mine = format!("# Mine\n\n## Memory\n\n{OLD_MEMORY_INSTRUCTION}\n");
         std::fs::write(&p, &mine).unwrap();
         update_memory_sentence(&p);
         assert_eq!(std::fs::read_to_string(&p).unwrap(), mine);
+    }
+
+    #[test]
+    fn preparing_the_persona_writes_a_missing_file_and_updates_an_old_one() {
+        // Used by both a start and a Restart of the agent's tab (`restart_session`).
+        let dir = scratch("prepare-persona");
+        let a = agent(SessionKind::Codex);
+        let p = dir.join("AGENTS.md");
+        prepare_persona(&dir, &a).unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), persona_text_for(&a));
+        let old = persona_text_for(&a).replace(MEMORY_INSTRUCTION, OLD_MEMORY_INSTRUCTION);
+        std::fs::write(&p, &old).unwrap();
+        prepare_persona(&dir, &a).unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), persona_text_for(&a));
     }
 
     #[test]

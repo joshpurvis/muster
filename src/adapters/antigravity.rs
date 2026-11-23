@@ -172,6 +172,29 @@ fn prepare_workspace(ctx: &SpawnCtx) -> anyhow::Result<std::path::PathBuf> {
     Ok(workspace)
 }
 
+/// A launch with Muster's MCP workspace that resumes no conversation: Muster opens a new one
+/// before its first prompt (`inject::prepare_new_conversation`), so that prompt is queued, not
+/// passed with `--prompt-interactive`.
+pub fn opens_new_conversation(args: &[String]) -> bool {
+    args.iter().any(|a| a.strip_prefix("--add-dir=").is_some_and(|d| Path::new(d).ends_with("antigravity-workspace")))
+        && resumed_in_launch(SessionKind::Antigravity, args).is_none()
+}
+
+/// agy's `/mcp` panel lists Muster's server as loaded ("✓ muster  Tools: ...", agy 1.5.13).
+pub fn mcp_panel_loaded(screen: &ScreenSnapshot) -> bool {
+    let lines = active_dialog_lines(&screen.lines);
+    lines.iter().any(|l| l.trim() == "MCP Servers")
+        && lines.iter().any(|l| l.trim_start_matches([' ', '>']).starts_with("✓ muster  Tools:"))
+}
+
+/// agy's screen before any turn: no submitted prompt ("> ...") above the input box.
+pub fn is_startup_screen(screen: &ScreenSnapshot) -> bool {
+    let lines = &screen.lines;
+    let Some(bottom) = tui::rfind(lines, tui::is_solid_rule) else { return false };
+    let Some(top) = tui::rfind(&lines[..bottom], tui::is_solid_rule) else { return false };
+    !lines[..top].iter().any(|l| l.starts_with("> ") || l.trim_end() == ">")
+}
+
 fn launch(ctx: &SpawnCtx, settings: bool, mcp: bool, user_settings: &Path) -> anyhow::Result<CommandSpec> {
     let mut args = Vec::new();
     if settings {
@@ -198,6 +221,7 @@ fn launch(ctx: &SpawnCtx, settings: bool, mcp: bool, user_settings: &Path) -> an
     let prompt = ctx.initial_prompt.as_ref().filter(|p| {
         !p.trim().is_empty()
             && resumed_in_launch(SessionKind::Antigravity, &ctx.extra_args).is_none()
+            && !mcp
     });
     if let Some(p) = prompt {
         args.push(format!("--prompt-interactive={p}"));
@@ -402,8 +426,21 @@ impl Adapter for AntigravityAdapter {
     fn composer_text(&self, screen: &ScreenSnapshot) -> Option<String> {
         let lines = &screen.lines;
         let bottom = tui::rfind(lines, tui::is_solid_rule)?;
-        // A panel can leave a complete, inactive composer visible above its controls.
-        let footer = lines[bottom + 1..].iter().find_map(|l| l.trim_start().strip_prefix("? for shortcuts"))?;
+        // A panel can leave a complete, inactive composer visible above its controls. agy
+        // 1.5.13 drops "? for shortcuts" while the box holds text, leaving the right-aligned
+        // status ("auto · Gemini 4 Neon · high") alone on the line under it.
+        let status_only = lines.get(bottom + 1).map(String::as_str).filter(|l| {
+            let t = l.trim_start();
+            l.len() - t.len() >= 8 && t.split(" · ").count() >= 2
+        });
+        // A typed slash command opens agy's command menu under the box instead.
+        let menu = lines[bottom + 1..].iter().take(12).any(|l| l.contains("enter Select"))
+            && lines.get(bottom + 1).is_some_and(|l| l.trim_start_matches([' ', '>']).starts_with('/'));
+        let footer = lines[bottom + 1..]
+            .iter()
+            .find_map(|l| l.trim_start().strip_prefix("? for shortcuts"))
+            .or(status_only)
+            .or(menu.then_some(""))?;
         let top = tui::rfind(&lines[..bottom], tui::is_solid_rule)?;
         let (first, rest) = lines[top + 1..bottom].split_first()?;
         let first = if first.trim_end() == ">" {
@@ -419,6 +456,7 @@ impl Adapter for AntigravityAdapter {
         let mode = footer.split('·').next()?.trim();
         if matches!((mode, text),
             ("auto", "Auto mode: edits & safe commands auto-approved (shift+tab to cycle)") |
+            ("accept-edits", "Accept-edits mode: file edits auto-approved (shift+tab to cycle)") |
             ("plan", "Plan mode: research & plan only (shift+tab to cycle)")) {
             return Some(String::new());
         }
@@ -594,11 +632,38 @@ mod tests {
         let plan = "Plan mode: research & plan only (shift+tab to cycle)";
         let screen = snap(&idle.replace(placeholder, plan).replace("auto ·", "plan ·"));
         assert_eq!(AntigravityAdapter.composer_text(&screen).as_deref(), Some(""));
+        // The empty box in accept-edits mode, as agy 1.5.13 draws it; under another mode it is text.
+        let edits = include_str!("fixtures/antigravity_idle_accept_edits.txt");
+        assert_eq!(AntigravityAdapter.composer_text(&snap(edits)).as_deref(), Some(""));
+        let edits_text = "Accept-edits mode: file edits auto-approved (shift+tab to cycle)";
+        assert_eq!(AntigravityAdapter.composer_text(&snap(&idle.replace(placeholder, edits_text))).as_deref(), Some(edits_text));
         let draft = placeholder.replace("edits &", "edits  &");
         assert_eq!(AntigravityAdapter.composer_text(&snap(&idle.replace(placeholder, &draft))).as_deref(), Some(draft.as_str()));
         assert!(AntigravityAdapter.clear_input_bytes().is_none());
         let panel = snap(include_str!("fixtures/antigravity_mcp_panel.txt"));
         assert!(AntigravityAdapter.composer_text(&panel).is_none());
+        // A typed `/clear` opens agy's command menu under the box (agy 1.5.13).
+        let menu = include_str!("fixtures/antigravity_slash_menu.txt");
+        assert_eq!(AntigravityAdapter.composer_text(&snap(menu)).as_deref(), Some("/clear"));
+        assert!(AntigravityAdapter.composer_text(&snap(&menu.replace("enter Select", "enter Pick"))).is_none());
+        // Startup screens hold no turn; one with a turn is not one.
+        assert!(is_startup_screen(&snap(idle)));
+        assert!(is_startup_screen(&snap(include_str!("fixtures/antigravity_typed_prompt.txt"))));
+        assert!(!is_startup_screen(&snap(menu)));
+        assert!(!is_startup_screen(&panel));
+        assert!(mcp_panel_loaded(&panel) && !mcp_panel_loaded(&snap(idle)));
+        assert!(!mcp_panel_loaded(&snap(&include_str!("fixtures/antigravity_mcp_panel.txt").replace("✓ muster", "✗ muster"))));
+        // A prompt Muster typed, as agy 1.5.13 shows it: no "? for shortcuts" under the box.
+        let typed = include_str!("fixtures/antigravity_typed_prompt.txt");
+        assert_eq!(
+            AntigravityAdapter.composer_text(&snap(typed)).as_deref(),
+            Some("[muster msg 1 from human origin=human hop=0]\n  What is 17 plus 25? Answer with the number.")
+        );
+        let status = "                                                                                             auto · Gemini 4 Neon · high";
+        assert!(typed.contains(status));
+        for not_a_box in [status.trim_start(), "MCP Servers", ""] {
+            assert!(AntigravityAdapter.composer_text(&snap(&typed.replace(status, not_a_box))).is_none(), "{not_a_box:?}");
+        }
         let command = include_str!("fixtures/antigravity_approval_command.txt");
         for closed in [
             include_str!("fixtures/antigravity_approved.txt"),
@@ -701,11 +766,17 @@ mod tests {
         let read = |p| serde_json::from_slice::<Value>(&std::fs::read(p).unwrap()).unwrap();
         // Without Muster's MCP server there is no rule for it, and the user's list is untouched.
         assert!(read(&file).get("permissions").is_none());
-        assert_eq!(launch(&ctx, false, true, &user).unwrap().args[0], add_dir);
+        // A fresh run with Muster's tools gets its first prompt after `/clear`, through the queue.
+        let fresh = launch(&ctx, false, true, &user).unwrap();
+        assert_eq!(fresh.args, [add_dir.as_str(), "--dangerously-skip-permissions", "--model", "demo"]);
+        assert!(!fresh.consumed_initial_prompt && opens_new_conversation(&fresh.args));
+        assert!(!opens_new_conversation(&launch(&ctx, true, false, &user).unwrap().args));
         ctx.extra_args = vec!["--conversation".into(), "conv-demo".into()];
         let spec = launch(&ctx, true, true, &user).unwrap();
         assert_eq!(spec.program, "agy");
         assert!(!spec.consumed_initial_prompt);
+        assert!(!opens_new_conversation(&spec.args), "a resumed conversation has its tools");
+        assert!(!opens_new_conversation(&["--add-dir=/repo/memory".to_string()]));
         assert_eq!(
             spec.args,
             [

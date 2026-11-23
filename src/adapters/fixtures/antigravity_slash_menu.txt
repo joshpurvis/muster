@@ -1,0 +1,19 @@
+
+      ▄▀▀▄        Antigravity CLI 1.5.13
+     ▀▀▀▀▀▀       Gemini 4 Neon (High)
+    ▀▀▀▀▀▀▀▀      /home/user/demo-app
+   ▄▀▀    ▀▀▄
+  ▄▀▀      ▀▀▄
+
+────────────────────────────────────────────────────────────
+> Do you have a tool named call_mcp_tool? Answer yes or no.
+
+  Yes.
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+> /clear
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+> /clear  Clear conversation and start a new one
+
+  ↑/↓ Navigate · enter Select · tab Complete
+esc to cancel                                                                        accept-edits · Gemini 4 Neon · high

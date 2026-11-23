@@ -1,0 +1,15 @@
+
+      ▄▀▀▄        Antigravity CLI 1.5.13
+     ▀▀▀▀▀▀       Gemini 4 Neon (High)
+    ▀▀▀▀▀▀▀▀      /home/user/demo-app
+   ▄▀▀    ▀▀▄
+  ▄▀▀      ▀▀▄
+
+ ┃ Introducing Gemini 4 Neon
+ ┃ Our best balance of intelligence, cost, and latency. Get building today with Neon.
+ ┃ esc to dismiss
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+> [muster msg 1 from human origin=human hop=0]
+  What is 17 plus 25? Answer with the number.
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+                                                                                             auto · Gemini 4 Neon · high

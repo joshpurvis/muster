@@ -1,0 +1,14 @@
+
+      ▄▀▀▄        Antigravity CLI 1.5.13
+     ▀▀▀▀▀▀       Gemini 4 Neon (High)
+    ▀▀▀▀▀▀▀▀      /home/user/demo-app
+   ▄▀▀    ▀▀▄
+  ▄▀▀      ▀▀▄
+
+ ┃ Introducing Gemini 4 Neon
+ ┃ Our best balance of intelligence, cost, and latency. Get building today with Neon.
+ ┃ esc to dismiss
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+> Accept-edits mode: file edits auto-approved (shift+tab to cycle)
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+? for shortcuts                                                                      accept-edits · Gemini 4 Neon · high

@@ -1209,8 +1209,10 @@ channel by channel id, `questionsAt` where it was last put, for channels without
 Session kinds are `claude`, `codex`, `shell` and `antigravity`. In the tab's folder, Muster launches
 
 ```text
-agy --settings=<session>/antigravity-settings.json --add-dir=<session>/antigravity-workspace <mode> [extra args] [--prompt-interactive=<prompt>]
+agy --settings=<session>/antigravity-settings.json --add-dir=<session>/antigravity-workspace <mode> [extra args]
 ```
+
+(`--prompt-interactive=<prompt>` only when the workspace is omitted, below.)
 
 The extra arguments allowed are `--model`, `--effort`, `--continue` (also `-c`) and
 `--conversation`. A resumed launch receives its initial prompt once idle. The environment
@@ -1244,6 +1246,17 @@ directory, so the same private workspace holds `.agents/AGENTS.md`: Muster's too
 server `muster`, called with `call_mcp_tool`, and a muster message is answered with `reply`
 (agy's callbacks carry no final message). An Antigravity agent's generated persona says the
 same; one written before this is updated once at its next start.
+
+agy loads MCP servers only when a turn starts or `/mcp` opens, and a conversation opened
+before they loaded never gets their tools (the one it opens at startup never has them; one
+opened later, or a resumed one, does). So a launch with the private workspace that resumes no
+conversation passes no `--prompt-interactive`: before any other prompt Muster types `/mcp`
+(waits up to 15 s for `✓ muster` in that panel), Esc, then `/clear`, and only then the first
+prompt and anything queued. It does this only on an unused startup screen with an empty input
+box; once a turn shows (the human typed first), the step is dropped. The input box is read with
+"? for shortcuts" under it, with only the status line under it (agy hides the hint while the box
+holds text), or with agy's command menu under it (a typed `/command`); the accept-edits
+placeholder counts as empty, like the auto and plan ones.
 
 On 23 Nov 2026, a signed-in check with agy 1.5.13 verified the title callback, hidden account
 information, conversation resume and command approval. A second check that day, in a real

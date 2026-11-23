@@ -29,6 +29,7 @@ import {
 import { hasTerminalFocus, setShortcutMatcher } from "./terms.ts";
 import { noteId } from "./layout/tree.ts";
 import { notesSupported } from "./notes.ts";
+import { endedSupported } from "./ended.ts";
 import { questionsSupported } from "./questions.ts";
 import { prsSupported } from "./prs.ts";
 import { canCloseWindow, isNative } from "./native.ts";
@@ -317,6 +318,13 @@ export const commands: Command[] = [
     group: "Notes",
     enabled: () => notesSupported.value,
     run: () => A.openNotesList(),
+  },
+  {
+    id: "ended-sessions",
+    title: "Archived sessions (closed tabs)",
+    group: "Notes",
+    enabled: () => endedSupported.value,
+    run: () => A.openEndedSessions(),
   },
   {
     id: "delete-note",

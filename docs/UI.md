@@ -47,7 +47,8 @@ share a name show their branch, or else their folder, under it.
 Below the channels, a **Notes** row (with the number of notes) opens the notes list described
 under "Notes": every note, type to filter, Enter opens it. Its menu has New note and, when the
 window still has the old Notes workspace (tabs of notes that had no channel when channels came
-in), Show unfiled note tabs.
+in), Show unfiled note tabs. Under it, an **Archived sessions** row opens the list of closed tabs
+described under "Archived sessions" (backends that don't keep them hide the row).
 
 Select a channel to restore its tiles, tab order, active tabs, focused group and zoom. Double-click
 its name to rename it. Its menu also offers New tab, New note, Permissions, Copy folder path,
@@ -330,6 +331,35 @@ docs/MCP.md "Notes") and `muster note` (docs/CLI.md); the human types in it.
   lightning after its title (", triggers allowed" in its name and tooltip). Backends without it
   show neither.
 - The status line's tab count includes notes. The phone UI has no notes (it receives none).
+
+### Archived sessions
+
+Every tab you have closed, newest first, all channels and accounts in one list
+(`components/EndedSessions.tsx`, `ended.ts`). Opened from the sidebar's **Archived sessions** row
+under Notes, or the palette's "Archived sessions (closed tabs)". It looks like the notes list:
+a filter field (name, last title, channel, agent or folder) above the rows, grouped by the day they
+closed (Today, Yesterday, weekday, then the date).
+
+- Each row: the kind's icon, the session's name, a tag for the channel it was in (the channel's
+  name and a colour of its own, taken from its id, one of the terminal palette's six hues; dashed
+  and marked "archived" once the channel is archived), its last title (else its folder), the named
+  agent and Claude profile it ran on, and the time it closed (the full date in the tooltip).
+- Enter or a click shows what Muster still has of it: channel, agent, kind, account, last title,
+  folder, when the tab opened and closed, how long it was open, how it ended (the exit code it had
+  already stopped with, else still running when the tab closed) and, when its last run's hooks
+  named one, the conversation id Claude Code or Codex gave it (copy buttons for the folder and the
+  id). It says plainly that a closed tab's screen and output aren't kept. Esc (or **‹ All**) goes
+  back to the list; Esc there closes it (focus returns to the sidebar row it was opened from).
+- The selection and an opened row follow the session, not the position: a tab closing elsewhere
+  while the list is open adds its row on top without moving them. The list reloads when a tab
+  closes, a channel is renamed or archived, and after a reconnect.
+- What is kept: one short record per closed tab, written in the same step that removes it
+  (`session.remove`, an archived channel's tabs); never its output. Names, titles and channel
+  names keep at most 300 characters. The newest 1000 are kept. **Remove agent** forgets the
+  agent's closed tabs too. On a narrow window the rows drop the last title or folder and keep the
+  account. Hiding a named agent's tab keeps the session running, so it isn't listed.
+  A tab whose start failed never ran and isn't listed either. The list reloads while open when a
+  tab closes. The phone UI has none.
 
 ### Questions
 

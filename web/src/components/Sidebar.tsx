@@ -12,8 +12,11 @@ import * as A from "../actions.ts";
 import { SIDEBAR_MAX, SIDEBAR_MIN, sidebarWidth } from "../layout/channels.ts";
 import { allSessions } from "../layout/tree.ts";
 import { drag } from "../layout/dnd.tsx";
-import { IconChannels, IconChevron, IconClock, IconMore, IconNote, IconPlus, IconShieldAlert, IconSpark } from "../icons.tsx";
+import {
+  IconArchive, IconChannels, IconChevron, IconClock, IconMore, IconNote, IconPlus, IconShieldAlert, IconSpark,
+} from "../icons.tsx";
 import { notes, notesSupported } from "../notes.ts";
+import { endedSupported } from "../ended.ts";
 import { cardKey, otherName, rowChip, type RowChip as Chip, sidebarRows, type SidebarRow } from "../sidebar.ts";
 import { cx, tildify } from "../util.ts";
 import { InlineEdit, StateDot } from "./common.tsx";
@@ -154,6 +157,12 @@ function ChannelsPanel({ now }: { now: number }) {
             ])}
             aria-haspopup="dialog" data-tip="Find and open any note" onClick={A.openNotesList}>
             <IconNote size={13} /><span>Notes</span><span class="channel-count">{notes.value.size}</span>
+          </button>}
+          {/* Every closed tab, newest first, all channels and accounts (docs/UI.md "Archived sessions"). */}
+          {endedSupported.value && <button type="button" class="channel-select channel-fallback"
+            {...contextMenu(channelViewItems)}
+            aria-haspopup="dialog" data-tip="Closed tabs from every channel, newest first" onClick={A.openEndedSessions}>
+            <IconArchive size={13} /><span>Archived sessions</span>
           </button>}
         </nav>
       </div>}

@@ -515,6 +515,47 @@ pub struct SessionInfo {
     pub cache_basis: crate::cache::CacheBasis,
 }
 
+/// A closed tab, kept for the "Archived sessions" list (docs/UI.md): what it was, where and when,
+/// never its output. Written when `Hub::remove_session` removes the session, in the same
+/// transaction (`Store::retire_session`); the newest `ENDED_SESSIONS_KEPT` are kept.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EndedSession {
+    /// The session's own id (never reused).
+    pub id: SessionId,
+    pub channel_id: ChannelId,
+    /// The channel's name now, else as it was when the session closed (a channel row that is gone).
+    pub channel_name: String,
+    /// The channel is archived (or gone).
+    pub channel_archived: bool,
+    pub kind: SessionKind,
+    pub name: String,
+    /// The last window title the program set, if any.
+    pub title: Option<String>,
+    pub cwd: String,
+    /// The Claude profile it ran on (None: the default one).
+    pub account_profile_id: Option<crate::account_profiles::ProfileId>,
+    /// The named agent whose session it was, if any.
+    pub agent: Option<String>,
+    /// The CLI's own conversation id (Claude's session id, Codex's thread), when its hooks named one.
+    pub conversation: Option<String>,
+    /// None: the process was still running when the tab closed (closing stopped it).
+    pub exit_code: Option<i32>,
+    pub created_at: i64,
+    pub ended_at: i64,
+}
+
+/// How many closed sessions `Store` keeps for the "Archived sessions" list.
+pub const ENDED_SESSIONS_KEPT: i64 = 1000;
+/// Longest name, title or channel name an `EndedSession` keeps (characters); folders keep
+/// `ENDED_PATH_MAX`. Bounds what one list answer can hold, whatever a tab was named.
+pub const ENDED_NAME_MAX: usize = 300;
+pub const ENDED_PATH_MAX: usize = 4096;
+
+/// `s` cut to at most `max` characters.
+pub fn clip(s: &str, max: usize) -> String {
+    s.chars().take(max).collect()
+}
+
 /// Timeline / event-log entry kinds. Terminal output is NOT stored here (see session logs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

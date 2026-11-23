@@ -360,8 +360,8 @@ pub fn minute_of_day(tz: &TimeZone, ms: i64) -> Option<u32> {
 }
 
 /// The calendar day `ms` falls on in `tz`, as `[start, end)` in unix ms: from that day's first
-/// instant to the next day's (23 or 25 hours on a daylight-saving day; where midnight doesn't
-/// exist, the day starts at its first moment).
+/// instant to the next day's (a daylight-saving day is as long as it is there, e.g. 23 or 25
+/// hours; where midnight doesn't exist, the day starts at its first moment).
 pub fn day_bounds(tz: &TimeZone, ms: i64) -> Option<(i64, i64)> {
     // From the civil dates, never "this time tomorrow": that can fall in a gap and resolve into
     // the day after.

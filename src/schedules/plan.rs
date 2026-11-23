@@ -167,8 +167,8 @@ pub fn due_slot(s: &Schedule, now: i64) -> Option<i64> {
 }
 
 /// The calendar day, in schedule `s`'s time zone, that the daily cap counts slot `slot` toward:
-/// `[start, end)` in unix ms (a daylight-saving day is 23 or 25 hours long). A zone that can't be
-/// read counts in UTC.
+/// `[start, end)` in unix ms (a daylight-saving day is as long as it is there, e.g. 23 or 25
+/// hours). A zone that can't be read counts in UTC.
 pub fn cap_day(s: &Schedule, slot: i64) -> (i64, i64) {
     let tz = cron::zone(&s.tz).unwrap_or(TimeZone::UTC);
     cron::day_bounds(&tz, slot).unwrap_or((slot, slot + DAY_MS))

@@ -682,10 +682,10 @@ already sent waits for its reply again; one whose message was recorded but never
 no prompt queue (the backend stopped in between) is `failed`; one still in line goes back in line
 until its hour is up. A schedule's own daily cap counts the runs that reached the agent by the
 calendar day of their slots in the schedule's time zone (a run sent a little after its slot, or a
-catch-up after midnight, counts toward the day it was for; a daylight-saving day is 23 or 25 hours),
-and refuses with `daily cap: it already ran once today (at most 1 a day)` (or `on Sun 22 Nov` for a
-catch-up of an earlier day). The agent's caps count a message by when it was sent, over any 24 hours.
-The newest 500 runs
+catch-up after midnight, counts toward the day it was for; a daylight-saving day is as long as it
+is locally, e.g. 23 or 25 hours), and refuses with `daily cap: it already ran once today (at most
+1 a day)` (or `on Sun 22 Nov` for a catch-up of an earlier day). The agent's caps count a message
+by when it was sent, over any 24 hours. The newest 500 runs
 per schedule are kept, whichever way they were made.
 
 **Caps.** Besides the 200-a-day cap, each agent takes at most `unattended_cap` (default 24)

@@ -6827,7 +6827,7 @@ fieldset.sch-then > legend {
 .ended-tag-dot { flex: none; width: 7px; height: 7px; border-radius: 50%; background: var(--tag); }
 .ended-tag-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ended-tag.archived { border-style: dashed; color: var(--text-muted); }
-.ended-tag-note { flex: none; color: var(--text-faint); font-size: 10.5px; }
+.ended-tag-note { flex: none; color: var(--text-muted); font-size: 10.5px; }
 .ended-list .sw-right { gap: 10px; }
 .ended-time { font-variant-numeric: tabular-nums; color: var(--text-muted); min-width: 34px; text-align: right; }
 .ended-detail { display: flex; flex-direction: column; min-height: 0; }
@@ -6853,7 +6853,9 @@ fieldset.sch-then > legend {
 .ended-kept { display: flex; gap: 8px; align-items: flex-start; margin: 0 18px 14px; }
 .ended-kept .icon { flex: none; margin-top: 2px; color: var(--text-faint); }
 @media (max-width: 760px) {
+  /* Narrow: the last title or folder goes; the account stays (the Notes list hides its detail). */
   .ended-list .sw-sub { display: none; }
   .ended-list .sw-label { max-width: none; flex: 1 1 auto; }
+  .ended-list .sw-detail { display: inline; max-width: 120px; }
   .ended-tag { max-width: 40%; }
 }

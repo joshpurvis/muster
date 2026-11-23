@@ -497,6 +497,15 @@ pub struct EndedSession {
 
 /// How many closed sessions `Store` keeps for the "Archived sessions" list.
 pub const ENDED_SESSIONS_KEPT: i64 = 1000;
+/// Longest name, title or channel name an `EndedSession` keeps (characters); folders keep
+/// `ENDED_PATH_MAX`. Bounds what one list answer can hold, whatever a tab was named.
+pub const ENDED_NAME_MAX: usize = 300;
+pub const ENDED_PATH_MAX: usize = 4096;
+
+/// `s` cut to at most `max` characters.
+pub fn clip(s: &str, max: usize) -> String {
+    s.chars().take(max).collect()
+}
 
 /// Timeline / event-log entry kinds. Terminal output is NOT stored here (see session logs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -7,8 +7,10 @@ import { fuzzy } from "./util.ts";
 
 /** The backend keeps closed tabs (its hello says how many). */
 export const endedSupported = signal(false);
-/** Bumped on every `session_removed`: an open list reloads. */
+/** Bumped on every `session_removed`, channel change and reconnect (hello): an open list reloads. */
 export const endedRevision = signal(0);
+/** How many closed tabs the backend keeps (src/model.rs `ENDED_SESSIONS_KEPT`); the list loads them all. */
+export const ENDED_KEPT = 1000;
 
 /** The terminal palette's six hues (each theme sets its own, readable on its background), as a
  * channel's tag colour: blue, purple, cyan, green, yellow, red. */
@@ -80,7 +82,7 @@ export function duration(ms: number): string {
 
 /** How the run ended, in words. */
 export function endText(e: EndedSession): string {
-  if (e.exit_code === null) return "Still running when the tab closed (closing stopped it)";
+  if (e.exit_code === null) return "Still running when the tab closed (closing stopped it), or stopped without an exit code";
   return e.exit_code === 0 ? "Had already finished (exit code 0)" : `Had already stopped (exit code ${e.exit_code})`;
 }
 

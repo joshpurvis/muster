@@ -8,7 +8,7 @@ import * as A from "../actions.ts";
 import { accountProfiles, meta, overlay } from "../state.ts";
 import { profileName } from "../account_profiles.ts";
 import {
-  byDay, channelColour, clock, conversationKeeper, duration, endedMatches, endedRevision, endText, fullTime,
+  byDay, channelColour, clock, conversationKeeper, duration, ENDED_KEPT, endedMatches, endedRevision, endText, fullTime,
 } from "../ended.ts";
 import { ago } from "../agents.ts";
 import { IconArchive, IconChevron, IconCopy, KindIcon } from "../icons.tsx";
@@ -42,15 +42,22 @@ export function EndedSessionsDialog({ Modal }: { Modal: ModalT }) {
     const el = document.activeElement as HTMLElement | null;
     return el?.closest(".channels-panel") ? el : null;
   });
-  const cancel = () => {
-    overlay.value = null;
-    opener?.focus();
-  };
+  // Focus goes back once the dialog (and its focus trap) is gone; opened elsewhere (the
+  // palette), the dialog's own close returns to the active tab.
+  const cancel = opener
+    ? () => {
+      overlay.value = null;
+      requestAnimationFrame(() => { if (opener.isConnected) opener.focus(); });
+    }
+    : undefined;
   const [list, setList] = useState<EndedSession[] | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [q, setQ] = useState("");
-  const [sel, setSel] = useState(0);
-  const [open, setOpen] = useState<EndedSession | null>(null);
+  // The selected and the opened row, by session id: a tab closing meanwhile (a new row on top)
+  // never moves the selection to another session.
+  const [selId, setSelId] = useState<number | null>(null);
+  const [openId, setOpenId] = useState<number | null>(null);
+  const [kept, setKept] = useState<EndedSession | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
   const backRef = useRef<HTMLButtonElement>(null);
@@ -58,46 +65,56 @@ export function EndedSessionsDialog({ Modal }: { Modal: ModalT }) {
 
   useEffect(() => {
     let live = true;
-    rpc.call<EndedSession[]>("session.ended_list", {})
+    rpc.call<EndedSession[]>("session.ended_list", { limit: ENDED_KEPT })
       .then((l) => { if (live) { setList(l); setErr(null); } })
       .catch((e) => { if (live) setErr(e instanceof Error ? e.message : String(e)); });
     return () => { live = false; };
   }, [revision]);
-  useLayoutEffect(() => (open ? backRef.current : inputRef.current)?.focus(), [open]);
+  // The opened row as the latest list has it (a renamed or archived channel shows at once),
+  // else as it was when opened.
+  const open = openId === null ? null : list?.find((x) => x.id === openId) ?? kept;
+  useLayoutEffect(() => (openId !== null ? backRef.current : inputRef.current)?.focus(), [openId]);
 
   const now = Date.now();
   const rows = useMemo(() => (list ?? []).filter((e) => endedMatches(q, e)), [list, q]);
   const groups = useMemo(() => byDay(rows, now), [rows, Math.floor(now / 60_000)]);
-  useEffect(() => setSel((s) => Math.min(s, Math.max(0, rows.length - 1))), [rows.length]);
+  const found = rows.findIndex((x) => x.id === selId);
+  const sel = found < 0 ? 0 : found;
+  const select = (i: number) => setSelId(rows[i]?.id ?? null);
   useEffect(() => {
     listRef.current?.querySelector(".sw-item.sel")?.scrollIntoView({ block: "nearest" });
-  }, [sel, open]);
+  }, [sel, openId]);
   const optionId = (id: number) => `ended-opt-${id}`;
+  const show = (e: EndedSession) => {
+    setSelId(e.id);
+    setKept(e);
+    setOpenId(e.id);
+  };
 
   const onKey = (e: KeyboardEvent) => {
     const n = Math.max(1, rows.length);
     if (e.key === "ArrowDown" || (e.key === "n" && e.ctrlKey)) {
       e.preventDefault();
-      setSel((sel + 1) % n);
+      select((sel + 1) % n);
     } else if (e.key === "ArrowUp" || (e.key === "p" && e.ctrlKey)) {
       e.preventDefault();
-      setSel((sel - 1 + n) % n);
+      select((sel - 1 + n) % n);
     } else if (e.key === "Home" && e.ctrlKey) {
       e.preventDefault();
-      setSel(0);
+      select(0);
     } else if (e.key === "End" && e.ctrlKey) {
       e.preventDefault();
-      setSel(n - 1);
+      select(n - 1);
     } else if (e.key === "Enter") {
       e.preventDefault();
-      if (rows[sel]) setOpen(rows[sel]);
+      if (rows[sel]) show(rows[sel]);
     }
   };
 
   if (open) {
     return (
       <Modal class="switcher notes-list ended-list" label={`Archived session ${open.name}`} onClose={cancel}>
-        <Detail e={open} now={now} backRef={backRef} back={() => setOpen(null)} />
+        <Detail e={open} now={now} backRef={backRef} back={() => setOpenId(null)} />
       </Modal>
     );
   }
@@ -119,7 +136,11 @@ export function EndedSessionsDialog({ Modal }: { Modal: ModalT }) {
           aria-autocomplete="list"
           aria-controls="ended-listbox"
           aria-activedescendant={rows[sel] ? optionId(rows[sel].id) : undefined}
-          onInput={(e) => setQ((e.target as HTMLInputElement).value)}
+          onInput={(e) => {
+            // A new filter starts at its first match.
+            setQ((e.target as HTMLInputElement).value);
+            setSelId(null);
+          }}
           onKeyDown={onKey}
         />
       </div>
@@ -155,8 +176,8 @@ export function EndedSessionsDialog({ Modal }: { Modal: ModalT }) {
                     `closed ${g.day}, ${when}`,
                   ].filter(Boolean).join(", ")}
                   class={cx("sw-item", "ended-row", i === sel && "sel")}
-                  onMouseMove={() => i !== sel && setSel(i)}
-                  onClick={() => setOpen(e)}
+                  onMouseMove={() => i !== sel && setSelId(e.id)}
+                  onClick={() => show(e)}
                 >
                   <span class="sw-icon"><KindIcon kind={e.kind} size={14} /></span>
                   <span class="sw-label">{e.name}</span>
@@ -177,7 +198,7 @@ export function EndedSessionsDialog({ Modal }: { Modal: ModalT }) {
       <div class="sw-foot">
         <span><kbd>⏎</kbd> details</span>
         <span><kbd>esc</kbd> close</span>
-        <span class="sw-foot-note">Muster keeps the newest 1000 closed tabs, never their output</span>
+        <span class="sw-foot-note">Muster keeps the newest {ENDED_KEPT} closed tabs, never their output</span>
       </div>
     </Modal>
   );
@@ -223,9 +244,9 @@ function Detail({ e, now, back, backRef }: {
           <span class="ended-mono">{folder}</span>
           <CopyButton text={e.cwd} what="Folder path copied" label="Copy folder path" />
         </Fact>
-        <Fact k="Started">{fullTime(e.created_at)}</Fact>
+        <Fact k="Opened">{fullTime(e.created_at)}</Fact>
         <Fact k="Closed">{fullTime(e.ended_at)} ({ago(e.ended_at, now) === "now" ? "just now" : `${ago(e.ended_at, now)} ago`})</Fact>
-        <Fact k="Ran for">{duration(e.ended_at - e.created_at)}</Fact>
+        <Fact k="Tab open for">{duration(e.ended_at - e.created_at)}</Fact>
         <Fact k="How it ended">{endText(e)}</Fact>
         {e.conversation && (
           <Fact k="Conversation">
@@ -237,7 +258,7 @@ function Detail({ e, now, back, backRef }: {
       <div class="dlg-note ended-kept" role="note">
         <IconArchive size={13} />
         <span>
-          Muster doesn't keep a closed tab's screen or output, so this is everything it has.
+          Muster keeps only these details: a closed tab's screen and output aren't kept, so they can't be shown here.
           {keeper && ` ${keeper} keeps its own copy of the conversation under the id above.`}
         </span>
       </div>

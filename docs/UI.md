@@ -345,14 +345,19 @@ closed (Today, Yesterday, weekday, then the date).
   and marked "archived" once the channel is archived), its last title (else its folder), the named
   agent and Claude profile it ran on, and the time it closed (the full date in the tooltip).
 - Enter or a click shows what Muster still has of it: channel, agent, kind, account, last title,
-  folder, when it started and closed, how long it ran, how it ended (still running when the tab
-  closed, or the exit code it had already stopped with) and, when its hooks named one, the
-  conversation id Claude Code or Codex gave it (copy buttons for the folder and the id). It says
-  plainly that Muster doesn't keep a closed tab's screen or output. Esc (or **‹ All**) goes back to
-  the list; Esc there closes it.
+  folder, when the tab opened and closed, how long it was open, how it ended (the exit code it had
+  already stopped with, else still running when the tab closed) and, when its last run's hooks
+  named one, the conversation id Claude Code or Codex gave it (copy buttons for the folder and the
+  id). It says plainly that a closed tab's screen and output aren't kept. Esc (or **‹ All**) goes
+  back to the list; Esc there closes it (focus returns to the sidebar row it was opened from).
+- The selection and an opened row follow the session, not the position: a tab closing elsewhere
+  while the list is open adds its row on top without moving them. The list reloads when a tab
+  closes, a channel is renamed or archived, and after a reconnect.
 - What is kept: one short record per closed tab, written in the same step that removes it
-  (`session.remove`, an archived channel's tabs, a removed agent's tab); never its output. The
-  newest 1000 are kept. Hiding a named agent's tab keeps the session running, so it isn't listed.
+  (`session.remove`, an archived channel's tabs); never its output. Names, titles and channel
+  names keep at most 300 characters. The newest 1000 are kept. **Remove agent** forgets the
+  agent's closed tabs too. On a narrow window the rows drop the last title or folder and keep the
+  account. Hiding a named agent's tab keeps the session running, so it isn't listed.
   A tab whose start failed never ran and isn't listed either. The list reloads while open when a
   tab closes. The phone UI has none.
 

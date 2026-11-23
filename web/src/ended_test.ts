@@ -47,7 +47,7 @@ Deno.test("words: duration, how it ended, who keeps the conversation", () => {
   equal(duration(25 * 60_000), "25 min");
   equal(duration(125 * 60_000), "2 h 5 min");
   equal(duration(28 * 3600_000), "1 day 4 h");
-  equal(endText(e(1, NOW)), "Still running when the tab closed (closing stopped it)");
+  equal(endText(e(1, NOW)), "Still running when the tab closed (closing stopped it), or stopped without an exit code");
   equal(endText(e(1, NOW, { exit_code: 0 })), "Had already finished (exit code 0)");
   equal(endText(e(1, NOW, { exit_code: 2 })), "Had already stopped (exit code 2)");
   equal(conversationKeeper(e(1, NOW)), null);

@@ -259,6 +259,7 @@ async fn dispatch_inner(hub: &Arc<Hub>, who: &Principal, method: &str, params: V
                     fields.remove("panels");
                     fields.remove("panel_origin");
                     fields.remove("notes");
+                    fields.remove("ended_sessions");
                 }
             }
             Ok(result)
@@ -3029,8 +3030,10 @@ mod tests {
         assert_eq!(call(&hub, "session.ended_list", json!({"limit": 0})).await.unwrap().as_array().unwrap().len(), 1);
         assert!(call(&hub, "session.ended_list", json!({"channel": 1})).await.is_err());
         assert_eq!(call(&hub, "hello", json!({})).await.unwrap()["ended_sessions"], 3);
-        // Paired phones can't read it.
+        // Paired phones can't read it, nor learn how many there are.
         assert!(crate::devices::method_scope("session.ended_list").is_none());
+        let h = dispatch(&hub, &Principal::Device { id: 1 }, "hello", json!({})).await.map_err(|e| e.0).unwrap();
+        assert!(h.get("ended_sessions").is_none() && h.get("sessions").is_some());
     }
 
     #[tokio::test]

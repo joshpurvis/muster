@@ -3222,20 +3222,23 @@ impl Store {
 
     /// A removal either keeps the session and its live launch, or durably removes
     /// the row and leaves the host retirement intent. Never publish half of it.
-    /// `ended`: the closed tab's record for the "Archived sessions" list, saved with it (its
-    /// `conversation` is taken from the session's hook record when it has none of its own).
+    /// `ended`: the closed tab's record for the "Archived sessions" list and the generation of
+    /// its last run, saved with it. Its `conversation` is the one that run's hooks named (a hook
+    /// record from an earlier run never counts), else the record's own (a named agent's resume id).
     pub fn retire_session(&self, id: SessionId, terminal: Option<&StoredTerminal>,
-        ended: Option<&EndedSession>) -> anyhow::Result<()> {
+        ended: Option<(&EndedSession, u64)>) -> anyhow::Result<()> {
         let mut conn = self.conn.lock();
         let transaction = conn.transaction()?;
-        if let Some(e) = ended {
+        if let Some((e, generation)) = ended {
             anyhow::ensure!(e.id == id, "ended session record for another session");
             let hook: Option<String> = transaction.query_row(
                 "SELECT record FROM runtime_state WHERE key=?1", [format!("hook-session:{id}")], |r| r.get(0),
             ).optional()?;
-            let conversation = e.conversation.clone().or_else(|| hook
+            let conversation = hook
                 .and_then(|r| serde_json::from_str::<HookSession>(&r).ok())
-                .and_then(|h| h.conversation));
+                .filter(|h| h.generation == generation)
+                .and_then(|h| h.conversation)
+                .or_else(|| e.conversation.clone());
             transaction.execute(
                 "INSERT OR REPLACE INTO ended_sessions(id, channel_id, channel_name, kind, name, title, cwd,
                     account_profile_id, agent, conversation, exit_code, created_at, ended_at)
@@ -3482,12 +3485,12 @@ impl Store {
     pub fn ended_sessions(&self, limit: usize) -> anyhow::Result<Vec<EndedSession>> {
         let conn = self.conn.lock();
         let mut q = conn.prepare(
-            "SELECT e.id, e.channel_id, COALESCE(c.name, e.channel_name), COALESCE(c.archived, 1), e.kind, e.name,
+            "SELECT e.id, e.channel_id, substr(COALESCE(c.name, e.channel_name), 1, ?2), COALESCE(c.archived, 1), e.kind, e.name,
                 e.title, e.cwd, e.account_profile_id, e.agent, e.conversation, e.exit_code, e.created_at, e.ended_at
              FROM ended_sessions e LEFT JOIN channels c ON c.id = e.channel_id
              ORDER BY e.ended_at DESC, e.id DESC LIMIT ?1",
         )?;
-        let rows = q.query_map([limit as i64], |r| {
+        let rows = q.query_map(params![limit as i64, ENDED_NAME_MAX as i64], |r| {
             let kind: String = r.get(4)?;
             Ok((kind, EndedSession {
                 id: r.get(0)?,
@@ -3515,6 +3518,12 @@ impl Store {
             out.push(e);
         }
         Ok(out)
+    }
+
+    /// Forget every closed tab of the named agent `name` (names are unique case-insensitively):
+    /// "Remove agent" forgets the agent, so the archive keeps nothing of it either.
+    pub fn forget_ended_agent(&self, name: &str) -> anyhow::Result<usize> {
+        Ok(self.conn.lock().execute("DELETE FROM ended_sessions WHERE agent = ?1 COLLATE NOCASE", [name])?)
     }
 
     /// How many closed sessions are kept.
@@ -3617,7 +3626,7 @@ mod tests {
         // The run's hooks named its conversation: the record takes it from there.
         let runtime = HookSession { generation: 1, conversation: Some("conv-1".into()), ..Default::default() };
         store.commit_hook(&serde_json::json!({}), None, None, None, Some((&info, &runtime)), None).unwrap();
-        store.retire_session(info.id, None, Some(&ended(info.id, ch.id, 500))).unwrap();
+        store.retire_session(info.id, None, Some((&ended(info.id, ch.id, 500), 1))).unwrap();
         assert!(store.load_sessions().unwrap().is_empty());
         let list = store.ended_sessions(10).unwrap();
         assert_eq!(list.len(), 1);
@@ -3639,13 +3648,34 @@ mod tests {
     }
 
     #[test]
+    fn only_the_closing_runs_hooks_name_its_conversation() {
+        let store = Store::open_memory().unwrap();
+        let mut info = crate::mcp::guard::test_session(0, None);
+        info.id = store.insert_session(&StoredSession { info: info.clone(), extra_args: vec![] }).unwrap();
+        // Run 1 named a conversation; run 2 (a fresh start) closed before its first hook.
+        let runtime = HookSession { generation: 1, conversation: Some("old".into()), ..Default::default() };
+        store.commit_hook(&serde_json::json!({}), None, None, None, Some((&info, &runtime)), None).unwrap();
+        store.retire_session(info.id, None, Some((&ended(info.id, 1, 5), 2))).unwrap();
+        assert_eq!(store.ended_sessions(1).unwrap()[0].conversation, None);
+        // Without a matching hook record, the record's own id (a named agent's resume id) stays.
+        let mut e = ended(77, 1, 6);
+        e.conversation = Some("resume".into());
+        e.agent = Some("Ada".into());
+        store.retire_session(77, None, Some((&e, 0))).unwrap();
+        assert_eq!(store.ended_sessions(1).unwrap()[0].conversation.as_deref(), Some("resume"));
+        // Removing the agent forgets its closed tabs (any case), nobody else's.
+        assert_eq!(store.forget_ended_agent("ada").unwrap(), 1);
+        assert_eq!(store.ended_sessions(10).unwrap().iter().map(|e| e.id).collect::<Vec<_>>(), [info.id]);
+    }
+
+    #[test]
     fn ended_sessions_are_newest_first_and_capped() {
         let store = Store::open_memory().unwrap();
         let total = ENDED_SESSIONS_KEPT as SessionId + 2;
         for id in 1..=total {
             // Two share an end time: the higher id is the newer.
             let at = if id == 2 { 1 } else { id as i64 };
-            store.retire_session(id, None, Some(&ended(id, 7, at))).unwrap();
+            store.retire_session(id, None, Some((&ended(id, 7, at), 0))).unwrap();
         }
         assert_eq!(store.ended_session_count().unwrap() as i64, ENDED_SESSIONS_KEPT);
         let list = store.ended_sessions(ENDED_SESSIONS_KEPT as usize + 5).unwrap();
@@ -3661,17 +3691,17 @@ mod tests {
         let mut info = crate::mcp::guard::test_session(0, None);
         info.id = store.insert_session(&StoredSession { info: info.clone(), extra_args: vec![] }).unwrap();
         store.fail_session_removal_for_test();
-        assert!(store.retire_session(info.id, None, Some(&ended(info.id, 1, 5))).is_err());
+        assert!(store.retire_session(info.id, None, Some((&ended(info.id, 1, 5), 0))).is_err());
         assert_eq!(store.ended_session_count().unwrap(), 0);
         // A record for another session is refused.
-        assert!(store.retire_session(info.id, None, Some(&ended(info.id + 1, 1, 5))).is_err());
+        assert!(store.retire_session(info.id, None, Some((&ended(info.id + 1, 1, 5), 0))).is_err());
     }
 
     #[test]
     fn an_unknown_kind_is_skipped_not_fatal() {
         let store = Store::open_memory().unwrap();
-        store.retire_session(1, None, Some(&ended(1, 1, 5))).unwrap();
-        store.retire_session(2, None, Some(&ended(2, 1, 6))).unwrap();
+        store.retire_session(1, None, Some((&ended(1, 1, 5), 0))).unwrap();
+        store.retire_session(2, None, Some((&ended(2, 1, 6), 0))).unwrap();
         store.conn.lock().execute("UPDATE ended_sessions SET kind='future' WHERE id=2", []).unwrap();
         assert_eq!(store.ended_sessions(10).unwrap().iter().map(|e| e.id).collect::<Vec<_>>(), [1]);
     }

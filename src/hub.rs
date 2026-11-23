@@ -4034,6 +4034,11 @@ impl Hub {
         self.store.ended_session_count()
     }
 
+    /// "Remove agent": the archive forgets the agent's closed tabs too.
+    pub fn forget_ended_agent(&self, name: &str) -> anyhow::Result<usize> {
+        self.store.forget_ended_agent(name)
+    }
+
     /// Kill (if alive) and forget a session, including its scrollback. A short record of it
     /// (`EndedSession`, never its output) stays for the "Archived sessions" list.
     pub fn remove_session(&self, id: SessionId) -> anyhow::Result<()> {
@@ -4048,15 +4053,15 @@ impl Hub {
                 EndedSession {
                     id,
                     channel_id: info.channel_id,
-                    channel_name: g.channels.get(&info.channel_id).map(|c| c.name.clone()).unwrap_or_default(),
+                    channel_name: g.channels.get(&info.channel_id).map(|c| clip(&c.name, ENDED_NAME_MAX)).unwrap_or_default(),
                     channel_archived: false,
                     kind: info.kind,
-                    name: info.name.clone(),
-                    title: info.title.clone(),
-                    cwd: info.cwd.clone(),
+                    name: clip(&info.name, ENDED_NAME_MAX),
+                    title: info.title.as_deref().map(|t| clip(t, ENDED_NAME_MAX)),
+                    cwd: clip(&info.cwd, ENDED_PATH_MAX),
                     account_profile_id: info.account_profile_id,
                     agent: agent.as_ref().map(|a| a.name.clone()),
-                    conversation: agent.as_ref().and_then(|a| a.resume_id.clone()),
+                    conversation: agent.as_ref().and_then(|a| a.resume_id.as_deref().map(|c| clip(c, ENDED_NAME_MAX))),
                     exit_code: info.exit_code,
                     created_at: info.created_at,
                     ended_at: now_ms(),
@@ -4064,7 +4069,8 @@ impl Hub {
             };
             let mut records = self.terminal_records.lock();
             let retired = records.get(&id).cloned().map(|mut record| { record.retired = true; record });
-            self.store.retire_session(id, retired.as_ref(), Some(&ended))?;
+            let generation = g.sessions[&id].generation;
+            self.store.retire_session(id, retired.as_ref(), Some((&ended, generation)))?;
             if let Some(record) = retired {
                 records.insert(id, record);
             }
@@ -6350,6 +6356,14 @@ mod tests {
         assert_eq!(list[1].agent, None);
         assert!(list.iter().all(|e| e.ended_at > 0 && e.exit_code.is_none()));
         assert_eq!(hub.ended_session_count().unwrap(), 2);
+    }
+
+    #[test]
+    fn removing_an_agent_forgets_its_closed_tabs() {
+        let hub = agent_fixture();
+        hub.remove_session(1).unwrap();
+        crate::agents::remove(&hub, "ada").unwrap();
+        assert_eq!(hub.ended_sessions(10).unwrap().iter().map(|e| e.id).collect::<Vec<_>>(), [1]);
     }
 
     #[tokio::test]

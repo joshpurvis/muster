@@ -363,9 +363,11 @@ pub fn minute_of_day(tz: &TimeZone, ms: i64) -> Option<u32> {
 /// instant to the next day's (23 or 25 hours on a daylight-saving day; where midnight doesn't
 /// exist, the day starts at its first moment).
 pub fn day_bounds(tz: &TimeZone, ms: i64) -> Option<(i64, i64)> {
-    let z = Timestamp::from_millisecond(ms).ok()?.to_zoned(tz.clone());
-    let start = z.start_of_day().ok()?;
-    let end = z.tomorrow().ok()?.start_of_day().ok()?;
+    // From the civil dates, never "this time tomorrow": that can fall in a gap and resolve into
+    // the day after.
+    let date = Timestamp::from_millisecond(ms).ok()?.to_zoned(tz.clone()).date();
+    let start = date.to_zoned(tz.clone()).ok()?;
+    let end = date.tomorrow().ok()?.to_zoned(tz.clone()).ok()?;
     Some((start.timestamp().as_millisecond(), end.timestamp().as_millisecond()))
 }
 
@@ -541,5 +543,10 @@ mod tests {
         // Where clocks skip midnight (Chile in September), the day starts at 01:00.
         let santiago = TimeZone::get("America/Santiago").unwrap();
         assert_eq!(day(&santiago, "2026-09-06T09:30"), ("2026-09-06 01:00 -03".to_string(), 23));
+        // Where clocks skip the last hour before midnight (Nuuk in March 2027), late on the day
+        // before is still a 24-hour day, and the short day ends at the next midnight.
+        let nuuk = TimeZone::get("America/Nuuk").unwrap();
+        assert_eq!(day(&nuuk, "2027-03-26T23:01").1, 24);
+        assert_eq!(day(&nuuk, "2027-03-27T12:00").1, 23);
     }
 }

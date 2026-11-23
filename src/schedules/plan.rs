@@ -248,11 +248,10 @@ fn cap_reason(s: &Schedule, cap: u32, runs: u32, slot: i64, now: i64) -> String 
         2 => "twice".to_string(),
         n => format!("{n} times"),
     };
-    let day = cap_day(s, slot);
-    let when = if day == cap_day(s, now) {
+    let tz = cron::zone(&s.tz).unwrap_or(TimeZone::UTC);
+    let when = if cron::format(&tz, slot, "%Y-%m-%d") == cron::format(&tz, now, "%Y-%m-%d") {
         "today".to_string()
     } else {
-        let tz = cron::zone(&s.tz).unwrap_or(TimeZone::UTC);
         format!("on {}", cron::format(&tz, slot, "%a %-d %b"))
     };
     format!("daily cap: it already ran {times} {when} (at most {cap} a day)")

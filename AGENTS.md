@@ -26,29 +26,18 @@
 
 ## Screenshots of the UI
 
-- Desktop UI (everything in `web/` except the phone page `web/src/m/`): every picture that goes in
-  a pull request, in `docs/screenshots/` or to a design review comes from WebKitGTK, the engine of
-  Muster's desktop window, through `web/dev/webkit_shot.sh` (`deno task shot:desktop`). Headless
-  Chromium hides bugs the window shows: a dropdown whose text was cut off in the window looked
-  right in Chromium and was "fixed" twice before anyone saw it there.
-  ```sh
-  bash scripts/isolated.sh deno task web       # after every UI change
-  MOCK_PORT=17840 deno task shot:desktop web/dev/webkit_shots/palette.json .muster-shots/palette
-  ```
-  The steps file runs JavaScript in the page, waits for a condition and saves a PNG, optionally
-  cut to one element; `web/dev/webkit_shot.py` describes the format and
-  `web/dev/webkit_shots/palette.json` is a worked example. `--theme light` / `--theme dark`
-  (default dark) and `--size WxH` (default 1600x1000) set the system theme and window size. Take
-  both themes when colours change. It only opens the mock (it checks the mock's `/api/health` and
-  refuses a real Muster). It needs PyGObject with the Cairo bindings, WebKitGTK 2.40 or newer with
-  the 4.1 API (webkit2gtk-4.1) and a graphical session; if it can't run, say so in the report
-  instead of sending Chromium pictures as the desktop's.
-- The headless Chromium scripts in `web/dev/` (`e2e*.ts`, `cdp.ts`) stay the behaviour checks.
-  Their PNGs show that a step happened, not how the window draws it.
-- Phone UI (`web/src/m/`, served at `/m`): unchanged, headless Chromium with mobile emulation
+- Desktop UI (everything in `web/` except the phone page `web/src/m/`): every picture for a pull
+  request, `docs/screenshots/` or a design review comes from WebKitGTK, the desktop window's
+  engine, through `deno task shot:desktop` (usage, flags and requirements in the headers of
+  `web/dev/webkit_shot.sh` and `web/dev/webkit_shot.py`; `web/dev/webkit_shots/palette.json` is
+  a worked example). Headless Chromium hides bugs the window shows. If WebKitGTK can't run, say
+  so in the report instead of sending Chromium pictures as the desktop's. Design reviews get these
+  pictures at the desktop window size, both themes when colours change, and the WebKitGTK version
+  that took them (the tool prints it).
+- The headless Chromium scripts in `web/dev/` (`e2e*.ts`, `cdp.ts`) stay the behaviour checks;
+  their PNGs show that a step happened, not how the window draws it.
+- Phone UI (`web/src/m/`, served at `/m`): headless Chromium with mobile emulation
   (docs/ANDROID.md, "Test plan").
-- Every picture uses the mock and invented sample data only: this repo is
-  public. Save working pictures in `.muster-shots/` in your worktree; convert the ones the repo
-  keeps to webp (`magick in.png -quality 80 out.webp`) in `docs/screenshots/`.
-- Design reviews of the desktop UI get these WebKitGTK pictures at the desktop window size, both
-  themes when colours change, and say which WebKitGTK version took them (the tool prints it).
+- This repo is public: every picture uses the mock and invented sample data only. Save working
+  pictures in `.muster-shots/` in your worktree; convert the ones the repo keeps to webp
+  (`magick in.png -quality 80 out.webp`) in `docs/screenshots/`.

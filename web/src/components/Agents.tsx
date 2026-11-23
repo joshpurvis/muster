@@ -1856,7 +1856,8 @@ function MemoryTab(
             <p>
               Memory is {agent.name}'s notebook: the files in <code>memory/</code> in its folder. Its{" "}
               <code>{personaFile}</code>{" "}
-              tells it to read them when a conversation starts and to keep its own notes there.
+              tells it to keep its own notes there and, when a conversation starts, to read the files its persona
+              names (all of them if it names none).
             </p>
             <p>Seed it with what it should know, like project facts, a style guide or past decisions.</p>
             <div class="mem-intro-actions">

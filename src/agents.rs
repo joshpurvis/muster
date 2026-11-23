@@ -408,16 +408,24 @@ answer such a prompt with the muster tool `reply`. If the answer needs longer (a
 and once you have it answer with the muster MCP tool `reply` (`msg_id` from the header): one reply per message, \
 delivered to the sender.";
 
+/// The generated "## Memory" section: memory folders grow large, so an agent reads at start only
+/// the files its persona names (all of them when it names none) and searches the rest.
+pub(crate) const MEMORY_INSTRUCTION: &str = "Keep durable notes (facts, decisions, open threads) in `memory/` in \
+this folder, one topic per file. When a conversation starts, read the files your persona names (all of `memory/` if it \
+names none); search the rest when a task needs it. Conversations get compacted or restarted; `memory/` is what survives.";
+
+/// What the "## Memory" section said before agents read only named files (`update_memory_sentence`).
+const OLD_MEMORY_INSTRUCTION: &str = "Keep durable notes (facts, decisions, open threads) in `memory/` in this \
+folder, one topic per file, and read them when a conversation starts. Conversations get compacted or restarted; \
+`memory/` is what survives.";
+
 pub fn persona_text(name: &str, kind: SessionKind, persona: &str) -> String {
     let persona = persona.trim();
     format!(
         "# {name}\n\n\
          You are {name}, a persistent muster agent ({kind}). This folder is your persistent home; your working directory may be a repository. Muster{resume}.\n\n\
          ## Persona\n\n{persona}\n\n\
-         ## Memory\n\n\
-         Keep durable notes (facts, decisions, open threads) in `memory/` in this folder, one topic per \
-         file, and read them when a conversation starts. Conversations get compacted or restarted; \
-         `memory/` is what survives.\n\n\
+         ## Memory\n\n{memory}\n\n\
          ## Links\n\n{links}\n\n\
          ## Messages\n\n\
          A prompt that starts with `[muster msg <id> from <sender> origin=<origin> hop=<n>]` came from \
@@ -432,6 +440,7 @@ pub fn persona_text(name: &str, kind: SessionKind, persona: &str) -> String {
         answer = if kind == SessionKind::Antigravity { ANSWER_ANTIGRAVITY } else { ANSWER_FINAL_MESSAGE },
         resume = " resumes your conversation when you restart",
         links = crate::links::INSTRUCTION,
+        memory = MEMORY_INSTRUCTION,
         // Only Claude sessions take messages that wait for the next turn (src/quiet.rs).
         quiet = if kind == SessionKind::Claude { format!(" {QUIET_INSTRUCTION}") } else { String::new() },
         persona = if persona.is_empty() { "(none given)" } else { persona },
@@ -675,6 +684,26 @@ fn update_antigravity_answer(path: &Path) {
     let next = format!("{}{ANSWER_ANTIGRAVITY}{}", &text[..at], &text[at + OLD_ANSWER_ANTIGRAVITY.len()..]);
     if let Err(e) = refuse_symlink(path).and_then(|()| Ok(paths::write_private(path, next.as_bytes())?)) {
         tracing::warn!("updating the reply sentence in {}: {e:#}", path.display());
+    }
+}
+
+/// An agent made before named memory files was told to read all of `memory/` at every start. At
+/// its next start Muster replaces that sentence with `MEMORY_INSTRUCTION` once, in the
+/// "## Memory" section of a file it generated (`add_quiet_sentence`'s rules: the last such
+/// heading, since the human's persona comes before it); a file changed there by hand is left
+/// alone. Best effort.
+fn update_memory_sentence(path: &Path) {
+    let Ok(text) = std::fs::read_to_string(path) else { return };
+    if !text.contains("a persistent muster agent") {
+        return;
+    }
+    let Some(start) = text.rfind("\n## Memory\n").map(|i| i + 1) else { return };
+    let end = text[start + 1..].find("\n## ").map_or(text.len(), |i| start + 1 + i);
+    let Some(i) = text[start..end].find(OLD_MEMORY_INSTRUCTION) else { return };
+    let at = start + i;
+    let next = format!("{}{MEMORY_INSTRUCTION}{}", &text[..at], &text[at + OLD_MEMORY_INSTRUCTION.len()..]);
+    if let Err(e) = refuse_symlink(path).and_then(|()| Ok(paths::write_private(path, next.as_bytes())?)) {
+        tracing::warn!("updating the memory sentence in {}: {e:#}", path.display());
     }
 }
 
@@ -2486,6 +2515,7 @@ async fn start_once(hub: &Arc<Hub>, name: &str, fresh: bool, window: Option<Wind
         Ok(Some(_)) => {
             refuse_symlink(&persona)?;
             add_links_section(&persona);
+            update_memory_sentence(&persona);
             if agent.kind == SessionKind::Claude {
                 add_quiet_sentence(&persona);
             }
@@ -4970,6 +5000,40 @@ mod tests {
         std::fs::write(&p, "# Mine\n\nMy own rules.\n").unwrap();
         add_links_section(&p);
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "# Mine\n\nMy own rules.\n");
+    }
+
+    #[test]
+    fn the_memory_section_names_files_and_older_personas_are_updated_once() {
+        let now = persona_text("ada", SessionKind::Claude, "Reviews diffs.");
+        let section = &now[now.find("## Memory").unwrap()..now.find("## Links").unwrap()];
+        assert_eq!(section, format!("## Memory\n\n{MEMORY_INSTRUCTION}\n\n"));
+        assert!(section.contains("read the files your persona names") && !section.contains("and read them when"));
+        let dir = scratch("memory-sentence");
+        for kind in [SessionKind::Claude, SessionKind::Codex, SessionKind::Antigravity] {
+            let p = dir.join(persona_file(kind));
+            // The persona (the human's words) quotes the old sentence too: only Muster's section changes.
+            let persona = format!("Reads `memory/state.md` first. Old rule: {OLD_MEMORY_INSTRUCTION}");
+            let current = persona_text("ada", kind, &persona);
+            let old = current.replacen(&format!("## Memory\n\n{MEMORY_INSTRUCTION}"), &format!("## Memory\n\n{OLD_MEMORY_INSTRUCTION}"), 1);
+            assert_ne!(old, current);
+            std::fs::write(&p, &old).unwrap();
+            update_memory_sentence(&p);
+            let once = std::fs::read_to_string(&p).unwrap();
+            assert_eq!(once, current, "{kind:?}: back to what Muster writes now, the persona's quote kept");
+            update_memory_sentence(&p);
+            assert_eq!(std::fs::read_to_string(&p).unwrap(), once, "{kind:?}: only once");
+        }
+        // A section changed by hand, or a file the human wrote, is left as it is.
+        let p = dir.join("CLAUDE.md");
+        let edited = persona_text("ada", SessionKind::Claude, "x")
+            .replace(MEMORY_INSTRUCTION, "Read every file in `memory/`, always.");
+        std::fs::write(&p, &edited).unwrap();
+        update_memory_sentence(&p);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), edited);
+        let mine = format!("# Mine\n\n## Memory\n\n{OLD_MEMORY_INSTRUCTION}\n");
+        std::fs::write(&p, &mine).unwrap();
+        update_memory_sentence(&p);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), mine);
     }
 
     #[test]

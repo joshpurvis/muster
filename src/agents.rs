@@ -2297,6 +2297,11 @@ pub fn remove(hub: &Hub, name: &str) -> anyhow::Result<Agent> {
     {
         tracing::warn!(agent = agent.name, "removing its session: {e:#}");
     }
+    // Forgetting the agent forgets its closed tabs in "Archived sessions" too (the one just
+    // closed included): its name, titles, folder and conversation ids.
+    if let Err(e) = hub.forget_ended_agent(&agent.name) {
+        tracing::warn!(agent = agent.name, "forgetting its closed tabs: {e:#}");
+    }
     hub.agents().remove(hub.store(), agent.id)?;
     hub.agents().sleep.set_asleep(agent.session_id, agent.id, false);
     crate::schedules::remove_for_agent(hub, agent.id);

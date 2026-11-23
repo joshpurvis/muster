@@ -1,0 +1,22 @@
+[
+ {"until": "globalThis.__muster?.windowId?.value != null", "settle": 0.5},
+ {
+  "js": "const m = globalThis.__muster; const w = m.windowId.value;\nconst ws = await m.rpc.call('workspace.add', {path: '/tmp', name: 'demo'});\nfor (const name of ['alpha', 'beta']) await m.rpc.call('channel.create', {workspace_id: ws.id, name, window_id: w});\nawait m.rpc.call('mock.ended_seed', {});\nawait m.rpc.call('hello', {});",
+  "until": "globalThis.__muster.windowChannels.value.length >= 2",
+  "timeout": 20
+ },
+ {"js": "location.reload();", "until": "document.querySelector('.channel-fallback [class*=icon]') && [...document.querySelectorAll('.channel-fallback')].some((b) => b.textContent.includes('Archived sessions'))", "settle": 0.8, "timeout": 20},
+ {"shot": "sidebar", "crop": ".sidebar", "pad": 0},
+ {
+  "js": "[...document.querySelectorAll('.channel-fallback')].find((b) => b.textContent.includes('Archived sessions')).click();",
+  "until": "document.querySelectorAll('.ended-row').length >= 8",
+  "settle": 0.6
+ },
+ {"shot": "list", "crop": "[role=dialog][aria-label=\"Archived sessions\"]", "pad": 24},
+ {"js": "document.querySelectorAll('.ended-row')[2].click();", "until": "document.querySelector('.ended-detail')", "settle": 0.5},
+ {"shot": "detail", "crop": ".modal.ended-list", "pad": 24},
+ {"js": "document.activeElement.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', bubbles: true, cancelable: true}));", "until": "document.querySelector('.ended-row') && !document.querySelector('.ended-detail')", "settle": 0.3},
+ {"js": "const i = document.querySelector('.sw-input'); i.value = 'beta'; i.dispatchEvent(new Event('input', {bubbles: true}));", "until": "document.querySelectorAll('.ended-row').length > 0 && document.querySelectorAll('.ended-row').length < 8", "settle": 0.4},
+ {"shot": "filtered", "crop": "[role=dialog][aria-label=\"Archived sessions\"]", "pad": 24},
+ {"js": "return {rows: document.querySelectorAll('.ended-row').length, theme: document.documentElement.dataset.theme};"}
+]

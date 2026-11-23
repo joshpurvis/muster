@@ -46,6 +46,8 @@ const DEVICE_SILENCE: Duration = Duration::from_secs(90);
 /// swallows everything (out of coverage) or a client that stopped reading would otherwise hold
 /// the connection, its queue and its session tails until TCP gives up.
 const DEVICE_WRITE_STALL: Duration = Duration::from_secs(30);
+/// `session.ended_list`: rows when the caller gives no `limit`.
+const ENDED_LIST_DEFAULT: usize = 500;
 /// `session.output` limits.
 const OUTPUT_DEFAULT_LINES: usize = 200;
 const OUTPUT_MAX_LINES: usize = 10_000;
@@ -115,6 +117,8 @@ pub fn hello(hub: &Hub) -> Value {
         "addon_revision": addons.revision,
         "panel_origin": format!("http://127.0.0.1:{}", hub.panels.port.load(Ordering::Relaxed)),
         "notes": crate::notes::list(hub).unwrap_or_default(),
+        // How many closed tabs "Archived sessions" lists; absent from older backends.
+        "ended_sessions": hub.ended_session_count().unwrap_or(0),
         "windows": hub.windows(),
         "home": crate::paths::home_dir().to_string_lossy(),
         "default_shell": crate::adapters::shell::user_shell(),
@@ -255,6 +259,7 @@ async fn dispatch_inner(hub: &Arc<Hub>, who: &Principal, method: &str, params: V
                     fields.remove("panels");
                     fields.remove("panel_origin");
                     fields.remove("notes");
+                    fields.remove("ended_sessions");
                 }
             }
             Ok(result)
@@ -331,6 +336,13 @@ async fn dispatch_inner(hub: &Arc<Hub>, who: &Principal, method: &str, params: V
         }
         // Notes (docs/PROTOCOL.md "Notes"). `from_session` (the CLI inside a session) only says
         // who wrote; without it the change is the human's.
+        // Closed tabs, newest first (docs/UI.md "Archived sessions"). No device scope.
+        "session.ended_list" => {
+            #[derive(Deserialize)] #[serde(deny_unknown_fields)] struct P { limit: Option<usize> }
+            let p: P = parse(params)?;
+            let limit = p.limit.unwrap_or(ENDED_LIST_DEFAULT).clamp(1, ENDED_SESSIONS_KEPT as usize);
+            to_value(hub.ended_sessions(limit)?)
+        }
         "note.list" => to_value(crate::notes::list(hub)?),
         "note.search" => {
             #[derive(Deserialize)] #[serde(deny_unknown_fields)] struct P { query: String }
@@ -3004,6 +3016,31 @@ mod tests {
     }
 
     const SCHED: Prov = Prov { origin: Origin::Schedule, hop: 1, msg_id: None };
+
+    #[tokio::test]
+    async fn ended_list_is_newest_first_bounded_and_desktop_only() {
+        let (hub, _st) = fixture();
+        assert_eq!(call(&hub, "hello", json!({})).await.unwrap()["ended_sessions"], 0);
+        for id in [1, 2, 3] {
+            hub.remove_session(id).unwrap();
+        }
+        let all = call(&hub, "session.ended_list", json!({})).await.unwrap();
+        let ids: Vec<i64> = all.as_array().unwrap().iter().map(|e| e["id"].as_i64().unwrap()).collect();
+        assert_eq!(ids.len(), 3);
+        let mut sorted = ids.clone();
+        sorted.sort_by(|a, b| b.cmp(a));
+        assert_eq!(ids, sorted, "newest first (same millisecond: the higher id)");
+        assert_eq!(all[0]["kind"], "codex");
+        assert_eq!(call(&hub, "session.ended_list", json!({"limit": 1})).await.unwrap().as_array().unwrap().len(), 1);
+        // 0 is raised to 1; unknown params are refused.
+        assert_eq!(call(&hub, "session.ended_list", json!({"limit": 0})).await.unwrap().as_array().unwrap().len(), 1);
+        assert!(call(&hub, "session.ended_list", json!({"channel": 1})).await.is_err());
+        assert_eq!(call(&hub, "hello", json!({})).await.unwrap()["ended_sessions"], 3);
+        // Paired phones can't read it, nor learn how many there are.
+        assert!(crate::devices::method_scope("session.ended_list").is_none());
+        let h = dispatch(&hub, &Principal::Device { id: 1 }, "hello", json!({})).await.map_err(|e| e.0).unwrap();
+        assert!(h.get("ended_sessions").is_none() && h.get("sessions").is_some());
+    }
 
     #[tokio::test]
     async fn cli_ask_from_an_agent_is_that_agents_ask_agent() {

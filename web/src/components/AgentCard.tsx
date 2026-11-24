@@ -136,16 +136,18 @@ export function hoverCard(agent: number) {
   openTimer = setTimeout(() => (agentCard.value = { agent, byKey: false }), cur ? SWITCH_MS : OPEN_MS);
 }
 
-/** Pointer left the row and its card: close soon, unless the keyboard opened it or one of its
- * menus is open (the pointer is in the menu). */
-export function leaveCard(agent: number) {
+/** Pointer left an agent's row (or its card): close the open card soon, unless the keyboard opened
+ * it or one of its menus is open (the pointer is in the menu). Whichever card is open, not only
+ * this row's: a quick pass over another agent's row on the way out cancels that card's close
+ * timer before the switch happens, and the card stayed. Entering a row or card clears the timer. */
+export function leaveCard() {
   clearTimeout(openTimer);
   clearTimeout(closeTimer);
   const check = () => {
     const cur = agentCard.peek();
-    if (!cur || cur.agent !== agent || cur.byKey) return;
+    if (!cur || cur.byKey) return;
     // A menu or dialog it opened, or focus in it (back from that dialog), keeps it.
-    if (menu.peek() || overlay.peek() || document.activeElement?.closest(`.channel-row[data-agent-id="${agent}"]`)) {
+    if (menu.peek() || overlay.peek() || document.activeElement?.closest(`.channel-row[data-agent-id="${cur.agent}"]`)) {
       closeTimer = setTimeout(check, CLOSE_MS);
       return;
     }

@@ -174,7 +174,18 @@ try {
   await a.wait(`!!document.querySelector('.agent-card')`, 2000);
   await a.key("Escape");
   await a.wait(`!document.querySelector('.agent-card')`, 2000);
-  ok("hover opens the card beside the row; it stays while the pointer is in it and closes after it leaves");
+  // Passing over another agent's row on the way out (quicker than the switch) still closes the
+  // open card: it used to stay until the pointer came back.
+  const o = (await a.rect(row("orchestrator")))!;
+  const out = { x: r.x + r.w + 600, y: o.y + o.h / 2 };
+  await move(out.x, out.y);
+  await move(r.x + 40, r.y + r.h / 2);
+  await a.wait(`!!document.querySelector('.agent-card')`, 2000);
+  await move(o.x + 40, o.y + o.h / 2);
+  await move(out.x, out.y);
+  await a.sleep(1200);
+  check(await a.eval(`!document.querySelector('.agent-card')`), "the card closes after the pointer crosses another row on its way out");
+  ok("hover opens the card beside the row; it stays while the pointer is in it and closes after it leaves, also across another row");
 
   // ---- one menu: the agent's items, then the channel's
   await a.click(sel("orchestrator"), { button: "right" });

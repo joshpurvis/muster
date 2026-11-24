@@ -255,7 +255,7 @@ function Row({ row, context, now }: { row: SidebarRow; context: string | null; n
   return <div ref={ref} class={cx("channel-row", active && "active", c && unread.value.has(c.id) && !active && "unread",
     c && d?.channel === c.id && "channel-drop", a && "agent-row", cardOpen && "card-open")}
     data-channel-id={c?.id} data-agent-id={a?.id} data-agent={a?.name}
-    onMouseEnter={a ? () => hoverCard(a.id) : undefined} onMouseLeave={a ? () => leaveCard(a.id) : undefined}
+    onMouseEnter={a ? () => hoverCard(a.id) : undefined} onMouseLeave={a ? leaveCard : undefined}
     onFocusOut={a ? (e) => rowFocusOut(a.id, e.currentTarget, e.relatedTarget as HTMLElement | null) : undefined}
     {...contextMenu(menu)}>
     {editing && c ? <div class="channel-rename"><InlineEdit fields={[{ value: c.name, label: "Channel name" }]}

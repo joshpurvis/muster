@@ -454,7 +454,13 @@ impl Adapter for AntigravityAdapter {
             .or(status_only)
             .or(menu.then_some(""))?;
         let top = tui::rfind(&lines[..bottom], tui::is_solid_rule)?;
-        let (first, rest) = lines[top + 1..bottom].split_first()?;
+        // Muster's copy of the screen can lose the box's top border (24 Nov: agy redrew a wrapped
+        // line with a file link over it). The border found is then an older one, above an earlier
+        // prompt in the transcript, and that prompt and its answer read as unsent text that held
+        // the queue for hours. The box starts at its last prompt line, `>` in column 0: a draft's
+        // further lines are indented, and so is everything agy prints between prompts.
+        let start = (top + 1..bottom).rev().find(|&i| lines[i].starts_with('>')).unwrap_or(top + 1);
+        let (first, rest) = lines[start..bottom].split_first()?;
         let first = if first.trim_end() == ">" {
             ""
         } else {
@@ -652,6 +658,13 @@ mod tests {
         let draft = placeholder.replace("edits &", "edits  &");
         assert_eq!(AntigravityAdapter.composer_text(&snap(&idle.replace(placeholder, &draft))).as_deref(), Some(draft.as_str()));
         assert!(AntigravityAdapter.clear_input_bytes().is_none());
+        // The box's top border lost in Muster's copy of the screen (24 Nov, the writer's tab): the
+        // border found is the one above the previous prompt, but the box is still empty, and a
+        // draft in it still reads as one.
+        let garbled = include_str!("fixtures/antigravity_garbled_border.txt");
+        assert_eq!(AntigravityAdapter.composer_text(&snap(garbled)).as_deref(), Some(""));
+        let typed_in = garbled.replace("\n>\n", "\n> my draft\n  second line\n");
+        assert_eq!(AntigravityAdapter.composer_text(&snap(&typed_in)).as_deref(), Some("my draft\n  second line"));
         let panel = snap(include_str!("fixtures/antigravity_mcp_panel.txt"));
         assert!(AntigravityAdapter.composer_text(&panel).is_none());
         // A typed `/clear` opens agy's command menu under the box (agy 1.5.13).

@@ -89,10 +89,20 @@ struct Item {
     /// `panel`: an older backend after a rollback types it as an ordinary prompt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     handoff: Option<HandoffPart>,
-    /// Antigravity's `/clear` ahead of a fresh run's first prompt (`prepare_new_conversation`).
+    /// Antigravity startup step. Its text is the last command: `/mcp` on resume, `/clear` when fresh.
     /// Skipped when false; an older backend types it as an ordinary prompt.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     new_conversation: bool,
+}
+
+impl Item {
+    fn mcp_commands(&self) -> &'static [&'static str] {
+        if self.text == "/clear" { &["/mcp", "/clear"] } else { &["/mcp"] }
+    }
+
+    fn mcp_screen_ok(&self, screen: &crate::adapters::ScreenSnapshot) -> bool {
+        self.new_conversation && (self.text == "/mcp" || crate::adapters::antigravity::is_startup_screen(screen))
+    }
 }
 
 /// The two prompts of a self handoff, queued together (`enqueue_handoff`).
@@ -261,10 +271,9 @@ pub struct Queues {
     /// In memory only: prompts from other agents or schedules a fresh start did not keep
     /// (`drop_queue`), to be returned to their senders as refused (`return_unsent`).
     returns: Mutex<Vec<Item>>,
-    /// In memory only: each fresh Antigravity run's new-conversation step
-    /// (`prepare_new_conversation`): its run, and the human's last keystroke when the run was
-    /// first ready for it (a trust dialog answered before that is fine). A step with no record
-    /// (queued before a backend restart) is dropped.
+    /// Antigravity startup step: run and human-input sequence. A fresh run arms on its unused
+    /// startup screen (a trust dialog answered earlier is fine). A resumed transcript already
+    /// has turns, so watch for human input from launch. A backend restart drops the step.
     opening: Mutex<HashMap<SessionId, (u64, Option<Option<u64>>)>>,
 }
 
@@ -909,7 +918,7 @@ pub async fn send(
             rebase(q, generation);
             join_parked(hub, q, &item)?;
             // Never ahead of a held self-handoff prompt: the new conversation reads it first.
-            // Nor ahead of a fresh Antigravity run's new-conversation step.
+            // Nor ahead of Antigravity's MCP startup step.
             let at = q.items.iter().take_while(|i| held(i) || i.new_conversation).count();
             q.items.insert(at, item);
             Ok(q.items.len() as u32)
@@ -1188,14 +1197,14 @@ pub(crate) fn prepare_initial(hub: &Hub, id: SessionId, generation: u64, text: S
     })
 }
 
-/// A fresh Antigravity run first opens a new conversation, ahead of every other prompt
-/// (`open_conversation`): agy 1.5.13 loads MCP servers only when a turn starts or `/mcp` opens,
-/// and a conversation opened before they loaded never gets their tools (checked 23 Nov 2026:
-/// the startup one never has them, one opened after `/mcp` or a resumed one does). Done only
-/// while that startup conversation is still empty (`is_startup_screen`): once a turn shows,
-/// someone used it and the step is dropped.
-pub(crate) fn prepare_new_conversation(hub: &Hub, id: SessionId, generation: u64) -> anyhow::Result<()> {
-    let item = Item { generation: Some(generation), text: "/clear".into(), clear_first: false, attempts: 0,
+/// agy loads MCP servers asynchronously. Check its panel before any queued prompt. Only a
+/// fresh run needs a new conversation after the tools load; a resumed run keeps its history.
+pub(crate) fn prepare_antigravity_mcp(hub: &Hub, id: SessionId, generation: u64, args: &[String]) -> anyhow::Result<()> {
+    if !crate::adapters::antigravity::has_mcp_workspace(args) { return Ok(()) }
+    let resumed = crate::adapters::resumed_in_launch(SessionKind::Antigravity, args).is_some();
+    let command = if resumed { "/mcp" } else { "/clear" };
+    let typed = resumed.then(|| hub.human_input_of(id).map(|(seq, _)| seq));
+    let item = Item { generation: Some(generation), text: command.into(), clear_first: false, attempts: 0,
         draft_noticed: false, source: crate::agents::Source::Human, panel: None, handoff: None, new_conversation: true };
     hub.injection.edit(id, |q| {
         // A queue parked by a fresh start stays parked until this run is confirmed (`adopt`).
@@ -1203,12 +1212,12 @@ pub(crate) fn prepare_new_conversation(hub: &Hub, id: SessionId, generation: u64
         q.items.retain(|i| !i.new_conversation);
         q.items.push_front(item);
     })?;
-    hub.injection.opening.lock().insert(id, (generation, None));
+    hub.injection.opening.lock().insert(id, (generation, typed));
     Ok(())
 }
 
-/// The new-conversation step of run `generation` may still go: this backend queued it for
-/// this run, and the human hasn't typed in the tab since the run was first ready for it.
+/// The MCP startup step of run `generation` may still go: this backend queued it for
+/// this run, and the human hasn't typed in the tab since the step was armed.
 /// `arm`: record that moment now if it isn't yet (the run is ready, on its startup screen).
 fn may_open(hub: &Hub, id: SessionId, generation: Option<u64>, arm: bool) -> bool {
     let typed = hub.human_input_of(id).map(|(seq, _)| seq);
@@ -1221,11 +1230,10 @@ fn may_open(hub: &Hub, id: SessionId, generation: Option<u64>, arm: bool) -> boo
     }
 }
 
-/// Load agy's MCP servers (`/mcp`, then Esc) and open a new conversation (`/clear`), as
-/// `prepare_new_conversation` describes. It starts only on an unused startup screen with an
-/// empty input box; a draft, a dialog or a used conversation ends it untyped (true: done).
-async fn open_conversation(hub: &Arc<Hub>, id: SessionId, generation: Option<u64>, adapter: &dyn Adapter) -> anyhow::Result<bool> {
-    use crate::adapters::antigravity::{is_startup_screen, mcp_panel_loaded};
+/// Load agy's MCP servers (`/mcp`, then Esc). Only a fresh, unused conversation gets `/clear`.
+async fn load_antigravity_mcp(hub: &Arc<Hub>, id: SessionId, item: &Item, adapter: &dyn Adapter) -> anyhow::Result<bool> {
+    use crate::adapters::antigravity::mcp_panel_loaded;
+    let generation = item.generation;
     let screen = || hub.screen(id);
     let box_is = |text: &str| screen().is_some_and(|s| adapter.composer_text(&s).as_deref() == Some(text));
     async fn until(check: &(dyn Fn() -> bool + Sync), limit: Duration) -> bool {
@@ -1241,15 +1249,14 @@ async fn open_conversation(hub: &Arc<Hub>, id: SessionId, generation: Option<u64
         hub.drain_antigravity_callbacks(id);
         screen().is_some_and(|s| !dialog_blocks_input(adapter, &s, info.state))
     });
-    if !(screen().is_some_and(|s| is_startup_screen(&s)) && box_is("") && clear_to_type()) {
-        tracing::info!(session = id, "not opening a new Antigravity conversation: the startup one may be in use");
+    if !(screen().is_some_and(|s| item.mcp_screen_ok(&s)) && box_is("") && clear_to_type()) {
+        tracing::info!(session = id, "skipping Antigravity MCP setup: the terminal may be in use");
         return Ok(true);
     }
     // Typed, not pasted: agy opens its command menu on the text, and Enter runs the command.
     let loaded = || screen().is_some_and(|s| mcp_panel_loaded(&s));
     let cleared = || box_is("");
-    let steps: [(&str, &(dyn Fn() -> bool + Sync)); 2] = [("/mcp", &loaded), ("/clear", &cleared)];
-    for (command, done) in steps {
+    for &command in item.mcp_commands() {
         if !(box_is("") && clear_to_type()) { return Ok(true) }
         hub.write_input_generation(id, generation, command.as_bytes())?;
         if !until(&|| box_is(command), Duration::from_secs(3)).await {
@@ -1257,9 +1264,9 @@ async fn open_conversation(hub: &Arc<Hub>, id: SessionId, generation: Option<u64
         }
         if !clear_to_type() { return Ok(true) }
         hub.write_input_generation(id, generation, b"\r")?;
-        let ok = until(done, Duration::from_secs(15)).await;
         if command == "/mcp" {
-            // Closed whether or not the servers showed as loaded (`/clear` needs the input box),
+            let ok = until(&loaded, Duration::from_secs(15)).await;
+            // Closed whether or not the servers showed as loaded (the next prompt needs the input box),
             // but only while the panel is what's on screen.
             let panel = screen().is_some_and(|s| s.lines.iter().any(|l| l.trim() == "MCP Servers"));
             if !(panel && may_open(hub, id, generation, false)) { return Ok(true) }
@@ -1268,7 +1275,7 @@ async fn open_conversation(hub: &Arc<Hub>, id: SessionId, generation: Option<u64
                 anyhow::bail!("Antigravity's MCP panel did not close; check the terminal");
             }
             if !ok { tracing::warn!(session = id, "Antigravity's MCP panel showed no loaded muster server"); }
-        } else if !ok {
+        } else if !until(&cleared, Duration::from_secs(15)).await {
             anyhow::bail!("Antigravity did not start a new conversation; check the terminal");
         }
     }
@@ -1311,9 +1318,10 @@ fn kick(hub: Arc<Hub>, id: SessionId) {
     tokio::spawn(async move {
         tokio::time::sleep(SETTLE).await;
         let is_ready = ready(&hub, id) && !hub.is_shutting_down() && !deferred(&hub, id, generation);
-        let startup = hub.screen(id).is_some_and(|s| crate::adapters::antigravity::is_startup_screen(&s));
-        let opening = hub.injection.inner.lock().get(&id).is_some_and(|q| q.items.front().is_some_and(|i| i.new_conversation));
-        let may = opening && is_ready && startup && may_open(&hub, id, generation, true);
+        let screen = hub.screen(id);
+        let opening = hub.injection.inner.lock().get(&id).and_then(|q| q.items.front())
+            .is_some_and(|i| screen.as_ref().is_some_and(|s| i.mcp_screen_ok(s)));
+        let may = opening && is_ready && may_open(&hub, id, generation, true);
         // Session moves take this lock: a panel batch is checked against its task as it is taken.
         let selected = {
             let _op = hub.panels.operations.lock();
@@ -1322,10 +1330,10 @@ fn kick(hub: Arc<Hub>, id: SessionId) {
                 if q.generation != generation { return None }
                 // A panel batch whose opener left its task returns to its panels (`panel_moves`).
                 q.items.retain(|item| item.panel.as_ref().is_none_or(|b| !unbound.contains(&b.id)));
-                // A fresh run's new conversation comes too late once its startup one was used.
+                // Drop startup commands once a human has taken over the terminal.
                 if is_ready && !may && q.items.front().is_some_and(|i| i.new_conversation) {
                     q.items.pop_front();
-                    tracing::info!(session = id, "not opening a new Antigravity conversation: the startup one may be in use");
+                    tracing::info!(session = id, "skipping Antigravity MCP setup: the terminal may be in use");
                 }
                 // A held handoff prompt keeps its place, and everything behind it waits.
                 let item = if is_ready && !q.items.front().is_some_and(held) { q.items.pop_front() } else { None };
@@ -1716,7 +1724,7 @@ async fn deliver(hub: &Arc<Hub>, id: SessionId, mut item: Item) -> anyhow::Resul
         return requeue(item);
     }
     if item.new_conversation {
-        return open_conversation(hub, id, generation, adapter).await;
+        return load_antigravity_mcp(hub, id, &item, adapter).await;
     }
     // A schedule's prompt that may no longer go (paused, expired, removed, timed out while it
     // waited here) is taken back, never typed (src/schedules/ `submit_gate`).
@@ -2262,16 +2270,43 @@ mod tests {
         assert_eq!(q.items.iter().map(|i| i.text.as_str()).collect::<Vec<_>>(), ["read memory/ first", "msg 11", "answer Q3: a", "msg 13", "msg 14"]);
         assert!(q.items.iter().all(|i| i.generation == Some(6)));
         // A fresh Antigravity run opens a new conversation ahead of all of them, once.
-        prepare_new_conversation(&hub, 1, 6).unwrap();
-        prepare_new_conversation(&hub, 1, 6).unwrap();
+        let args = ["--add-dir=/session/antigravity-workspace".into()];
+        prepare_antigravity_mcp(&hub, 1, 6, &args).unwrap();
+        prepare_antigravity_mcp(&hub, 1, 6, &args).unwrap();
         let q = hub.injection.inner.lock().get(&1).cloned().unwrap();
         assert_eq!(q.items.iter().map(|i| i.text.as_str()).collect::<Vec<_>>(), ["/clear", "read memory/ first", "msg 11", "answer Q3: a", "msg 13", "msg 14"]);
         assert!(q.items[0].new_conversation && q.items.iter().skip(1).all(|i| !i.new_conversation));
+        assert_eq!(q.items[0].mcp_commands(), ["/mcp", "/clear"]);
         assert_eq!(waiting(&q), 5, "Muster's own step is not a waiting prompt");
         // Saved with the queue; ordinary prompts keep their old format.
         let reloaded = Queues::load(hub.store()).unwrap();
         assert!(reloaded.inner.lock()[&1].items[0].new_conversation);
         assert!(!serde_json::to_string(&q.items[1]).unwrap().contains("new_conversation"));
+    }
+
+    #[test]
+    fn resumed_antigravity_waits_for_mcp_and_keeps_the_conversation() {
+        let hub = hub();
+        prepare_initial(&hub, 1, 6, "first prompt".into(), crate::agents::Source::Human).unwrap();
+        let mut args = vec!["--conversation=demo".into(), "--add-dir=/repo/memory".into()];
+        prepare_antigravity_mcp(&hub, 1, 6, &args).unwrap();
+        assert_eq!(hub.injection.inner.lock()[&1].items, [plain(6, "first prompt")]);
+        args.push("--add-dir=/session/antigravity-workspace".into());
+        prepare_antigravity_mcp(&hub, 1, 6, &args).unwrap();
+        let q = hub.injection.inner.lock()[&1].clone();
+        assert_eq!(q.items.len(), 2);
+        let setup = &q.items[0];
+        let history = crate::adapters::tui::testutil::snap(&format!("> previous turn\n{}",
+            include_str!("adapters/fixtures/antigravity_idle_auto.txt")));
+        assert!(!crate::adapters::antigravity::is_startup_screen(&history));
+        assert!(setup.mcp_screen_ok(&history));
+        assert_eq!(setup.mcp_commands(), ["/mcp"]);
+        assert_eq!(q.items[1].text, "first prompt");
+        assert_eq!(waiting(&q), 1);
+        assert!(!may_open(&hub, 1, Some(5), true));
+        assert!(may_open(&hub, 1, Some(6), false));
+        hub.note_human_keys(1, b"x");
+        assert!(!may_open(&hub, 1, Some(6), true));
     }
 
     /// Without a fresh start an exit drops the queue as before. A fresh start whose new run

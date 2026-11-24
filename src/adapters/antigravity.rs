@@ -185,12 +185,9 @@ fn prepare_workspace(ctx: &SpawnCtx) -> anyhow::Result<std::path::PathBuf> {
     Ok(workspace)
 }
 
-/// A launch with Muster's MCP workspace that resumes no conversation: Muster opens a new one
-/// before its first prompt (`inject::prepare_new_conversation`), so that prompt is queued, not
-/// passed with `--prompt-interactive`.
-pub fn opens_new_conversation(args: &[String]) -> bool {
+/// Launches with Muster's MCP workspace check the server in `/mcp` before the first prompt.
+pub fn has_mcp_workspace(args: &[String]) -> bool {
     args.iter().any(|a| a.strip_prefix("--add-dir=").is_some_and(|d| Path::new(d).ends_with("antigravity-workspace")))
-        && resumed_in_launch(SessionKind::Antigravity, args).is_none()
 }
 
 /// agy's `/mcp` panel lists Muster's server as loaded ("✓ muster  Tools: ...", agy 1.5.13).
@@ -784,14 +781,16 @@ mod tests {
         // A fresh run with Muster's tools gets its first prompt after `/clear`, through the queue.
         let fresh = launch(&ctx, false, true, &user, &[]).unwrap();
         assert_eq!(fresh.args, [add_dir.as_str(), "--dangerously-skip-permissions", "--model", "demo"]);
-        assert!(!fresh.consumed_initial_prompt && opens_new_conversation(&fresh.args));
-        assert!(!opens_new_conversation(&launch(&ctx, true, false, &user, &[]).unwrap().args));
+        assert!(!fresh.consumed_initial_prompt && has_mcp_workspace(&fresh.args));
+        assert!(!has_mcp_workspace(&launch(&ctx, true, false, &user, &[]).unwrap().args));
         ctx.extra_args = vec!["--conversation".into(), "conv-demo".into()];
+        let without_mcp = launch(&ctx, true, false, &user, &[]).unwrap();
+        assert!(!has_mcp_workspace(&without_mcp.args));
         let spec = launch(&ctx, true, true, &user, &[]).unwrap();
         assert_eq!(spec.program, "agy");
         assert!(!spec.consumed_initial_prompt);
-        assert!(!opens_new_conversation(&spec.args), "a resumed conversation has its tools");
-        assert!(!opens_new_conversation(&["--add-dir=/repo/memory".to_string()]));
+        assert!(has_mcp_workspace(&spec.args), "a resumed launch must wait for Muster's tools too");
+        assert!(!has_mcp_workspace(&["--add-dir=/repo/memory".to_string()]));
         assert_eq!(
             spec.args,
             [

@@ -669,8 +669,9 @@ pub enum Why {
     /// An idle agent reset (src/auto_reset.rs) stops it before forgetting its conversation; it
     /// says so in its own words, so this sleep logs nothing of its own.
     Reset,
-    /// A move to another account applied now (`agents::restart_moved`): stopped only to be
-    /// started at once on the new account, so this sleep logs nothing of its own either.
+    /// A move to another account or a kind switch applied now (`agents::restart_moved`,
+    /// `agents::restart_switched`): stopped only to be started at once on the new account or CLI,
+    /// so this sleep logs nothing of its own either.
     Move,
 }
 
@@ -721,9 +722,10 @@ pub(crate) async fn sleep_held(hub: &Arc<Hub>, name: &str, why: Why, _held: &cra
         return Err(NotNow(format!("{} can't sleep now: {}", a.name, typed_reason(why))).into());
     }
     let (info, f) = facts(hub, &a);
-    // A move applied now begins a new conversation anyway: no saved one is needed (only then).
+    // A move or a kind switch applied now begins a new conversation anyway: no saved one is
+    // needed (only then).
     let checked = match why {
-        Why::Move if a.handoff.is_some() && a.resume_id.is_none() => Agent { resume_id: Some(String::new()), ..a.clone() },
+        Why::Move if (a.handoff.is_some() || a.reset_on_next_start) && a.resume_id.is_none() => Agent { resume_id: Some(String::new()), ..a.clone() },
         _ => a.clone(),
     };
     if let Some(no) = blocker(&checked, info.as_ref(), &f) {

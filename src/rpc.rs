@@ -1226,12 +1226,13 @@ async fn dispatch_inner(hub: &Arc<Hub>, who: &Principal, method: &str, params: V
         }
         "agent.update" => {
             require_local(who, method)?;
-            // `muster agent edit --self-handoff`, `--tools-up-front` or `--lead` inside a session names it
+            // `muster agent edit --self-handoff`, `--tools-up-front`, `--lead` or `--kind` inside a session names it
             // (never a request field).
             let mut params = params;
             let from_session = params.as_object_mut().and_then(|o| o.remove("from_session")).filter(|v| !v.is_null());
             let mut p: crate::agents::AgentUpdate = parse(params)?;
-            // Only the human grants self handoff, turns on tools up front or makes a lead agent: a click in the window,
+            // Only the human grants self handoff, turns on tools up front, makes a lead agent or switches an agent's
+            // kind: a click in the window,
             // or the CLI from a terminal outside every session (`owner_terminal`, checked by
             // `http_call`).
             p.by_owner = from_session.is_none()
@@ -1240,16 +1241,24 @@ async fn dispatch_inner(hub: &Arc<Hub>, who: &Principal, method: &str, params: V
             // Letting an agent take scheduled or triggered work, or moving one that does to or
             // from the subscription, only with a click in the owner's window: checked with the
             // record it changes, under one lock (`agents::widens_unattended`).
-            let (b, switch) = crate::agents::update_switch(hub, p, via == Via::Outside)?;
+            let (b, switch, kind_switch) = crate::agents::update_full(hub, p, via == Via::Outside)?;
             // A move to another account: Save notes first and Now (`agents::switch_account`).
             let switch = match switch {
                 Some(sw) => Some(crate::agents::switch_account(hub, sw).await),
+                None => None,
+            };
+            // A kind switch: Now (`agents::switch_kind_now`).
+            let kind_switch = match kind_switch {
+                Some(ks) => Some(crate::agents::switch_kind_now(hub, ks).await),
                 None => None,
             };
             let b = hub.agents().get(&b.name).unwrap_or(b);
             let mut v = crate::agents::agent_view(hub, &b);
             if let Some(sw) = switch {
                 v["switch"] = sw;
+            }
+            if let Some(ks) = kind_switch {
+                v["kind_switch"] = ks;
             }
             Ok(v)
         }
@@ -3878,6 +3887,94 @@ mod tests {
             .await.map_err(|e| e.0).unwrap_err();
         assert!(e.contains("Codex"), "{e}");
         assert!(!hub.agents().get("rpc-cody").unwrap().lead);
+    }
+
+    /// An Antigravity agent can be a lead: only the human turns it on, its persona says so, and
+    /// its scheduled turn's messages and `muster new` go as `lead` (a trigger's work stays as it is).
+    #[tokio::test]
+    async fn an_antigravity_agent_can_be_a_lead() {
+        let (hub, _st) = fixture();
+        crate::agents::create(&hub, NewAgent {
+            working_location: None, account_profile: None, provider: None, name: "rpc-gina".into(),
+            kind: Some(SessionKind::Antigravity), model: None, effort: None, persona: None, accepts: None,
+            permissions: None, autostart: false, sleep_after_min: None,
+        }).unwrap();
+        let a = hub.agents().get("rpc-gina").unwrap();
+        hub.agents().link_session(hub.store(), a.id, Some(2)).unwrap();
+        let on = json!({"name": "rpc-gina", "lead": true});
+        let e = call(&hub, "agent.update", on.clone()).await.unwrap_err();
+        assert!(e.contains("only the human"), "{e}");
+        let mut from = on.clone();
+        from["from_session"] = json!(2);
+        let e = dispatch_via(&hub, &Principal::Local, "agent.update", from, Via::Window).await.map_err(|e| e.0).unwrap_err();
+        assert!(e.contains("only the human"), "an agent can't make itself a lead: {e}");
+        let r = dispatch_via(&hub, &Principal::Local, "agent.update", on, Via::Window).await.map_err(|e| e.0).unwrap();
+        assert_eq!(r["lead"], true);
+        let persona = std::fs::read_to_string(crate::agents::home_dir_for("rpc-gina").join("AGENTS.md")).unwrap();
+        assert!(persona.contains("## Lead agent") && persona.contains("message other agents and sessions"), "{persona}");
+        assert!(persona.contains("call_mcp_tool"), "its own way to answer stays");
+        // A reminder's turn: what it sends and starts goes as `lead`, one hop on.
+        hub.agents().set_prov(2, Some(SCHED)).unwrap();
+        assert_eq!(hub.agents().send_prov(2).unwrap().origin, Origin::Lead);
+        assert_eq!(spawn_prov(&hub, Some(2), Some(SessionKind::Claude)).ok().flatten(), Some(Prov { origin: Origin::Lead, hop: 2, msg_id: None }));
+        assert_eq!(spawn_prov(&hub, Some(2), Some(SessionKind::Antigravity)).ok().flatten().map(|p| p.origin), Some(Origin::Lead));
+        // A trigger's work is never lifted.
+        hub.agents().set_prov(2, Some(Prov { origin: Origin::Webhook, hop: 1, msg_id: None })).unwrap();
+        assert_eq!(hub.agents().send_prov(2).unwrap().origin, Origin::Webhook);
+        assert!(spawn_prov(&hub, Some(2), Some(SessionKind::Claude)).is_err());
+    }
+
+    /// Switching a named agent between Claude and Antigravity: only the human, only those two
+    /// kinds; it keeps its id, tab, lead flag and schedules, starts a new conversation, clears what
+    /// the new CLI can't use, maps its modes, writes the new persona file and keeps the old one.
+    #[tokio::test]
+    async fn the_owner_switches_an_agent_between_claude_and_antigravity() {
+        let (hub, _st) = fixture();
+        agent(&hub, "rpc-kai");
+        let kai = hub.agents().get("rpc-kai").unwrap();
+        hub.agents().link_session(hub.store(), kai.id, Some(2)).unwrap();
+        hub.agents().update(hub.store(), kai.id, |a| a.resume_id = Some("0f7e3c1a-58b2-4d0e-9a6c-2b1d4e5f6a7b".into())).unwrap();
+        let home = crate::agents::home_dir_for("rpc-kai");
+        let window = |v: Value| { let hub = hub.clone(); async move {
+            dispatch_via(&hub, &Principal::Local, "agent.update", v, Via::Window).await.map_err(|e| e.0) } };
+        window(json!({"name": "rpc-kai", "lead": true, "model": "opus", "tools_up_front": true,
+            "permissions": {"claude_mode": "bypass", "codex_sandbox": "workspace_write"}})).await.unwrap();
+        std::fs::write(home.join("CLAUDE.md"), "edited by hand\n").unwrap();
+        let to = json!({"name": "rpc-kai", "kind": "antigravity", "model": "gemini-4-neon-high"});
+        // Not from a script, an agent, or for Codex.
+        let e = call(&hub, "agent.update", to.clone()).await.unwrap_err();
+        assert!(e.contains("only the human") && e.contains("--kind antigravity"), "{e}");
+        let mut from = to.clone();
+        from["from_session"] = json!(2);
+        assert!(window(from).await.unwrap_err().contains("only the human"));
+        let e = window(json!({"name": "rpc-kai", "kind": "codex"})).await.unwrap_err();
+        assert!(e.contains("only between Claude and Antigravity"), "{e}");
+        // A switch can't keep what only Claude has.
+        let e = window(json!({"name": "rpc-kai", "kind": "antigravity", "tools_up_front": true})).await.unwrap_err();
+        assert!(e.contains("Claude agents only"), "{e}");
+        assert_eq!(hub.agents().get("rpc-kai").unwrap().kind, SessionKind::Claude, "nothing changed");
+        let r = window(to).await.unwrap();
+        assert_eq!((r["kind"].as_str(), r["model"].as_str(), r["lead"].as_bool()), (Some("antigravity"), Some("gemini-4-neon-high"), Some(true)));
+        assert_eq!(r["kind_switch"]["outcome"], "next_start", "{r}");
+        assert_eq!(r["kind_switch"]["kept_aside"], json!(["CLAUDE.md.before-antigravity"]));
+        let a = hub.agents().get("rpc-kai").unwrap();
+        assert_eq!((a.id, a.session_id, a.tools_up_front, a.reset_on_next_start), (kai.id, Some(2), false, true));
+        assert_eq!(a.permissions.antigravity_mode, crate::model::AntigravityMode::FullAccess, "bypass is full access");
+        assert_eq!(hub.store().load_agents().unwrap()[0].kind, SessionKind::Antigravity, "saved");
+        // Persona: the new CLI's file from the record; the hand-edited one kept, none left to mislead.
+        assert!(!home.join("CLAUDE.md").exists());
+        assert_eq!(std::fs::read_to_string(home.join("CLAUDE.md.before-antigravity")).unwrap(), "edited by hand\n");
+        let agents_md = std::fs::read_to_string(home.join("AGENTS.md")).unwrap();
+        assert!(agents_md.contains("persistent muster agent (antigravity)") && agents_md.contains("## Lead agent"), "{agents_md}");
+        // Its next run: the tab becomes Antigravity's, and the Claude conversation is forgotten.
+        crate::agents::follow_kind(&hub, 2).unwrap();
+        assert_eq!(hub.session(2).unwrap().kind, SessionKind::Antigravity);
+        assert_eq!(hub.agents().get("rpc-kai").unwrap().resume_id, None);
+        // And back: the Antigravity file is kept aside in its turn.
+        let r = window(json!({"name": "rpc-kai", "kind": "claude"})).await.unwrap();
+        assert_eq!((r["kind"].as_str(), r["model"].as_str()), (Some("claude"), None));
+        assert_eq!(hub.agents().get("rpc-kai").unwrap().permissions.claude_mode, crate::model::ClaudeMode::Bypass);
+        assert!(home.join("CLAUDE.md").exists() && home.join("AGENTS.md.before-claude").exists() && !home.join("AGENTS.md").exists());
     }
 
     /// `start_fresh` (MCP; `muster start-fresh` calls it): refused, and recorded, unless the agent

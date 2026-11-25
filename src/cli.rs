@@ -2720,8 +2720,8 @@ pub fn agent_edit(d: &Discovery, o: AgentOpts) -> anyhow::Result<()> {
     if let Value::Object(m) = move_params(&o.switch, to) {
         params.as_object_mut().expect("an object").extend(m);
     }
-    // Asking an agent to save notes is the human's: say whose call it is.
-    if o.switch.save_notes && let Some(id) = env_session() {
+    // Asking an agent to save notes, or switching its kind, is the human's: say whose call it is.
+    if (o.switch.save_notes || o.kind.is_some()) && let Some(id) = env_session() {
         params["from_session"] = json!(id);
     }
     let b = client::rpc(d, "agent.update", params)?;
@@ -2729,7 +2729,37 @@ pub fn agent_edit(d: &Discovery, o: AgentOpts) -> anyhow::Result<()> {
     if let Some(line) = switch_line(b["name"].as_str().unwrap_or(&o.name), &b["switch"]) {
         println!("  {line}");
     }
+    if let Some(line) = kind_switch_line(b["name"].as_str().unwrap_or(&o.name), &b["kind_switch"]) {
+        println!("  {line}");
+    }
     Ok(())
+}
+
+/// What `agent.update`'s `kind_switch` says happened to a switch between Claude and Antigravity,
+/// in a line.
+pub fn kind_switch_line(name: &str, ks: &Value) -> Option<String> {
+    let to = match ks["to"].as_str()? {
+        "antigravity" => "Antigravity",
+        "claude" => "Claude",
+        other => other,
+    };
+    let what = match ks["outcome"].as_str() {
+        Some("restarted") => format!("{name} switched to {to} now: a new conversation started there."),
+        Some("busy") => match ks["why"].as_str() {
+            Some(why) => format!("{name} can't restart now ({why}), so it switches to {to} at its next start."),
+            None => format!("{name} isn't idle, so it switches to {to} at its next start."),
+        },
+        Some("replaced") => format!("Another change to {name} came first; it is {to} from its next start."),
+        Some("failed") => format!("{name} didn't restart: {}. It switches to {to} at its next start.",
+            ks["error"].as_str().unwrap_or("unknown error")),
+        _ if ks["now"] == true || ks["running"] == false => format!("{name} isn't running, so it starts as {to} next \
+            time (a new conversation; memory/ and its schedules stay)."),
+        _ => format!("{name} switches to {to} at its next start (a new conversation; memory/ and its schedules stay). \
+            Until then it keeps running as it is: `muster agent edit {name} --kind {} --now` restarts it now if it is idle.",
+            ks["to"].as_str().unwrap_or("")),
+    };
+    let kept: Vec<&str> = ks["kept_aside"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+    Some(if kept.is_empty() { what } else { format!("{what} Old persona file kept as {}.", kept.join(", ")) })
 }
 
 /// What `agent.update`'s `switch` says happened to a move to another account, in a line.

@@ -729,6 +729,28 @@ export function releaseNewSessions() {
   if (holds === 0 && held.peek().size) held.value = new Set();
 }
 
+// Tabs a Muster link click is bringing into this window, by the tab the click was in: each arrives
+// in that tab's group (layout/channels.ts `into`), not in a new split beside it. Set before the
+// call that brings it and cleared once the call is done.
+const linkOrigins = signal<ReadonlyMap<number, number>>(new Map());
+
+/** While `bring` runs, tab `tab` arriving in this window joins tab `origin`'s group. */
+export async function arriveFromLink(tab: number, origin: number, bring: () => Promise<void>) {
+  linkOrigins.value = new Map(linkOrigins.peek()).set(tab, origin);
+  try {
+    await bring();
+  } finally {
+    const m = new Map(linkOrigins.peek());
+    m.delete(tab);
+    linkOrigins.value = m;
+  }
+}
+
+/** The tab a link click in which is bringing tab `tab` here, if any. */
+export function linkOrigin(tab: number): number | undefined {
+  return linkOrigins.peek().get(tab);
+}
+
 const liveTabs = computed((): TabHome[] => {
   const valid = (id: number | null | undefined) => id != null && channelById.value.has(id) ? id : null;
   const notes = windowNotes.value.map((n) => ({ id: noteTab(n.id),
@@ -746,7 +768,8 @@ const liveTabs = computed((): TabHome[] => {
     ...(questionsShown.value ? [{ id: QUESTIONS_TAB, channel: shown, questions: true }] : []),
     ...shownAddons.value.map((a) => ({ id: addonTab(a.id), channel: shown, pinned: `addon:${a.id}` })),
     ...(prsShown.value ? [{ id: PRS_TAB, channel: shown, pinned: "prs" }] : []),
-  ].filter((t) => !held.value.has(t.id));
+  ].filter((t) => !held.value.has(t.id))
+    .map((t) => linkOrigins.value.has(t.id) ? { ...t, into: linkOrigins.value.get(t.id) } : t);
 });
 
 /** The session ids of the layout in on-screen order (groups, then their strips). */

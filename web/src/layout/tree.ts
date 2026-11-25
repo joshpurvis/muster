@@ -561,6 +561,13 @@ export function placeBeside(s: LayoutState, tab: number, opener: number): Layout
   return right ? addTab(s, tab, right) : splitPane(s, "right", tab, origin);
 }
 
+/** Tab `tab` joins the group that holds tab `origin` (a Muster link clicked there), selected; without
+ * `origin` in the layout, the focused group. A tab already in the layout keeps its place. */
+export function joinGroupOf(s: LayoutState, tab: number, origin: number): LayoutState {
+  if (paneOfSession(s.root, tab)) return s;
+  return addTab(s, tab, paneOfSession(s.root, origin)?.id ?? s.focus);
+}
+
 // ---------- mutations ----------
 
 export function focusPane(s: LayoutState, id: string): LayoutState {

@@ -527,7 +527,7 @@ transcripts and pasted elsewhere (src/links.rs, web/src/links.ts):
 
 | Address | Shows |
 |---|---|
-| `muster://note/91` | the note: selected here, or opened beside the terminal that showed the link (from closed, or from another window), as Jump does |
+| `muster://note/91` | the note: selected here, or opened as a tab of the group the link was clicked in (from closed, or from another window), as Jump does |
 | `muster://panel/3` | the panel, selected here or brought from its window |
 | `muster://tab/12` | session 12's tab |
 | `muster://agent/reviewer` | the named agent's tab |
@@ -560,9 +560,13 @@ transcripts and pasted elsewhere (src/links.rs, web/src/links.ts):
   (docs/CLI.md). Every agent's instructions say to mention things this way: the MCP server's
   instructions, and a named agent's CLAUDE.md or AGENTS.md ("Links"; an agent made before this
   gets the section at its next start, unless its file was replaced by hand).
-- **Where**: a link always shows the thing in the window it was clicked in (a note beside the
-  terminal that showed the link, a panel or tab moved here from another window), also with "Jump
-  focuses the other window" on: raising that window would show whatever is selected there.
+- **Where**: a link always shows the thing in the window it was clicked in, also with "Jump
+  focuses the other window" on: raising that window would show whatever is selected there. A
+  closed note, or a note, panel or tab moved here from another window, opens as a tab of the group
+  the link was clicked in (the terminal's, the note's or the Questions tab's), never in a new split
+  or the group beside it; a note from a terminal's link also joins that terminal's channel. One
+  already in this window is selected where it is. An agent's `note_open` and `panel_open` still
+  open beside its terminal.
 - Not yet: outside Muster's window (another terminal, a browser) the address isn't registered
   with the system, so it does nothing there; the phone UI and Markdown panels show it as plain
   text.

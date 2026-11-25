@@ -99,8 +99,8 @@ mq.addEventListener("change", applyThemePref);
 terms.setFontSize(prefs.value.fontSize);
 terms.setInputPaused((sid) => !!sessions.value.get(sid)?.input_interrupted);
 terms.onClipboardFailed((text) => toast("error", text));
-// A click on a Muster link in a terminal shows what it names: a closed note opens beside the
-// terminal that linked it.
+// A click on a Muster link in a terminal shows what it names: a closed note opens as a tab of the
+// terminal's own group (in its channel), not in a new split.
 terms.onMusterLink((link, sid) => void A.showLink(link, sid));
 
 rpc.onHello = async (h, reconnect) => {

@@ -647,3 +647,20 @@ Deno.test("a channel where Questions got its own group from the default and was 
   assert(q.tabs.length === 1 && Math.abs(paneRects(w.layouts[20].root).get(q.id)!.w - 0.4) < 1e-9,
     `its own group at 40%: ${sig(w.layouts[20].root)}`);
 });
+
+Deno.test("a note or panel a link brings in joins the clicked tab's group, ahead of its opener", () => {
+  let l = splitPane(emptyLayout([1]), "right", 2);
+  l = { ...l, focus: allPanes(l.root)[1].id };
+  const base: WindowLayoutState = { v: 2, active: 10, layouts: { 10: l }, sidebar: { hidden: false, channels: true, width: 260 } };
+  const sessions = [{ id: 1, channel: 10 }, { id: 2, channel: 10 }];
+  // Beside its opener (an agent's note_open): the group to the right of terminal 1.
+  const beside = reconcileChannels(base, [10], [...sessions, { id: noteTab(5), channel: 10, beside: 1 }]);
+  equal(sig(beside.layouts[10].root), `row([1] [2,${noteTab(5)}])`);
+  // From a link clicked in terminal 1 (also its opener): terminal 1's own group.
+  const linked = reconcileChannels(base, [10], [...sessions, { id: noteTab(5), channel: 10, beside: 1, into: 1 },
+    { id: panelTab(6), channel: 10, beside: 2, into: 1 }]);
+  equal(sig(linked.layouts[10].root), `row([1,${noteTab(5)},${panelTab(6)}] [2])`);
+  // Once there, a later reconcile (the link done, `into` gone) leaves it where it is.
+  equal(sig(reconcileChannels(linked, [10], [...sessions, { id: noteTab(5), channel: 10, beside: 1 },
+    { id: panelTab(6), channel: 10, beside: 2 }]).layouts[10].root), sig(linked.layouts[10].root));
+});

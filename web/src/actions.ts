@@ -80,6 +80,8 @@ import {
   accountProfilesSupported,
   questionsShown,
   prsShown,
+  arriveFromLink,
+  linkOrigin,
 } from "./state.ts";
 import { drawerHeight, folderChannel, rememberPlace, type TerminalDrawerState } from "./layout/channels.ts";
 import type { ScheduleOverlay } from "./state.ts";
@@ -281,7 +283,10 @@ async function pullHere(sid: SessionId): Promise<boolean> {
   const s = sessions.value.get(sid);
   const here = windowId.value;
   if (!s || here === null) return hereIds.value.has(sid);
-  const group = channelLayout.value?.layouts[s.channel_id]?.focus;
+  const l = channelLayout.value?.layouts[s.channel_id];
+  // From a link: into the group the link was clicked in, when that is in the tab's channel.
+  const origin = linkOrigin(sid);
+  const group = (l && origin !== undefined ? paneOfSession(l.root, origin)?.id : undefined) ?? l?.focus;
   holdNewSessions();
   try {
     await setSessionWindow(s, here, windowOfSession(s));
@@ -374,7 +379,8 @@ export async function gotoPanel(id: number, raise = true) {
 
 /** Show note `id`: selected here, or opened here (from closed, or from another window; with
  * "Jump focuses the other window", that window is raised instead when it can be). `beside`: open
- * it beside that session's tab, as an agent's `note_open` does (a link clicked in its terminal);
+ * it from that session (its channel; beside its tab, as an agent's `note_open` does, unless a link
+ * click names the group: `showLink`);
  * `raise` as for `gotoSession`. */
 export async function gotoNote(id: number, group?: string, beside?: SessionId, raise = true) {
   const n = notes.value.get(id);
@@ -401,10 +407,16 @@ export async function gotoNote(id: number, group?: string, beside?: SessionId, r
   revealSession(tab);
 }
 
-/** Show what Muster link `link` names (links.ts), or say in a short message that it is gone. From
- * a terminal, `beside` is its session: a closed note opens beside it. A thing in another window
- * comes to this one (raising that window, as Jump may, would show whatever is selected there). */
-export function showLink(link: MusterLink, beside?: SessionId): boolean {
+/** Show what Muster link `link` names (links.ts), or say in a short message that it is gone.
+ * `origin` is the tab the link was clicked in (a terminal, a note, Questions): a closed note, or
+ * a thing from another window, opens as a tab of that tab's group, never in a new split. From a
+ * terminal, a closed note also joins that terminal's channel. A thing in another window comes to
+ * this one (raising that window, as Jump may, would show whatever is selected there); one already
+ * here is selected where it is. */
+export function showLink(link: MusterLink, origin?: number): boolean {
+  const beside = origin !== undefined && sessions.value.has(origin) ? origin : undefined;
+  const bring = (tab: number, go: () => Promise<void>) =>
+    void (origin === undefined || hereIds.value.has(tab) ? go() : arriveFromLink(tab, origin, go));
   return followLink(link, {
     hasNote: (id) => notes.value.has(id),
     hasPanel: (id) => panels.value.get(id)?.closed === false,
@@ -413,9 +425,9 @@ export function showLink(link: MusterLink, beside?: SessionId): boolean {
       const a = agents.value.find((x) => x.name.toLowerCase() === name.toLowerCase());
       return a ? { name: a.name, session: a.session_id } : null;
     },
-    gotoNote: (id) => void gotoNote(id, undefined, beside, false),
-    gotoPanel: (id) => void gotoPanel(id, false),
-    gotoSession: (id) => void gotoSession(id, false),
+    gotoNote: (id) => bring(noteTab(id), () => gotoNote(id, undefined, beside, false)),
+    gotoPanel: (id) => bring(panelTab(id), () => gotoPanel(id, false)),
+    gotoSession: (id) => bring(id, () => gotoSession(id, false)),
     notify: (text) => toast("info", text, 5000),
   });
 }

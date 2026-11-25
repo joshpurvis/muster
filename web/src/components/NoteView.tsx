@@ -10,6 +10,7 @@ import { ago } from "../agents.ts";
 import { connStatus } from "../rpc.ts";
 import { schedules } from "../state.ts";
 import { setNoteTriggers, showLink } from "../actions.ts";
+import { noteTab } from "../layout/tree.ts";
 import { linkAt, parseMusterLink, type TextLink } from "../links.ts";
 import { type LinkHit, NoteLinks } from "../note_links.ts";
 import { IconZap } from "../icons.tsx";
@@ -99,13 +100,13 @@ const MOD_ENTER = isMac ? "⌘Enter" : "Ctrl+Enter";
 
 /** Open a link from a note: a web address in the browser (from the native window, the system
  * browser), a Muster address in Muster, as a click on it in a terminal does. */
-function openLink(l: TextLink) {
+function openLink(l: TextLink, from: number) {
   if (l.kind === "web") {
     globalThis.open(l.uri, "_blank", "noopener,noreferrer");
     return;
   }
   const m = parseMusterLink(l.uri);
-  if (m) showLink(m);
+  if (m) showLink(m, noteTab(from));
 }
 
 /** What the status line says a link under the pointer opens: a note by its title. */
@@ -267,7 +268,7 @@ export function NoteView({ id, hidden = false }: { id: number; hidden?: boolean 
       pressed = null;
       if (!p || e.button !== 0 || e.target !== el || moved(p, e)) return;
       const hit = map.at(e.clientX, e.clientY);
-      if (hit && hit.link.start === p.link.start && hit.link.uri === p.link.uri) openLink(p.link);
+      if (hit && hit.link.start === p.link.start && hit.link.uri === p.link.uri) openLink(p.link, id);
     };
     const resized = new ResizeObserver(soon);
     resized.observe(el);
@@ -361,7 +362,7 @@ export function NoteView({ id, hidden = false }: { id: number; hidden?: boolean 
             if (l) {
               e.preventDefault();
               e.stopPropagation();
-              openLink(l);
+              openLink(l, id);
             }
           }
           // Undo; redo on Ctrl+Shift+Z or Ctrl+Y (⌘Z, ⇧⌘Z and ⌘Y on a Mac). Kept from the

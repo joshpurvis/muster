@@ -18,6 +18,7 @@ import { agents, agentsLoaded, dismissToastKey, sessions, toast } from "../state
 import { isAsleep } from "../agents.ts";
 import { wakeCold } from "../cache.ts";
 import * as A from "../actions.ts";
+import { QUESTIONS_TAB } from "../layout/tree.ts";
 import { cx } from "../util.ts";
 import { markdownLinks, parseMusterLink, type TextPart, webAddress } from "../links.ts";
 
@@ -219,11 +220,11 @@ function Lightbox({ src, caption, onClose }: { src: string; caption: string; onC
 
 type LinkPart = Exclude<TextPart, string>;
 
-/** Follow a link from a card: a Muster link shows what it names in this window, a web link opens
- * in the browser. */
+/** Follow a link from a card: a Muster link shows what it names in this window (a tab it brings
+ * here joins the Questions tab's group), a web link opens in the browser. */
 export function openLink(url: string) {
   const link = parseMusterLink(url);
-  if (link) A.showLink(link);
+  if (link) A.showLink(link, QUESTIONS_TAB);
   else globalThis.open(url, "_blank", "noopener,noreferrer");
 }
 

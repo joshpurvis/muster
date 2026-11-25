@@ -1554,6 +1554,21 @@ async function agentMethod(method: string, p: any): Promise<unknown> {
         p.reason ?? "",
         p.age_ms ?? 40 * 60_000,
       );
+    // Dev only: an agent's queued messages are held (src/held.rs), or no longer (`clear`): the
+    // sidebar's Needs you box lists it.
+    case "mock.hold": {
+      const s = sessions.get(agentNamed(p.agent).session_id ?? -1);
+      if (!s) throw new Error(`${p.agent} is not running`);
+      (s as any).queue_held = p.clear ? null : {
+        since: Date.now() - (p.age_ms ?? 42 * 60_000),
+        reason: p.reason ?? "unsent text is in the input box: send it or clear it",
+        senders: p.senders ?? ["orchestrator", "worker"],
+        prompts: p.prompts ?? 3,
+      };
+      s.queued = p.clear ? 0 : p.prompts ?? 3;
+      broadcast("session_upserted", s);
+      return {};
+    }
     // Dev only: a message arriving from an agent (e2e checks the log updates live).
     case "mock.agent_message": {
       const a = agentNamed(p.to);

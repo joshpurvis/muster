@@ -1,7 +1,7 @@
 // The sidebar's one list (docs/UI.md "Channels sidebar"): each channel in its saved order, with
 // the named agent that owns it, agents whose channel isn't in this window after them, the
 // "Needs you" box, and what each agent's row flags. Pure functions, tested in sidebar_test.ts.
-import type { Agent, Channel, ChannelId, Schedule } from "./types.ts";
+import type { Agent, Channel, ChannelId, QueueHeld, Schedule, SessionInfo } from "./types.ts";
 import { isProposal, outcomeTone, waitingProposals } from "./schedules.ts";
 
 /** One row: a channel (with the agent that owns it, if any), or an agent with no channel here. */
@@ -57,6 +57,40 @@ export function needsYouItems(schedules: Schedule[], hidden: HiddenRuns): NeedsI
     .sort((a, b) => (b.last_run!.started_at - a.last_run!.started_at) || a.id - b.id)
     .map((s): NeedsItem => ({ kind: "run", schedule: s }));
   return [...props, ...runs];
+}
+
+/** A session whose queued messages are held, for Needs you: `who` is its agent's name, else the
+ * session's own. */
+export interface HeldQueue {
+  session: SessionInfo;
+  who: string;
+  held: QueueHeld;
+}
+
+/** The sessions whose queued messages are held (`queue_held`), the longest wait first. They
+ * lead the "Needs you" box: messages that sit untyped until you look. */
+export function heldQueues(sessions: Iterable<SessionInfo>, agents: Agent[]): HeldQueue[] {
+  const out: HeldQueue[] = [];
+  for (const s of sessions) {
+    if (!s.queue_held) continue;
+    out.push({ session: s, who: agents.find((a) => a.session_id === s.id)?.name ?? s.name, held: s.queue_held });
+  }
+  return out.sort((a, b) => a.held.since - b.held.since || a.session.id - b.session.id);
+}
+
+/** "42 min", "1 h 5 min", "2 h": how long a queue has been held. */
+export function heldFor(ms: number): string {
+  const min = Math.max(0, Math.floor(ms / 60_000));
+  const h = Math.floor(min / 60), m = min % 60;
+  return h === 0 ? `${m} min` : m === 0 ? `${h} h` : `${h} h ${m} min`;
+}
+
+/** A held queue in words: "3 messages held 42 min · from lead, manager" and why, as a sentence. */
+export function heldText(held: QueueHeld, now: number): { line: string; why: string } {
+  const what = held.prompts === 1 ? "1 message" : `${held.prompts} messages`;
+  const from = held.senders.length ? ` · from ${held.senders.join(", ")}` : "";
+  const why = held.reason ? held.reason[0].toUpperCase() + held.reason.slice(1) : "";
+  return { line: `${what} held ${heldFor(now - held.since)}${from}`, why };
 }
 
 /** An agent row's chip: amber while proposals wait, red while a run failed (both count), else

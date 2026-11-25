@@ -268,6 +268,8 @@ pub struct Queues {
     /// In memory only: since when each idle session's prompts have waited untyped, and whether
     /// the human was told (`watch_stalls`).
     stalls: Mutex<HashMap<SessionId, (tokio::time::Instant, Option<String>)>>,
+    /// In memory only: how long each session's oldest prompt has waited (`watch_held`).
+    held: Mutex<HashMap<SessionId, crate::held::Track>>,
     /// In memory only: prompts from other agents or schedules a fresh start did not keep
     /// (`drop_queue`), to be returned to their senders as refused (`return_unsent`).
     returns: Mutex<Vec<Item>>,
@@ -297,7 +299,7 @@ impl Queues {
             }
         }
         store.save_runtime("prompt-queues", &queues)?;
-        Ok(Self { inner: Mutex::new(queues), store: store.clone(), retry_at: Mutex::new(HashMap::new()), view_noticed: Mutex::default(), stalls: Mutex::default(), returns: Mutex::default(), opening: Mutex::default() })
+        Ok(Self { inner: Mutex::new(queues), store: store.clone(), retry_at: Mutex::new(HashMap::new()), view_noticed: Mutex::default(), stalls: Mutex::default(), held: Mutex::default(), returns: Mutex::default(), opening: Mutex::default() })
     }
 
     fn edit<T>(&self, id: SessionId, change: impl FnOnce(&mut SessQ) -> T) -> anyhow::Result<T> {
@@ -626,6 +628,8 @@ pub struct Wait {
     pub needs_human: bool,
     /// The human was already told of this gate (the draft and subagent-view notices).
     pub told: bool,
+    /// Only the agent's own turn is in the way (it is working): the prompts are typed when it ends.
+    pub busy: bool,
 }
 
 /// What `wait_reason` reads from the queue, the session and its screen.
@@ -651,8 +655,8 @@ struct WaitFacts {
 }
 
 fn wait_from(id: SessionId, f: &WaitFacts) -> Option<Wait> {
-    let human = |text: String| Some(Wait { text, needs_human: true, told: false });
-    let by_itself = |text: &str| Some(Wait { text: text.into(), needs_human: false, told: false });
+    let human = |text: String| Some(Wait { text, needs_human: true, told: false, busy: false });
+    let by_itself = |text: &str| Some(Wait { text: text.into(), needs_human: false, told: false, busy: false });
     if !f.pending { return None }
     if f.blocked {
         return human(format!(
@@ -669,7 +673,7 @@ fn wait_from(id: SessionId, f: &WaitFacts) -> Option<Wait> {
     // A subagent's view holds the queue whatever the agent does (`kick` checks it first).
     if let Some(Unsafe::OtherView(name)) = &f.screen {
         return Some(Wait { text: format!("the terminal shows subagent {name}: switch back to the main conversation"),
-            needs_human: true, told: f.view_told });
+            needs_human: true, told: f.view_told, busy: false });
     }
     match f.state {
         Some(AgentState::NeedsApproval) => return human("a permission prompt is open in the terminal".into()),
@@ -677,7 +681,7 @@ fn wait_from(id: SessionId, f: &WaitFacts) -> Option<Wait> {
         Some(AgentState::Error) => return human("the agent shows an error: check its terminal".into()),
         Some(AgentState::Stuck) => return human("the agent looks stuck: check its terminal".into()),
         Some(state) if !f.ready => return Some(Wait {
-            text: format!("it is typed once the agent is idle (now {})", state.as_str()), needs_human: false, told: false }),
+            text: format!("it is typed once the agent is idle (now {})", state.as_str()), needs_human: false, told: false, busy: state == AgentState::Working }),
         _ => {}
     }
     match &f.screen {
@@ -686,7 +690,7 @@ fn wait_from(id: SessionId, f: &WaitFacts) -> Option<Wait> {
         _ => {}
     }
     if f.draft {
-        return Some(Wait { text: "unsent text is in the input box: send it or clear it".into(), needs_human: true, told: f.draft_told });
+        return Some(Wait { text: "unsent text is in the input box: send it or clear it".into(), needs_human: true, told: f.draft_told, busy: false });
     }
     None
 }
@@ -846,6 +850,71 @@ fn watch_stalls(hub: &Arc<Hub>) {
                 kick(hub.clone(), id);
             }
         }
+    }
+}
+
+/// How often `watch_held` looks (in ticks of a second): a hold is minutes long.
+const HELD_CHECK_EVERY: u32 = 10;
+
+/// What identifies a prompt as the oldest in its queue, across requeues (not its attempt count).
+fn head_key(item: &Item) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    match &item.panel {
+        // A panel batch's text may grow while it waits: its id stays.
+        Some(batch) => (1u8, batch.id).hash(&mut h),
+        None => (0u8, &item.text).hash(&mut h),
+    }
+    if let crate::agents::Source::Chain(p) = &item.source { p.msg_id.hash(&mut h); }
+    h.finish()
+}
+
+/// Called every `HELD_CHECK_EVERY` seconds: a session whose oldest prompt has waited 15 minutes
+/// for anything but the agent's own turn, or an hour behind a turn, is marked held
+/// (`SessionInfo::queue_held`, the sidebar's Needs you box) and the human told once, with a
+/// notice and a desktop notification (src/held.rs). The mark goes when the queue moves.
+fn watch_held(hub: &Arc<Hub>, now: i64) {
+    let waiting: Vec<(SessionId, u64, Vec<String>, u32)> = hub.injection.inner.lock().iter()
+        .filter_map(|(id, q)| {
+            // The prompt being typed (or paused for review) is still the oldest until it is done.
+            // Muster's own startup step is not a message: it is neither counted nor the oldest.
+            let all = || q.active.as_ref().map(|a| &a.item).into_iter().chain(q.items.iter()).filter(|i| !i.new_conversation);
+            let head = all().next()?;
+            let senders = crate::held::senders(all().map(|i| match i.source {
+                crate::agents::Source::Human => (i.text.as_str(), None, true),
+                crate::agents::Source::Chain(p) => (i.text.as_str(), p.msg_id, false),
+            }));
+            Some((*id, head_key(head), senders, all().count() as u32))
+        }).collect();
+    let gone: Vec<SessionId> = {
+        let mut tracks = hub.injection.held.lock();
+        let gone = tracks.keys().filter(|id| !waiting.iter().any(|(w, ..)| w == *id)).copied().collect();
+        tracks.retain(|id, _| waiting.iter().any(|(w, ..)| w == id));
+        gone
+    };
+    for id in gone { hub.set_queue_held(id, None); }
+    for (id, head, senders, prompts) in waiting {
+        let wait = wait_reason(hub, id);
+        let seen = crate::held::Seen {
+            head,
+            busy: wait.as_ref().is_some_and(|w| w.busy),
+            reason: wait.map(|w| w.text).unwrap_or_else(|| "nothing is in the way, yet they were not typed: check its terminal".into()),
+            senders,
+            prompts,
+        };
+        let mut track = hub.injection.held.lock().remove(&id);
+        let (held, tell) = crate::held::step(&mut track, &seen, now);
+        if let Some(track) = track { hub.injection.held.lock().insert(id, track); }
+        if let Some(held) = held.as_ref().filter(|_| tell) {
+            let who = hub.agents().by_session(id).map(|a| a.name)
+                .or_else(|| hub.session(id).map(|s| format!("{} (session {id})", s.name)))
+                .unwrap_or_else(|| format!("session {id}"));
+            let (summary, body) = crate::held::notice(&who, held, now);
+            tracing::warn!(session = id, waiting = held.prompts, why = held.reason.as_str(), "queued prompts are held");
+            hub.notice("warn", format!("{summary}: {body}"));
+            crate::notify::alert(&summary, &body);
+        }
+        hub.set_queue_held(id, held);
     }
 }
 
@@ -2044,6 +2113,7 @@ pub fn spawn_tasks(hub: Arc<Hub>) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut ticks = 0u32;
         loop {
             tokio::select! {
                 ev = rx.recv() => match ev {
@@ -2069,6 +2139,8 @@ pub fn spawn_tasks(hub: Arc<Hub>) {
                         .collect();
                     // Before this tick's kicks: a worker's claim would hide the gate it checks.
                     watch_stalls(&hub);
+                    ticks = ticks.wrapping_add(1);
+                    if ticks % HELD_CHECK_EVERY == 0 { watch_held(&hub, crate::model::now_ms()); }
                     if !hub.injection.returns.lock().is_empty() { return_unsent(&hub); }
                     for id in ids {
                         kick(hub.clone(), id);
@@ -2188,6 +2260,77 @@ mod tests {
         assert!(!untouched_since_idle(AgentState::Idle, idle_since, typed_at(&hub)), "a key after the turn is a draft");
     }
 
+    /// 24 Nov: three jobs for one agent sat 40+ minutes and Muster said so only in
+    /// `muster queue`. After 15 minutes the session is marked held (the Needs you box reads
+    /// it) with one notice naming the reason and the senders, never the messages' text; it
+    /// clears when the queue moves.
+    #[test]
+    fn prompts_that_wait_15_minutes_are_marked_held_once_and_cleared_when_the_queue_moves() {
+        let hub = hub();
+        let mut rx = hub.subscribe();
+        let notices = |rx: &mut tokio::sync::broadcast::Receiver<ServerEvent>| {
+            let mut out = vec![];
+            while let Ok(ev) = rx.try_recv() { if let ServerEvent::Notice { text, .. } = ev { out.push(text); } }
+            out
+        };
+        let from = |id: i64, who: &str, body: &str| Item {
+            source: crate::agents::Source::Chain(crate::agents::Prov { origin: crate::agents::Origin::Human, hop: 1, msg_id: Some(id) }),
+            ..plain(5, &format!("{}\n  {body}", crate::agents::envelope(id, who, crate::agents::Origin::Human, 1)))
+        };
+        hub.injection.edit(1, |q| {
+            q.generation = Some(5);
+            q.items.extend([from(7, "lead", "SECRET job one"), from(8, "manager", "SECRET job two"), from(9, "lead", "SECRET job three")]);
+        }).unwrap();
+        const MIN: i64 = 60_000;
+        watch_held(&hub, 0);
+        watch_held(&hub, 14 * MIN);
+        assert_eq!(hub.session(1).unwrap().queue_held, None);
+        assert!(notices(&mut rx).is_empty());
+        watch_held(&hub, 15 * MIN);
+        let held = hub.session(1).unwrap().queue_held.expect("held after 15 minutes");
+        // The fixture has no terminal: its prompts wait because the session is not running.
+        assert_eq!((held.since, held.reason.as_str(), held.prompts), (0, "the session is not running", 3));
+        assert_eq!(held.senders, ["lead", "manager"]);
+        let told = notices(&mut rx);
+        assert_eq!(told, ["s0 (session 1): 3 messages have waited 15 min: The session is not running. From lead, manager."]);
+        // Later looks: still held, no second notice.
+        watch_held(&hub, 16 * MIN);
+        watch_held(&hub, 45 * MIN);
+        assert!(hub.session(1).unwrap().queue_held.is_some());
+        assert!(notices(&mut rx).is_empty());
+        assert!(!serde_json::to_string(&hub.session(1).unwrap()).unwrap().contains("SECRET"));
+        // The oldest prompt is typed: the queue moved, so the mark goes; the rest wait anew.
+        hub.injection.edit(1, |q| { q.items.pop_front(); }).unwrap();
+        watch_held(&hub, 46 * MIN);
+        assert_eq!(hub.session(1).unwrap().queue_held, None);
+        watch_held(&hub, 61 * MIN);
+        assert_eq!(hub.session(1).unwrap().queue_held.map(|h| (h.since, h.prompts)), Some((46 * MIN, 2)));
+        assert_eq!(notices(&mut rx).len(), 1);
+        // The queue empties: nothing is held.
+        hub.injection.edit(1, |q| q.items.clear()).unwrap();
+        watch_held(&hub, 62 * MIN);
+        assert_eq!(hub.session(1).unwrap().queue_held, None);
+        assert!(hub.injection.held.lock().is_empty());
+        // Muster's own startup step alone is not a held message, and a prompt being typed is
+        // still tracked while it is out of the list.
+        hub.injection.edit(1, |q| q.items.push_back(Item { new_conversation: true, ..plain(5, "/mcp") })).unwrap();
+        watch_held(&hub, 63 * MIN);
+        watch_held(&hub, 90 * MIN);
+        assert_eq!(hub.session(1).unwrap().queue_held, None);
+        assert!(notices(&mut rx).is_empty());
+        hub.injection.edit(1, |q| { q.items.clear(); q.active = Some(Active { item: plain(5, "one"), stage: Stage::Selected }); }).unwrap();
+        watch_held(&hub, 91 * MIN);
+        assert_eq!(hub.injection.held.lock().len(), 1);
+    }
+
+    /// The oldest prompt keeps its identity while it is typed, requeued and retried.
+    #[test]
+    fn a_retried_prompt_is_still_the_same_oldest_prompt() {
+        let a = plain(5, "one");
+        assert_eq!(head_key(&a), head_key(&Item { attempts: 2, draft_noticed: true, clear_first: true, ..a.clone() }));
+        assert_ne!(head_key(&a), head_key(&plain(5, "two")));
+    }
+
     /// Each reason a queue waits, in the order they are checked, and whether only the human can
     /// end it.
     #[test]
@@ -2214,6 +2357,10 @@ mod tests {
         human(WaitFacts { state: Some(AgentState::NeedsApproval), ready: false, ..ready.clone() }, "permission prompt");
         human(WaitFacts { state: Some(AgentState::AskingQuestion), ready: false, ..ready.clone() }, "question");
         by_itself(WaitFacts { state: Some(AgentState::Working), ready: false, ..ready.clone() }, "once the agent is idle (now working)");
+        // Only that one is the agent's own turn (a held queue counts it by the hour, src/held.rs).
+        assert!(wait_from(41, &WaitFacts { state: Some(AgentState::Working), ready: false, ..ready.clone() }).unwrap().busy);
+        assert!(!wait_from(41, &WaitFacts { state: Some(AgentState::Starting), ready: false, ..ready.clone() }).unwrap().busy);
+        assert!(!wait_from(41, &WaitFacts { draft: true, ..ready.clone() }).unwrap().busy);
         human(WaitFacts { screen: Some(Unsafe::Dialog), ..ready.clone() }, "dialog");
         human(WaitFacts { screen: Some(Unsafe::OtherView("sleeper".into())), ..ready.clone() }, "subagent sleeper");
         // A working subagent on screen: still the human's to switch back, not a wait for idle.

@@ -356,6 +356,7 @@ mod tests {
             queued: 0, quiet_waiting: 0,
             subagents: 0,
             background: 0,
+            queue_held: None,
             size_owner: None,
             input_interrupted: false,
             live_cwd: None,

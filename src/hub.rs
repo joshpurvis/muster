@@ -2004,6 +2004,16 @@ impl Hub {
         }
     }
 
+    /// Mark the session's queued prompts as held, or not (src/held.rs). True when it changed.
+    pub fn set_queue_held(&self, id: SessionId, held: Option<crate::held::QueueHeld>) -> bool {
+        let mut g = self.inner.lock();
+        let Some(e) = g.sessions.get_mut(&id) else { return false };
+        if e.info.queue_held == held { return false }
+        e.info.queue_held = held;
+        self.publish_session(&e.info);
+        true
+    }
+
     /// Tests: put a session on run `generation` (a new run, without a terminal).
     #[cfg(test)]
     pub(crate) fn set_generation_for_test(&self, id: SessionId, generation: u64) {
@@ -3226,6 +3236,7 @@ impl Hub {
                 queued: 0, quiet_waiting: 0,
                 subagents: 0,
                 background: 0,
+                queue_held: None,
                 size_owner: None,
                 input_interrupted: false,
                 live_cwd: None,

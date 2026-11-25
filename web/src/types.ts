@@ -165,6 +165,17 @@ export function approvalParams(s: Pick<SessionInfo, "id" | "state_seq" | "state_
   return { id: s.id, decision, state_seq: s.state_seq, state_since: s.state_since };
 }
 
+/** A session's queued prompts have waited too long to be typed (src/held.rs). */
+export interface QueueHeld {
+  /** Unix ms since when the oldest prompt has waited at the head of the queue. */
+  since: number;
+  /** Why they wait, in Muster's words (lower case, no full stop). */
+  reason: string;
+  /** Who sent them, each once ("you" for your own). Never their text. */
+  senders: string[];
+  prompts: number;
+}
+
 export interface SessionInfo {
   account_profile_id?: number | null;
   id: SessionId;
@@ -191,6 +202,9 @@ export interface SessionInfo {
   /** Changes with every state/detail change and answered prompt (stale-approval guard). */
   state_seq?: number;
   queued: number;
+  /** Set while its queued prompts are held: 15 minutes behind anything but the agent's own
+   * turn, or an hour behind a turn (the sidebar's Needs you box). Missing from older daemons. */
+  queue_held?: QueueHeld | null;
   /** Quiet messages (`tell_agent` with wake=false, src/quiet.rs) waiting for its next turn. Missing
    * from older daemons. */
   quiet_waiting?: number;

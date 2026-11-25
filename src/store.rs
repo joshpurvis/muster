@@ -3090,6 +3090,7 @@ impl Store {
                     queued: r.get::<_, i64>(14)?.max(0) as u32, quiet_waiting: 0,
                     subagents: 0,
                     background: 0,
+                    queue_held: None,
                     size_owner: None,
                     input_interrupted: false,
                     live_cwd: None,

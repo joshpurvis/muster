@@ -13,6 +13,7 @@ mod detect;
 mod devices;
 mod executables;
 mod gui;
+mod held;
 mod hookcmd;
 mod hook_inbox;
 mod hub;

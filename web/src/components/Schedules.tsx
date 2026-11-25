@@ -8,6 +8,8 @@ import { rpc } from "../rpc.ts";
 import {
   agentMessages,
   agents,
+  agentsSupported,
+  sessions,
   knowSchedule,
   scheduleHistoryOpen,
   loadScheduleRuns,
@@ -19,7 +21,7 @@ import {
   setPref,
   toast,
 } from "../state.ts";
-import { hideRun, needsYouItems } from "../sidebar.ts";
+import { type HeldQueue, heldQueues, heldText, hideRun, needsYouItems } from "../sidebar.ts";
 import * as A from "../actions.ts";
 import { notes } from "../notes.ts";
 import { UNATTENDED_WARNING } from "../agents.ts";
@@ -83,7 +85,7 @@ import type { Schedule, SchedulePreview, ScheduleRun, ScheduleSettings, WhenInpu
 import { KIND_LABEL } from "../types.ts";
 import { Kbd, Spinner } from "./common.tsx";
 import { openMenu, type MenuItem } from "./Menu.tsx";
-import { IconAgents, IconChevron, IconChevronDown, IconClock, IconMore, IconPause, IconShieldAlert, IconSpark, IconZap } from "../icons.tsx";
+import { IconAgents, IconChevron, IconChevronDown, IconClock, IconMail, IconMore, IconPause, IconShieldAlert, IconSpark, IconZap } from "../icons.tsx";
 import { MoreOptions, PillSelect } from "./DialogKit.tsx";
 import { cx } from "../util.ts";
 import { idleText } from "../cache.ts";
@@ -123,9 +125,10 @@ export function SchedulesPausedNotice() {
   );
 }
 
-/** "Needs you", at the top of the sidebar while anything waits for the human: schedules waiting
- * for approval (Approve / Edit… / Dismiss), then schedules whose last run failed (its history on
- * click, the schedule's menu, Hide). Gone when empty. `openAgent` opens the agent's card. */
+/** "Needs you", at the top of the sidebar while anything waits for the human: sessions whose
+ * queued messages are held (its name shows its tab), then schedules waiting for approval
+ * (Approve / Edit… / Dismiss), then schedules whose last run failed (its history on click, the
+ * schedule's menu, Hide). Gone when empty. `openAgent` opens the agent's card. */
 /** Which Needs you item had keyboard focus, so when it goes (approved, dismissed or hidden, by
  * its button, its menu or from another window, however long the reply takes) focus moves to the
  * item now at its place, else the agent's row, else the Channels heading, never to the page. */
@@ -133,6 +136,8 @@ const nyFocus = { index: -1, agent: 0, schedule: 0 };
 
 export function NeedsYou({ now, openAgent }: { now: number; openAgent: (agent: number) => void }) {
   const items = schedulesSupported.value ? needsYouItems(schedules.value, prefs.value.hiddenRuns) : [];
+  const held = heldQueues(sessions.value.values(), agentsSupported.value ? agents.value : []);
+  const count = items.length + held.length;
   useLayoutEffect(() => {
     const at = document.activeElement;
     if (nyFocus.index < 0 || (at && at !== document.body && at.isConnected)) return;
@@ -145,7 +150,7 @@ export function NeedsYou({ now, openAgent }: { now: number; openAgent: (agent: n
     nyFocus.index = -1;
     to?.focus();
   });
-  if (!items.length) return null;
+  if (!count) return null;
   const track = (e: FocusEvent) => {
     const item = (e.target as HTMLElement).closest<HTMLElement>(".ny-item");
     const all = [...(e.currentTarget as HTMLElement).querySelectorAll(".ny-item")];
@@ -159,11 +164,12 @@ export function NeedsYou({ now, openAgent }: { now: number; openAgent: (agent: n
     if (to && !(e.currentTarget as HTMLElement).contains(to) && !to.closest(".menu-layer, .modal-backdrop")) nyFocus.index = -1;
   };
   return (
-    <section class="needs-you" aria-label={`Needs you: ${items.length}`} onFocusIn={track} onFocusOut={left}>
+    <section class="needs-you" aria-label={`Needs you: ${count}`} onFocusIn={track} onFocusOut={left}>
       <div class="ny-head" aria-hidden="true">
-        <IconSpark size={12} /><span>Needs you</span><span class="ap-count">{items.length}</span>
+        <IconSpark size={12} /><span>Needs you</span><span class="ap-count">{count}</span>
       </div>
       <div role="list">
+        {held.map((h) => <NeedsHeld key={`h${h.session.id}`} h={h} now={now} />)}
         {items.map((i) =>
           i.kind === "proposal"
             ? <NeedsProposal key={`p${i.schedule.id}`} s={i.schedule} now={now} openAgent={openAgent} />
@@ -171,6 +177,28 @@ export function NeedsYou({ now, openAgent }: { now: number; openAgent: (agent: n
         )}
       </div>
     </section>
+  );
+}
+
+/** A session whose queued messages are held, in Needs you: its agent's name (shows its tab), how
+ * many messages, how long and from whom, and why they wait. It goes by itself once the queue
+ * moves; there is nothing to dismiss. */
+function NeedsHeld({ h, now }: { h: HeldQueue; now: number }) {
+  const { line, why } = heldText(h.held, now);
+  return (
+    <div role="listitem" class="ny-item ny-held" data-session={h.session.id} aria-label={`${h.who}: ${line}. ${why}.`}>
+      <IconMail size={12} class="ny-icon" />
+      <div class="ny-text">
+        <button type="button" class="ny-name" data-tip={`Show ${h.who}'s tab`} aria-label={`Show ${h.who}'s tab: ${line}. ${why}.`}
+          onClick={() => void A.gotoSession(h.session.id)}>
+          {h.who}
+        </button>
+        <span class="ny-sub">
+          <span class="ny-when" data-tip={`Waiting since ${new Date(h.held.since).toLocaleString()}`}>{line}</span>
+        </span>
+        <span class="ny-sub ny-why">{why}</span>
+      </div>
+    </div>
   );
 }
 

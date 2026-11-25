@@ -76,6 +76,19 @@ try {
   await shot("sidebar-needs-you");
   ok("Needs you holds the proposal and the blocked run; the worker's row has the red chip");
 
+  // ---- a held queue leads Needs you, shows the agent's tab on click, and goes by itself
+  await R("mock.hold", { agent: "reviewer", prompts: 3, senders: ["orchestrator", "worker"] });
+  await a.wait(`document.querySelector('.needs-you .ny-item')?.matches('.ny-held')`, 3000);
+  const heldRow: string = await a.eval(`document.querySelector('.needs-you .ny-held').textContent`);
+  check(/^reviewer3 messages held 4[12] min · from orchestrator, workerUnsent text is in the input box/.test(heldRow), `the held row says who, how many, how long, from whom and why: ${heldRow}`);
+  check(await a.eval(`document.querySelector('.needs-you .ap-count').textContent`) === "3", "it counts in the box");
+  await a.click(".needs-you .ny-held .ny-name");
+  await a.wait(`${M}.focusedSession.value?.name === 'reviewer'`, 3000);
+  await shot("sidebar-held-queue");
+  await R("mock.hold", { agent: "reviewer", clear: true });
+  await a.wait(`!document.querySelector('.needs-you .ny-held') && document.querySelectorAll('.needs-you .ny-item').length === 2`, 3000);
+  ok("a held queue leads Needs you, its name shows the agent's tab, and it goes when the queue moves");
+
   // ---- the card by keyboard: → opens and focuses it, Tab walks its buttons and leaves it, Esc and ← close
   await a.eval(`document.querySelector(${js(sel("orchestrator"))}).focus()`);
   await a.key("Right");

@@ -3218,6 +3218,9 @@ legend {
 .needs-you .sch-approve { background: var(--accent-fill); }
 .needs-you .sch-approve:hover:not(:disabled) { background: var(--accent-fill-hover); }
 .ny-when { white-space: nowrap; }
+/* A held queue: the count line wraps (it names the senders); why it waits reads as text. */
+.ny-held .ny-when { white-space: normal; overflow-wrap: anywhere; }
+.ny-held .ny-why { color: var(--text-muted); overflow-wrap: anywhere; }
 .ny-run .ny-name { display: flex; align-items: center; }
 .ny-run .ny-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .ny-chev { flex: none; margin-right: 3px; color: var(--text-faint); transition: transform var(--t) var(--ease); }

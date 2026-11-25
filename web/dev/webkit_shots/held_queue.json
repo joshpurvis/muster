@@ -1,0 +1,33 @@
+[
+ {
+  "until": "globalThis.__muster?.windowId?.value != null && globalThis.__muster.agents.value.some((a) => a.name === 'orchestrator')",
+  "settle": 0.5
+ },
+ {
+  "js": "const m = globalThis.__muster; const w = m.windowId.value;\nawait m.rpc.call('agent.start', {name: 'reviewer', window_id: w});\nawait m.rpc.call('agent.start', {name: 'worker', window_id: w});\nconst first = m.windowChannels.value[0]; if (first) m.channelLayout.value = {...m.channelLayout.value, active: first.id};",
+  "timeout": 20
+ },
+ {
+  "until": "document.querySelector('.channel-row[data-agent=reviewer]') && document.querySelector('.channel-row[data-agent=worker]')",
+  "settle": 0.8,
+  "shot": "before",
+  "crop": ".sidebar",
+  "pad": 0
+ },
+ {
+  "js": "const m = globalThis.__muster;\nawait m.rpc.call('mock.hold', {agent: 'reviewer', prompts: 3, age_ms: 42 * 60000, senders: ['orchestrator', 'worker']});\nawait m.rpc.call('mock.hold', {agent: 'worker', prompts: 1, age_ms: 75 * 60000, senders: ['you'], reason: 'the agent has worked for over 60 minutes without typing them and may be stuck: check its terminal'});",
+  "until": "document.querySelectorAll('.needs-you .ny-held').length === 2",
+  "settle": 0.6,
+  "shot": "after",
+  "crop": ".sidebar",
+  "pad": 0
+ },
+ {
+  "shot": "needs-you-held",
+  "crop": ".needs-you",
+  "pad": 8
+ },
+ {
+  "js": "return [...document.querySelectorAll('.needs-you .ny-held')].map((e) => e.textContent);"
+ }
+]

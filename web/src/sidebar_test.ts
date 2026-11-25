@@ -1,5 +1,5 @@
-import { cardKey, failedRun, hideRun, needsYouItems, otherName, ownerOf, rowChip, sidebarRows } from "./sidebar.ts";
-import type { Agent, Channel, RunOutcome, Schedule, ScheduleRun } from "./types.ts";
+import { cardKey, failedRun, heldFor, heldQueues, heldText, hideRun, needsYouItems, otherName, ownerOf, rowChip, sidebarRows } from "./sidebar.ts";
+import type { Agent, Channel, QueueHeld, RunOutcome, Schedule, ScheduleRun, SessionInfo } from "./types.ts";
 
 function equal<T>(a: T, b: T) {
   const x = JSON.stringify(a), y = JSON.stringify(b);
@@ -95,4 +95,30 @@ Deno.test("keys: → opens a focused row's card; Esc closes it, ← too from one
   // In the prompt box ← scrolls the text instead.
   equal(cardKey("ArrowLeft", "card", false), null);
   equal(cardKey("ArrowRight", "card"), null);
+});
+
+Deno.test("Needs you lists the sessions whose queued messages are held, the longest wait first", () => {
+  const MIN = 60_000;
+  const held = (since: number, extra: Partial<QueueHeld> = {}): QueueHeld =>
+    ({ since, reason: "unsent text is in the input box: send it or clear it", senders: ["lead", "manager"], prompts: 3, ...extra });
+  const ses = (id: number, name: string, queue_held?: QueueHeld | null, state = "idle") =>
+    ({ id, name, state, queue_held } as unknown as SessionInfo);
+  const agents = [{ id: 1, name: "writer", session_id: 7 } as unknown as Agent];
+  const list = heldQueues([
+    ses(5, "claude", held(30 * MIN)),
+    ses(6, "codex"),
+    ses(7, "claude", held(10 * MIN)),
+    ses(8, "claude", null),
+    // A session that did not start again keeps its prompts for its next start: still listed.
+    ses(9, "codex", held(40 * MIN), "exited"),
+  ], agents);
+  // The agent's name where an agent owns the session, else the session's own.
+  equal(list.map((h) => [h.session.id, h.who]), [[7, "writer"], [5, "claude"], [9, "codex"]]);
+  equal(heldQueues([ses(6, "codex")], agents), []);
+  equal(heldText(held(10 * MIN), 52 * MIN), {
+    line: "3 messages held 42 min · from lead, manager",
+    why: "Unsent text is in the input box: send it or clear it",
+  });
+  equal(heldText(held(0, { prompts: 1, senders: [] }), 75 * MIN).line, "1 message held 1 h 15 min");
+  equal([heldFor(120 * MIN), heldFor(59_000), heldFor(-5)], ["2 h", "0 min", "0 min"]);
 });

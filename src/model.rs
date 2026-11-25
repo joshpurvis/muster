@@ -463,6 +463,10 @@ pub struct SessionInfo {
     /// runs: stopping the CLI would end it.
     #[serde(default)]
     pub background: u32,
+    /// Its queued prompts have waited too long to be typed (src/held.rs): since when, why and
+    /// from whom. Runtime only: None after a restart, until they have waited that long again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_held: Option<crate::held::QueueHeld>,
     pub created_at: i64,
     /// Client window this session is a tab in (None: adopted by the next `window.claim`).
     #[serde(default)]

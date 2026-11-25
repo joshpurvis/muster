@@ -18,6 +18,7 @@ import { agents, agentsLoaded, dismissToastKey, sessions, toast } from "../state
 import { isAsleep } from "../agents.ts";
 import { wakeCold } from "../cache.ts";
 import * as A from "../actions.ts";
+import { QUESTIONS_TAB } from "../layout/tree.ts";
 import { cx } from "../util.ts";
 import { markdownLinks, parseMusterLink, type TextPart, webAddress } from "../links.ts";
 
@@ -219,11 +220,11 @@ function Lightbox({ src, caption, onClose }: { src: string; caption: string; onC
 
 type LinkPart = Exclude<TextPart, string>;
 
-/** Follow a link from a card: a Muster link shows what it names in this window, a web link opens
- * in the browser. */
-export function openLink(url: string) {
+/** Follow a link from a card: a Muster link shows what it names in this window (a tab it brings
+ * here joins the group of tab `from`, the card's own tab), a web link opens in the browser. */
+export function openLink(url: string, from = QUESTIONS_TAB) {
   const link = parseMusterLink(url);
-  if (link) A.showLink(link);
+  if (link) A.showLink(link, from);
   else globalThis.open(url, "_blank", "noopener,noreferrer");
 }
 
@@ -232,18 +233,19 @@ export function openLink(url: string) {
  * A link is a button, never an `<a href>`: the desktop window's "Open Link" menu would otherwise
  * load the address itself. `inButton`: inside an option's button, where a link can't be a control
  * of its own: it looks like one, a click on it follows it instead of choosing the option, and the
- * keyboard reaches it among the card's links (`optionLinks`). */
-export function LinkedText({ text, inButton = false }: { text: string; inButton?: boolean }) {
+ * keyboard reaches it among the card's links (`optionLinks`). `from`: the tab the card is in
+ * (Questions, or PRs to merge), whose group a tab the link brings here joins. */
+export function LinkedText({ text, inButton = false, from = QUESTIONS_TAB }: { text: string; inButton?: boolean; from?: number }) {
   const parts = markdownLinks(text);
   if (!parts.some((p) => typeof p !== "string")) return <>{text}</>;
-  return <>{parts.map((p, i) => (typeof p === "string" ? p : <InlineLink key={i} part={p} inButton={inButton} />))}</>;
+  return <>{parts.map((p, i) => (typeof p === "string" ? p : <InlineLink key={i} part={p} inButton={inButton} from={from} />))}</>;
 }
 
-function InlineLink({ part, inButton }: { part: LinkPart; inButton: boolean }) {
+function InlineLink({ part, inButton, from = QUESTIONS_TAB }: { part: LinkPart; inButton: boolean; from?: number }) {
   const follow = (e: Event) => {
     e.preventDefault();
     e.stopPropagation();
-    openLink(part.url);
+    openLink(part.url, from);
   };
   return inButton
     ? <span class="qv-inline-link" data-tip={part.url} onClick={follow}>{part.label}</span>

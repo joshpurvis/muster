@@ -4,7 +4,7 @@
 import { addonTab, PRS_TAB } from "./tree.ts";
 import {
   allPanes, allSessions, emptyLayout, FIRST_PLACE, findPane, generalPlace, type LayoutState, parseLayout,
-  parseTabPlace, placeBeside, placeOf, putAt, QUESTIONS_TAB, reconcile, removeSession, sameGeneralPlace,
+  joinGroupOf, parseTabPlace, placeBeside, placeOf, putAt, QUESTIONS_TAB, reconcile, removeSession, sameGeneralPlace,
   type TabPlace,
 } from "./tree.ts";
 import { type Channel, DEFAULT_PERMISSIONS, type Permissions, type SessionKind, storedPermissions } from "../types.ts";
@@ -55,6 +55,9 @@ export interface TabHome {
   id: number;
   channel: number | null;
   beside?: number | null;
+  /** Shown from a Muster link clicked in tab `into`: it arrives in that tab's group (not beside it,
+   * as `beside` would put it), as long as it is new to the layout. */
+  into?: number | null;
   /** The window's Questions tab: it arrives in a channel at that channel's place
    * (`questionsIn`), else at the window's `questionsAt`, then stays wherever it is moved. */
   questions?: boolean;
@@ -144,9 +147,14 @@ export function savedChannel(s: WindowLayoutState, tab: number): number | null {
 function reconcileChannel(s: LayoutState, tabs: TabHome[], places: Map<number, TabPlace>): LayoutState {
   const ids = tabs.map((t) => t.id);
   const existing = allSessions(s.root).filter((id) => ids.includes(id));
-  // Existing panels/notes keep their places; new ones go beside their opener, when present.
-  let next = reconcile(s, [...new Set([...tabs.filter((t) => t.beside == null).map((t) => t.id), ...existing])]);
-  for (const t of tabs) if (t.beside != null) next = placeBeside(next, t.id, t.beside);
+  // Existing panels/notes keep their places; new ones go beside their opener, when present, and
+  // ones a link click shows go into the clicked tab's group.
+  const placed = (t: TabHome) => t.into != null || t.beside != null;
+  let next = reconcile(s, [...new Set([...tabs.filter((t) => !placed(t)).map((t) => t.id), ...existing])]);
+  for (const t of tabs) {
+    if (t.into != null) next = joinGroupOf(next, t.id, t.into);
+    else if (t.beside != null) next = placeBeside(next, t.id, t.beside);
+  }
   // Arriving (another channel was shown, it was hidden, or its group went): at its place.
   const arrivals = tabs.filter((t) => (t.questions || t.pinned) && !existing.includes(t.id));
   const index = (t: TabHome) => {

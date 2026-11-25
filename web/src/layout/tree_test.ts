@@ -23,6 +23,7 @@ import {
   isSessionTab,
   noteId,
   noteTab,
+  joinGroupOf,
   placeBeside,
   placePanel,
   parseLayout,
@@ -93,6 +94,23 @@ Deno.test("new panels join the opener's right group and move like terminal tabs"
   assertEquals(sig(placePanel(s, 10, 1).root), sig(s.root), "reload must not re-place an existing panel");
   s = reconcile(s, [1, 2]);
   assertEquals(sig(s.root), "row([1] [2])");
+});
+
+Deno.test("a tab shown from a link joins the clicked tab's group, never a new split", () => {
+  // One group: the note joins it (beside the terminal would split the window).
+  let s = joinGroupOf(emptyLayout([1]), noteTab(7), 1);
+  assertEquals(sig(s.root), `[1,${noteTab(7)}]`);
+  assertEquals(paneOfSession(s.root, 1)?.active, noteTab(7), "selected");
+  // Two groups, the link clicked in the left one: it stays left (beside would take the right one).
+  s = splitPane(emptyLayout([1]), "right", 2);
+  assertEquals(sig(joinGroupOf(s, panelTab(3), 1).root), "row([1,-4] [2])");
+  assertEquals(sig(joinGroupOf(s, noteTab(7), 2).root), `row([1] [2,${noteTab(7)}])`);
+  // Clicked in a note's tab: that note's group. An origin not in the layout: the focused group.
+  s = joinGroupOf(s, noteTab(8), 1);
+  assertEquals(sig(joinGroupOf(s, noteTab(9), noteTab(8)).root), `row([1,${noteTab(8)},${noteTab(9)}] [2])`);
+  assertEquals(sig(joinGroupOf(s, noteTab(9), 99).root), sig(addTab(s, noteTab(9)).root));
+  // Already here: it keeps its place.
+  assertEquals(sig(joinGroupOf(s, noteTab(8), 2).root), sig(s.root));
 });
 
 Deno.test("emptyLayout has one pane", () => {

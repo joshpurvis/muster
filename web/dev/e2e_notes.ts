@@ -134,8 +134,9 @@ export async function noteChecks(a: Browser, { shots, ok, check }: NoteCtx) {
   await a.type("\n- typed just before a reload");
   await a.wait(`document.querySelector('.note-status .note-state')?.textContent.startsWith('Not saved yet')`, 3000);
   check(!(await body(id)).includes("typed just before a reload"), "the save really failed");
-  await a.eval(`location.reload()`);
-  await a.wait(`!!document.querySelector('.app') && ${M}.notes.value.size > 0`, 10000);
+  // The mark goes with the old page, so the wait can't pass on it before the reload lands.
+  await a.eval(`globalThis.__beforeReload = true; location.reload()`);
+  await a.wait(`!globalThis.__beforeReload && !!document.querySelector('.app') && ${M}?.notes.value.size > 0`, 10000);
   await a.eval(`(() => { const r = ${M}.rpc; if (r.__guarded) return; const call = r.call.bind(r);
     r.call = (m, p) => m === "window.show" ? Promise.reject(new Error("e2e: window.show blocked")) : call(m, p);
     r.__guarded = true; })()`);

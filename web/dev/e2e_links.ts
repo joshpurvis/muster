@@ -1,7 +1,7 @@
 // Links checks against the MOCK daemon (docs/UI.md "Links"): a shell prints a note's link as a
 // hyperlink (OSC 8: the title only) and as Claude Code and Codex print Markdown links
-// (`title (muster://…)`), then turns mouse reporting on. A click opens the closed note beside the
-// terminal, a link to a deleted note says so, no click reaches the program, and the clicks make
+// (`title (muster://…)`), then turns mouse reporting on. A click opens the closed note as a tab of
+// the terminal's own group (never a new split, nor the group beside it), a link to a deleted note says so, no click reaches the program, and the clicks make
 // no call but the ones that show something. Then a note's own links (`noteLinkChecks`): web and
 // Muster addresses open on Ctrl+click, a plain click places the caret.
 //
@@ -64,23 +64,49 @@ export async function linkChecks(a: Browser, shots: string, ok: (m: string) => v
     await a.clickAt(x, y);
   };
 
-  // ---- a hyperlink (OSC 8): the title alone; a plain click opens the closed note beside it
+  /** How many groups the window shows, and whether tab `id` is in the terminal's group. */
+  const groups = (): Promise<number> => a.eval(`document.querySelectorAll('.pane').length`);
+  const inTerminalGroup = (id: number): Promise<boolean> => a.eval(`(() => {
+    const g = (id) => document.querySelector('[data-tab-sid="' + id + '"]')?.closest('.pane') ?? null;
+    return g(${id}) !== null && g(${id}) === g(${sid});
+  })()`);
+
+  // ---- a hyperlink (OSC 8): the title alone; a plain click opens the closed note in the
+  // terminal's own group, not in a new split beside it
+  const before = await groups();
+  check(before === 1, `one group to start with (${before})`);
   await clickLink("Your three pairs", "Pairs to review", "links-1-hover-hyperlink");
   await a.wait(`${M}.notes.value.get(${note.id})?.window_id != null && !!document.querySelector('${tab}.active')`, 5000);
-  check((await R("note.get", { id: note.id })).beside === sid, "opened beside the terminal that showed the link");
+  check((await R("note.get", { id: note.id })).beside === sid, "opened from the terminal that showed the link (its channel)");
+  check(await inTerminalGroup(noteTab(note.id)), "the note opened as a tab of the terminal's group");
+  check((await groups()) === 1, "no new split");
   await a.wait(`document.querySelector('textarea.note-text')?.value.includes('billing + receipts')`, 4000);
   await shot("links-2-note-opened");
-  ok("a click on a hyperlinked title (OSC 8) opened the closed note beside the terminal; mouse reporting was on");
+  ok("a click on a hyperlinked title (OSC 8) opened the closed note in the terminal's own group, no new split; mouse reporting was on");
 
-  // ---- the text form Claude Code and Codex print: the address in the text is a link too
+  // ---- the text form Claude Code and Codex print: the address in the text is a link too. With a
+  // second group to the right (a note an agent opened beside the terminal), the link's note still
+  // joins the terminal's group, not that one.
   await R("note.close", { id: note.id });
   await a.wait(`${M}.notes.value.get(${note.id})?.window_id == null && !document.querySelector('${tab}')`, 4000);
+  const side = await R("note.create", { title: "Side note", body: "opened by an agent\n" });
+  await R("note.open", { id: side.id, window_id: await a.eval(`${M}.windowId.value`), beside: sid });
+  await a.wait(`document.querySelectorAll('.pane').length === 2 && !!document.querySelector('[data-tab-sid="${noteTab(side.id)}"]')`, 4000);
+  check(!(await inTerminalGroup(noteTab(side.id))), "the agent's note sits in its own group, right of the terminal");
   await clickLink("Codex:", "muster://note/", "links-1b-hover-text-link");
   await a.wait(`${M}.notes.value.get(${note.id})?.window_id != null && !!document.querySelector('${tab}.active')`, 4000);
-  ok("a click on the address in `Pairs to review (muster://note/N)` opens the closed note again");
+  check(await inTerminalGroup(noteTab(note.id)), "the note joined the terminal's group, not the group beside it");
+  check((await groups()) === 2, "no third group");
+  await shot("links-2b-same-group");
+  await R("note.close", { id: side.id });
+  await a.wait(`document.querySelectorAll('.pane').length === 1`, 4000);
+  ok("a click on the address in `Pairs to review (muster://note/N)` opens the closed note again, in the terminal's group with another group beside it");
 
   // ---- a link to a note that is gone: a short message, nothing else. Pressed where the pointer
-  // already is, with no move first (a link printed under a pointer that stays put).
+  // already is, with no move first (a link printed under a pointer that stays put). The note is
+  // the selected tab of the terminal's group now: the terminal's tab first.
+  await a.click(`.tab[data-tab-sid="${sid}"]`);
+  await a.wait(`!!document.querySelector('.tab.active[data-tab-sid="${sid}"]')`, 3000);
   const [ox, oy] = await at("Old:", "muster://note/");
   await a.send("Input.dispatchMouseEvent", { type: "mousePressed", x: ox, y: oy, button: "left", clickCount: 1, buttons: 1 });
   await a.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: ox, y: oy, button: "left", clickCount: 1 });
@@ -125,7 +151,9 @@ export async function noteLinkChecks(a: Browser, shots: string, ok: (m: string) 
   ].join("\n");
   const note = await R("note.create", { title: "Release links", body });
   const here = await a.eval(`${M}.windowId.value`);
-  await R("note.open", { id: note.id, window_id: here });
+  // Opened as an agent's `note_open` does: in its own group beside the terminal.
+  const shell: number = await a.eval(`${M}.windowSessions.value.find((s) => s.kind === 'shell')?.id ?? null`);
+  await R("note.open", { id: note.id, window_id: here, beside: shell });
   const tab = `.note-tab[data-tab-sid="${noteTab(note.id)}"]`;
   await a.wait(`!!document.querySelector('${tab}')`, 4000);
   await a.click(tab);
@@ -233,6 +261,8 @@ export async function noteLinkChecks(a: Browser, shots: string, ok: (m: string) 
   await press(mx, my, CTRL);
   const ttab = `.note-tab[data-tab-sid="${noteTab(target.id)}"]`;
   await a.wait(`!!document.querySelector('${ttab}.active')`, 4000);
+  check(await a.eval(`document.querySelector('${ttab}').closest('.pane') === document.querySelector('${tab}').closest('.pane')`),
+    "the linked note opened in the group of the note that links it");
   check((await opened()).length === 2, "a Muster address doesn't go to the browser");
   ok("Ctrl+click on muster://note/N opens that note in Muster (status line named it by title)");
 

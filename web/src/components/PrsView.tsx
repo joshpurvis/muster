@@ -29,6 +29,7 @@ import { agents, sessions, toast } from "../state.ts";
 import * as A from "../actions.ts";
 import { cx } from "../util.ts";
 import { LinkedText } from "./QuestionsView.tsx";
+import { PRS_TAB } from "../layout/tree.ts";
 
 const NARROW_PX = 760;
 /** Below this height the dock stops sticking to the bottom (it would leave no room for the card). */
@@ -332,19 +333,19 @@ function Stage({ p, now, onZoom }: { p: Pr; now: number; onZoom: (index: number)
           <span>{nb(b.body)}</span>
         </div>
       )}
-      <p class="qv-ctx"><LinkedText text={p.summary} /></p>
-      <p class="qv-ex"><b>Who notices</b><LinkedText text={p.who_notices} /></p>
+      <p class="qv-ctx"><LinkedText from={PRS_TAB} text={p.summary} /></p>
+      <p class="qv-ex"><b>Who notices</b><LinkedText from={PRS_TAB} text={p.who_notices} /></p>
       <Pictures p={p} stale={s === "stale"} onZoom={onZoom} />
       <section class="pm-words" aria-label={`${p.poster.label}'s words`}>
         <div class="pm-h">{p.poster.label}'s words</div>
         <div class="qv-fate">
           <div>
             <span>Tests it ran</span>
-            <span><LinkedText text={p.tests} />
+            <span><LinkedText from={PRS_TAB} text={p.tests} />
               {noChecks && <span class="pm-only">The only test evidence: GitHub runs no checks here.</span>}</span>
           </div>
-          <div><span>How to undo</span><span><LinkedText text={p.undo} /></span></div>
-          <div><span>After the merge</span><span><LinkedText text={p.after_merge} /></span></div>
+          <div><span>How to undo</span><span><LinkedText from={PRS_TAB} text={p.undo} /></span></div>
+          <div><span>After the merge</span><span><LinkedText from={PRS_TAB} text={p.after_merge} /></span></div>
         </div>
       </section>
       <details class="qv-details">

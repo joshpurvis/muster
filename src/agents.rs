@@ -2197,11 +2197,12 @@ fn check_kind_switch(a: &Agent, to: SessionKind, by_owner: bool) -> anyhow::Resu
 }
 
 /// The permission mode an agent switching from `from` to `to` gets in the new CLI: the nearest
-/// that is no wider than the one it had, so a switch never lets it do more unasked. Plan stays
-/// plan; Claude's bypass and Antigravity's full access are the same (no prompts at all) and map to
-/// each other; Claude's default (asks before edits) has no Antigravity match and becomes
-/// accept-edits, as the stored-mode upgrade maps it (`model::StoredPermissions`); Antigravity's
-/// auto becomes Claude's accept-edits. The other kinds' fields are kept.
+/// match, no wider than the one it had with one exception. Plan stays plan; Claude's bypass and
+/// Antigravity's full access are the same (no prompts at all) and map to each other; Antigravity's
+/// auto becomes Claude's accept-edits. The exception: Claude's default (asks before edits) has no
+/// Antigravity match, and becomes accept-edits (edits without asking; commands still ask), as the
+/// stored-mode upgrade maps it (`model::StoredPermissions`), rather than plan, where it could
+/// change nothing. The other kinds' fields are kept.
 pub fn switch_permissions(p: Permissions, from: SessionKind, to: SessionKind) -> Permissions {
     use crate::model::{AntigravityMode as A, ClaudeMode as C};
     match (from, to) {
@@ -2305,11 +2306,21 @@ pub fn update_full(hub: &Hub, req: AgentUpdate, outside: bool) -> anyhow::Result
         check_kind_switch(&cur, to, req.by_owner)?;
         anyhow::ensure!(moving.is_none(), "switch {}'s kind and move it to another account in two edits", cur.name);
     }
+    // `--kind <the kind it is saved as> --now` after a switch that waits for its next start (its
+    // tab still runs the old kind): that switch, now. The human's alone, as the switch was.
+    let pending = match (req.kind, live_session(hub, &cur)) {
+        (Some(k), Some(live)) if req.now && moving.is_none() && k == cur.kind && live.kind != cur.kind => {
+            check_kind_switch(&Agent { kind: live.kind, ..cur.clone() }, k, req.by_owner)?;
+            Some(KindSwitch { name: cur.name.clone(), from: live.kind, to: k, now: true, kept_aside: Vec::new() })
+        }
+        _ => None,
+    };
     // `now` alone: the move waiting for its next start, now (Restart now, `--now` without
     // `--profile`).
-    let waiting = cur.handoff.clone().filter(|_| cur.kind == SessionKind::Claude && moving.is_none() && switching.is_none() && req.now);
+    let waiting = cur.handoff.clone().filter(|_| cur.kind == SessionKind::Claude && moving.is_none() && switching.is_none()
+        && pending.is_none() && req.now);
     anyhow::ensure!(
-        !req.now || moving.is_some() || waiting.is_some() || switching.is_some(),
+        !req.now || moving.is_some() || waiting.is_some() || switching.is_some() || pending.is_some(),
         "{} has no move waiting: `now` goes with a move to another account or a kind switch, or applies a move that waits \
          for its next start",
         cur.name
@@ -2428,21 +2439,33 @@ pub fn update_full(hub: &Hub, req: AgentUpdate, outside: bool) -> anyhow::Result
             r => r?,
         }
     }
+    // With a switch, the call's permissions apply after the tab's mapped modes (below), so they
+    // are never skipped as matching the tab's modes before the switch.
     let channel_patch = req.permissions.and_then(|patch| {
         let c = next.channel_id.and_then(|id| hub.channel(id))?;
-        (!c.archived && patch.onto(c.permissions) != c.permissions).then_some((c.id, patch))
+        (!c.archived && (next.kind != cur.kind || patch.onto(c.permissions) != c.permissions)).then_some((c.id, patch))
     });
     // `now` alone changes nothing in the record: written back, it could restore a move a start
     // cleared meanwhile.
     if channel_patch.is_none() && serde_json::to_value(&next)? == serde_json::to_value(&cur)? {
         let save_notes = req.save_notes.unwrap_or(false);
         let switch = waiting.map(|h| Switch { name: cur.name.clone(), from: h.from, to: cur.account_profile_id, at: h.at, now: true, save_notes });
-        return Ok((cur, switch, None));
+        return Ok((cur, switch, pending));
+    }
+    // Its own tab's modes follow a switch as the record's did (`switch_permissions`), before the
+    // new kind is saved: a start (or a daemon restart) between the two never finds the new kind
+    // on the old tab's modes for it. Only the new kind's field changes, so the old kind's run is
+    // untouched. The call's own permissions, if any, follow below.
+    if next.kind != cur.kind
+        && let Some(c) = next.channel_id.and_then(|id| hub.channel(id)).filter(|c| !c.archived)
+    {
+        let (from, to) = (cur.kind, next.kind);
+        hub.change_permissions(c.id, |current| switch_permissions(current, from, to))?;
     }
     let next = hub.agents().set_config(hub.store(), &next)?;
     let kind_switch = (next.kind != cur.kind).then(|| KindSwitch {
         name: next.name.clone(), from: cur.kind, to: next.kind, now: req.now, kept_aside,
-    });
+    }).or(pending);
     let save_notes = req.save_notes.unwrap_or(false);
     let switch = match (moving, waiting) {
         (Some(to), _) => Some(Switch {
@@ -2456,14 +2479,6 @@ pub fn update_full(hub: &Hub, req: AgentUpdate, outside: bool) -> anyhow::Result
         (None, Some(h)) => Some(Switch { name: next.name.clone(), from: h.from, to: cur.account_profile_id, at: h.at, now: true, save_notes }),
         (None, None) => None,
     };
-    // Its own tab's modes follow a switch as the record's did (`switch_permissions`), then the
-    // call's own permissions, if any.
-    if next.kind != cur.kind
-        && let Some(c) = next.channel_id.and_then(|id| hub.channel(id)).filter(|c| !c.archived)
-    {
-        let (from, to) = (cur.kind, next.kind);
-        hub.change_permissions(c.id, |current| switch_permissions(current, from, to))?;
-    }
     if let Some((id, patch)) = channel_patch {
         hub.change_permissions(id, |current| patch.onto(current))?;
     }
@@ -2554,6 +2569,17 @@ pub fn reach_profile(agent: &Agent, session_channel: Option<&Channel>, own: Opti
         });
     }
     p.unwrap_or((None, agent.permissions))
+}
+
+/// The kinds a message to `agent` may reach, for its permission checks: the kind it is saved as
+/// and, after a switch that waits for its next start (`AgentUpdate::kind`), the kind its running
+/// tab `session` still runs.
+pub fn reach_kinds(agent: &Agent, session: Option<&SessionInfo>) -> Vec<SessionKind> {
+    let mut kinds = vec![agent.kind];
+    if let Some(s) = session.filter(|s| s.kind != agent.kind && s.kind != SessionKind::Shell) {
+        kinds.push(s.kind);
+    }
+    kinds
 }
 
 /// An agent plus its session.
@@ -3290,7 +3316,10 @@ async fn restart_switched(hub: &Arc<Hub>, ks: &KindSwitch) -> anyhow::Result<(&'
 /// agent, any still waiting are sent again as ordinary messages (typed in, starting a turn),
 /// from the same sender on the same route, through every check a message gets (`deliver`); the
 /// waiting one is marked expired first, so none is sent twice, and waits again when the send
-/// fails. In the background: the start lock is held by the start that calls it.
+/// fails. Only what its sender could still send it now: a message checked against a narrower
+/// mode than its Antigravity tab now gives (in Claude's terms, `switch_permissions`), or from an
+/// origin it no longer accepts, keeps waiting. In the background: the start lock is held by the
+/// start that calls it.
 fn hand_over_quiet(hub: &Arc<Hub>, agent: &Agent) {
     if agent.kind != SessionKind::Antigravity {
         return;
@@ -3298,11 +3327,18 @@ fn hand_over_quiet(hub: &Arc<Hub>, agent: &Agent) {
     let (id, name) = (agent.id, agent.name.clone());
     let hub = hub.clone();
     tokio::spawn(async move {
-        let waiting = match hub.store().waiting_quiet_for_agent(id) {
+        let Some(agent) = hub.agents().by_id(id) else { return };
+        let tab = agent.channel_id.and_then(|c| hub.channel(c)).map_or(agent.permissions, |c| c.permissions);
+        let width = crate::quiet::width(switch_permissions(tab, SessionKind::Antigravity, SessionKind::Claude).claude_mode);
+        let waiting = match hub.store().waiting_quiet_for_agent(id, width) {
             Ok(w) => w,
             Err(e) => return tracing::warn!(agent = name, "reading its waiting messages: {e:#}"),
         };
         for m in waiting {
+            if let Err(why) = crate::mcp::guard::check_agent_delivery(&name, &agent.accepts_origins, m.origin, m.hop, 0) {
+                tracing::info!(agent = name, msg = m.id, "a waiting message stays waiting: {why}");
+                continue;
+            }
             match hub.store().expire_agent_quiet(m.id, now_ms()) {
                 Ok(true) => {}
                 Ok(false) => continue,
@@ -4788,6 +4824,19 @@ mod tests {
         }
         let same = p(C::Plan, A::FullAccess);
         assert_eq!(switch_permissions(same, SessionKind::Claude, SessionKind::Claude), same);
+    }
+
+    /// A message to an agent whose switch waits for its next start is checked for both kinds: the
+    /// saved one and the one its running tab still runs.
+    #[test]
+    fn a_pending_switch_is_checked_for_both_kinds() {
+        let a = agent(SessionKind::Antigravity);
+        let mut s = crate::mcp::guard::test_session(1, None);
+        s.kind = SessionKind::Claude;
+        assert_eq!(reach_kinds(&a, Some(&s)), vec![SessionKind::Antigravity, SessionKind::Claude]);
+        s.kind = SessionKind::Antigravity;
+        assert_eq!(reach_kinds(&a, Some(&s)), vec![SessionKind::Antigravity]);
+        assert_eq!(reach_kinds(&a, None), vec![SessionKind::Antigravity]);
     }
 
     /// The lead section is true for both kinds that can lead, and only they get it.

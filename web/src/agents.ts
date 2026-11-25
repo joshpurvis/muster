@@ -564,7 +564,8 @@ export function restartShownChanged(shown: RestartShown, now: RestartShown | nul
 
 /** The message after saving a move (`agent.update`'s `switch`). */
 /** The permission modes an agent switching from `from` to `to` gets in the new CLI: the nearest
- * no wider than it had (bypass and full access are the same). Mirrors `agents::switch_permissions`. */
+ * match (bypass and full access are the same; Claude's default, which asks before edits, becomes
+ * accept edits, as agy has no such mode). Mirrors `agents::switch_permissions`. */
 export function switchPermissions(p: Permissions, from: Agent["kind"], to: Agent["kind"]): Permissions {
   if (from === "claude" && to === "antigravity") {
     const m = { plan: "plan", default: "accept_edits", accept_edits: "accept_edits", bypass: "full_access" } as const;

@@ -1866,15 +1866,16 @@ impl Store {
         Ok(n.max(0) as usize)
     }
 
-    /// Agent `agent`'s quiet messages still waiting (never shown, expired or refused), oldest
+    /// Agent `agent`'s quiet messages still waiting (never shown, expired or refused) whose send
+    /// was checked against a permission mode at least `width` wide (`quiet::width`), oldest
     /// first: what a switch to Antigravity hands over (`agents::hand_over_quiet`).
-    pub fn waiting_quiet_for_agent(&self, agent: i64) -> anyhow::Result<Vec<crate::agents::AgentMessage>> {
+    pub fn waiting_quiet_for_agent(&self, agent: i64, width: i64) -> anyhow::Result<Vec<crate::agents::AgentMessage>> {
         let conn = self.conn.lock();
         let mut st = conn.prepare(&format!(
             "{AGENT_MESSAGE_SELECT} WHERE m.to_agent = ?1 AND m.quiet = 1 AND m.shown_at IS NULL
-             AND m.expired_at IS NULL AND m.refused IS NULL ORDER BY m.id"
+             AND m.expired_at IS NULL AND m.refused IS NULL AND m.width >= ?2 ORDER BY m.id"
         ))?;
-        let rows = st.query_map(params![agent], Self::row_agent_message)?;
+        let rows = st.query_map(params![agent, width], Self::row_agent_message)?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 

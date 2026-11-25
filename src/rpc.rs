@@ -2200,11 +2200,13 @@ tokio::task_local! {
 
 /// Does this call turn on something only the human may (`owner_terminal`): an agent's self
 /// handoff (src/self_handoff.rs), its message tools up front (src/mcp/tools.rs), its lead role
-/// (`agents::Agent::lead`) or a move's notes request, typed into it as the human's
-/// (`agents::AgentUpdate::save_notes`), alone or together?
+/// (`agents::Agent::lead`), a move's notes request, typed into it as the human's
+/// (`agents::AgentUpdate::save_notes`), or a switch of its kind (`agents::AgentUpdate::kind`: any
+/// kind named, also to apply a waiting switch now), alone or together?
 fn grants_owner_switch(method: &str, params: &Value) -> bool {
     method == "agent.update"
-        && ["self_handoff", "tools_up_front", "lead", "save_notes"].iter().any(|k| params.get(*k) == Some(&Value::Bool(true)))
+        && (["self_handoff", "tools_up_front", "lead", "save_notes"].iter().any(|k| params.get(*k) == Some(&Value::Bool(true)))
+            || params.get("kind").is_some_and(Value::is_string))
 }
 
 /// Is the `/api/rpc` call on connection `peer` the human's own: the client token, on no session's
@@ -3814,6 +3816,10 @@ mod tests {
         assert!(grants_owner_switch("agent.update", &json!({"name": "rpc-otto", "account_profile": 2, "save_notes": true})));
         assert!(!grants_owner_switch("agent.update", &json!({"name": "rpc-otto", "account_profile": 2, "save_notes": false})));
         assert!(!grants_owner_switch("agent.update", &json!({"name": "rpc-otto", "tools_up_front": false})));
+        // A kind switch is the human's too: the CLI from their own terminal is attributed to them.
+        assert!(grants_owner_switch("agent.update", &json!({"name": "rpc-otto", "kind": "antigravity"})));
+        assert!(grants_owner_switch("agent.update", &json!({"name": "rpc-otto", "kind": "antigravity", "now": true})));
+        assert!(!grants_owner_switch("agent.update", &json!({"name": "rpc-otto", "kind": null})));
         // `muster agent edit` typed in a Muster tab: refused, whatever the terminal check said.
         let mut from = on.clone();
         from["from_session"] = json!(2);
@@ -3966,9 +3972,13 @@ mod tests {
         assert_eq!(std::fs::read_to_string(home.join("CLAUDE.md.before-antigravity")).unwrap(), "edited by hand\n");
         let agents_md = std::fs::read_to_string(home.join("AGENTS.md")).unwrap();
         assert!(agents_md.contains("persistent muster agent (antigravity)") && agents_md.contains("## Lead agent"), "{agents_md}");
+        // Until its next run, its Claude run keeps the subscription's schedule rules.
+        hub.set_state_for_test(2, crate::model::AgentState::Idle);
+        assert!(crate::schedules::facts(&hub, &a).subscription_claude, "its Claude run is still going");
         // Its next run: the tab becomes Antigravity's, and the Claude conversation is forgotten.
         crate::agents::follow_kind(&hub, 2).unwrap();
         assert_eq!(hub.session(2).unwrap().kind, SessionKind::Antigravity);
+        assert!(!crate::schedules::facts(&hub, &a).subscription_claude);
         assert_eq!(hub.agents().get("rpc-kai").unwrap().resume_id, None);
         // And back: the Antigravity file is kept aside in its turn.
         let r = window(json!({"name": "rpc-kai", "kind": "claude"})).await.unwrap();

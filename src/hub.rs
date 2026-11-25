@@ -3871,7 +3871,14 @@ impl Hub {
         self.ensure_not_shutting_down()?;
         // Fail before interrupting a live process if its selected profile cannot start.
         let info = self.session(id).ok_or_else(|| anyhow::anyhow!("no such session: {id}"))?;
-        self.check_account_profile(info.account_profile_id)?;
+        // A named agent's tab that switches kind on this start (`agents::follow_kind`) starts on
+        // the agent's account, not the old kind's: a disabled Claude profile can't keep it from
+        // switching to Antigravity.
+        let profile = match self.agents.by_session(id) {
+            Some(a) if a.kind != info.kind => a.account_profile_id.filter(|_| a.kind == SessionKind::Claude),
+            _ => info.account_profile_id,
+        };
+        self.check_account_profile(profile)?;
         self.check_session_provider(id)?;
         {
             let mut g = self.inner.lock();

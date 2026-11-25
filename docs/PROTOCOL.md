@@ -252,15 +252,23 @@ changes which model runs the agent; Codex agents can't switch, and can't be swit
   messages waiting for it: its tab's prompt queue and held prompts stay with the tab (the same
   session id), and messages that waited for a Claude turn (wake=false) are sent again as ordinary
   messages at its first Antigravity start, since Antigravity has no hook to take them (each
-  through every check a message gets; one whose send fails waits for the next start).
+  through every check a message gets; one whose send fails waits for the next start). Only those
+  its sender could still send: one checked against a narrower mode than the Antigravity tab now
+  gives, or from an origin the agent no longer accepts, keeps waiting.
+- Until its next start, a message to it is checked against both kinds' modes (the saved kind and
+  the kind its tab still runs), and a schedule keeps a Claude subscription's rules while its
+  Claude run lasts. The switch applies at a restart even when its old Claude profile is disabled,
+  and `muster agent edit <name> --kind <the new kind> --now` applies a waiting switch at once.
 - Cleared: its conversation (the next start is a new one: a Claude conversation id means nothing
   to agy, nor the other way), the model and effort (the call's own `model`/`effort` are used, else
   the new CLI's default), a pending account move, and for Antigravity the account profile,
   OpenRouter, tools up front and self handoff, which only Claude has.
-- Permissions: the new CLI's mode is the nearest one no wider than the old one's: Claude plan ->
-  Antigravity plan, default and accept edits -> accept edits, bypass -> full access; Antigravity
-  plan -> plan, accept edits and auto -> accept edits, full access -> bypass. Its own tab's modes
-  follow the same way; the call's own `permissions` apply on top.
+- Permissions: the new CLI's mode is the nearest match: Claude plan -> Antigravity plan, default
+  and accept edits -> accept edits, bypass -> full access; Antigravity plan -> plan, accept edits
+  and auto -> accept edits, full access -> bypass. Each is no wider than the old one except Claude
+  default (asks before edits): agy has no such mode, so it gets accept edits (edits without asking)
+  rather than plan. Its own tab's modes follow the same way, before the new kind is saved; the
+  call's own `permissions` apply on top.
 - Persona: the old kind's file (`CLAUDE.md` or `AGENTS.md`) is moved aside to
   `<file>.before-<new kind>` (`.<ms>` added when that name is taken), and so is a file already at
   the new kind's name; then the new kind's file is written from the record. Nothing is deleted, so

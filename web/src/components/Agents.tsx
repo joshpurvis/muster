@@ -871,7 +871,11 @@ export function AgentDialog(
         patch.now = kindNow;
       }
       if (d.accepts.join() !== before.accepts.join()) patch.accepts = d.accepts;
-      if (JSON.stringify(d.permissions) !== JSON.stringify(before.permissions)) {
+      // A switch maps the modes itself, on the record and on its tab (`agents::switch_permissions`):
+      // sent only when changed by hand from what the switch gives, so a tab narrowed on its own
+      // isn't widened back to the record's modes.
+      const unedited = switching ? switchPermissions(before.permissions, agent.kind, d.kind) : before.permissions;
+      if (JSON.stringify(d.permissions) !== JSON.stringify(unedited)) {
         patch.permissions = d.permissions;
       }
       if (moving) {

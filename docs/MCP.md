@@ -788,7 +788,7 @@ provenance: `human`, hop 0):
 | UserPromptSubmit with an envelope | Counts only for an unanswered message muster delivered to that session; unknown, foreign or answered ids are ignored. |
 | UserPromptSubmit that showed quiet messages | Raised to the stricter of the turn's and every shown message's (a non-human origin wins, then the higher hop), in the same transaction as the turn's attribution. A hop-3 message read during a turn the human started keeps the turn at hop 3. |
 
-**Lead agents.** The human can make a Claude agent a lead agent (`lead`; Edit agent > More
+**Lead agents.** The human can make a Claude or Antigravity agent a lead agent (`lead`; Edit agent > More
 options > "Lead agent", or `muster agent edit <name> --lead on` from a terminal outside Muster).
 In a turn a reminder or a schedule started (origin `schedule`, or `lead` below), what a lead
 agent's session sends or spawns goes as origin `lead` (`agents::sending_prov`): its
@@ -814,6 +814,9 @@ lifted, and what isn't:
   `wake: true`. A `reply` the human or a schedule asked is shown in the message log either way;
 - what reaches a lead is unchanged: its accepted origins decide what it takes.
 
+An Antigravity lead works the same way: it calls these tools through `call_mcp_tool` (its persona
+says how), and its lead section is the same text. An agent switched from Claude to Antigravity, or
+back, stays a lead (see "Switching an agent's kind" in docs/PROTOCOL.md).
 Codex agents can't be leads (refused; a flag written into the database by hand is ignored), and no
 tool sets it: turning it on takes a click in Muster's window or the owner's terminal, the check
 `tools_up_front` makes; anyone may turn it off, which is saved even when the persona file can't be

@@ -1046,7 +1046,15 @@ sends only what changed (`schedule.settings.set`). The dialog scrolls in a short
   shows as Custom with its text, and Custom stays chosen (also with its field cleared) until
   another entry is picked. Effort lists the chosen model's levels where they differ from the
   CLI's; changing the model puts a listed level it doesn't offer back to Default (a custom one
-  stays). Switching kind puts a model or level the new kind doesn't list back to Default. Then persona (monospace textarea, written to `CLAUDE.md` / `AGENTS.md`), accepted origins (Human, Schedule, Webhook (triggered) checkboxes,
+  stays). Switching kind puts a model or level the new kind doesn't list back to Default.
+  Edit of a Claude or Antigravity agent shows a **Runs on** choice (Claude | Antigravity) above the
+  persona. Picking the other kind opens a "Switch to …" panel: its next start is a new conversation
+  in that CLI; memory/, tab, schedules, reminders and waiting messages stay (and the lead flag); the
+  persona is written to the new kind's file and the old one is kept beside it; switching to
+  Antigravity clears the Claude-only settings. "At its next start" (default) or "Now" (restarts it
+  only if idle). The Permissions pill shows the mapped mode (docs/PROTOCOL.md "Switching an agent's
+  kind"); Claude-only options hide. Saving sends `kind` (and `now`); the toast says what happened.
+  Only the owner's click (or terminal) switches. Then persona (monospace textarea, written to `CLAUDE.md` / `AGENTS.md`), accepted origins (Human, Schedule, Webhook (triggered) checkboxes,
   at least one), the Permissions pill opening only the control for the agent's kind, and an
   Autostart toggle (under More options).
 - Ticking Schedule or Webhook on a Claude agent shows, in amber: "Anthropic's consumer terms are
@@ -1097,10 +1105,10 @@ sends only what changed (`schedule.settings.set`). The dialog scrolls in a short
   doesn't look each one up first. About 2,200 more tokens on every request, mostly cached.
   Applies from its next start." The closed More options line says "Message tools up front" when
   on. Only the owner's click turns it on (as for Can start itself fresh).
-- **Lead agent** (Edit only, Claude agents, off by default; after Load message tools up front):
+- **Lead agent** (Edit only, Claude and Antigravity agents, off by default; after Load message tools up front):
   in a turn a reminder or a schedule started, what it sends and the sessions it starts go as
-  origin `lead`, which Claude agents take like the owner's (`lead`, docs/MCP.md "Lead agents").
-  The hint leads with that (starting Claude builders, messaging Claude agents), then that each
+  origin `lead`, which agents take like the owner's (`lead`, docs/MCP.md "Lead agents").
+  The hint leads with that (starting builders, messaging other agents), then that each
   message still counts one step and a chain stops after 8, that a trigger's work keeps the usual
   rules and nothing scheduled work reaches can set reminders or schedules, and that only the owner
   turns it on. The closed More options line says "Lead agent" when on, and

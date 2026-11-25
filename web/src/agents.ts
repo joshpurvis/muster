@@ -5,6 +5,7 @@
 import type {
   AccountProfile,
   Agent,
+  AgentKindSwitch,
   AgentSwitch,
   AgentMessage,
   AgentState,
@@ -13,10 +14,11 @@ import type {
   ModelCatalog,
   OpenRouterModel,
   Origin,
+  Permissions,
   Provider,
   SessionInfo,
 } from "./types.ts";
-import { STATE_LABEL } from "./types.ts";
+import { KIND_LABEL, STATE_LABEL } from "./types.ts";
 import { idleText } from "./cache.ts";
 import { profileName } from "./account_profiles.ts";
 
@@ -561,6 +563,48 @@ export function restartShownChanged(shown: RestartShown, now: RestartShown | nul
 }
 
 /** The message after saving a move (`agent.update`'s `switch`). */
+/** The permission modes an agent switching from `from` to `to` gets in the new CLI: the nearest
+ * no wider than it had (bypass and full access are the same). Mirrors `agents::switch_permissions`. */
+export function switchPermissions(p: Permissions, from: Agent["kind"], to: Agent["kind"]): Permissions {
+  if (from === "claude" && to === "antigravity") {
+    const m = { plan: "plan", default: "accept_edits", accept_edits: "accept_edits", bypass: "full_access" } as const;
+    return { ...p, antigravity_mode: m[p.claude_mode] };
+  }
+  if (from === "antigravity" && to === "claude") {
+    const m = { plan: "plan", accept_edits: "accept_edits", auto: "accept_edits", full_access: "bypass" } as const;
+    return { ...p, claude_mode: m[p.antigravity_mode] };
+  }
+  return p;
+}
+
+/** The toast for `agent.update`'s `kind_switch`. */
+export function kindSwitchMessage(name: string, ks: AgentKindSwitch): { level: "success" | "warn"; text: string } {
+  const to = KIND_LABEL[ks.to];
+  const kept = ks.kept_aside.length ? ` Its old persona file is kept as ${ks.kept_aside.join(", ")}.` : "";
+  switch (ks.outcome) {
+    case "restarted":
+      return { level: "success", text: `${name} switched to ${to}: a new conversation started there.${kept}` };
+    case "busy":
+      return {
+        level: "warn",
+        text: ks.why
+          ? `${name} can't restart now (${ks.why}), so it switches to ${to} at its next start.${kept}`
+          : `${name} isn't idle, so it switches to ${to} at its next start.${kept}`,
+      };
+    case "replaced":
+      return { level: "warn", text: `Another change to ${name} came first. It runs ${to} from its next start.` };
+    case "failed":
+      return { level: "warn", text: `${name} didn't restart: ${ks.error ?? "unknown error"}. It switches to ${to} at its next start.` };
+    default:
+      return {
+        level: "success",
+        text: ks.running
+          ? `Saved. ${name} keeps running as it is and switches to ${to} at its next start.${kept}`
+          : `Saved. ${name} starts as ${to} next time.${kept}`,
+      };
+  }
+}
+
 export function switchMessage(name: string, sw: AgentSwitch): { level: "success" | "warn"; text: string } {
   const notes = sw.notes === "asked"
     ? ""

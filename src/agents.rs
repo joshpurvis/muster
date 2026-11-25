@@ -643,7 +643,7 @@ pub fn rename_old_tools(text: &str) -> Option<String> {
 pub const QUIET_INSTRUCTION: &str = "To report or pass something on without waiting for an answer, use `tell_agent`; \
 with wake=false it waits for the agent's next turn instead of starting one. Messages that arrived that way come at the \
 start of a turn, after the prompt, under a line saying the human did not type them. After a long job, `reply` with \
-wake=false unless the asker must act now. Only Claude agents and sessions take wake=false: for a Codex one, leave wake on.";
+wake=false unless the asker must act now. Only Claude agents and sessions take wake=false: for a Codex or Antigravity one, leave wake on.";
 
 /// The sentence that ends the generated "## Messages" section before `QUIET_INSTRUCTION`.
 const MESSAGES_END: &str = "To ask other agents, use the muster MCP tools `list_agents` and `ask_agent`.";
@@ -4071,6 +4071,8 @@ pub fn agent_json(b: &Agent, session: Option<&SessionInfo>) -> Value {
         "self_handoff_at": b.self_handoff_at,
         "tools_up_front": b.tools_up_front,
         "lead": b.lead,
+        // The kinds Edit agent can switch it to and from (`AgentUpdate::kind`); empty for Codex.
+        "switch_kinds": if can_lead(b.kind) { json!(["claude", "antigravity"]) } else { json!([]) },
     })
 }
 

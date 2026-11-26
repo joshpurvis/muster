@@ -545,9 +545,11 @@ transcripts and pasted elsewhere (src/links.rs, web/src/links.ts):
   So do the question's own links ([Questions](#questions), "Links on a card").
 - **Click in a terminal**: a left click without a modifier follows a Muster link. Muster takes the press and
   release itself, so a program with mouse reporting on gets no click, no selection starts, and a
-  middle-click (paste) or a click with a modifier does what it always did. Web links are as
-  before: Ctrl+click (⌘-click) on an address, and xterm's "Do you want to navigate…" question
-  for a hyperlink. Other hyperlinks (`file://`, …) do nothing.
+  middle-click (paste) or a click with a modifier does what it always did. A web address
+  written out opens on Ctrl+click (⌘-click). A hyperlink to a web address (OSC 8, what
+  Antigravity prints for a Markdown link) opens in the browser on a click, without a question;
+  hovering it shows its address as a tooltip, since its text may say something else. Other
+  hyperlinks (`file://`, `javascript:`, …) do nothing.
 - **In a note**: the same addresses in a note's text, and web addresses, open on Ctrl+click or
   Ctrl+Enter ("Notes", "Links").
 - **Gone**: a link to a deleted note, a closed panel or tab, or an agent that doesn't exist (or

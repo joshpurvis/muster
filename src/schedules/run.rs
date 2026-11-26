@@ -301,10 +301,12 @@ pub(super) fn previous_running(hub: &Hub, schedule: i64, before: i64) -> anyhow:
     let sent = hub.store().latest_sent_run(schedule, before)?;
     let Some(msg) = sent.and_then(|r| r.msg_id) else { return Ok(false) };
     let st = hub.agents().msg_status(hub.store(), msg);
-    if st.reply.is_some() || !st.active {
+    let m = hub.store().agent_message(msg)?;
+    // Its reply came (the turn's final message, or the agent's `reply` that the run took).
+    if m.as_ref().is_some_and(|m| m.run_reply().is_some()) || !st.active {
         return Ok(false);
     }
-    let session = hub.store().agent_message(msg)?.and_then(|m| m.to_session).and_then(|s| hub.session(s));
+    let session = m.and_then(|m| m.to_session).and_then(|s| hub.session(s));
     Ok(session.is_some_and(|s| s.state != AgentState::Idle && s.state != AgentState::Exited))
 }
 
@@ -485,7 +487,7 @@ async fn execute(hub: &Arc<Hub>, mut run: Run) -> anyhow::Result<()> {
     wait_reply(hub, &s, &mut run).await
 }
 
-async fn wait_reply(hub: &Arc<Hub>, s: &Schedule, run: &mut Run) -> anyhow::Result<()> {
+pub(super) async fn wait_reply(hub: &Arc<Hub>, s: &Schedule, run: &mut Run) -> anyhow::Result<()> {
     let msg = run.msg_id.expect("a sent run");
     let Some(m) = hub.store().agent_message(msg)? else {
         return finish(hub, s, run, Outcome::Failed, Some("its message is gone".into()));
@@ -498,13 +500,18 @@ async fn wait_reply(hub: &Arc<Hub>, s: &Schedule, run: &mut Run) -> anyhow::Resu
     let mut rx = hub.subscribe();
     // Woken when the prompt is taken back before it was submitted (`unsent`): that ends the run.
     let woken = hub.schedules.waiters.lock().entry(run.id).or_default().clone();
+    // The agent may answer with its `reply` tool instead of a final message (an Antigravity
+    // agent's turn has none): as for `ask_agent`, a reply that brings no origin the message's
+    // chain didn't have is this run's reply (`agent_reply::status` takes it). Held until the
+    // run is recorded, so one that comes meanwhile is taken after it, as a late reply.
+    let _waiting = hub.replies.wait(msg);
     let waited = tokio::select! {
         w = crate::agents::wait_for_reply(
             &mut rx,
             sid,
             Duration::from_millis(left as u64),
             || hub.session(sid),
-            || hub.agents().msg_status(hub.store(), msg),
+            || crate::agent_reply::status(hub, msg),
         ) => w,
         _ = woken.notified() => {
             hub.schedules.waiters.lock().remove(&run.id);
@@ -556,7 +563,7 @@ pub(super) fn step_context(hub: &Hub, s: &Schedule, run: &Run, tz: &jiff::tz::Ti
     let x = plan::Extra {
         event: ev.as_ref(),
         reply_of: Some(&parent_agent),
-        reply: pmsg.as_ref().and_then(|m| m.reply.as_deref()),
+        reply: pmsg.as_ref().and_then(|m| m.run_reply()),
         outcome: Some(outcome),
         append_event: false,
     };
@@ -661,7 +668,7 @@ pub(super) fn finish(hub: &Hub, s: &Schedule, run: &mut Run, outcome: Outcome, r
 /// reply and a reply that arrives after it stopped waiting both come here).
 pub(super) fn reply_to_note_once(hub: &Hub, s: &Schedule, run: &Run) {
     let Some(note) = s.note_id else { return };
-    let has_reply = run.msg_id.and_then(|m| hub.store().agent_message(m).ok().flatten()).is_some_and(|m| m.reply.is_some());
+    let has_reply = run.msg_id.and_then(|m| hub.store().agent_message(m).ok().flatten()).is_some_and(|m| m.run_reply().is_some());
     if !has_reply {
         return;
     }
@@ -750,7 +757,7 @@ fn reply_to_note(hub: &Hub, s: &Schedule, agent: &str, run: &Run, note: NoteId) 
     let reply = run
         .msg_id
         .and_then(|m| hub.store().agent_message(m).ok().flatten())
-        .and_then(|m| m.reply)
+        .and_then(|m| m.run_reply().map(str::to_string))
         .ok_or_else(|| anyhow::anyhow!("the reply wasn't kept"))?;
     let tz = super::cron::zone(&s.tz).unwrap_or(jiff::tz::TimeZone::UTC);
     let heading = format!("## {} · {}", super::cron::format(&tz, run.slot, "%a %-d %b %Y %H:%M"), s.name);
@@ -820,7 +827,9 @@ pub fn recover(hub: &Arc<Hub>) {
         }
         if let Some(msg) = run.msg_id {
             let st = hub.agents().msg_status(hub.store(), msg);
-            if st.delivered_at.is_none() && st.reply.is_none() && !crate::inject::holds_message(hub, msg) {
+            // A message the agent answered with its `reply` tool reached it.
+            let answered = hub.store().agent_message(msg).ok().flatten().is_some_and(|m| m.answer.is_some());
+            if st.delivered_at.is_none() && st.reply.is_none() && !answered && !crate::inject::holds_message(hub, msg) {
                 let _ = finish(hub, &s, &mut run, Outcome::Failed,
                     Some("Muster stopped before the message was typed; nothing reached the agent".into()));
                 continue;

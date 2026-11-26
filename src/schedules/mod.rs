@@ -965,9 +965,10 @@ pub fn schedule_json(hub: &Hub, s: &Schedule) -> Value {
 /// A run as `schedule.runs` and `schedule_run` carry it, with its message (text and reply).
 pub fn run_json(hub: &Hub, r: &Run) -> Value {
     let msg = r.msg_id.and_then(|m| hub.store().agent_message(m).ok().flatten());
-    // A reply that came after the wait ended still counts as one.
+    // A reply that came after the wait ended (a final message, or a `reply` the run took) still
+    // counts as one.
     let (outcome, late) = match (&msg, r.outcome) {
-        (Some(m), Outcome::TimedOut | Outcome::NoReply) if m.reply.is_some() => (Outcome::Replied, true),
+        (Some(m), Outcome::TimedOut | Outcome::NoReply) if m.run_reply().is_some() => (Outcome::Replied, true),
         _ => (r.outcome, false),
     };
     json!({
@@ -2113,12 +2114,15 @@ pub fn not_submitted(hub: &Arc<Hub>, source: &crate::agents::Source, action: pla
     run::unsent(hub, msg, action);
 }
 
-/// A reply arrived for agent message `msg` (the hook handler): a schedule run's reply goes to
-/// its note even when the run had stopped waiting for it, once.
+/// A reply arrived for agent message `msg` (the hook handler's final message, or a `reply` the
+/// run took after it stopped waiting: `agent_reply::finish`): a schedule run's reply goes to its
+/// note even when the run had stopped waiting for it, once. A run still waiting files it itself
+/// when it ends (`run::finish`), with the reply it took: a final message and a `reply` that both
+/// arrive in its wait can't put one text in the note and the other in `{reply}`.
 pub fn on_reply(hub: &Hub, msg: i64) {
     let Ok(Some(r)) = hub.store().run_by_msg(msg) else { return };
     let Some(s) = hub.schedules.get(r.schedule_id) else { return };
-    if r.kind != RunKind::Chain {
+    if r.kind != RunKind::Chain && r.outcome != Outcome::Pending {
         run::reply_to_note_once(hub, &s, &r);
     }
     if r.outcome != Outcome::Pending {

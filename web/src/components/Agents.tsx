@@ -45,7 +45,9 @@ import {
   readMemoryFile,
   pendingMove,
   saveNotesBlocked,
+  kindSwitchMessage,
   switchMessage,
+  switchPermissions,
   SLEEP_AFTER_DEFAULT,
   SLEEP_AFTER_MAX,
   SLEEP_AFTER_MIN,
@@ -57,6 +59,7 @@ import {
 import type {
   Agent,
   AgentWorkingLocation,
+  AgentKindSwitch,
   AgentMessage,
   AgentSwitch,
   AgentTemplate,
@@ -552,7 +555,7 @@ interface Draft {
   selfHandoff: boolean;
   /** Muster's message tools in the prompt from the start (Edit, Claude only). */
   toolsUpFront: boolean;
-  /** A lead agent: what it sends from scheduled work is taken like the human's (Edit, Claude only; the human's to set). */
+  /** A lead agent: what it sends from scheduled work is taken like the human's (Edit, Claude and Antigravity; the human's to set). */
   lead: boolean;
 }
 
@@ -648,6 +651,8 @@ export function AgentDialog(
   const [conversation, setConversation] = useState<"" | "keep" | "reset">("");
   /** A move to another account: when it applies, Save notes first, and why. */
   const [moveNow, setMoveNow] = useState(false);
+  /** A switch between Claude and Antigravity: restart it now (if idle) or at its next start. */
+  const [kindNow, setKindNow] = useState(false);
   // Off by default: asking starts a turn, and HANDOFF.md and memory/ carry it over anyway.
   const [saveNotes, setSaveNotes] = useState(false);
   const [restarting, setRestarting] = useState(false);
@@ -720,7 +725,12 @@ export function AgentDialog(
     if (k === d.kind) return;
     const provider = k === "antigravity" ? "subscription" : d.provider;
     const model = keepForKind(d.model, listedModels(provider, k, catalog, orModels));
-    set({ kind: k, provider, model, effort: keepForKind(d.effort, effortsFor(catalog, k, model)) });
+    // Editing: the modes the switch gives it (`switchPermissions`), from the agent's own, so the
+    // Permissions pill shows what it will run with (switching back restores them).
+    const permissions = agent
+      ? k === agent.kind ? storedPermissions(agent.permissions) : switchPermissions(storedPermissions(agent.permissions), agent.kind, k)
+      : d.permissions;
+    set({ kind: k, provider, model, effort: keepForKind(d.effort, effortsFor(catalog, k, model)), permissions });
     setCustom({ model: false, effort: false });
   };
   /** Switching provider keeps the model only when the other list has it (an OpenRouter id means
@@ -780,12 +790,16 @@ export function AgentDialog(
   const checkoutHint = d.working_location.mode === "worktree"
     ? "Keeps a separate branch and working files for this agent. The worktree is reused on subsequent starts."
     : "Shares files, branch and uncommitted changes with anyone using this checkout.";
-  /** Self handoff: an existing Claude agent on a backend that knows it. */
-  const canSelfHandoff = !!agent && agent.kind === "claude" && agent.self_handoff !== undefined;
-  /** Message tools up front: an existing Claude agent on a backend that knows it. */
-  const canToolsUpFront = !!agent && agent.kind === "claude" && agent.tools_up_front !== undefined;
-  /** Lead agent: an existing Claude agent on a backend that knows it. */
-  const canLead = !!agent && agent.kind === "claude" && agent.lead !== undefined;
+  /** Switching kind: an existing Claude or Antigravity agent on a backend that can. */
+  const canSwitchKind = !!agent && !!agent.switch_kinds?.includes(agent.kind);
+  /** The Kind choice differs from what it runs now. */
+  const switching = !!agent && d.kind !== agent.kind;
+  /** Self handoff: an existing Claude agent (staying Claude) on a backend that knows it. */
+  const canSelfHandoff = !!agent && agent.kind === "claude" && d.kind === "claude" && agent.self_handoff !== undefined;
+  /** Message tools up front: an existing Claude agent (staying Claude) on a backend that knows it. */
+  const canToolsUpFront = !!agent && agent.kind === "claude" && d.kind === "claude" && agent.tools_up_front !== undefined;
+  /** Lead agent: an existing Claude or Antigravity agent on a backend that knows it. */
+  const canLead = !!agent && (agent.kind === "claude" || agent.kind === "antigravity") && agent.lead !== undefined;
   const moreSummary = [
     or && (d.provider === "openrouter" ? "OpenRouter" : "Subscription"),
     d.autostart ? "Autostart on" : "No autostart",
@@ -852,8 +866,16 @@ export function AgentDialog(
       if (canSelfHandoff && d.selfHandoff !== before.selfHandoff) patch.self_handoff = d.selfHandoff;
       if (canToolsUpFront && d.toolsUpFront !== before.toolsUpFront) patch.tools_up_front = d.toolsUpFront;
       if (canLead && d.lead !== before.lead) patch.lead = d.lead;
+      if (switching) {
+        patch.kind = d.kind;
+        patch.now = kindNow;
+      }
       if (d.accepts.join() !== before.accepts.join()) patch.accepts = d.accepts;
-      if (JSON.stringify(d.permissions) !== JSON.stringify(before.permissions)) {
+      // A switch maps the modes itself, on the record and on its tab (`agents::switch_permissions`):
+      // sent only when changed by hand from what the switch gives, so a tab narrowed on its own
+      // isn't widened back to the record's modes.
+      const unedited = switching ? switchPermissions(before.permissions, agent.kind, d.kind) : before.permissions;
+      if (JSON.stringify(d.permissions) !== JSON.stringify(unedited)) {
         patch.permissions = d.permissions;
       }
       if (moving) {
@@ -865,9 +887,15 @@ export function AgentDialog(
         if (locationChanged) patch.reset_conversation = true;
       }
       if (Object.keys(patch).length) {
-        const a = await rpc.call<Agent & { switch?: AgentSwitch }>("agent.update", { name: agent.name, ...patch });
+        const a = await rpc.call<Agent & { switch?: AgentSwitch; kind_switch?: AgentKindSwitch }>(
+          "agent.update",
+          { name: agent.name, ...patch },
+        );
         knowAgent(a);
-        if (a.switch) {
+        if (a.kind_switch) {
+          const m = kindSwitchMessage(a.name, a.kind_switch);
+          toast(m.level, m.text, 8000);
+        } else if (a.switch) {
           const m = switchMessage(a.name, a.switch);
           toast(m.level, m.text, 8000);
         } else {
@@ -1008,6 +1036,57 @@ export function AgentDialog(
             </div>
           )}
           {!agent && d.name && nErr && <span class="field-hint field-bad" id={`${id}-name-err`}>{nErr}</span>}
+          {canSwitchKind && agent && (
+            <div class="kind-row">
+              <span class="field-label" id={`${id}-kind`}>Runs on</span>
+              <div class="seg seg-kind" role="radiogroup" aria-labelledby={`${id}-kind`}>
+                {(agent.switch_kinds ?? []).map((k) => (
+                  <button
+                    key={k}
+                    type="button"
+                    role="radio"
+                    data-kind={k}
+                    aria-checked={d.kind === k}
+                    class={cx("seg-btn", d.kind === k && "on")}
+                    onClick={() => setKind(k)}
+                  >
+                    <KindIcon kind={k} size={13} /> {KIND_LABEL[k]}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+          {switching && agent && (
+            <div class="field pill-panel move-panel kind-panel" role="group" aria-labelledby={`${id}-switch`}>
+              <span class="field-label" id={`${id}-switch`}>Switch to {KIND_LABEL[d.kind]}</span>
+              <span class="field-hint move-explain">
+                Its next start is a new conversation in {KIND_LABEL[d.kind]}. Its memory/ notes, tab, schedules,
+                reminders and waiting messages stay{agent.lead ? ", and it stays a lead agent" : ""}. Its persona is
+                written to {d.kind === "claude" ? "CLAUDE.md" : "AGENTS.md"}; the old{" "}
+                {agent.kind === "claude" ? "CLAUDE.md" : "AGENTS.md"} is kept beside it.
+                {d.kind === "antigravity" && " Claude-only settings (account, OpenRouter, tools up front, starting itself fresh) are cleared."}
+              </span>
+              <div class="seg" role="radiogroup" aria-label="When it switches">
+                {([false, true] as const).map((now) => (
+                  <button
+                    key={String(now)}
+                    type="button"
+                    role="radio"
+                    aria-checked={kindNow === now}
+                    class={cx("seg-btn", kindNow === now && "on")}
+                    onClick={() => setKindNow(now)}
+                  >
+                    {now ? "Now" : "At its next start"}
+                  </button>
+                ))}
+              </div>
+              {kindNow && (
+                <span class="field-hint">
+                  Restarts it only if it is idle. If it is busy, it switches at its next start.
+                </span>
+              )}
+            </div>
+          )}
           <div class="persona-field">
             <textarea
               class="quiet-input persona-input"
@@ -1471,8 +1550,8 @@ export function AgentDialog(
                   </span>
                 </label>
                 <span id="lead-hint" class="field-hint sleep-after">
-                  In a turn a reminder or a schedule started, it can still start Claude builders and message
-                  Claude agents, which take its messages as if you sent them. Each message still counts one step,
+                  In a turn a reminder or a schedule started, it can still start builders and message other
+                  agents, which take its messages as if you sent them. Each message still counts one step,
                   and a chain stops after 8. Work a trigger started keeps the usual rules, and nothing scheduled
                   work reaches can set reminders or schedules. Only you can turn this on.
                 </span>

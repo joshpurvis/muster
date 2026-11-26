@@ -781,20 +781,20 @@ impl Schedules {
     }
 }
 
-/// Facts about a schedule's agent that the rules read. A Claude agent counts as on its
-/// subscription when either its record or its running process says so: a switch to OpenRouter
-/// only takes effect at the next start, and until then the subscription's rules (expiry, quiet
-/// hours by default) still apply.
+/// Facts about a schedule's agent that the rules read. An agent counts as a Claude agent on its
+/// subscription when either its record or its running process says so: a switch to OpenRouter,
+/// or to Antigravity (`agents::AgentUpdate::kind`), only takes effect at the next start, and until
+/// then the subscription's rules (expiry, quiet hours by default) still apply.
 pub fn facts(hub: &Hub, agent: &Agent) -> Facts {
     use crate::openrouter::Provider;
     let running = agent
         .session_id
         .and_then(|s| hub.session(s))
         .filter(|s| s.state != AgentState::Exited)
-        .map(|s| s.provider);
+        .map(|s| (s.kind, s.provider));
+    let claude_sub = (SessionKind::Claude, Provider::Subscription);
     Facts {
-        subscription_claude: agent.kind == SessionKind::Claude
-            && (agent.provider == Provider::Subscription || running == Some(Provider::Subscription)),
+        subscription_claude: (agent.kind, agent.provider) == claude_sub || running == Some(claude_sub),
     }
 }
 

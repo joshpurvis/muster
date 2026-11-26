@@ -230,8 +230,8 @@ pub struct Agent {
     /// applies from its next start.
     pub tools_up_front: bool,
     /// A lead agent: what it sends and spawns from scheduled work goes as `Origin::Lead`, taken
-    /// like the human's by accept lists (`sending_prov`). Claude agents only, off by default, turned on only by the human
-    /// (`check_lead`); no agent can set it, on itself or another.
+    /// like the human's by accept lists (`sending_prov`). Claude and Antigravity agents only (`can_lead`),
+    /// off by default, turned on only by the human (`check_lead`); no agent can set it, on itself or another.
     pub lead: bool,
 }
 
@@ -305,10 +305,16 @@ impl Route {
     }
 }
 
-/// Does `a` count as the human for what it sends (`Agent::lead`)? Only a Claude agent: a Codex
-/// agent never does, whatever its stored flag says.
+/// Can an agent of `kind` be a lead agent? Claude and Antigravity agents: a Codex agent takes
+/// scheduled and triggered work by default and stays under the origin rules.
+pub fn can_lead(kind: SessionKind) -> bool {
+    matches!(kind, SessionKind::Claude | SessionKind::Antigravity)
+}
+
+/// Does `a` count as the human for what it sends (`Agent::lead`)? Only a kind that can lead
+/// (`can_lead`): a Codex agent never does, whatever its stored flag says.
 pub fn is_lead(a: &Agent) -> bool {
-    a.lead && a.kind == SessionKind::Claude
+    a.lead && can_lead(a.kind)
 }
 
 /// The provenance a session's messages and spawns start from: its own (`prov`), except that a lead
@@ -383,7 +389,7 @@ pub fn persona_text_for(a: &Agent) -> String {
 pub const LEAD_SECTION: &str = "\n## Lead agent\n\n\
      The human made you a lead agent: in a turn a reminder or a schedule started (origin=schedule, or \
      origin=lead for scheduled work another lead passed on), you can still start sessions \
-     (`spawn_session`) and message Claude agents and sessions (`ask_agent`, `tell_agent`, \
+     (`spawn_session`) and message other agents and sessions (`ask_agent`, `tell_agent`, \
      `send_message`, `reply`, with wake=true: a message that waits for a later turn is refused there). \
      They get your messages as origin=lead, which they take like the human's. \
      Each message still counts one hop, and a chain ends after 8. Work a trigger started \
@@ -637,7 +643,7 @@ pub fn rename_old_tools(text: &str) -> Option<String> {
 pub const QUIET_INSTRUCTION: &str = "To report or pass something on without waiting for an answer, use `tell_agent`; \
 with wake=false it waits for the agent's next turn instead of starting one. Messages that arrived that way come at the \
 start of a turn, after the prompt, under a line saying the human did not type them. After a long job, `reply` with \
-wake=false unless the asker must act now. Only Claude agents and sessions take wake=false: for a Codex one, leave wake on.";
+wake=false unless the asker must act now. Only Claude agents and sessions take wake=false: for a Codex or Antigravity one, leave wake on.";
 
 /// The sentence that ends the generated "## Messages" section before `QUIET_INSTRUCTION`.
 const MESSAGES_END: &str = "To ask other agents, use the muster MCP tools `list_agents` and `ask_agent`.";
@@ -1404,7 +1410,7 @@ impl Registry {
         Ok(Some(a.clone()))
     }
 
-    /// `agent.update`: the configuration fields of `next` (model, effort, persona, profile,
+    /// `agent.update`: the configuration fields of `next` (kind, model, effort, persona, profile,
     /// accepted origins, autostart); the runtime fields stay as they are now.
     fn set_config(&self, store: &Store, next: &Agent) -> anyhow::Result<Agent> {
         let mut g = self.inner.lock();
@@ -1425,6 +1431,7 @@ impl Registry {
         a.self_handoff = next.self_handoff;
         a.tools_up_front = next.tools_up_front;
         a.lead = next.lead;
+        a.kind = next.kind;
         store.update_agent_config(&a)?;
         *b = a.clone();
         Ok(a)
@@ -2013,10 +2020,18 @@ pub fn create(hub: &Hub, req: NewAgent) -> anyhow::Result<Agent> {
 }
 
 /// `agent.update` / `muster agent edit`: an absent field stays as it is; an empty model or
-/// effort clears it. The kind and name don't change (they name the home dir and persona file).
+/// effort clears it. The name doesn't change (it names the home dir). The kind changes only
+/// between Claude and Antigravity, and only by the human (`kind`).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentUpdate {
+    /// Switch it to this kind (Claude <-> Antigravity; `check_kind_switch`). It keeps its id, name,
+    /// tab, home with memory/, schedules, reminders, triggers, waiting messages and lead flag; its
+    /// next start is a new conversation in the new CLI, settings only the old one understands are
+    /// cleared (`switch_kind`), and its persona file is written for the new CLI (`switch_persona`).
+    /// Needs `by_owner`. With `now`, a running, idle agent restarts into it at once.
+    #[serde(default)]
+    pub kind: Option<SessionKind>,
     #[serde(default)]
     pub working_location: Option<WorkingLocation>,
     /// Required when changing location: true resets at the next start, false keeps the thread.
@@ -2045,9 +2060,10 @@ pub struct AgentUpdate {
     /// stays on the old profile. Picking its current profile is no change.
     #[serde(default)]
     pub account_profile: Option<crate::account_profiles::ProfileChoice>,
-    /// With a move: restart the agent now if it is running and idle (`start_fresh_if`);
-    /// otherwise (and by default) the move applies at its next start. Without one: apply the
-    /// move already waiting for its next start the same way (refused when none is waiting).
+    /// With a move or a kind switch: restart the agent now if it is running and idle
+    /// (`restart_moved`, `restart_switched`); otherwise (and by default) the change applies at its
+    /// next start. Without one: apply the move already waiting for its next start the same way
+    /// (refused when none is waiting).
     #[serde(default)]
     pub now: bool,
     /// With a move: first ask a running, idle agent to write what it needs into memory/ (off by
@@ -2070,7 +2086,7 @@ pub struct AgentUpdate {
     /// agents only; turning it on needs `by_owner`, turning it off works from anywhere.
     #[serde(default)]
     pub tools_up_front: Option<bool>,
-    /// Make it a lead agent (`Agent::lead`). Claude agents only; turning it on needs `by_owner`,
+    /// Make it a lead agent (`Agent::lead`). Claude and Antigravity agents only; turning it on needs `by_owner`,
     /// turning it off works from anywhere.
     #[serde(default)]
     pub lead: Option<bool>,
@@ -2092,6 +2108,24 @@ pub struct Switch {
     pub at: i64,
     pub now: bool,
     pub save_notes: bool,
+}
+
+/// A kind switch `update_full` saved (`AgentUpdate::kind`), for `switch_kind_now` to report and
+/// carry out.
+#[derive(Debug, Clone)]
+pub struct KindSwitch {
+    pub name: String,
+    pub from: SessionKind,
+    pub to: SessionKind,
+    pub now: bool,
+    /// Persona files moved aside (`switch_persona`).
+    pub kept_aside: Vec<String>,
+}
+
+/// `update_full` without the kind switch.
+#[cfg(test)]
+pub fn update_switch(hub: &Hub, req: AgentUpdate, outside: bool) -> anyhow::Result<(Agent, Option<Switch>)> {
+    update_full(hub, req, outside).map(|(a, sw, _)| (a, sw))
 }
 
 /// `update_switch` without the account move.
@@ -2121,15 +2155,15 @@ fn check_tools_up_front(a: &Agent, by_owner: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// May this `agent.update` make `a` a lead agent? Only a Claude agent (Codex agents keep the origin
-/// rules), and only by the human (`by_owner`, as for `check_tools_up_front`): a lead's messages and
+/// May this `agent.update` make `a` a lead agent? Only a Claude or Antigravity agent (`can_lead`:
+/// Codex agents keep the origin rules), and only by the human (`by_owner`, as for `check_tools_up_front`): a lead's messages and
 /// spawns count as the human's even in a scheduled or triggered turn. Turning it off works from
 /// anywhere.
 fn check_lead(a: &Agent, by_owner: bool) -> anyhow::Result<()> {
     anyhow::ensure!(
-        a.kind == SessionKind::Claude,
-        "only Claude agents can be lead agents: {} uses {}, and scheduled or triggered work it handles stays \
-         under the origin rules",
+        can_lead(a.kind),
+        "only Claude and Antigravity agents can be lead agents: {} uses {}, and scheduled or triggered work it handles \
+         stays under the origin rules",
         a.name, a.kind.label()
     );
     anyhow::ensure!(
@@ -2142,14 +2176,116 @@ fn check_lead(a: &Agent, by_owner: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// May this `agent.update` switch `a` to `to`? Only between Claude and Antigravity (a Codex agent
+/// takes scheduled and triggered work by default, and its thread can't follow), and only by the
+/// human (`by_owner`, as for `check_lead`): it changes which model runs the agent, on whose terms.
+fn check_kind_switch(a: &Agent, to: SessionKind, by_owner: bool) -> anyhow::Result<()> {
+    let ok = |k| matches!(k, SessionKind::Claude | SessionKind::Antigravity);
+    anyhow::ensure!(
+        ok(a.kind) && ok(to),
+        "an agent switches only between Claude and Antigravity: {} uses {}. Make a new agent for {}",
+        a.name, a.kind.label(), to.label()
+    );
+    anyhow::ensure!(
+        by_owner,
+        "only the human can switch {name} to {to}: in Edit agent (Kind) in Muster's window, or with `muster agent edit \
+         {name} --kind {kind}` in a terminal outside Muster. This call came from inside a Muster session (an agent, or a \
+         shell tab), from a script, or from a program Muster can't identify, so it may be an agent's",
+        name = a.name, to = to.label(), kind = to.as_str()
+    );
+    Ok(())
+}
+
+/// The permission mode an agent switching from `from` to `to` gets in the new CLI: the nearest
+/// match, no wider than the one it had with one exception. Plan stays plan; Claude's bypass and
+/// Antigravity's full access are the same (no prompts at all) and map to each other; Antigravity's
+/// auto becomes Claude's accept-edits. The exception: Claude's default (asks before edits) has no
+/// Antigravity match, and becomes accept-edits (edits without asking; commands still ask), as the
+/// stored-mode upgrade maps it (`model::StoredPermissions`), rather than plan, where it could
+/// change nothing. The other kinds' fields are kept.
+pub fn switch_permissions(p: Permissions, from: SessionKind, to: SessionKind) -> Permissions {
+    use crate::model::{AntigravityMode as A, ClaudeMode as C};
+    match (from, to) {
+        (SessionKind::Claude, SessionKind::Antigravity) => Permissions {
+            antigravity_mode: match p.claude_mode {
+                C::Plan => A::Plan,
+                C::Default | C::AcceptEdits => A::AcceptEdits,
+                C::Bypass => A::FullAccess,
+            },
+            ..p
+        },
+        (SessionKind::Antigravity, SessionKind::Claude) => Permissions {
+            claude_mode: match p.antigravity_mode {
+                A::Plan => C::Plan,
+                A::AcceptEdits | A::Auto => C::AcceptEdits,
+                A::FullAccess => C::Bypass,
+            },
+            ..p
+        },
+        _ => p,
+    }
+}
+
+/// What a switch to `to` clears in `next` (the record being edited): its conversation (the old
+/// CLI's id means nothing to the new one: the next start is a new conversation), the model and
+/// effort (the old CLI's names; the call's own, if any, are applied after), a pending account
+/// move, and for Antigravity what only Claude has: the account profile, OpenRouter, loading
+/// message tools up front and the self handoff right. Its permission modes follow
+/// (`switch_permissions`); its lead flag stays (both kinds can lead).
+fn switch_kind(next: &mut Agent, to: SessionKind) {
+    let from = next.kind;
+    next.kind = to;
+    next.reset_on_next_start = true;
+    next.model = None;
+    next.effort = None;
+    next.handoff = None;
+    next.permissions = switch_permissions(next.permissions, from, to);
+    if to != SessionKind::Claude {
+        next.account_profile_id = None;
+        next.provider = Provider::Subscription;
+        next.tools_up_front = false;
+        next.self_handoff = false;
+    }
+}
+
+/// A switch's persona files in `home`: the old kind's file is moved aside (so neither CLI reads a
+/// stale copy: Claude Code also reads AGENTS.md when a folder has no CLAUDE.md, or beside it when
+/// set to), and so is a file already at the new kind's name, then the new one is written from the
+/// record (`text`). Moved aside, never deleted: a persona file the human edited by hand stays, as
+/// `<file>.before-<new kind>` (`.<ms>` added when taken). The names kept aside.
+fn switch_persona(home: &Path, from: SessionKind, to: SessionKind, text: &str) -> anyhow::Result<Vec<String>> {
+    ensure_home(home)?;
+    let mut kept = Vec::new();
+    let mut names = vec![persona_file(from)];
+    if persona_file(to) != persona_file(from) {
+        names.push(persona_file(to));
+    }
+    for name in names {
+        let path = home.join(name);
+        match lstat(&path)? {
+            None => continue,
+            Some(m) if m.file_type().is_symlink() => anyhow::bail!("{} is a symbolic link; muster doesn't write through links", path.display()),
+            Some(_) => {}
+        }
+        let mut aside = format!("{name}.before-{}", to.as_str());
+        if lstat(&home.join(&aside))?.is_some() {
+            aside = format!("{aside}.{}", now_ms());
+        }
+        std::fs::rename(&path, home.join(&aside)).map_err(|e| anyhow::anyhow!("moving {} aside: {e}", path.display()))?;
+        kept.push(aside);
+    }
+    write_persona(&home.join(persona_file(to)), text)?;
+    Ok(kept)
+}
+
 /// `agent.update`. Model, effort and permissions apply from the agent's next start; the persona
 /// file is rewritten now (the CLI reads it when a conversation starts). Its own tab gets the new
 /// permission profile, so a restart runs with it. A move to another account (`account_profile`)
 /// is recorded here and returned for `switch_account` to carry out. `outside`: not a click in
 /// Muster's window (`rpc::Via::Outside`): a change that widens unattended work
 /// (`widens_unattended`) is refused. Read, checked and written under `Registry::config_lock`,
-/// one update at a time.
-pub fn update_switch(hub: &Hub, req: AgentUpdate, outside: bool) -> anyhow::Result<(Agent, Option<Switch>)> {
+/// one update at a time. Returns the account move and the kind switch it saved, to carry out.
+pub fn update_full(hub: &Hub, req: AgentUpdate, outside: bool) -> anyhow::Result<(Agent, Option<Switch>, Option<KindSwitch>)> {
     let _one = hub.agents().config_lock.lock();
     let cur = hub.agents().get(&req.name).ok_or_else(|| no_agent(hub, &req.name))?;
     let mut next = cur.clone();
@@ -2164,12 +2300,29 @@ pub fn update_switch(hub: &Hub, req: AgentUpdate, outside: bool) -> anyhow::Resu
         }
         _ => None,
     };
+    // Another kind: same id, name, tab, home, schedules and messages; a new conversation.
+    let switching = req.kind.filter(|k| *k != cur.kind);
+    if let Some(to) = switching {
+        check_kind_switch(&cur, to, req.by_owner)?;
+        anyhow::ensure!(moving.is_none(), "switch {}'s kind and move it to another account in two edits", cur.name);
+    }
+    // `--kind <the kind it is saved as> --now` after a switch that waits for its next start (its
+    // tab still runs the old kind): that switch, now. The human's alone, as the switch was.
+    let pending = match (req.kind, live_session(hub, &cur)) {
+        (Some(k), Some(live)) if req.now && moving.is_none() && k == cur.kind && live.kind != cur.kind => {
+            check_kind_switch(&Agent { kind: live.kind, ..cur.clone() }, k, req.by_owner)?;
+            Some(KindSwitch { name: cur.name.clone(), from: live.kind, to: k, now: true, kept_aside: Vec::new() })
+        }
+        _ => None,
+    };
     // `now` alone: the move waiting for its next start, now (Restart now, `--now` without
     // `--profile`).
-    let waiting = cur.handoff.clone().filter(|_| cur.kind == SessionKind::Claude && moving.is_none() && req.now);
+    let waiting = cur.handoff.clone().filter(|_| cur.kind == SessionKind::Claude && moving.is_none() && switching.is_none()
+        && pending.is_none() && req.now);
     anyhow::ensure!(
-        !req.now || moving.is_some() || waiting.is_some(),
-        "{} has no move waiting: `now` goes with a move to another account, or applies one that waits for its next start",
+        !req.now || moving.is_some() || waiting.is_some() || switching.is_some() || pending.is_some(),
+        "{} has no move waiting: `now` goes with a move to another account or a kind switch, or applies a move that waits \
+         for its next start",
         cur.name
     );
     if let (Some(h), Some(at)) = (&waiting, req.handoff_at) {
@@ -2209,6 +2362,9 @@ pub fn update_switch(hub: &Hub, req: AgentUpdate, outside: bool) -> anyhow::Resu
             at: now_ms().max(cur.handoff.as_ref().map_or(0, |h| h.at + 1)),
             reason,
         });
+    }
+    if let Some(to) = switching {
+        switch_kind(&mut next, to);
     }
 
     if let Some(m) = req.model {
@@ -2256,12 +2412,23 @@ pub fn update_switch(hub: &Hub, req: AgentUpdate, outside: bool) -> anyhow::Resu
         }
         next.lead = on;
     }
+    // Checked against the kind it has after this edit: a switch to Antigravity can't keep or
+    // grant what only Claude has.
+    if next.kind != SessionKind::Claude {
+        anyhow::ensure!(!next.tools_up_front, "loading message tools up front is for Claude agents only: {} uses {}",
+            next.name, next.kind.label());
+        anyhow::ensure!(!next.self_handoff, "starting itself fresh is for Claude agents only: {} uses {}",
+            next.name, next.kind.label());
+    }
     if outside && let Some(why) = widens_unattended(hub, &cur, &next) {
         anyhow::bail!("{why}");
     }
     // The persona file tells a promoted agent about its fresh start or its lead role, so it
     // follows the right.
-    if next.persona != cur.persona || next.self_handoff != cur.self_handoff || next.lead != cur.lead {
+    let mut kept_aside = Vec::new();
+    if next.kind != cur.kind {
+        kept_aside = switch_persona(Path::new(&next.home_dir), cur.kind, next.kind, &persona_text_for(&next))?;
+    } else if next.persona != cur.persona || next.self_handoff != cur.self_handoff || next.lead != cur.lead {
         let home = PathBuf::from(&next.home_dir);
         let written = ensure_home(&home).and_then(|()| write_persona(&home.join(persona_file(next.kind)), &persona_text_for(&next)));
         // Taking a right back (lead or self handoff off, nothing else in the file changed) is saved
@@ -2272,18 +2439,33 @@ pub fn update_switch(hub: &Hub, req: AgentUpdate, outside: bool) -> anyhow::Resu
             r => r?,
         }
     }
+    // With a switch, the call's permissions apply after the tab's mapped modes (below), so they
+    // are never skipped as matching the tab's modes before the switch.
     let channel_patch = req.permissions.and_then(|patch| {
         let c = next.channel_id.and_then(|id| hub.channel(id))?;
-        (!c.archived && patch.onto(c.permissions) != c.permissions).then_some((c.id, patch))
+        (!c.archived && (next.kind != cur.kind || patch.onto(c.permissions) != c.permissions)).then_some((c.id, patch))
     });
     // `now` alone changes nothing in the record: written back, it could restore a move a start
     // cleared meanwhile.
     if channel_patch.is_none() && serde_json::to_value(&next)? == serde_json::to_value(&cur)? {
         let save_notes = req.save_notes.unwrap_or(false);
         let switch = waiting.map(|h| Switch { name: cur.name.clone(), from: h.from, to: cur.account_profile_id, at: h.at, now: true, save_notes });
-        return Ok((cur, switch));
+        return Ok((cur, switch, pending));
+    }
+    // Its own tab's modes follow a switch as the record's did (`switch_permissions`), before the
+    // new kind is saved: a start (or a daemon restart) between the two never finds the new kind
+    // on the old tab's modes for it. Only the new kind's field changes, so the old kind's run is
+    // untouched. The call's own permissions, if any, follow below.
+    if next.kind != cur.kind
+        && let Some(c) = next.channel_id.and_then(|id| hub.channel(id)).filter(|c| !c.archived)
+    {
+        let (from, to) = (cur.kind, next.kind);
+        hub.change_permissions(c.id, |current| switch_permissions(current, from, to))?;
     }
     let next = hub.agents().set_config(hub.store(), &next)?;
+    let kind_switch = (next.kind != cur.kind).then(|| KindSwitch {
+        name: next.name.clone(), from: cur.kind, to: next.kind, now: req.now, kept_aside,
+    }).or(pending);
     let save_notes = req.save_notes.unwrap_or(false);
     let switch = match (moving, waiting) {
         (Some(to), _) => Some(Switch {
@@ -2301,10 +2483,10 @@ pub fn update_switch(hub: &Hub, req: AgentUpdate, outside: bool) -> anyhow::Resu
         hub.change_permissions(id, |current| patch.onto(current))?;
     }
     publish(hub, &next);
-    if next.provider != cur.provider || next.accepts_origins != cur.accepts_origins {
+    if next.provider != cur.provider || next.accepts_origins != cur.accepts_origins || next.kind != cur.kind {
         crate::schedules::agent_changed(hub, next.id);
     }
-    Ok((next, switch))
+    Ok((next, switch, kind_switch))
 }
 
 /// Does changing `cur` to `next` widen unattended work, which takes a click in Muster's window?
@@ -2387,6 +2569,17 @@ pub fn reach_profile(agent: &Agent, session_channel: Option<&Channel>, own: Opti
         });
     }
     p.unwrap_or((None, agent.permissions))
+}
+
+/// The kinds a message to `agent` may reach, for its permission checks: the kind it is saved as
+/// and, after a switch that waits for its next start (`AgentUpdate::kind`), the kind its running
+/// tab `session` still runs.
+pub fn reach_kinds(agent: &Agent, session: Option<&SessionInfo>) -> Vec<SessionKind> {
+    let mut kinds = vec![agent.kind];
+    if let Some(s) = session.filter(|s| s.kind != agent.kind && s.kind != SessionKind::Shell) {
+        kinds.push(s.kind);
+    }
+    kinds
 }
 
 /// An agent plus its session.
@@ -2557,9 +2750,12 @@ async fn start_once(hub: &Arc<Hub>, name: &str, fresh: bool, window: Option<Wind
         }
     }
     // Its tab counts the messages waiting for its next turn, those sent before this start too
-    // (src/quiet.rs).
+    // (src/quiet.rs); an Antigravity agent gets any left from when it ran Claude.
     if let Ok(s) = &r {
         crate::quiet::refresh(hub, s.session.id);
+        if s.started {
+            hand_over_quiet(hub, &s.agent);
+        }
     }
     r
 }
@@ -2791,7 +2987,10 @@ pub async fn restart_session(hub: &Arc<Hub>, id: SessionId, expect: Option<&Rest
     if let Some(h) = &agent.handoff {
         handed_off(hub, agent.id, h.at);
     }
-    if let Some(a) = hub.agents().by_id(agent.id) { publish(hub, &a); }
+    if let Some(a) = hub.agents().by_id(agent.id) {
+        publish(hub, &a);
+        hand_over_quiet(hub, &a);
+    }
     Ok(session)
 }
 
@@ -2960,6 +3159,25 @@ fn handed_off(hub: &Hub, id: i64, at: i64) {
     }
 }
 
+/// Before a new run of session `sid`, once the old one has stopped: when it is the tab of a named
+/// agent that switched kind (`AgentUpdate::kind`), the tab becomes the new kind's, on the agent's
+/// account, and the agent forgets the old CLI's conversation, so nothing passes it to the new CLI
+/// (the start that got here already reset it; a hook of the old run may have saved it again).
+/// The session keeps its id, tab, queue and messages.
+pub(crate) fn follow_kind(hub: &Hub, sid: SessionId) -> anyhow::Result<()> {
+    let Some(a) = hub.agents().by_session(sid) else { return Ok(()) };
+    let Some(s) = hub.session(sid) else { return Ok(()) };
+    if s.kind == a.kind {
+        return Ok(());
+    }
+    let ok = |k| matches!(k, SessionKind::Claude | SessionKind::Antigravity);
+    anyhow::ensure!(ok(s.kind) && ok(a.kind), "{}'s tab runs {}, which can't become {}", a.name, s.kind.label(), a.kind.label());
+    hub.agents().update(hub.store(), a.id, |b| b.resume_id = None)?;
+    hub.set_session_kind(sid, a.kind, a.account_profile_id)?;
+    tracing::info!(agent = a.name, from = s.kind.as_str(), to = a.kind.as_str(), "its tab switched kind");
+    Ok(())
+}
+
 /// Before restarting session `sid` of `agent`: its tab runs on the agent's account.
 fn follow_account(hub: &Hub, agent: &Agent, sid: SessionId) -> anyhow::Result<()> {
     if agent.kind != SessionKind::Claude {
@@ -3033,6 +3251,128 @@ pub async fn switch_account(hub: &Arc<Hub>, sw: Switch) -> Value {
         }
     }
     out
+}
+
+/// Carry out kind switch `ks` that `update_full` saved: with `now`, restart a running, idle agent
+/// into its new CLI at once (`restart_switched`); otherwise it switches at its next start. What
+/// happened, for the `agent.update` reply (`kind_switch`): `from`, `to`, `running`, `kept_aside`
+/// (persona files moved aside) and `outcome`: `next_start`, `restarted`, `busy` (Now was asked; it
+/// switches at its next start, its turn untouched; `why` when Muster can say), `replaced` (another
+/// edit or a start came first) or `failed` (`error`).
+pub async fn switch_kind_now(hub: &Arc<Hub>, ks: KindSwitch) -> Value {
+    let live = hub.agents().get(&ks.name).and_then(|a| live_session(hub, &a));
+    let mut out = json!({
+        "from": ks.from.as_str(), "to": ks.to.as_str(), "now": ks.now, "running": live.is_some(),
+        "kept_aside": ks.kept_aside,
+    });
+    let outcome = if ks.now && live.is_some() { restart_switched(hub, &ks).await } else { Ok(("next_start", None)) };
+    match outcome {
+        Ok((o, why)) => {
+            out["outcome"] = json!(o);
+            if let Some(why) = why {
+                out["why"] = json!(why);
+            }
+        }
+        Err(e) => {
+            out["outcome"] = json!("failed");
+            out["error"] = json!(format!("{e:#}"));
+        }
+    }
+    out
+}
+
+/// Restart a switched agent now, in its new CLI, if it is still that kind and the run of the old
+/// kind is still running and idle: as `restart_moved` does for a move (put to sleep under the
+/// start lock, whose claim refuses while a prompt is typed or waits, a message is on its way or
+/// keys were typed just now; then started, which switches its tab: `follow_kind`).
+async fn restart_switched(hub: &Arc<Hub>, ks: &KindSwitch) -> anyhow::Result<(&'static str, Option<String>)> {
+    let held = hub.agents().start_lock.lock().await;
+    let Some(a) = hub.agents().get(&ks.name).filter(|a| a.kind == ks.to) else {
+        return Ok(("replaced", None));
+    };
+    let Some(live) = live_session(hub, &a) else { return Ok(("next_start", None)) };
+    if live.kind == a.kind {
+        return Ok(("replaced", None));
+    }
+    if !session_idle(&live) {
+        return Ok(("busy", None));
+    }
+    move_preflight(hub, &a)?;
+    if let Err(e) = crate::sleep::sleep_held(hub, &ks.name, crate::sleep::Why::Move, &held).await {
+        let Some(no) = e.downcast_ref::<crate::sleep::NotNow>() else { return Err(e) };
+        if hub.agents().get(&ks.name).and_then(|b| live_session(hub, &b)).is_none() {
+            return Ok(("next_start", None));
+        }
+        return Ok(("busy", Some(no.reason().to_string())));
+    }
+    let s = start_locked(hub, &ks.name, false, None, None).await
+        .map_err(|e| e.context(format!("it is asleep, and starts as {} when it next wakes", ks.to.label())))?;
+    publish(hub, &s.agent);
+    Ok(("restarted", None))
+}
+
+/// Messages that waited for a Claude agent's next turn (wake=false, src/quiet.rs) can't reach it
+/// once it runs Antigravity, which has no hook to take them. At each start of an Antigravity
+/// agent, any still waiting are sent again as ordinary messages (typed in, starting a turn),
+/// from the same sender on the same route, through every check a message gets (`deliver`); the
+/// waiting one is marked expired first, so none is sent twice, and waits again when the send
+/// fails. Only what its sender could still send it now: a message checked against a narrower
+/// mode than its Antigravity tab now gives (in Claude's terms, `switch_permissions`), or from an
+/// origin it no longer accepts, keeps waiting. In the background: the start lock is held by the
+/// start that calls it.
+fn hand_over_quiet(hub: &Arc<Hub>, agent: &Agent) {
+    if agent.kind != SessionKind::Antigravity {
+        return;
+    }
+    let (id, name) = (agent.id, agent.name.clone());
+    let hub = hub.clone();
+    tokio::spawn(async move {
+        let Some(agent) = hub.agents().by_id(id) else { return };
+        let tab = agent.channel_id.and_then(|c| hub.channel(c)).map_or(agent.permissions, |c| c.permissions);
+        let width = crate::quiet::width(switch_permissions(tab, SessionKind::Antigravity, SessionKind::Claude).claude_mode);
+        let waiting = match hub.store().waiting_quiet_for_agent(id, width) {
+            Ok(w) => w,
+            Err(e) => return tracing::warn!(agent = name, "reading its waiting messages: {e:#}"),
+        };
+        for m in waiting {
+            if let Err(why) = crate::mcp::guard::check_agent_delivery(&name, &agent.accepts_origins, m.origin, m.hop, 0) {
+                tracing::info!(agent = name, msg = m.id, "a waiting message stays waiting: {why}");
+                continue;
+            }
+            match hub.store().expire_agent_quiet(m.id, now_ms()) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(e) => {
+                    tracing::warn!(agent = name, msg = m.id, "handing over a waiting message: {e:#}");
+                    continue;
+                }
+            }
+            publish_message(&hub, m.id);
+            let out = Outgoing {
+                agent: name.clone(),
+                agent_id: Some(id),
+                text: m.text.clone().unwrap_or_default(),
+                from: m.from.clone(),
+                from_session: m.from_session,
+                route: Route { origin: m.origin, hop: m.hop, reply_to: m.reply_to },
+            };
+            if let Err(e) = deliver(&hub, out).await {
+                // A policy refusal is recorded as its own message, like any refused send.
+                if e.downcast_ref::<Refused>().is_some() {
+                    continue;
+                }
+                // Not lost: it waits again, for the agent's next start to try once more.
+                if let Err(e) = hub.store().unexpire_agent_quiet(m.id) {
+                    tracing::warn!(agent = name, msg = m.id, "keeping a waiting message: {e:#}");
+                }
+                publish_message(&hub, m.id);
+                hub.notice("warn", format!(
+                    "Message {} to {name} waited for its next turn, and {name} now runs Antigravity, which can't take such \
+                     messages; sending it again failed ({e:#}), so it waits for {name}'s next start", m.id));
+            }
+        }
+        crate::quiet::refresh_agent(&hub, id);
+    });
 }
 
 /// Why Save notes first is skipped (None: ask): `off`, `not_running`, `busy` or `at_limit`.
@@ -3767,6 +4107,8 @@ pub fn agent_json(b: &Agent, session: Option<&SessionInfo>) -> Value {
         "self_handoff_at": b.self_handoff_at,
         "tools_up_front": b.tools_up_front,
         "lead": b.lead,
+        // The kinds Edit agent can switch it to and from (`AgentUpdate::kind`); empty for Codex.
+        "switch_kinds": if can_lead(b.kind) { json!(["claude", "antigravity"]) } else { json!([]) },
     })
 }
 
@@ -4467,6 +4809,47 @@ mod tests {
 
     /// A start reads as a new conversation from what it launches: Claude without `--resume`,
     /// Codex without a saved thread.
+
+    /// A switch never widens what the agent may do unasked: each mode maps to the nearest one no
+    /// wider, except bypass and full access, which are the same.
+    #[test]
+    fn a_kind_switch_maps_permission_modes_no_wider() {
+        use crate::model::{AntigravityMode as A, ClaudeMode as C};
+        let p = |c, a| Permissions { claude_mode: c, antigravity_mode: a, ..Permissions::default() };
+        for (c, want) in [(C::Plan, A::Plan), (C::Default, A::AcceptEdits), (C::AcceptEdits, A::AcceptEdits), (C::Bypass, A::FullAccess)] {
+            assert_eq!(switch_permissions(p(c, A::Auto), SessionKind::Claude, SessionKind::Antigravity).antigravity_mode, want);
+        }
+        for (a, want) in [(A::Plan, C::Plan), (A::AcceptEdits, C::AcceptEdits), (A::Auto, C::AcceptEdits), (A::FullAccess, C::Bypass)] {
+            assert_eq!(switch_permissions(p(C::Default, a), SessionKind::Antigravity, SessionKind::Claude).claude_mode, want);
+        }
+        let same = p(C::Plan, A::FullAccess);
+        assert_eq!(switch_permissions(same, SessionKind::Claude, SessionKind::Claude), same);
+    }
+
+    /// A message to an agent whose switch waits for its next start is checked for both kinds: the
+    /// saved one and the one its running tab still runs.
+    #[test]
+    fn a_pending_switch_is_checked_for_both_kinds() {
+        let a = agent(SessionKind::Antigravity);
+        let mut s = crate::mcp::guard::test_session(1, None);
+        s.kind = SessionKind::Claude;
+        assert_eq!(reach_kinds(&a, Some(&s)), vec![SessionKind::Antigravity, SessionKind::Claude]);
+        s.kind = SessionKind::Antigravity;
+        assert_eq!(reach_kinds(&a, Some(&s)), vec![SessionKind::Antigravity]);
+        assert_eq!(reach_kinds(&a, None), vec![SessionKind::Antigravity]);
+    }
+
+    /// The lead section is true for both kinds that can lead, and only they get it.
+    #[test]
+    fn the_lead_section_goes_to_claude_and_antigravity_leads_only() {
+        for (kind, lead) in [(SessionKind::Claude, true), (SessionKind::Antigravity, true), (SessionKind::Codex, false)] {
+            let a = Agent { lead: true, ..agent(kind) };
+            assert_eq!(is_lead(&a), lead, "{kind:?}");
+            assert_eq!(persona_text_for(&a).contains("## Lead agent"), lead, "{kind:?}");
+        }
+        assert!(!LEAD_SECTION.contains("Claude"), "nothing in it is Claude's alone");
+    }
+
     #[test]
     fn antigravity_agent_arguments_and_permissions() {
         let kind = SessionKind::Antigravity;

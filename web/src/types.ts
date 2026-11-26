@@ -274,6 +274,19 @@ export interface AgentHandoff {
 }
 
 /** What `agent.update` did with a move to another account (src/agents.rs `switch_account`). */
+/** What `agent.update` did with a switch between Claude and Antigravity (`kind_switch`). */
+export interface AgentKindSwitch {
+  from: Agent["kind"];
+  to: Agent["kind"];
+  now: boolean;
+  running: boolean;
+  outcome: "next_start" | "restarted" | "busy" | "replaced" | "failed";
+  /** Persona files moved aside, e.g. CLAUDE.md.before-antigravity. */
+  kept_aside: string[];
+  error?: string;
+  why?: string;
+}
+
 export interface AgentSwitch {
   /** The new profile's name. */
   to: string;
@@ -326,8 +339,11 @@ export interface Agent {
   /** Its sessions get Muster's message tools in the prompt from the start, instead of through
    * Claude Code's tool search (src/mcp/tools.rs `UP_FRONT`). Older daemons: absent. */
   tools_up_front?: boolean;
-  /** A lead agent: what it sends from scheduled work goes as origin "lead", taken like the human's (docs/MCP.md "Lead agents"). Absent from an older backend. */
+  /** A lead agent (Claude or Antigravity): what it sends from scheduled work goes as origin "lead", taken like the human's (docs/MCP.md "Lead agents"). Absent from an older backend. */
   lead?: boolean;
+  /** The kinds Edit agent can switch it between (Claude and Antigravity; empty for Codex).
+   * Absent from an older backend, which can't switch. */
+  switch_kinds?: Agent["kind"][];
   /** Why its last wake failed, while it is still asleep (it stays asleep; the next message or
    * typing tries again). */
   wake_error?: string;

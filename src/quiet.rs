@@ -1178,6 +1178,18 @@ mod tests {
         assert_eq!(hub.session(3).unwrap().quiet_waiting, 2);
     }
 
+    /// A switch to Antigravity hands over only what was checked against a mode at least as wide as
+    /// the one it now runs with (`agents::hand_over_quiet`).
+    #[tokio::test]
+    async fn a_handover_takes_only_messages_checked_against_a_mode_as_wide() {
+        let (hub, _, beta, _) = hub();
+        let id = stored(&hub, &beta, Origin::Human, now_ms());
+        let ids = |w| hub.store().waiting_quiet_for_agent(beta.id, w).unwrap().iter().map(|m| m.id).collect::<Vec<_>>();
+        assert_eq!(ids(width(ClaudeMode::Default)), vec![id]);
+        assert_eq!(ids(width(ClaudeMode::Plan)), vec![id]);
+        assert!(ids(width(ClaudeMode::Bypass)).is_empty(), "sent to a narrower run: not to full access");
+    }
+
     #[tokio::test]
     async fn a_week_old_message_expires_unseen_and_counts_follow() {
         let (hub, _, beta, _) = hub();

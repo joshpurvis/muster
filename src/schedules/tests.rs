@@ -561,3 +561,25 @@ mod phase3;
 // The daily cap counts calendar days in the schedule's zone.
 #[path = "tests_daily_cap.rs"]
 mod daily_cap;
+
+/// A schedule made before its agent switched from Claude to Antigravity still runs for that agent
+/// afterwards (same id), now by Antigravity's rules: no 7-day expiry.
+#[test]
+fn a_schedule_made_before_a_kind_switch_still_runs_for_the_agent() {
+    let f = Fixture::new(at(LONDON, "2026-10-12T08:00"));
+    let s = f.create(json!({"agent": "cleo", "prompt": "p", "tz": LONDON, "quiet_hours": false, "when": {"kind": "cron", "cron": "0 9 * * *"}})).unwrap();
+    let cleo = f.hub.agents().get("cleo").unwrap();
+    let mut u: crate::agents::AgentUpdate = serde_json::from_value(json!({"name": "cleo", "kind": "antigravity"})).unwrap();
+    u.by_owner = true;
+    crate::agents::update_full(&f.hub, u, false).unwrap();
+    let now = f.hub.agents().get("cleo").unwrap();
+    assert_eq!((now.id, now.kind), (cleo.id, SessionKind::Antigravity));
+    assert_eq!(f.hub.schedules.get(s.id).unwrap().agent_id, cleo.id, "the schedule stays");
+    assert!(!facts(&f.hub, &now).subscription_claude);
+    // Past the 7 days a Claude subscription schedule would have expired: it runs.
+    f.set(at(LONDON, "2026-10-20T09:00") + 100);
+    let started = f.tick();
+    assert_eq!(started.len(), 1);
+    assert_eq!(started[0].schedule_id, s.id);
+    assert_ne!(f.runs(s.id)[0].reason.as_deref(), Some(plan::EXPIRED));
+}

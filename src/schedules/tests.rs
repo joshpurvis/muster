@@ -562,6 +562,10 @@ mod phase3;
 #[path = "tests_daily_cap.rs"]
 mod daily_cap;
 
+// A run's reply through the agent's MCP `reply` tool.
+#[path = "tests_mcp_reply.rs"]
+mod mcp_reply;
+
 /// A schedule made before its agent switched from Claude to Antigravity still runs for that agent
 /// afterwards (same id), now by Antigravity's rules: no 7-day expiry.
 #[test]

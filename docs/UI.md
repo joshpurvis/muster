@@ -27,7 +27,10 @@ kills it, and reopening restores the window's channel selection, layouts and sid
 
 ## Channels sidebar
 
-The sidebar is one list of channels in a 240px dock, with Messages and Usage under it. A named
+The sidebar is one list of channels in a 240px dock, with Messages and Usage under it. Usage has
+one row per Claude account, then Codex, then Antigravity's two quota pools, **Gemini** and
+**Claude+GPT** (the Claude and GPT models agy runs), each with its 5-hour and weekly bars; a row's
+tip names it in full, and a pool nobody has used yet reads 0% with no window running. A named
 agent has no section of its own: it lives in its channel's row (see "Agents in the sidebar"), and
 agents whose channel isn't in this window (never started yet, or shown in another window) get a
 row after the channels, before Notes. **Alt+G** hides or shows the entire sidebar. The window's ⋯
@@ -998,7 +1001,7 @@ sends only what changed (`schedule.settings.set`). The dialog scrolls in a short
 - New only: a template picker (Blank, Orchestrator, Researcher, Reviewer, PR reviewer, Background worker, from
   `agent.templates`) with the chosen template's one-line description under it (every template's
   as its hover tip); picking one fills every field (a name you typed is kept). Name and kind
-  (Claude · Codex · Antigravity). Antigravity uses its own login and offers Gemini models with the effort built into the ID, so it has no separate effort picker.
+  (Claude · Codex · Antigravity). Antigravity uses its own login and offers its Gemini models, Claude Opus 5.5, Claude Sonnet 5.5 and GPT-OSS 120B, each with the effort levels agy accepts for it (none for an Orchestrator or for Default).
 - **Provider** (shown when the backend supports it; under More options): Subscription · OpenRouter. Subscription is
   the CLI's own login, as before. Without `OPENROUTER_API_KEY` on the backend, OpenRouter is
   disabled and a hint under it says how to set it (`env OPENROUTER_API_KEY=… muster reload` from a
@@ -1043,11 +1046,13 @@ sends only what changed (`schedule.settings.set`). The dialog scrolls in a short
   agent's card in the sidebar shows the same "Moves to Work at its next start" line in amber
   under its state. A Claude agent's tab menu has Switch account… as well.
 - Model and Effort pills for the agent's kind (`agent.models`): Default (the CLI's
-  choice; the pill reads "Default"), the CLI's models (Claude's aliases such as `opus`; Codex's model ids) or levels, and
+  choice; the pill reads "Default"), the CLI's models (Claude's aliases such as `opus`; Codex's model ids;
+  Antigravity's base names such as `claude-opus-5-5`, the Claude and GPT ones marked with their own
+  quota) or levels, and
   Custom…, which shows a text field under the pills for any other value. A saved value the list doesn't have
   shows as Custom with its text, and Custom stays chosen (also with its field cleared) until
   another entry is picked. Effort lists the chosen model's levels where they differ from the
-  CLI's; changing the model puts a listed level it doesn't offer back to Default (a custom one
+  CLI's (an Antigravity agent shows Effort only once a listed model with levels is picked); changing the model puts a listed level it doesn't offer back to Default (a custom one
   stays). Switching kind puts a model or level the new kind doesn't list back to Default.
   Edit of a Claude or Antigravity agent shows a **Runs on** choice (Claude | Antigravity) above the
   persona. Picking the other kind opens a "Switch to …" panel: its next start is a new conversation

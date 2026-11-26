@@ -106,7 +106,9 @@ and targets in them are refused.
 
 For `spawn_session` with `kind: "antigravity"`, the extra arguments are `--model`,
 `--effort`, `--continue` (or `-c`) and `--conversation`. For example, pass
-`"model": "gemini-4-neon-high"`. The channel supplies the execution mode.
+`"model": "claude-opus-5-5", "effort": "high"` (agy resolves it to `claude-opus-5-5-high`, and
+refuses a level the model lacks). `agent.models` lists the models with their levels. The channel
+supplies the execution mode.
 
 ### Links
 

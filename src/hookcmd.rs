@@ -13,7 +13,9 @@
 //!   huge tool result doesn't bloat the event log.
 //! - Antigravity's title callback accepts only `state`. Its stdin includes account data.
 //!   Only validated state, approval status and conversation id may reach either transport.
-//!   The title command has no stdout.
+//!   Beside it, the plan quota's allowlisted buckets (used percentage and reset time, nothing
+//!   else) go to `POST /usage/antigravity` (src/antigravity_usage.rs). The title command has no
+//!   stdout.
 //! - Also sends `X-Muster-Agent: <agent>` (informational only).
 //!
 //! Host-managed runs use `$MUSTER_HOOK_DB`: append to the application-owned durable inbox
@@ -76,7 +78,51 @@ pub fn run(agent: &str, event: &str, payload_arg: Option<String>) -> i32 {
         Some(p) => p.into_bytes(),
         None => read_stdin(),
     };
-    let Some(mut body) = callback_body(agent, event, &raw) else { return 0 };
+    // Antigravity's plan quota goes its own way, beside the state (src/antigravity_usage.rs).
+    let usage = (agent == "antigravity" && event == "state")
+        .then(|| {
+            let id: crate::model::SessionId = std::env::var("MUSTER_SESSION_ID").ok()?.parse().ok()?;
+            let last = crate::paths::session_dir(id).join(crate::antigravity_usage::LAST_REPORT);
+            antigravity_usage(&url, &token, &raw, last)
+        })
+        .flatten();
+    let code = forward(agent, event, url, token, &raw);
+    if let Some(usage) = usage {
+        let _ = usage.recv_timeout(USAGE_WAIT);
+    }
+    code
+}
+
+/// How long the title callback still waits for its quota report once the state is handled.
+const USAGE_WAIT: Duration = Duration::from_millis(600);
+
+/// Send the quota buckets of agy's callback input (`antigravity_usage::hook_body`: numbers only)
+/// to `POST /usage/antigravity` on a thread, unless this session sent the same figures within
+/// `RENEW_EVERY_MS` (recorded in `last`). The receiver hears when it is done.
+fn antigravity_usage(url: &str, token: &str, raw: &[u8], last: std::path::PathBuf) -> Option<std::sync::mpsc::Receiver<()>> {
+    let body = crate::antigravity_usage::hook_body(&serde_json::from_slice(raw).ok()?)?;
+    let recent = std::fs::symlink_metadata(&last)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age.as_millis() < crate::antigravity_usage::RENEW_EVERY_MS);
+    if recent && crate::adapters::antigravity::read_last_state(&last).as_ref() == Some(&body) {
+        return None;
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (url, token) = (url.to_string(), token.to_string());
+    std::thread::spawn(move || {
+        if matches!(post(&url, "/usage/antigravity", &token, "antigravity", &body), Ok(200..=299)) {
+            let _ = crate::paths::write_private(&last, &body);
+        }
+        let _ = tx.send(());
+    });
+    Some(rx)
+}
+
+/// Forward one callback's payload to the daemon (its durable inbox, or HTTP).
+fn forward(agent: &str, event: &str, url: String, token: String, raw: &[u8]) -> i32 {
+    let Some(mut body) = callback_body(agent, event, raw) else { return 0 };
     let last = (agent == "antigravity").then(|| {
         let id = std::env::var("MUSTER_SESSION_ID").ok()?.parse().ok()?;
         Some(crate::paths::session_dir(id).join(crate::adapters::antigravity::LAST_STATE))
@@ -559,6 +605,37 @@ mod tests {
         assert!(req.contains("Authorization: Bearer tok\r\n"));
         assert!(req.contains("X-Muster-Agent: codex\r\n"));
         assert!(req.ends_with(r#"{"type":"agent-turn-complete"}"#));
+    }
+
+    /// The title callback sends agy's quota numbers, and nothing else of its input, to
+    /// `/usage/antigravity`; the same figures again only after `RENEW_EVERY_MS`.
+    #[test]
+    fn antigravity_quota_goes_to_its_own_endpoint_once_per_change() {
+        let dir = std::env::temp_dir().join(format!("muster-hook-agy-usage-{}", crate::paths::random_token()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let last = dir.join(crate::antigravity_usage::LAST_REPORT);
+        let real = include_bytes!("fixtures/antigravity_title_1.5.13.json");
+        let (port, h) = answer_once(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}");
+        let url = format!("http://127.0.0.1:{port}");
+        let done = antigravity_usage(&url, "tok", real, last.clone()).unwrap();
+        done.recv_timeout(Duration::from_secs(3)).unwrap();
+        let req = h.join().unwrap();
+        assert!(req.starts_with("POST /usage/antigravity HTTP/1.1\r\n"), "{req}");
+        assert!(req.contains("Authorization: Bearer tok\r\n"));
+        for private in ["example.invalid", "alpha", "demo-app", "Pro", "transcript", "11111111"] {
+            assert!(!req.contains(private), "{private} sent: {req}");
+        }
+        assert!(req.contains(r#""gemini-5h":{"resets_at":1783324232,"used_percentage":29.9}"#), "{req}");
+        // Unchanged within a minute: nothing sent. Changed, or no quota: as it says.
+        assert!(antigravity_usage(&url, "tok", real, last.clone()).is_none());
+        let changed = String::from_utf8_lossy(real).replace("0.7012", "0.5");
+        let (port, h) = answer_once(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}");
+        let done = antigravity_usage(&format!("http://127.0.0.1:{port}"), "tok", changed.as_bytes(), last.clone()).unwrap();
+        done.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(h.join().unwrap().contains(r#""used_percentage":50.0"#));
+        assert!(antigravity_usage(&url, "tok", br#"{"agent_state":"authenticating","quota":null}"#, last.clone()).is_none());
+        assert!(antigravity_usage(&url, "tok", b"not json", last).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A one-request server answering `response`; returns what it was sent.

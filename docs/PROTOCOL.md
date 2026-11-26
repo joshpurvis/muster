@@ -25,6 +25,7 @@ mode 0600: `{"pid": 123, "port": 7433, "panel_port": 51234, "token": "<client to
 | `POST /hook/<event>` | `Authorization: Bearer <session token>` | Agent hook callbacks (body: JSON payload). |
 | `POST /quiet/take` | `Authorization: Bearer <session token>` | Body `{"msg": <id> \| null, "permission_mode": <string> \| null}`: the message id of the envelope the prompt starts with (null: a prompt Muster didn't type in, the human's turn), and the `permission_mode` of Claude Code's `UserPromptSubmit` payload, the mode the process runs in now (`plan`, `default`, `acceptEdits`, `bypassPermissions`; any other, such as the user's own default `auto`, or null counts as the mode the session's tab sets). The quiet messages waiting for the turn this session's `UserPromptSubmit` hook is starting (docs/MCP.md "Quiet messages"), marked offered: `{context: string \| null, quiet: {agent: number[], session: number[]}, left: number}`. Only that session's own, and only while the token's run is its current one; `context` is null when none wait for this turn or the session isn't Claude. Not reachable through a funnel or proxy. |
 | `POST /usage/claude` | `Authorization: Bearer <session token>` | A Claude session's status-line usage report (`muster statusline`): `{rate_limits: {five_hour?, seven_day?: {used_percentage, resets_at}}, api_duration_ms?, context?: {conversation, tokens}}` (`api_duration_ms`: the run's `cost.total_api_duration_ms`; more than the run's previous report is the evidence that the numbers are newly fetched; a report may carry it alone, as the baseline before the run's first response; `context`: the conversation's id, Claude Code's `session_id`, and its size, `context_window.current_usage`'s input, cache-write and cache-read tokens, kept per named agent with that conversation for the cold-answer rule (only from a report that carries `api_duration_ms`, which orders them), docs/MCP.md "Questions for the human"; other fields are ignored), at most 16 KiB. Attributed by the token to its session and run, and filed under the configuration folder recorded at that run's launch; a run without one is ignored. See "Claude account profiles". |
+| `POST /usage/antigravity` | `Authorization: Bearer <session token>` | An Antigravity tab's plan quota, sent by its title callback (`muster hook antigravity state`) beside the state: `{quota: {<bucket>: {used_percentage, resets_at}}}` for the buckets `gemini-5h`, `gemini-weekly` (the Gemini models' pool), `3p-5h` and `3p-weekly` (the Claude and GPT models' pool), from agy's `quota` (`used_percentage` is 100 × (1 − `remaining_fraction`), one decimal; `resets_at` Unix s from `reset_time`, null while no window is running; a bucket whose `reset_time` can't be read is not sent, so the last good reading stays). Other buckets and fields are ignored; the callback sends the same figures again only after a minute. The token must be an Antigravity session's. Every tab shares the machine's agy login, so the newest reading of each bucket is kept (`runtime_state`, kept across restarts). See `antigravity_usage.get`. |
 | `POST /mcp` | `Authorization: Bearer <session token>` | MCP (streamable HTTP, JSON responses). |
 | `GET /api/health` | none | `{"ok":true,"version":"..."}` |
 | `POST /api/trigger/<name>` | `Authorization: Bearer <the trigger's secret>` | Fire a URL trigger (body: up to 16 KiB of data, handed to its agent as quoted untrusted text). This machine only; see "Schedules", Phase 2. |
@@ -234,6 +235,9 @@ type Template = { id: string; label: string; about: string; name: string; kind: 
 type KindModels = { models: { id: string /* passed to --model / -m */; note: string | null;
              efforts: string[] | null /* this model's levels where they differ; null: the CLI's */ }[];
              efforts: string[] /* passed to --effort / -c model_reasoning_effort= */ };
+// Antigravity lists base model names (`claude-opus-5-5`, `gemini-4-neon`), each with its own
+// levels (`[]` for an Orchestrator, which takes none), and no CLI-wide list: agy gets
+// `--model claude-opus-5-5 --effort high` and resolves it to its `claude-opus-5-5-high` slug.
 type OpenRouterModel = { id: string /* --model / -m, e.g. "anthropic/claude-sonnet-5.5" */; name: string;
              vendor: string /* the id's prefix, for grouping */; context_length: number | null;
              prompt_per_m: number | null; completion_per_m: number | null /* USD per million tokens */;
@@ -1268,8 +1272,11 @@ agy --settings=<session>/antigravity-settings.json --add-dir=<session>/antigravi
 The extra arguments allowed are `--model`, `--effort`, `--continue` (also `-c`) and
 `--conversation`. A resumed launch receives its initial prompt once idle. The environment
 includes `AGY_CLI_DISABLE_AUTO_UPDATE=true`, `AGY_CLI_HIDE_ACCOUNT_INFO=true` and
-`AGY_CLI_OSC7501=off`. Antigravity uses its own login. Its catalog suggests eight Gemini
-model IDs with the effort built into the ID. A custom model or explicit effort is also accepted.
+`AGY_CLI_OSC7501=off`. Antigravity uses its own login. Its catalog (`agent.models`) lists base
+model names with the levels agy accepts for each: the Gemini models, the three Orchestrators (no
+effort), Claude Opus 5.5, Claude Sonnet 5.5 and GPT-OSS 120B. agy resolves `--model claude-opus-5-5
+--effort high` to its `claude-opus-5-5-high` slug (agy 1.5.13, 25 Nov 2026). A custom model (such as
+a full slug) or explicit effort is also accepted.
 
 The private settings file holds a title command, `muster hook antigravity state`, and, when
 Muster's MCP server is supplied, a `permissions.allow` list: the user's own allow rules from
@@ -1280,7 +1287,8 @@ user's `permissions.allow` list with the one in `--settings` for the session (ch
 copied in. They are read at each launch; a missing or malformed file adds none.
 The helper forwards only a validated `agent_state`, boolean `tool_confirmation_pending`
 and a valid conversation ID as `session_id`. It drops account and usage fields before
-the durable inbox or HTTP transport. The `state` event updates the tab and supplies
+the durable inbox or HTTP transport. Separately, it sends the plan quota's four allowlisted
+buckets, as numbers only, to `POST /usage/antigravity` (above); nothing else of the input. The `state` event updates the tab and supplies
 the ID for `--conversation` on restart. Set `MUSTER_ANTIGRAVITY_SETTINGS=0` on the
 daemon for screen detection alone. Once a callback arrives, it controls working and idle.
 Visible dialogs take precedence. A trust or settings dialog needs an answer in the terminal.
@@ -1453,6 +1461,7 @@ may ignore them. `Workspace`, `SessionInfo`, and named-agent records include nul
 | `workspace.set_account_profile` | `{id, account_profile}` | `Workspace`; profile ID or `"default"`; affects only future selection |
 | `account_usage.get` | `{}` | `UsageSnapshot` (below) |
 | `codex_usage.get` | `{}` | `CodexUsage \| null` (below); null when no recent Codex session log has plan limits |
+| `antigravity_usage.get` | `{}` | `AntigravityUsage \| null` (below); null when no Antigravity tab has reported its quota |
 | `account_profile.same_account` | `{id, with: number \| null}` | `AccountProfile`; `with`: the profile it signs in to the same account as, `null`: its own account |
 | `account_profile.login_changed` | `{account_profile: number \| "default"}` | `UsageSnapshot`; forgets that profile's (or Default's) usage and its same-account declaration |
 
@@ -1477,6 +1486,15 @@ used_percentage, resets_at (Unix s or null)}`. Muster reads it from the newest `
 event in Codex's own session logs (`$CODEX_HOME/sessions`, else `~/.codex/sessions`; the six most recently
 modified logs), so it is only as fresh as the last Codex turn on this machine; clients age it
 with the same `stale_after_ms` as Claude's figures. It sends no request to OpenAI.
+
+`AntigravityUsage` is `{pools[]}`, one per quota pool with any known window, Gemini first:
+`{id: "gemini" | "3p", name: "Gemini models" | "Claude and GPT models", windows[]}`, each
+window `{window_minutes (300 or 10080), used_percentage, resets_at (Unix s, or null while the
+pool is unused), observed_at (Unix ms the reading arrived)}`. It is what agy last gave an
+Antigravity tab's title callback (`POST /usage/antigravity`), so it is only as fresh as the last
+state change of an Antigravity tab; clients age it with the same `stale_after_ms`. Muster sends
+no request for it. `muster profile usage` prints it after the Claude table, and its `--json`
+adds it as `antigravity`.
 
 These management methods are local-client-only (not available to paired devices or MCP).
 There is no login, token, configuration-file copy, or directory deletion API.

@@ -3250,7 +3250,7 @@ legend {
 
 /* Usage: the sidebar's bottom-left section, a small table of every account's usage windows. */
 /* Content-height at the bottom; min-width lets long names ellipsize instead of widening it. */
-.us { --us-col: 62px; flex: none; display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+.us { --us-col: 58px; flex: none; display: flex; flex-direction: column; min-height: 0; min-width: 0; }
 /* One hairline above it. */
 .sidebar > .us { border-top: 1px solid var(--border); }
 .us.open .ap-chev { transform: rotate(90deg); }

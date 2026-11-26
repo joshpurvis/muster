@@ -2,6 +2,7 @@ mod account_profiles;
 mod adapters;
 mod agent_reply;
 mod agents;
+mod antigravity_usage;
 mod assets;
 mod auto_reset;
 mod addon;
@@ -317,7 +318,7 @@ Example: muster keys 12 esc text:/compact enter")]
     #[command(after_help = "Arguments after `--` go to the agent CLI, after muster's permission flags:\n  \
 muster new . --kind codex --prompt \"hi\" -- -m gpt-6.2-sol -c model_reasoning_effort=xhigh\n  \
 muster new --kind claude -- --model haiku\n  \
-muster new --kind antigravity -- --model gemini-4-neon-high")]
+muster new --kind antigravity -- --model claude-opus-5-5 --effort high")]
     New {
         /// Folder or repo (default: current directory).
         path: Option<PathBuf>,

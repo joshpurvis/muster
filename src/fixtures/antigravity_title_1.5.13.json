@@ -1,0 +1,25 @@
+{
+  "cwd": "/home/alpha/demo-app",
+  "session_id": "11111111-2222-4333-8444-555555555555",
+  "conversation_id": "11111111-2222-4333-8444-555555555555",
+  "transcript_path": "/home/alpha/.gemini/antigravity/brain/11111111-2222-4333-8444-555555555555/.system_generated/logs/transcript.jsonl",
+  "model": {"id": "Gemini 4 Neon (High)", "display_name": "Gemini 4 Neon (High)", "effort": "high"},
+  "workspace": {"current_dir": "/home/alpha/demo-app", "project_dir": "/home/alpha/demo-app"},
+  "version": "1.5.13",
+  "context_window": {"total_input_tokens": 0, "total_output_tokens": 0, "context_window_size": 524288, "used_percentage": 0, "remaining_percentage": 100, "current_usage": null},
+  "exceeds_200k_tokens": null,
+  "product": "antigravity",
+  "quota": {
+    "3p-5h": {"remaining_fraction": 1, "reset_time": "1970-01-01T00:00:00Z", "reset_in_seconds": 0},
+    "3p-weekly": {"remaining_fraction": 1, "reset_time": "1970-01-01T00:00:00Z", "reset_in_seconds": 0},
+    "gemini-5h": {"remaining_fraction": 0.7012, "reset_time": "2026-07-06T07:50:32Z", "reset_in_seconds": 9000},
+    "gemini-weekly": {"remaining_fraction": 0.1641, "reset_time": "2026-07-09T11:15:00Z", "reset_in_seconds": 282268}
+  },
+  "agent_state": "initializing",
+  "vcs": {"type": "git"},
+  "sandbox": {"enabled": false},
+  "subagents": [],
+  "plan_tier": "Pro",
+  "email": "someone@example.invalid",
+  "terminal_width": 120
+}

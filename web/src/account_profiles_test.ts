@@ -1,5 +1,6 @@
 import {
   accountBars,
+  antigravityBars,
   asOf,
   atLimit,
   codexBars,
@@ -223,6 +224,38 @@ Deno.test("Codex shows its own windows, labelled by length, and ages like Claude
   equal(c.bars.map((b) => [b.label, b.bar.label, b.bar.level]), [["5h", "–", "ok"], ["Wk", "76%", "warn"]]);
   equal(codexBars(u, NOW + 700_000, 600_000)!.bars[1].bar.current, false);
   equal(codexBars(null, NOW, 600_000), null);
+});
+
+Deno.test("Antigravity shows one row per quota pool, aged like Codex's", () => {
+  const w = (window_minutes: number, used_percentage: number, resets_at: number | null, observed_at = NOW - 60_000) => ({
+    window_minutes,
+    used_percentage,
+    resets_at,
+    observed_at,
+  });
+  const u = {
+    pools: [
+      { id: "gemini", name: "Gemini models", windows: [w(10080, 84, NOW / 1000 + 86_400), w(300, 30, NOW / 1000 + 3600)] },
+      { id: "3p", name: "Claude and GPT models", windows: [w(300, 0, null), w(10080, 5, NOW / 1000 - 1)] },
+      { id: "later", name: "Some new pool", windows: [] },
+    ],
+  };
+  const [gemini, other, ...rest] = antigravityBars(u, NOW, 600_000);
+  equal(rest, []); // a pool with no windows is not shown
+  equal([gemini.name, gemini.full, gemini.tool, gemini.key], ["Gemini", "Antigravity Gemini models", "antigravity", "antigravity:gemini"]);
+  equal(gemini.bars.map((b) => [b.label, b.bar.label, b.bar.level]), [["5h", "30%", "ok"], ["Wk", "84%", "warn"]]);
+  equal(other.name, "Claude+GPT");
+  // Unused: 0% with no window running. Past its reset: unknown.
+  equal([other.bars[0].bar.label, other.bars[0].bar.current, other.bars[0].bar.tip], ["0%", true, "5-hour: 0% · no window running"]);
+  equal([other.bars[1].bar.label, other.bars[1].bar.fill], ["–", null]);
+  // A figure without a reset time that isn't 0% has an unknown reset, not an idle window.
+  const unknown = antigravityBars({ pools: [{ id: "gemini", name: "Gemini models", windows: [w(10080, 75, null)] }] }, NOW, 600_000);
+  equal(unknown[0].bars[0].bar.tip, "Weekly: 75% · resets ?");
+  // Older than the stale limit: grey, never counted as the peak.
+  const old = antigravityBars(u, NOW + 700_000, 600_000);
+  equal(old[0].bars.map((b) => b.bar.current), [false, false]);
+  equal(peakUsage(antigravityBars(u, NOW, 600_000))?.tip.startsWith("Highest now: Antigravity Gemini models"), true);
+  equal(antigravityBars(null, NOW, 600_000), []);
 });
 
 Deno.test("the collapsed Usage heading shows the fullest current figure, never a stale one", () => {

@@ -140,8 +140,8 @@ pub fn tool_definitions() -> Vec<Value> {
                     "kind": {"type": "string", "enum": ["claude", "codex", "antigravity", "shell"], "description": "What to run."},
                     "prompt": {"type": "string", "description": "Initial task for the agent (or command for a shell)."},
                     "name": {"type": "string", "description": "Display name for the session."},
-                    "model": {"type": "string", "description": "Model for the agent, e.g. 'sonnet' or 'opus' (claude), 'gpt-6.2-sol' (codex), 'gemini-4-neon-high' (antigravity). Default: the CLI's own default."},
-                    "effort": {"type": "string", "description": "Reasoning effort, e.g. 'low', 'medium', 'high' (claude --effort), 'xhigh' (codex model_reasoning_effort)."},
+                    "model": {"type": "string", "description": "Model for the agent, e.g. 'sonnet' or 'opus' (claude), 'gpt-6.2-sol' (codex), 'gemini-4-neon' or 'claude-opus-5-5' (antigravity). Default: the CLI's own default."},
+                    "effort": {"type": "string", "description": "Reasoning effort, e.g. 'low', 'medium', 'high' (claude --effort), 'xhigh' (codex model_reasoning_effort), 'high' (antigravity --effort; agy refuses a level the model lacks, e.g. claude-opus-5-5 has low, medium and high)."},
                     "args": {"type": "array", "items": {"type": "string"}, "description": "Extra CLI arguments for the agent. Only an allowlist is accepted (claude: --model, --effort, --fallback-model, --append-system-prompt, --continue, --resume, --verbose, --debug; codex: -m, -c with model/model_reasoning_* keys, -i, --no-alt-screen; antigravity: --model, --effort, --conversation, --continue/-c); permissions always come from the channel's profile."},
                     "channel_id": {"type": "integer", "description": "Existing channel to spawn in. Mutually exclusive with new_channel."},
                     "new_channel": {

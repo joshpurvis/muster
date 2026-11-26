@@ -1,11 +1,12 @@
 import type { ComponentChildren } from "preact";
 import { useEffect, useId, useRef, useState } from "preact/hooks";
-import { accountProfiles, accountProfilesSupported, accountUsage, codexUsage, meta, overlay, prefs, setPref, toast } from "../state.ts";
+import { accountProfiles, accountProfilesSupported, accountUsage, antigravityUsage, codexUsage, meta, overlay, prefs, setPref, toast } from "../state.ts";
 import { rpc } from "../rpc.ts";
-import type { AccountProfile, AccountUsage, CodexUsage, ProfileChoice } from "../types.ts";
+import type { AccountProfile, AccountUsage, AntigravityUsage, CodexUsage, ProfileChoice } from "../types.ts";
 import {
   accountBars,
   type AccountBars,
+  antigravityBars,
   asOf,
   codexBars,
   lastObserved,
@@ -36,6 +37,10 @@ function useUsageClock(): number {
       // Older backends have no codex_usage.get: Codex is then simply not shown.
       rpc.call<CodexUsage | null>("codex_usage.get", {}).then((u) => {
         if (alive) codexUsage.value = u;
+      }).catch(() => {});
+      // Likewise antigravity_usage.get: no Antigravity rows then.
+      rpc.call<AntigravityUsage | null>("antigravity_usage.get", {}).then((u) => {
+        if (alive) antigravityUsage.value = u;
       }).catch(() => {});
     };
     refresh();
@@ -109,13 +114,15 @@ export function UsageTable({ usage, now, selected, account }: {
 }
 
 /** The sidebar's bottom-left Usage section: a small table, one line per account (every Claude
- * login, then Codex), its windows as columns named once in the heading. */
+ * login, then Codex, then Antigravity's two quota pools), its windows as columns named once in
+ * the heading. */
 export function UsageCard() {
   const now = useUsageClock();
   const open = prefs.value.usageCard;
   const claude = accountUsage.value?.rows.length ? accountBars(asOf(accountUsage.value, now), now) : [];
-  const codex = codexBars(codexUsage.value, now, accountUsage.value?.stale_after_ms ?? 30 * 60_000);
-  const accounts = codex ? [...claude, codex] : claude;
+  const staleAfter = accountUsage.value?.stale_after_ms ?? 30 * 60_000;
+  const codex = codexBars(codexUsage.value, now, staleAfter);
+  const accounts = [...claude, ...(codex ? [codex] : []), ...antigravityBars(antigravityUsage.value, now, staleAfter)];
   if (!accounts.length) return null;
   const cols = [...new Set(accounts.flatMap((a) => a.bars.map((b) => b.label)))];
   return (
@@ -168,11 +175,11 @@ function Meter({ bar }: { bar: UsageBar }) {
 
 /** One account as a list row. Tab reaches it (↑/↓ move between accounts), its tip then shows
  * every window's story, and a screen reader hears the same text as its label. A Claude row
- * opens the Claude profiles dialog (the full usage table); Codex has no profiles, so its row
- * only informs. */
+ * opens the Claude profiles dialog (the full usage table); Codex and Antigravity have no
+ * profiles, so their rows only inform. */
 function UsageRow({ a, children }: { a: AccountBars; children: ComponentChildren }) {
   const opens = a.tool === "claude" && accountProfilesSupported.value;
-  const story = `${a.name} — ${a.bars.map((b) => b.bar.tip).join("; ")}`;
+  const story = `${a.full ?? a.name} — ${a.bars.map((b) => b.bar.tip).join("; ")}`;
   return (
     <div role="listitem" class="us-item">
       <div

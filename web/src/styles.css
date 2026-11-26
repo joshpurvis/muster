@@ -3221,6 +3221,16 @@ legend {
 /* A held queue: the count line wraps (it names the senders); why it waits reads as text. */
 .ny-held .ny-when { white-space: normal; overflow-wrap: anywhere; }
 .ny-held .ny-why { color: var(--text-muted); overflow-wrap: anywhere; }
+/* A schedule failing in a row: its reason reads as text under the chip, three lines at most
+ * (the whole of it in the tooltip). */
+.ny-run .ny-sub.ny-why {
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; line-clamp: 3; overflow: hidden;
+  color: var(--text-muted); overflow-wrap: anywhere;
+}
+.ny-expired .ny-name { display: flex; align-items: center; min-width: 0; }
+.ny-expired .ny-sub { overflow-wrap: anywhere; }
+.needs-you .ny-bad { color: var(--error-text); }
+.ny-expired .ny-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .ny-run .ny-name { display: flex; align-items: center; }
 .ny-run .ny-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .ny-chev { flex: none; margin-right: 3px; color: var(--text-faint); transition: transform var(--t) var(--ease); }

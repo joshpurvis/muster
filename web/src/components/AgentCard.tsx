@@ -1,7 +1,7 @@
 // A named agent in the sidebar (docs/UI.md "Agents in the sidebar"): its row's dot and status,
 // its one menu (the agent's actions, then its channel's), and the card that opens beside the row
 // on hover or with → on the focused row: state, tags, quick actions, its schedules and folder.
-import { signal } from "@preact/signals";
+import { effect, signal } from "@preact/signals";
 import { useEffect, useLayoutEffect, useRef } from "preact/hooks";
 import {
   accountProfiles,
@@ -11,8 +11,10 @@ import {
   windowChannels,
   toast,
   scheduleSettings,
+  scheduleHistoryOpen,
   schedules,
   schedulesSupported,
+  scheduleToOpen,
   sessions,
   windowPrefs,
 } from "../state.ts";
@@ -33,6 +35,23 @@ import { IconMore } from "../icons.tsx";
  * with the pointer doesn't close it). `n` counts keyboard opens, so → on a row whose card is
  * already open moves focus into it again. One at a time. */
 export const agentCard = signal<{ agent: number; byKey: boolean; n?: number } | null>(null);
+
+/** A notice's Open (a schedule failed twice, or expired): the sidebar shows, with the schedule's
+ * agent's card open and its runs under it. Only the request is tracked: the work runs outside
+ * the effect, so the signals it reads never run it again. */
+effect(() => {
+  const want = scheduleToOpen.value;
+  if (want) setTimeout(() => openSchedule(want.id), 0);
+});
+
+function openSchedule(id: number) {
+  const s = schedules.peek().find((x) => x.id === id);
+  if (!s) return void toast("warn", "That schedule was removed", 3000);
+  A.revealSidebar();
+  if (!scheduleHistoryOpen.peek().has(s.id)) A.toggleScheduleHistory(s.id);
+  // After the sidebar has drawn its rows (it may have been hidden).
+  setTimeout(() => openCardByKey(s.agent_id), 0);
+}
 
 /** The agent's live facts, as its row and card show them. */
 export function agentFacts(a: Agent, now: number) {

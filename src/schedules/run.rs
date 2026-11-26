@@ -108,6 +108,17 @@ pub fn tick(hub: &Arc<Hub>, now: i64) -> Vec<Run> {
         if plan::expires_at(&s, &f).is_some_and(|e| now >= e) && hub.schedules.expired_seen.lock().insert(s.id) {
             publish(hub, &s);
             cancel_unsent(hub, Some(s.id), plan::EXPIRED, false);
+            // Told once per 7-day window, also across restarts (renewing starts a new window).
+            if !s.expired_told {
+                match hub.schedules.edit(s.id, |x| {
+                    x.expired_told = true;
+                    Ok(())
+                }) {
+                    Ok(x) => alert_schedule(hub, "warn", &format!("{}: \"{}\" expired: renew or remove", agent.name, x.name),
+                        "Claude subscription agents' schedules stop after 7 days unless you renew them.", x.id),
+                    Err(e) => tracing::warn!(schedule = s.id, "{e:#}"),
+                }
+            }
         }
         if s.next_run.is_none_or(|t| t > now) {
             continue;
@@ -256,9 +267,8 @@ fn handle_due(hub: &Arc<Hub>, id: i64, now: i64, settings: &super::Settings, qui
     if run.outcome == Outcome::Pending {
         return Ok(Some(run));
     }
-    // Expiry is worth telling even when this schedule only notifies on failure.
-    let expired = run.reason.as_deref() == Some(plan::EXPIRED);
-    notify_outcome(hub, &s, agent, &run, expired);
+    // An expiry was told when it came (`tick`, "expired: renew or remove").
+    notify_outcome(hub, &s, agent, &run, false);
     start_next(hub, &s, &run, then, child);
     Ok(None)
 }
@@ -537,6 +547,11 @@ pub(super) async fn wait_reply(hub: &Arc<Hub>, s: &Schedule, run: &mut Run) -> a
                 Outcome::Blocked,
                 Some(info.state_detail.clone().unwrap_or_else(|| info.state.as_str().replace('_', " "))),
             ),
+            // An Antigravity agent has no final message Muster can read: only its `reply` counts.
+            AskVerdict::Unattributed if info.kind == crate::model::SessionKind::Antigravity => (
+                Outcome::NoReply,
+                Some("the turn ended without the agent's `reply` for this run (an Antigravity agent answers only with its reply tool)".into()),
+            ),
             AskVerdict::Unattributed => (Outcome::NoReply, Some("the turn ended without a final message for this run".into())),
             AskVerdict::Ended => (Outcome::Ended, Some("the agent's process ended".into())),
             AskVerdict::Wait => (Outcome::TimedOut, Some(format!("no reply within {} minutes", plan::RUN_TIMEOUT_MS / 60_000))),
@@ -769,6 +784,17 @@ fn reply_to_note(hub: &Hub, s: &Schedule, agent: &str, run: &Run, note: NoteId) 
 }
 
 fn notify_outcome(hub: &Hub, s: &Schedule, agent: &str, run: &Run, force: bool) {
+    // The second failure in a row is told whatever the schedule's Notify me says, once per row
+    // (the third and later are not): it replaces this run's own notice.
+    if run.kind != RunKind::Chain && run.outcome.is_failure() {
+        let runs = hub.store().runs(s.id, None, super::FAILING_LOOKBACK).unwrap_or_default();
+        if let Some(f) = super::failing_of(hub, &runs).filter(|f| f.runs == 2 && f.last_run == run.id) {
+            let owner = hub.agents().by_id(s.agent_id).map(|a| a.name).unwrap_or_else(|| agent.to_string());
+            tracing::warn!(schedule = s.id, run = run.id, why = f.reason.as_str(), "a schedule failed twice in a row");
+            alert_schedule(hub, "warn", &format!("{owner}: \"{}\" has failed twice", s.name), &f.reason, s.id);
+            return;
+        }
+    }
     let want = force
         || match s.notify {
             Notify::Always => true,
@@ -792,6 +818,12 @@ fn notify_outcome(hub: &Hub, s: &Schedule, agent: &str, run: &Run, force: bool) 
 /// (feature/phone-push reworks `notify::alert` into sinks) needs only this one place.
 pub(super) fn alert(hub: &Hub, level: &str, summary: &str, body: &str) {
     hub.notice(level, if body.is_empty() { summary.to_string() } else { format!("{summary}: {body}") });
+    crate::notify::alert(summary, body);
+}
+
+/// An `alert` whose in-app notice has a button that opens schedule `id`.
+pub(super) fn alert_schedule(hub: &Hub, level: &str, summary: &str, body: &str, id: i64) {
+    hub.notice_schedule(level, if body.is_empty() { summary.to_string() } else { format!("{summary}: {body}") }, id);
     crate::notify::alert(summary, body);
 }
 

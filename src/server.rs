@@ -905,7 +905,8 @@ mod tests {
         assert!(!streamed(&ServerEvent::WorkspaceRemoved { id: 1 }));
         assert!(!streamed(&ServerEvent::Notice {
             level: "info".into(),
-            text: "x".into()
+            text: "x".into(),
+            schedule: None,
         }));
     }
 

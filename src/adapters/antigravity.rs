@@ -96,7 +96,7 @@ pub(crate) fn user_allow_rules(file: &Path) -> Vec<String> {
 }
 
 /// A JSON file of the user's: a regular file of at most 4 MiB (never blocks on a FIFO).
-fn read_json(file: &Path) -> Option<Value> {
+pub(crate) fn read_json(file: &Path) -> Option<Value> {
     use std::io::Read;
     use std::os::unix::fs::OpenOptionsExt;
     let file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(file).ok()?;
@@ -153,12 +153,21 @@ fn on(var: &str) -> bool {
 
 /// Build the credential file outside the previously shared tree. Only publish the
 /// completed directory once the old run's entries have been checked and removed.
-fn prepare_workspace(ctx: &SpawnCtx) -> anyhow::Result<std::path::PathBuf> {
+/// With `guards`, also the owner's guards (src/agy_guard.rs): their list in the session dir, out
+/// of the agent's workspace, and an agy hook file that runs them through `muster hook antigravity
+/// guard` (agy 1.5.13 loads `.agents/hooks.json` from an `--add-dir` folder too).
+fn prepare_workspace(ctx: &SpawnCtx, guards: &[crate::agy_guard::Guard]) -> anyhow::Result<std::path::PathBuf> {
     use std::os::unix::fs::DirBuilderExt;
     let workspace = ctx.session_dir.join("antigravity-workspace");
     let config = workspace.join(".agents");
-    for path in [&workspace, &config, &config.join("mcp_config.json"), &config.join("AGENTS.md")] {
+    let guard_file = ctx.session_dir.join(crate::agy_guard::CONFIG);
+    for path in [&workspace, &config, &config.join("mcp_config.json"), &config.join("AGENTS.md"), &config.join("hooks.json"), &guard_file] {
         crate::agents::refuse_symlink(path)?;
+    }
+    // The previous run's list goes first: a run without guards never reads an old one.
+    match std::fs::remove_file(&guard_file) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+        _ => {}
     }
     let stage = ctx
         .session_dir
@@ -171,6 +180,12 @@ fn prepare_workspace(ctx: &SpawnCtx) -> anyhow::Result<std::path::PathBuf> {
             &serde_json::to_vec_pretty(&server)?,
         )?;
         crate::paths::write_private(&stage.join(".agents/AGENTS.md"), TOOLS_INSTRUCTION.as_bytes())?;
+        if !guards.is_empty() {
+            let list = crate::agy_guard::Config { cwd: ctx.cwd.to_string_lossy().into(), guards: guards.to_vec() };
+            crate::paths::write_private(&guard_file, &serde_json::to_vec_pretty(&list)?)?;
+            let hooks = crate::agy_guard::hooks_json(&ctx.muster_bin, &guard_file, &list);
+            crate::paths::write_private(&stage.join(".agents/hooks.json"), &serde_json::to_vec_pretty(&hooks)?)?;
+        }
         match std::fs::remove_dir_all(&workspace) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
             _ => {}
@@ -205,7 +220,7 @@ pub fn is_startup_screen(screen: &ScreenSnapshot) -> bool {
     !lines[..top].iter().any(|l| l.starts_with("> ") || l.trim_end() == ">")
 }
 
-fn launch(ctx: &SpawnCtx, settings: bool, mcp: bool, user_settings: &Path, other_servers: &[std::path::PathBuf]) -> anyhow::Result<CommandSpec> {
+fn launch(ctx: &SpawnCtx, settings: bool, mcp: bool, user_settings: &Path, other_servers: &[std::path::PathBuf], guards: &[crate::agy_guard::Guard]) -> anyhow::Result<CommandSpec> {
     let mut args = Vec::new();
     if settings {
         let file = ctx.session_dir.join("antigravity-settings.json");
@@ -224,7 +239,7 @@ fn launch(ctx: &SpawnCtx, settings: bool, mcp: bool, user_settings: &Path, other
         }
     }
     if mcp {
-        let workspace = prepare_workspace(ctx)?;
+        let workspace = prepare_workspace(ctx, guards)?;
         args.push(format!("--add-dir={}", workspace.display()));
     }
     args.extend(mode_args(ctx.permissions.antigravity_mode));
@@ -250,6 +265,35 @@ fn launch(ctx: &SpawnCtx, settings: bool, mcp: bool, user_settings: &Path, other
         .map(|(k, v)| (k.into(), v.into()))
         .collect(),
     })
+}
+
+/// The rules around agy's input box, walking up from `bottom`, the last rule above the footer.
+/// agy 1.5.13 draws status rows in their own ruled blocks between the box and the footer
+/// (`  ● [00:52:20] 25m timer running` while a timer runs). Such a block has no `>` prompt
+/// line and only indented rows that start with a symbol; anything else (an empty block in
+/// mid-redraw, a box whose `>` line is unreadable, a transcript) stops the walk, so a lost
+/// border never makes an older prompt read as the box.
+fn composer_rules(lines: &[String], mut bottom: usize) -> Option<(usize, usize, bool)> {
+    const MAX_STATUS_BLOCKS: usize = 4;
+    let status_block = |block: &[String]| {
+        let rows: Vec<&String> = block.iter().filter(|l| !l.trim().is_empty()).collect();
+        (1..=3).contains(&rows.len())
+            && rows.iter().all(|l| {
+                l.starts_with(char::is_whitespace)
+                    && l.trim_start().chars().next().is_some_and(|c| !c.is_ascii() && !c.is_alphanumeric())
+            })
+    };
+    let mut top = tui::rfind(&lines[..bottom], tui::is_solid_rule)?;
+    let mut walked = false;
+    for _ in 0..MAX_STATUS_BLOCKS {
+        let block = &lines[top + 1..bottom];
+        if block.iter().any(|l| l.starts_with('>')) || !status_block(block) {
+            break;
+        }
+        (bottom, walked) = (top, true);
+        top = tui::rfind(&lines[..bottom], tui::is_solid_rule)?;
+    }
+    Some((top, bottom, walked))
 }
 
 // The composer and modal content are separated from past turns by a solid rule.
@@ -361,6 +405,7 @@ impl Adapter for AntigravityAdapter {
             on("MUSTER_ANTIGRAVITY_MCP"),
             &user_settings_file(),
             &other_server_files(&ctx.cwd),
+            &crate::agy_guard::load(),
         )
     }
 
@@ -453,7 +498,7 @@ impl Adapter for AntigravityAdapter {
             .find_map(|l| l.trim_start().strip_prefix("? for shortcuts"))
             .or(status_only)
             .or(menu.then_some(""))?;
-        let top = tui::rfind(&lines[..bottom], tui::is_solid_rule)?;
+        let (top, bottom, walked) = composer_rules(lines, bottom)?;
         // Muster's copy of the screen can lose the box's top border (24 Nov: agy redrew a wrapped
         // line with a file link over it). The border found is then an older one, above an earlier
         // prompt in the transcript, and that prompt and its answer read as unsent text that held
@@ -461,6 +506,17 @@ impl Adapter for AntigravityAdapter {
         // further lines are indented, and so is everything agy prints between prompts.
         let start = (top + 1..bottom).rev().find(|&i| lines[i].starts_with('>')).unwrap_or(top + 1);
         let (first, rest) = lines[start..bottom].split_first()?;
+        // Above status rows, the box is only taken as it is drawn: a draft's further lines are
+        // indented or blank (a paragraph break), and its last line is not blank. A submitted
+        // prompt in the transcript is followed by agy's column-0 `○`/`●` rows or by the blank line
+        // before the next box, so a box whose own `>` line was lost never borrows the prompt of
+        // the turn above.
+        if walked
+            && (rest.iter().any(|l| !l.trim().is_empty() && !l.starts_with(char::is_whitespace))
+                || rest.last().is_some_and(|l| l.trim().is_empty()))
+        {
+            return None;
+        }
         let first = if first.trim_end() == ">" {
             ""
         } else {
@@ -717,6 +773,52 @@ mod tests {
     }
 
     #[test]
+    fn composer_above_status_rows() {
+        // agy 1.5.13 with a timer running: the timer row sits in its own ruled block between
+        // the box and the footer (26 Nov, an agent that set a 25 minute timer stopped taking
+        // messages because the box read as missing).
+        let timer = include_str!("fixtures/antigravity_timer_row.txt");
+        let row = "  ● [00:52:20] 25m timer running";
+        let rule = "─".repeat(120);
+        let read = |text: &str| AntigravityAdapter.composer_text(&snap(text));
+        assert_eq!(read(timer).as_deref(), Some(""));
+        let draft = timer.replace("\n>\n", "\n> my draft\n  second line\n");
+        assert_eq!(read(&draft).as_deref(), Some("my draft\n  second line"));
+        // Two status rows: in one block, and each in its own block.
+        let task = "  ● 1 task running (/tasks)";
+        assert_eq!(read(&timer.replace(row, &format!("{row}\n{task}"))).as_deref(), Some(""));
+        let stacked = timer.replace(row, &format!("{row}\n{rule}\n{task}"));
+        assert_eq!(read(&stacked).as_deref(), Some(""));
+        assert_eq!(read(&stacked.replace("\n>\n", "\n> my draft\n")).as_deref(), Some("my draft"));
+        // A lost top border above the box still finds the box, not the previous prompt.
+        let lost = timer.replacen(&format!("\n{rule}\n>\n"), "\n>\n", 1);
+        assert_eq!(read(&lost).as_deref(), Some(""));
+        // Blocks that are not status rows stop the walk: the box is then not found.
+        for not_status in [
+            "",                             // mid-redraw: two rules with nothing between
+            "  my draft continues",          // indented text, not a status row
+            "● Scheduling 1 timer",          // a transcript line in column 0
+            &format!("{row}\n{row}\n{row}\n{row}"), // too many rows for a status block
+        ] {
+            let screen = timer.replace(&format!("{row}\n"), &format!("{not_status}\n"));
+            assert!(read(&screen).is_none(), "{not_status:?}");
+        }
+        // A box whose prompt line was lost does not borrow the prompt of the turn above it.
+        let no_prompt = timer.replace("\n>\n", "\n  ● stray\n");
+        assert!(read(&no_prompt).is_none());
+        // A pasted message with a paragraph break: agy 1.5.13 draws the blank line as a blank row
+        // in the box (captured 26 Nov), and Muster reads the box right after pasting.
+        let paragraphs = "[muster msg 7 from human origin=human hop=0]\n  First paragraph here.\n\n  Second paragraph after a blank line.";
+        assert_eq!(read(&timer.replace("\n>\n", &format!("\n> {paragraphs}\n"))).as_deref(), Some(paragraphs));
+        // The box's top border and `>` line both lost, over an answer of indented text only: the
+        // blank line agy leaves before the box keeps the older prompt out.
+        let thoughts = "○ Thought for 4.1s (A timer fits: the build takes about 20 minutes...)\n● Scheduling 1 timer (1500s: check the build) (ctrl+o to expand)\n\n";
+        let lost_both = timer.replacen(thoughts, "", 1).replacen(&format!("{rule}\n>\n"), "", 1);
+        assert_eq!(lost_both.matches(&rule).count(), 3, "fixture shape changed");
+        assert!(read(&lost_both).is_none());
+    }
+
+    #[test]
     fn callback_states() {
         use AgentState::*;
         for (status, state) in [
@@ -773,7 +875,7 @@ mod tests {
             ),
         ] {
             ctx.permissions.antigravity_mode = mode;
-            let spec = launch(&ctx, false, false, &user, &[]).unwrap();
+            let spec = launch(&ctx, false, false, &user, &[], &[]).unwrap();
             assert_eq!(
                 spec.args,
                 [flag, "--model", "demo", "--prompt-interactive=read alpha"]
@@ -786,20 +888,20 @@ mod tests {
         let mcp = workspace.join(".agents/mcp_config.json");
         let settings = format!("--settings={}", file.display());
         let add_dir = format!("--add-dir={}", workspace.display());
-        assert_eq!(launch(&ctx, true, false, &user, &[]).unwrap().args[0], settings);
+        assert_eq!(launch(&ctx, true, false, &user, &[], &[]).unwrap().args[0], settings);
         assert!(!workspace.exists());
         let read = |p| serde_json::from_slice::<Value>(&std::fs::read(p).unwrap()).unwrap();
         // Without Muster's MCP server there is no rule for it, and the user's list is untouched.
         assert!(read(&file).get("permissions").is_none());
         // A fresh run with Muster's tools gets its first prompt after `/clear`, through the queue.
-        let fresh = launch(&ctx, false, true, &user, &[]).unwrap();
+        let fresh = launch(&ctx, false, true, &user, &[], &[]).unwrap();
         assert_eq!(fresh.args, [add_dir.as_str(), "--dangerously-skip-permissions", "--model", "demo"]);
         assert!(!fresh.consumed_initial_prompt && has_mcp_workspace(&fresh.args));
-        assert!(!has_mcp_workspace(&launch(&ctx, true, false, &user, &[]).unwrap().args));
+        assert!(!has_mcp_workspace(&launch(&ctx, true, false, &user, &[], &[]).unwrap().args));
         ctx.extra_args = vec!["--conversation".into(), "conv-demo".into()];
-        let without_mcp = launch(&ctx, true, false, &user, &[]).unwrap();
+        let without_mcp = launch(&ctx, true, false, &user, &[], &[]).unwrap();
         assert!(!has_mcp_workspace(&without_mcp.args));
-        let spec = launch(&ctx, true, true, &user, &[]).unwrap();
+        let spec = launch(&ctx, true, true, &user, &[], &[]).unwrap();
         assert_eq!(spec.program, "agy");
         assert!(!spec.consumed_initial_prompt);
         assert!(has_mcp_workspace(&spec.args), "a resumed launch must wait for Muster's tools too");
@@ -822,10 +924,10 @@ mod tests {
         assert_eq!(read(&file), json!({"title": title, "permissions": {"allow": [MUSTER_TOOLS_RULE]}}));
         let clash = std::env::temp_dir().join(format!("muster-agy-clash-{:x}.json", rand::random::<u64>()));
         std::fs::write(&clash, r#"{"mcpServers":{"muster":{"command":"other"}}}"#).unwrap();
-        launch(&ctx, true, true, &user, &[clash.clone()]).unwrap();
+        launch(&ctx, true, true, &user, &[clash.clone()], &[]).unwrap();
         assert_eq!(read(&file), json!({"title": title}), "another `muster` server gets no rule");
         std::fs::remove_file(clash).unwrap();
-        launch(&ctx, true, true, &user, &[]).unwrap();
+        launch(&ctx, true, true, &user, &[], &[]).unwrap();
         assert_eq!(
             std::fs::read_to_string(workspace.join(".agents/AGENTS.md")).unwrap(),
             TOOLS_INSTRUCTION
@@ -841,19 +943,36 @@ mod tests {
                 0
             );
         }
+        // No guards: no hook file and no guard list.
+        let hooks = workspace.join(".agents/hooks.json");
+        let guard_list = dir.join(crate::agy_guard::CONFIG);
+        assert!(!hooks.exists() && !guard_list.exists());
+        // The owner's guards: their list in the session dir (out of the agent's workspace), and a
+        // hook file in the workspace that runs them through Muster.
+        let guards = [crate::agy_guard::Guard { matcher: "Bash".into(), command: "demo-guard".into(), timeout_s: 10 }];
+        launch(&ctx, true, true, &user, &[], &guards).unwrap();
+        assert_eq!(read(&guard_list), json!({"cwd": dir.to_string_lossy(), "guards": [{"matcher": "Bash", "command": "demo-guard", "timeout_s": 10}]}));
+        let hook = &read(&hooks)["muster-guards"]["PreToolUse"][0]["hooks"][0];
+        assert_eq!(hook["command"], format!("'/tmp/demo app/muster' hook antigravity guard {}", guard_list.display()));
+        for p in [&hooks, &guard_list] {
+            assert_eq!(std::fs::metadata(p).unwrap().permissions().mode() & 0o077, 0);
+        }
+        // The next run without guards drops both.
+        launch(&ctx, true, true, &user, &[], &[]).unwrap();
+        assert!(!hooks.exists() && !guard_list.exists());
         std::fs::remove_dir_all(workspace.join(".agents")).unwrap();
         let other = dir.join("fixture");
         std::fs::create_dir(&other).unwrap();
         std::os::unix::fs::symlink(&other, workspace.join(".agents")).unwrap();
-        assert!(launch(&ctx, false, true, &user, &[]).is_err());
+        assert!(launch(&ctx, false, true, &user, &[], &[]).is_err());
         assert_eq!(std::fs::read_dir(other).unwrap().count(), 0);
         std::fs::remove_file(workspace.join(".agents")).unwrap();
         std::fs::write(workspace.join("old-run"), "fixture").unwrap();
-        launch(&ctx, false, true, &user, &[]).unwrap();
+        launch(&ctx, false, true, &user, &[], &[]).unwrap();
         assert!(!workspace.join("old-run").exists());
         std::fs::remove_file(&mcp).unwrap();
         std::os::unix::fs::symlink(dir.join("absent"), &mcp).unwrap();
-        assert!(launch(&ctx, false, true, &user, &[]).is_err());
+        assert!(launch(&ctx, false, true, &user, &[], &[]).is_err());
         assert!(!dir.join("absent").exists());
         std::fs::remove_dir_all(dir).unwrap();
     }

@@ -1,0 +1,40 @@
+[
+ {
+  "until": "globalThis.__muster?.windowId?.value != null && globalThis.__muster.schedules.value.some((s) => s.name === 'Morning digest')",
+  "settle": 0.6
+ },
+ {
+  "js": "const m = globalThis.__muster; const pr = m.schedules.value.find((s) => s.name === 'Daily PR summary');\nconst why = 'agent worker accepts only webhook messages, and this one is origin=schedule (the chain it belongs to was started by a schedule, not the human). Claude agents take human-started work only by default.';\nawait m.rpc.call('schedule.mock_fail', {id: pr.id, outcome: 'refused', reason: why});\nawait m.rpc.call('schedule.mock_fail', {id: pr.id, outcome: 'refused', reason: why});",
+  "until": "document.querySelector('.toast') && document.querySelector('.needs-you')",
+  "settle": 0.6,
+  "shot": "failed-toast",
+  "crop": ".toast",
+  "pad": 8
+ },
+ {
+  "shot": "failed-needs-you",
+  "crop": ".needs-you",
+  "pad": 8
+ },
+ {
+  "js": "document.querySelectorAll('.toast-x').forEach((b) => b.click());\nconst m = globalThis.__muster; const d = m.schedules.value.find((s) => s.name === 'Morning digest');\nawait m.rpc.call('schedule.mock_expire', {id: d.id});",
+  "until": "document.querySelector('.toast')",
+  "settle": 0.6,
+  "shot": "expired-toast",
+  "crop": ".toast",
+  "pad": 8
+ },
+ {
+  "shot": "expired-needs-you",
+  "crop": ".needs-you",
+  "pad": 8
+ },
+ {
+  "shot": "window"
+ },
+ {
+  "js": "const open = document.querySelector('.toast-action'); if (open) open.click(); return !!open;",
+  "settle": 0.8,
+  "shot": "opened"
+ }
+]

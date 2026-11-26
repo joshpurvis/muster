@@ -361,6 +361,7 @@ export function scheduleMock(deps: ScheduleDeps) {
       created_at: s.created_at,
       updated_at: s.updated_at,
       last_run: r.filter((x) => x.kind !== "chain").at(-1) ?? null,
+      failing: waiting(s) ? null : failingOf(r),
       trigger: isTrig(s.when),
       origin: isTrig(s.when) ? "webhook" : "schedule",
       then: thenJson(s.then),
@@ -377,6 +378,23 @@ export function scheduleMock(deps: ScheduleDeps) {
     };
   }
   const waiting = (s: Sched) => !!s.made_by && s.made_by.approved_at === null;
+
+  /** As src/schedules/mod.rs `failing_of`: two or more of the newest own runs failed in a row
+   * (skipped and running ones neither count nor break it; a late reply does). */
+  const FAILURES = new Set(["blocked", "no_reply", "ended", "timed_out", "refused", "failed"]);
+  function failingOf(all: any[]) {
+    const row: any[] = [];
+    for (const r of [...all].reverse().slice(0, 20)) {
+      if (r.kind === "chain" || r.outcome === "pending" || r.outcome === "skipped") continue;
+      if (!FAILURES.has(r.outcome) || r.late_reply) break;
+      row.push(r);
+    }
+    if (row.length < 2) return null;
+    const first = String(row[0].reason ?? "").split(". ")[0].replace(/\.$/, "");
+    const label = String(row[0].outcome).replace("_", " ");
+    const reason = !first ? label : first.startsWith(label) ? first : `${label}: ${first}`;
+    return { runs: row.length, outcome: row[0].outcome, reason, since: row.at(-1).started_at };
+  }
 
   const agentName = (id: number | null) => deps.agents().find((a) => a.id === id)?.name ?? null;
   function thenJson(t: ThenSteps | null) {
@@ -736,6 +754,28 @@ export function scheduleMock(deps: ScheduleDeps) {
         const limit = Math.min(200, Math.max(1, Number(p.limit ?? 20)));
         const all = [...(runs.get(s.id) ?? [])].reverse().filter((r) => p.before == null || r.id < p.before);
         return { runs: all.slice(0, limit), more: all.length > limit };
+      }
+      case "schedule.mock_fail": {
+        // Dev only: a run of schedule `id` failed now ({id, outcome, reason}); the second in a
+        // row gets the backend's "failed twice" notice, with a button that opens the schedule.
+        const s = get(p.id);
+        record(s, newRun(s, { outcome: p.outcome ?? "refused", reason: p.reason ?? null, finished_at: now() }));
+        const f = failingOf(runs.get(s.id) ?? []);
+        if (f?.runs === 2) {
+          broadcast("notice", { level: "warn", text: `${agentOf(s)?.name}: "${s.name}" has failed twice: ${f.reason}`, schedule: s.id });
+        }
+        return publish(s);
+      }
+      case "schedule.mock_expire": {
+        // Dev only: schedule `id` (a Claude subscription agent's) expired an hour ago, told once.
+        const s = get(p.id);
+        s.window_from = now() - 7 * DAY - 60 * MIN;
+        broadcast("notice", {
+          level: "warn",
+          text: `${agentOf(s)?.name}: "${s.name}" expired: renew or remove: Claude subscription agents' schedules stop after 7 days unless you renew them.`,
+          schedule: s.id,
+        });
+        return publish(s);
       }
       case "schedule.mock_watch": {
         // Dev only: how a git or GitHub watcher is doing ({id, state, detail}).

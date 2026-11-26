@@ -562,6 +562,19 @@ export type RunOutcome =
   | "skipped"
   | "failed";
 
+/** A schedule's runs failing in a row (`Schedule.failing`). */
+export interface ScheduleFailing {
+  /** How many in a row (of its newest 20 runs at most). */
+  runs: number;
+  /** The newest failure's outcome. */
+  outcome: RunOutcome;
+  /** "refused: agent alpha accepts only webhook messages, …": the outcome and the first sentence
+   * of its reason. */
+  reason: string;
+  /** When the first of them started (Unix ms). */
+  since: number;
+}
+
 /** One run of a schedule (`schedule.runs`, `schedule_run`, `Schedule.last_run`). */
 export interface ScheduleRun {
   id: number;
@@ -631,6 +644,9 @@ export interface Schedule {
   created_at: number;
   updated_at: number;
   last_run: ScheduleRun | null;
+  /** Its last runs that counted failed, two or more in a row (absent otherwise, and from older
+   * backends). Skipped and running runs neither count nor break the row; a reply does. */
+  failing?: ScheduleFailing | null;
   /** Phase 2 (absent from older backends): fired by an event, not the clock. */
   trigger?: boolean;
   origin?: "schedule" | "webhook";
@@ -920,7 +936,7 @@ export type ServerEvent =
   | { event: "session_upserted"; data: SessionInfo }
   | { event: "session_removed"; data: { id: SessionId } }
   | { event: "event"; data: TimelineEvent }
-  | { event: "notice"; data: { level: "info" | "warn" | "error"; text: string } }
+  | { event: "notice"; data: { level: "info" | "warn" | "error"; text: string; schedule?: number } }
   | { event: "window_upserted"; data: Win }
   | { event: "window_removed"; data: { id: WindowId } }
   | { event: "agent_upserted"; data: Agent }

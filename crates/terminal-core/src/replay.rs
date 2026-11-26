@@ -188,11 +188,35 @@ pub(crate) fn process(parser: &mut vt100::Parser<TitleCb>, data: &[u8]) -> Vec<(
                     [top, bottom, ..] => Some((top, bottom)),
                 };
             }
+            // Cursor moves vt100 0.16 ignores (xterm.js does them), given as ones it knows. agy's
+            // renderer moves back with CBT after a file link; ignored, the text after it landed
+            // in the wrong column and overwrote the input box's border in the daemon's copy of the
+            // screen (24 Nov), which then read the box as holding unsent text.
+            (true, None, None, b'Z' | b'I' | b'`') => {
+                parser.process(&data[pos..c.at]);
+                pos = c.end;
+                let n = c.params.first().copied().filter(|&p| p > 0).unwrap_or(1);
+                parser.process(&tab_moves(c.fin, n, parser.screen().cursor_position().1));
+            }
             _ => {}
         }
     }
     parser.process(&data[pos..]);
     changes
+}
+
+/// What CBT (`CSI n Z`, back `n` tab stops), CHT (`CSI n I`, forward `n`) and HPA (`CSI n \``,
+/// to column `n`) do, as sequences vt100 handles: from column `col` (0-based), tab stops every
+/// 8 columns as vt100 keeps them.
+fn tab_moves(fin: u8, n: u16, col: u16) -> Vec<u8> {
+    match fin {
+        b'Z' => {
+            let stop = (0..n.min(1000)).fold(col, |c, _| c.saturating_sub(1) / 8 * 8);
+            format!("\x1b[{}G", stop + 1).into_bytes()
+        }
+        b'I' => vec![b'\t'; n.min(1000) as usize],
+        _ => format!("\x1b[{n}G").into_bytes(),
+    }
 }
 
 /// Where the output's unfinished part starts: an escape sequence or UTF-8 character it ends
@@ -828,6 +852,24 @@ mod tests {
         assert!(!p.callbacks().tracked.focus_reporting);
         let changes = process(&mut p, b"ab\x1b[?1049hcd\x1b[?1049l");
         assert_eq!(changes, [(10, true), (20, false)]);
+    }
+
+    #[test]
+    fn process_does_the_tab_and_column_moves_vt100_ignores() {
+        let row0 = |data: &[u8]| live(data, 40, 4).screen().rows(0, 40).next().unwrap();
+        // CBT: back to the previous tab stop(s); at column 0 it stays.
+        assert_eq!(row0(b"0123456789abcdefghij\x1b[2ZX"), "01234567X9abcdefghij");
+        assert_eq!(row0(b"0123456789\x1b[ZX"), "01234567X9");
+        assert_eq!(row0(b"01234567\x1b[ZX"), "X1234567");
+        assert_eq!(row0(b"\x1b[3ZX"), "X");
+        // CHT: forward to the next tab stop(s). HPA: to a column.
+        assert_eq!(row0(b"ab\x1b[2IX"), "ab              X");
+        assert_eq!(row0(b"ab\x1b[10`X"), "ab       X");
+        // As agy draws it: a link's text, line feeds down to the next text, back with CBT. The
+        // text lands under where xterm.js puts it, and the border two rows down stays whole.
+        let p = live(b"\x1b[3;1H----------------------------------------\x1b[1;1H  see notes/open-threads.md\n\n\x1b[3Zab", 40, 4);
+        let rows: Vec<String> = p.screen().rows(0, 40).map(|r| r.trim_end().to_string()).collect();
+        assert_eq!(rows[2], "--------ab------------------------------");
     }
 
     #[test]

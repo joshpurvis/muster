@@ -46,8 +46,9 @@ pub const RENEW_EVERY_MS: u128 = 60 * 1000;
 const MAX_RESET_S: i64 = 9_999_999_999;
 
 /// What the title callback forwards from agy's JSON: the allowlisted buckets, each with its used
-/// percentage (one decimal) and its reset time (Unix seconds; null when no window is running).
-/// None when it carries none of them.
+/// percentage (one decimal) and its reset time (Unix seconds; null when no window is running:
+/// agy sends 1970-01-01 then, or no time). A bucket whose reset time can't be read is left out,
+/// so the daemon keeps its last good reading. None when it carries none of them.
 pub fn hook_body(payload: &Value) -> Option<Vec<u8>> {
     let quota = payload.get("quota")?.as_object()?;
     let mut out = Map::new();
@@ -59,12 +60,14 @@ pub fn hook_body(payload: &Value) -> Option<Vec<u8>> {
         let Some(left) = b.get("remaining_fraction").and_then(Value::as_f64).filter(|f| f.is_finite() && (0.0..=1.0).contains(f))
         else { continue };
         let used = ((1.0 - left) * 1000.0).round() / 10.0;
-        let resets_at = b
-            .get("reset_time")
-            .and_then(Value::as_str)
-            .and_then(crate::codex_usage::parse_ts)
-            .map(|ms| ms / 1000)
-            .filter(|s| *s > 0 && *s <= MAX_RESET_S);
+        let resets_at = match b.get("reset_time") {
+            None | Some(Value::Null) => None,
+            Some(t) => match t.as_str().and_then(crate::codex_usage::parse_ts).map(|ms| ms / 1000) {
+                Some(s) if s <= 0 => None,
+                Some(s) if s <= MAX_RESET_S => Some(s),
+                _ => continue,
+            },
+        };
         out.insert((*id).into(), json!({"used_percentage": used, "resets_at": resets_at}));
     }
     if out.is_empty() {
@@ -186,8 +189,8 @@ mod tests {
     fn the_hook_forwards_only_the_four_buckets_from_the_real_input() {
         let body: Value = serde_json::from_slice(&hook_body(&serde_json::from_str(REAL).unwrap()).unwrap()).unwrap();
         assert_eq!(body, json!({"quota": {
-            "gemini-5h": {"used_percentage": 29.9, "resets_at": 1_795_676_453},
-            "gemini-weekly": {"used_percentage": 83.6, "resets_at": 1_796_069_072},
+            "gemini-5h": {"used_percentage": 29.9, "resets_at": 1_783_324_232},
+            "gemini-weekly": {"used_percentage": 83.6, "resets_at": 1_783_595_700},
             "3p-5h": {"used_percentage": 0.0, "resets_at": null},
             "3p-weekly": {"used_percentage": 0.0, "resets_at": null},
         }}));
@@ -212,23 +215,28 @@ mod tests {
             "3p-weekly": {"remaining_fraction": "0.5"},
         }});
         assert_eq!(hook_body(&odd), None);
-        // One good bucket of a partial quota; a bad reset time leaves only the time unknown.
-        let partial = json!({"quota": {"gemini-weekly": {"remaining_fraction": 0.25, "reset_time": "soon"}}});
+        // A partial quota: its good bucket. One whose reset time can't be read is left out (the
+        // daemon keeps its last reading); one with no reset time has no window running.
+        let partial = json!({"quota": {
+            "gemini-weekly": {"remaining_fraction": 0.25, "reset_time": "soon"},
+            "gemini-5h": {"remaining_fraction": 0.5, "reset_time": "99999999999-01-01T00:00:00Z"},
+            "3p-5h": {"remaining_fraction": 1},
+        }});
         let body: Value = serde_json::from_slice(&hook_body(&partial).unwrap()).unwrap();
-        assert_eq!(body, json!({"quota": {"gemini-weekly": {"used_percentage": 75.0, "resets_at": null}}}));
+        assert_eq!(body, json!({"quota": {"3p-5h": {"used_percentage": 0.0, "resets_at": null}}}));
     }
 
     #[test]
     fn the_daemon_checks_the_report_again() {
         let body = json!({"quota": {
-            "gemini-5h": {"used_percentage": 29.9, "resets_at": 1_795_676_453},
+            "gemini-5h": {"used_percentage": 29.9, "resets_at": 1_783_324_232},
             "3p-weekly": {"used_percentage": 0, "resets_at": null},
             "3p-5h": {"used_percentage": 101, "resets_at": null},
             "gemini-weekly": {"used_percentage": 5, "resets_at": "tomorrow"},
             "email": {"used_percentage": 1, "resets_at": null},
         }, "email": "someone@example.invalid"});
         assert_eq!(parse_report(&body), vec![
-            Reported { bucket: "gemini-5h", used_percentage: 29.9, resets_at: Some(1_795_676_453) },
+            Reported { bucket: "gemini-5h", used_percentage: 29.9, resets_at: Some(1_783_324_232) },
             Reported { bucket: "3p-weekly", used_percentage: 0.0, resets_at: None },
         ]);
         assert!(parse_report(&json!({})).is_empty());

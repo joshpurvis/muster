@@ -248,6 +248,9 @@ Deno.test("Antigravity shows one row per quota pool, aged like Codex's", () => {
   // Unused: 0% with no window running. Past its reset: unknown.
   equal([other.bars[0].bar.label, other.bars[0].bar.current, other.bars[0].bar.tip], ["0%", true, "5-hour: 0% · no window running"]);
   equal([other.bars[1].bar.label, other.bars[1].bar.fill], ["–", null]);
+  // A figure without a reset time that isn't 0% has an unknown reset, not an idle window.
+  const unknown = antigravityBars({ pools: [{ id: "gemini", name: "Gemini models", windows: [w(10080, 75, null)] }] }, NOW, 600_000);
+  equal(unknown[0].bars[0].bar.tip, "Weekly: 75% · resets ?");
   // Older than the stale limit: grey, never counted as the peak.
   const old = antigravityBars(u, NOW + 700_000, 600_000);
   equal(old[0].bars.map((b) => b.bar.current), [false, false]);

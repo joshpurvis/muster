@@ -740,16 +740,15 @@ export function AgentDialog(
     set({ provider: p, model: keepForKind(d.model, listedModels(p, d.kind, catalog, orModels)) });
     setCustom((c) => ({ ...c, model: false }));
   };
-  /** A level the new model doesn't offer goes back to Default; a custom effort stays. */
+  /** A level the new model doesn't offer goes back to Default; a custom effort stays, except on a
+   * model that takes no level at all (an Antigravity Orchestrator, or Antigravity's Default):
+   * Effort hides there, and a hidden level would still be sent and refused by agy. */
   const setModel = (model: string, on: boolean) => {
-    const effort = effortAfterModel(
-      d.effort,
-      effortsFor(catalog, d.kind, d.model),
-      effortsFor(catalog, d.kind, model),
-      custom.effort,
-    );
+    const after = effortsFor(catalog, d.kind, model);
+    const none = !!catalog && after.length === 0;
+    const effort = none ? "" : effortAfterModel(d.effort, effortsFor(catalog, d.kind, d.model), after, custom.effort);
     set({ model, effort });
-    setCustom((c) => ({ ...c, model: on }));
+    setCustom((c) => ({ ...c, model: on, effort: none ? false : c.effort }));
   };
   const pick = (t: AgentTemplate) => {
     setTpl(t.id);

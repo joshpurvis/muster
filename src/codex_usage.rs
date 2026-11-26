@@ -105,7 +105,9 @@ pub(crate) fn parse_ts(s: &str) -> Option<i64> {
     let (hms, frac) = time.split_once('.').unwrap_or((time, ""));
     let mut t = hms.splitn(3, ':').map(|x| x.parse::<i64>().ok());
     let (h, mi, se) = (t.next()??, t.next()??, t.next()??);
-    if !(1..=12).contains(&mo) || !(1..=31).contains(&da) || h > 23 || mi > 59 || se > 60 {
+    // Years 0-9999 only: the arithmetic below can't overflow, whatever the input says.
+    if !(0..=9999).contains(&y) || !(1..=12).contains(&mo) || !(1..=31).contains(&da) || !(0..=23).contains(&h)
+        || !(0..=59).contains(&mi) || !(0..=60).contains(&se) {
         return None;
     }
     let ms = format!("{:0<3}", frac.get(..frac.len().min(3))?).parse::<i64>().ok()?;
@@ -132,6 +134,10 @@ mod tests {
         assert_eq!(parse_ts("2026-11-11T07:48:58.963Z"), Some(1_794_383_338_963));
         assert_eq!(parse_ts("2026-11-11T07:48:58+01:00"), None);
         assert_eq!(parse_ts("2026-13-11T07:48:58Z"), None);
+        // Out-of-range parts are refused, never overflowed.
+        assert_eq!(parse_ts("9223372036854775807-01-01T00:00:00Z"), None);
+        assert_eq!(parse_ts("10000-01-01T00:00:00Z"), None);
+        assert_eq!(parse_ts("2026-11-11T-1:00:00Z"), None);
     }
 
     #[test]

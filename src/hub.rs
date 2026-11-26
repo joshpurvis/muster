@@ -5693,10 +5693,10 @@ mod tests {
         assert_eq!(u.pools.iter().map(|p| p.id).collect::<Vec<_>>(), ["gemini", "3p"]);
         assert_eq!(u.pools[0].windows[0].used_percentage, 29.9);
         // A later partial report changes only its own bucket; an empty one changes nothing.
-        hub.record_antigravity_usage("agy-run", &serde_json::json!({"quota": {"3p-5h": {"used_percentage": 12.5, "resets_at": 1_795_676_000}}})).unwrap();
+        hub.record_antigravity_usage("agy-run", &serde_json::json!({"quota": {"3p-5h": {"used_percentage": 12.5, "resets_at": 1_783_330_000}}})).unwrap();
         hub.record_antigravity_usage("agy-run", &serde_json::json!({"email": "someone@example.invalid"})).unwrap();
         let u = hub.antigravity_usage().unwrap().unwrap();
-        assert_eq!((u.pools[1].windows[0].used_percentage, u.pools[1].windows[0].resets_at), (12.5, Some(1_795_676_000)));
+        assert_eq!((u.pools[1].windows[0].used_percentage, u.pools[1].windows[0].resets_at), (12.5, Some(1_783_330_000)));
         assert_eq!(u.pools[0].windows[0].used_percentage, 29.9);
         let saved = hub.store.load_runtime::<serde_json::Value>(crate::antigravity_usage::STATE_KEY).unwrap().unwrap();
         assert!(!saved.to_string().contains("example.invalid"), "{saved}");

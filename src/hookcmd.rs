@@ -625,7 +625,7 @@ mod tests {
         for private in ["example.invalid", "alpha", "demo-app", "Pro", "transcript", "11111111"] {
             assert!(!req.contains(private), "{private} sent: {req}");
         }
-        assert!(req.contains(r#""gemini-5h":{"resets_at":1795676453,"used_percentage":29.9}"#), "{req}");
+        assert!(req.contains(r#""gemini-5h":{"resets_at":1783324232,"used_percentage":29.9}"#), "{req}");
         // Unchanged within a minute: nothing sent. Changed, or no quota: as it says.
         assert!(antigravity_usage(&url, "tok", real, last.clone()).is_none());
         let changed = String::from_utf8_lossy(real).replace("0.7012", "0.5");

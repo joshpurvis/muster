@@ -260,7 +260,8 @@ export function codexBars(u: CodexUsage | null, now: number, staleAfterMs: numbe
 const POOL_SHORT: Record<string, string> = { gemini: "Gemini", "3p": "Claude+GPT" };
 
 /** Antigravity's two quota pools (Gemini models; Claude and GPT models), one row each, aged like
- * Codex's figures. A pool nobody has used yet has no window running: 0%, nothing to reset. */
+ * Codex's figures. A pool nobody has used yet has no window running: 0% and no reset time (any
+ * other figure without one has an unknown reset time). */
 export function antigravityBars(u: AntigravityUsage | null, now: number, staleAfterMs: number): AccountBars[] {
   return (u?.pools ?? []).filter((p) => p.windows.length).map((p) => {
     const bars = [...p.windows].sort((a, b) => a.window_minutes - b.window_minutes).map((w) => {
@@ -274,7 +275,7 @@ export function antigravityBars(u: AntigravityUsage | null, now: number, staleAf
         reported_by: null,
       }, now, staleAfterMs);
       const b = bar(n.title, win, now);
-      const idle = w.resets_at == null && win.status === "current";
+      const idle = w.resets_at == null && w.used_percentage === 0 && win.status === "current";
       return { label: n.label, bar: idle ? { ...b, tip: `${n.title}: ${b.label} · no window running` } : b };
     });
     return { key: `antigravity:${p.id}`, tool: "antigravity" as const, name: POOL_SHORT[p.id] ?? p.name, full: `Antigravity ${p.name}`, bars };

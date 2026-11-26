@@ -19,7 +19,9 @@
 // the tab shows nothing or a card that is done with (merged, closed, withdrawn), unless the pointer
 // or the keyboard is on the dock, the list or a large picture is open. Otherwise the bar says it
 // came ("1 new: <title>", a button that shows it), and the strip scrolls to its pill, marked until
-// it is looked at. Off screen, prs_notice.ts posts a toast instead.
+// it is looked at; the card shown, posted again, gets "Posted again: <title>". A new card that comes
+// with the tab on screen is read from GitHub at once (prs.ts). Off screen, prs_notice.ts posts a
+// toast instead.
 import { signal } from "@preact/signals";
 import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
 import {
@@ -143,29 +145,34 @@ export function PrsView() {
   // A reorder of the list moves what is under the pointer: Merge ignores clicks for a moment.
   const order = waiting.map((p) => p.id).join(",");
   const inView = prsInView.value;
-  // New cards not looked at yet, but the one shown.
-  const fresh = arrivedPrs.value.filter((p) => p.id !== current?.id);
+  // New posts not looked at yet: other cards, or the card shown posted again while it was shown
+  // (its new words and pictures replace the old in place, so the bar says so).
+  const fresh = arrivedPrs.value;
   const freshKey = fresh.map((p) => `${p.id}:${p.post}`).join(",");
   const [said, setSaid] = useState("");
+  const cueHead = fresh.length === 1 && fresh[0].id === current?.id ? "Posted again" : `${fresh.length} new`;
 
   // The card shown stays shown: one the list put first (nothing picked yet, or the one picked was
   // withdrawn) is held, so a new card sorting ahead of it doesn't take its place.
   useLayoutEffect(() => {
     if (current && selectedPr.peek() !== current.id) selectedPr.value = current.id;
   }, [current?.id]);
-  // The card shown, on screen, is new no longer (as soon as it is drawn).
+  // A card that comes on screen is new no longer (as soon as it is drawn); one posted again while
+  // shown stays new until its cue is clicked.
   useLayoutEffect(() => {
     if (current && (inView || !!ref.current?.getClientRects().length)) seenPr(current.id);
-  }, [current?.id, current?.post, inView, freshKey]);
+  }, [current?.id, inView]);
   // A new card takes the stage from one that is done with, unless something is in hand there;
   // otherwise it waits in the bar's cue. Before paint, so the old card isn't drawn again.
   useLayoutEffect(() => {
-    if (!fresh.length || !makesWay(current)) return;
+    const others = fresh.filter((p) => p.id !== current?.id);
+    if (!others.length || !makesWay(current)) return;
     const root = ref.current;
     // The pointer resting on the dock after a Merge is fine (no button under it; Merge on the new
-    // card ignores clicks for a moment); on a button there ("Next waiting") it waits.
-    if (zoom || menu || root?.querySelector(".pb-dock button:hover, .pb-dock :focus")) return;
-    const to = fresh[0];
+    // card ignores clicks for a moment); on a button there ("Next waiting"), or the keyboard in
+    // the dock or the strip, it waits.
+    if (zoom || menu || root?.querySelector(".pb-dock button:hover, .pb-dock :focus, .pb-strip :focus")) return;
+    const to = others[0];
     const hadFocus = !!root?.querySelector(".pb-scroll")?.contains(document.activeElement);
     selectedPr.value = to.id;
     prsFilter.value = "waiting";
@@ -176,6 +183,7 @@ export function PrsView() {
 
   const pick = (p: Pr) => {
     selectedPr.value = p.id;
+    seenPr(p.id);
     prsFilter.value = p.status === "merged" ? "merged" : "waiting";
     setMenu(false);
     ref.current?.querySelector(".pb-scroll")?.scrollTo(0, 0);
@@ -227,8 +235,8 @@ export function PrsView() {
         </button>
         {fresh.length > 0 && (
           <button type="button" class="pb-new" data-tip={`${target(fresh[0])} · ${titleOf(fresh[0])}`}
-            aria-label={`${fresh.length} new: ${target(fresh[0])}, ${titleOf(fresh[0])}. Show it`} onClick={() => pick(fresh[0])}>
-            <span class="pb-new-n">{fresh.length} new:</span> <span class="pb-new-t">{titleOf(fresh[0])}</span>
+            aria-label={`${cueHead}: ${target(fresh[0])}, ${titleOf(fresh[0])}. Show it`} onClick={() => pick(fresh[0])}>
+            <span class="pb-new-n">{cueHead}:</span> <span class="pb-new-t">{titleOf(fresh[0])}</span>
           </button>
         )}
         {list.length > 0 && (
@@ -240,7 +248,7 @@ export function PrsView() {
         )}
       </div>
       <span class="sr-only" role="status" aria-live="polite">
-        {fresh.length ? `${fresh.length} new pull request${fresh.length === 1 ? "" : "s"}: ${target(fresh[0])}, ${titleOf(fresh[0])}` : said}
+        {fresh.length ? `${cueHead === "Posted again" ? "Posted again" : `${fresh.length} new pull request${fresh.length === 1 ? "" : "s"}`}: ${target(fresh[0])}, ${titleOf(fresh[0])}` : said}
       </span>
       <div class="pb-wrap" {...inert}>
         {list.length > 0 && <Strip list={list} current={current} fresh={fresh} onPick={pick} />}
@@ -276,11 +284,12 @@ function Strip({ list, current, fresh, onPick }: { list: Pr[]; current: Pr | und
     ref.current?.querySelector<HTMLElement>(".pb-pill.on")?.scrollIntoView({ block: "nearest", inline: "nearest" });
   }, [current?.id]);
   // A new card's pill comes into view (marked .new until it is looked at). Only the strip scrolls.
-  const newest = fresh.at(-1);
-  const newestKey = newest ? `${newest.id}:${newest.post}` : "";
+  // Again when it moves (its first read can move it to another group), never under the keyboard.
+  const newest = fresh.filter((p) => p.id !== current?.id).at(-1);
+  const newestKey = newest ? `${newest.id}:${newest.post}:${list.findIndex((p) => p.id === newest.id)}` : "";
   useEffect(() => {
     const strip = ref.current, pill = newest && strip?.querySelector<HTMLElement>(`#prs-pill-${newest.id}`);
-    if (!strip || !pill) return;
+    if (!strip || !pill || strip.contains(document.activeElement)) return;
     const s = strip.getBoundingClientRect(), r = pill.getBoundingClientRect();
     const by = r.left < s.left ? r.left - s.left - 14 : r.right > s.right ? r.right - s.right + 14 : 0;
     if (by) strip.scrollBy({ left: by, behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" });

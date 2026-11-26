@@ -460,17 +460,21 @@ merges, never a model.
   palette's **PRs to merge** shows it again. Not on the phone.
 - **A new card**: a card an agent posts, or posts again, while the window is open is new until
   the human looks at it in the tab (`web/src/prs.ts` `arrivedPrs`). Cards there when the window
-  opened are not new, and a refresh, **Not now** or the list reloaded after a reconnect brings no
-  new one. With the tab on screen: when it shows a card that is done with (merged, closed,
-  withdrawn) or nothing, the new card takes its place, unless the pointer is on a button of the
-  dock, the keyboard is in the dock, or the list or a large picture is open; otherwise the bar
-  shows **N new: <title>**, a button that shows it (on a narrow tab, on a line of its own), and
-  the strip scrolls to the new pill, ringed (and flashed as it comes) until it is looked at; a
-  screen reader hears it. Elsewhere (another tab in front, the tab hidden, or its group covered
-  by a zoomed one): a toast **New PR to merge: <repo> #<n>** with **Show**, which opens the tab
-  on that card; a hidden tab comes back only then (`web/src/prs_notice.ts`). Several new cards
-  share one toast ("3 new PRs to merge: <the first> and 2 more"); while the window is out of
-  sight the toast waits until it is back.
+  opened are not new, and a refresh or **Not now** brings no new one; a card posted while the
+  window was disconnected is new once the list is reloaded after the reconnect. One that arrives
+  with the tab on screen is read from GitHub at once. With the tab on screen: when it shows a card
+  that is done with (merged, closed, withdrawn) or nothing, the new card takes its place, unless
+  the pointer is on a button of the dock, the keyboard is in the dock or the strip, or the list or
+  a large picture is open; otherwise the bar shows **N new: <title>**, a button that shows it (on
+  a narrow tab, on a line of its own), and the strip scrolls to the new pill, ringed (and flashed
+  as it comes) until it is looked at. The card shown, posted again while shown, gets **Posted
+  again: <title>** until it is clicked. A screen reader hears each. Elsewhere (another tab in
+  front, the tab hidden, or its group covered by a zoomed one): a toast **New PR to merge: <repo>
+  #<n>** with **Show**, which opens the tab on that card; a hidden tab comes back only then
+  (`web/src/prs_notice.ts`). Several new cards share one toast ("3 new PRs to merge: <the first>
+  and 2 more"); a card that stops waiting leaves it, and a toast that has gone (timed out or
+  dismissed) isn't named again by the next. While the window is out of sight the toast waits
+  until it is back.
 - **Reading GitHub**: Muster reads every waiting card's pull request when the tab is shown and every
   2 minutes while it is (never in the background), and the card's **Check again** reads it now.
 - **Layout**: a bar with **Waiting N**, **Merged N** and **All N with titles ▾** (a list grouped

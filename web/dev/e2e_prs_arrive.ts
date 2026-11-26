@@ -86,14 +86,20 @@ try {
   await waitFor(`[...document.querySelectorAll('.toast .toast-text')].some((e) => e.textContent === 'New PR to merge: acme/notes-app #240')`,
     "a toast says: New PR to merge: acme/notes-app #240");
   await shot("prs-arrive-1-toast");
+  // Dismissed, then read twice (its first read comes now): no toast comes back.
+  await a.eval(`document.querySelectorAll('.toast .toast-x').forEach((b) => b.click())`);
   await R("pr.refresh", {});
   await R("pr.refresh", { id: n240.id, force: true });
   await a.sleep(600);
-  check((await prToasts()).length <= 1, `one toast after two refreshes: ${js(await prToasts())}`);
+  check((await prToasts()).length === 0, `no toast again after two refreshes: ${js(await prToasts())}`);
+  await R("mock.pr_post", { again: n240.id });
+  await waitFor(`[...document.querySelectorAll('.toast .toast-text')].some((e) => e.textContent === 'New PR to merge: acme/notes-app #240')`,
+    "posted again: a toast again");
   check(await a.eval(`!!document.querySelector('.prs-tab .tab-count')`), "the tab's badge counts it");
   check(await clickToastShow(), "the toast has Show");
   await waitFor(`!!document.querySelector('.prs-tab.active') && !!document.querySelector('.prs-view h2.qv-q')`, "Show opens the tab");
-  check((await title()) === NB("Pin a note to the top of the list"), `Show opens it on the new card: ${await title()}`);
+  await waitFor(`document.querySelector('.prs-view h2.qv-q')?.textContent === ${js(NB("Pin a note to the top of the list"))}`,
+    `Show opens it on the new card, read from GitHub: ${await title()}`);
   if (before) {
     // The old window had no Show: open the tab and the card by hand.
     await a.click(".prs-tab");
@@ -109,9 +115,11 @@ try {
   await waitFor(`document.querySelector('.prs-view .qv-ah')?.textContent === 'Merged'`, "merged from the tab", 12000);
   await a.sleep(300);
   await shot("prs-arrive-2a-merged");
-  await R("mock.pr_post", { n: 241, title: "Sort notes by last edit" });
+  const n241 = await R("mock.pr_post", { n: 241, title: "Sort notes by last edit" });
+  // Posted unread (no title yet): the tab asks for its read at once, not at the next 2 minute one.
   await waitFor(`document.querySelector('.prs-view h2.qv-q')?.textContent === ${js(NB("Sort notes by last edit"))}`,
-    "the stage moves from the merged card to the new one");
+    "the stage moves from the merged card to the new one, read at once");
+  await waitFor(`!!document.querySelector('.pm-merge:not(:disabled)')`, "its Merge is on");
   check((await prToasts()).length === 0, "no toast while the tab is in front");
   await a.sleep(400);
   await shot("prs-arrive-2b-moved");
@@ -143,9 +151,8 @@ try {
   const waitingTitle = await title();
   await shot("prs-arrive-3a-waiting");
   await R("mock.pr_post", { n: 242, title: "Show the note's last edit time on hover" });
-  await waitFor(`!!document.querySelector('.pb-new')`, "the bar says a card arrived");
-  const cue = await a.eval(`document.querySelector('.pb-new')?.textContent ?? ''`);
-  check(cue === "1 new: Show the note's last edit time on hover", `the cue reads "1 new: <title>": ${cue}`);
+  await waitFor(`document.querySelector('.pb-new')?.textContent === "1 new: Show the note's last edit time on hover"`,
+    `the cue reads "1 new: <title>": ${await a.eval(`document.querySelector('.pb-new')?.textContent ?? ''`)}`);
   check((await title()) === waitingTitle, "the waiting card stays shown");
   await a.sleep(700);
   check(await pillVisible(242), "the strip scrolled the new pill into view");
@@ -160,6 +167,15 @@ try {
   check(await a.eval(`!document.querySelector('.pb-new')`), "the cue goes once it is shown");
   ok("tab showing a waiting card: the cue, the pill in view; the cue shows the card");
 
+  // ---- 3a. the card shown posted again: the bar says so until it is looked at
+  const n242 = await a.eval(`${M}.rpc.call('pr.list', {}).then((r) => r.prs.find((p) => p.number === 242).id)`);
+  await R("mock.pr_post", { again: n242 });
+  await waitFor(`document.querySelector('.pb-new')?.textContent === "Posted again: Show the note's last edit time on hover"`,
+    "the card shown, posted again: the cue says so");
+  await a.click(".pb-new");
+  await waitFor(`!document.querySelector('.pb-new')`, "looked at: the cue goes");
+  ok("the card shown posted again: Posted again in the bar until clicked");
+
   // ---- 3b. a withdrawn arrival takes its cue with it
   const n245 = await R("mock.pr_post", { n: 245, title: "Archive old notes" });
   await waitFor(`!!document.querySelector('.pb-new')`, "the cue for #245");
@@ -171,8 +187,8 @@ try {
   await a.click(shellTab);
   await a.sleep(500);
   check(!(await tabActive()), "the shell tab is in front");
-  await R("mock.pr_post", { again: n240.id });
-  await waitFor(`[...document.querySelectorAll('.toast .toast-text')].some((e) => e.textContent === 'New PR to merge: acme/notes-app #240')`,
+  await R("mock.pr_post", { again: n241.id });
+  await waitFor(`[...document.querySelectorAll('.toast .toast-text')].some((e) => e.textContent === 'New PR to merge: acme/notes-app #241')`,
     "a toast for a card posted again");
   ok("a card posted again: a toast");
   await a.eval(`document.querySelectorAll('.toast .toast-x').forEach((b) => b.click())`);
@@ -181,9 +197,9 @@ try {
   await a.click(".prs-tab");
   await a.sleep(300);
   // Back in the tab, the card posted again waits in the cue: look at it.
-  await waitFor(`document.querySelector('.pb-new')?.textContent === '1 new: Pin a note to the top of the list'`,
+  await waitFor(`document.querySelector('.pb-new')?.textContent === '1 new: Sort notes by last edit'`,
     "back in the tab, the cue names the card posted again");
-  if (before) await pickPill(240);
+  if (before) await pickPill(241);
   else await a.click(".pb-new");
   await a.sleep(300);
   await a.key("Alt+W");
@@ -204,23 +220,34 @@ try {
     await a.key("Enter");
   }
   await waitFor(`!!document.querySelector('.prs-tab.active')`, "Show brings the hidden tab back");
-  check((await title()) === NB("Export a note as Markdown"), `on the new card: ${await title()}`);
+  await waitFor(`document.querySelector('.prs-view h2.qv-q')?.textContent === ${js(NB("Export a note as Markdown"))}`,
+    `on the new card: ${await title()}`);
   ok("hidden tab: a toast, the tab stays hidden until Show");
 
   // ---- 6. several at once in the background: one toast that counts them
   await a.click(shellTab);
   await a.sleep(400);
-  await R("mock.pr_post", { n: 250, title: "Tags on notes" });
+  // A toast dismissed is not named again by the next one.
+  await R("mock.pr_post", { n: 249, title: "Print a note" });
+  await waitFor(`[...document.querySelectorAll('.toast .toast-text')].some((e) => e.textContent === 'New PR to merge: acme/notes-app #249')`,
+    "a toast for #249");
+  await a.eval(`document.querySelectorAll('.toast .toast-x').forEach((b) => b.click())`);
+  const n250 = await R("mock.pr_post", { n: 250, title: "Tags on notes" });
   await R("mock.pr_post", { n: 251, title: "Colour a tag" });
   await R("mock.pr_post", { n: 252, title: "Filter by tag" });
-  await waitFor(`[...document.querySelectorAll('.toast .toast-text')].some((e) => e.textContent.startsWith('3 new PRs to merge'))`,
-    "one toast counts three new cards");
+  await waitFor(`[...document.querySelectorAll('.toast .toast-text')].some((e) => e.textContent === '3 new PRs to merge: acme/notes-app #250 and 2 more')`,
+    `one toast counts the three new cards, not the dismissed one: ${js(await prToasts())}`);
   check((await prToasts()).length === 1, `one toast for three: ${js(await prToasts())}`);
   await shot("prs-arrive-6-three");
-  ok("three at once: one toast");
+  // The first withdrawn: the toast names, and Show opens, the next.
+  await R("mock.pr_withdraw", { id: n250.id });
+  await waitFor(`[...document.querySelectorAll('.toast .toast-text')].some((e) => e.textContent === '2 new PRs to merge: acme/notes-app #251 and 1 more')`,
+    `a withdrawn card leaves the toast: ${js(await prToasts())}`);
+  check(await clickToastShow(), "the toast has Show");
+  await waitFor(`document.querySelector('.prs-view h2.qv-q')?.textContent === ${js(NB("Colour a tag"))}`, "Show opens the card it names");
+  ok("three at once: one toast; a dismissed one isn't named again; a withdrawn one leaves it");
 
   // narrow: the cue still fits the bar
-  await a.click(".prs-tab");
   await a.size(640, 820);
   await a.sleep(500);
   await R("mock.pr_post", { n: 253, title: "A much longer title that has to be cut short to fit a narrow bar" });

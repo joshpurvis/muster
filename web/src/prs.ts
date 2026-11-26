@@ -49,6 +49,10 @@ function noteArrival(p: Pr) {
   if (!book.note(p) || !listed || p.status !== "waiting") return;
   const keep = new Set(stillNew(newPosts.peek(), prs.peek()).map((x) => x.id));
   newPosts.value = [...newPosts.peek().filter((a) => a.id !== p.id && keep.has(a.id)), { id: p.id, post: p.post }];
+  // Muster reads a card from GitHub only while the tab is on screen (its title, the rules,
+  // Merge): one arriving then is read now, not at the next 2 minute read. Off screen, the tab
+  // reads every card when it is shown.
+  if (prsInView.peek() && !p.github) refreshPrs(p.id, false).catch(() => {});
 }
 
 /** The tab showed card `id`: it is new no longer. */
@@ -98,14 +102,14 @@ export async function loadPrs() {
 }
 
 /** Read GitHub again: every waiting card (at most once a minute each), or card `id` now (Check
- * again: at most every 3 seconds). */
-export async function refreshPrs(id?: number): Promise<void> {
+ * again: at most every 3 seconds; `force` false: at most once a minute, as for every card). */
+export async function refreshPrs(id?: number, force = true): Promise<void> {
   if (!prsSupported.peek()) return;
   if (id === undefined) {
     const r = await rpc.call<{ prs: Pr[] }>("pr.refresh", {});
     applyList(r.prs);
   } else {
-    applyPr(await rpc.call<Pr>("pr.refresh", { id, force: true }));
+    applyPr(await rpc.call<Pr>("pr.refresh", { id, force }));
   }
 }
 

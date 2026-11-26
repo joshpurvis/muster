@@ -3,8 +3,8 @@
 // `pr.merge` "merges" a ready card after a moment (any other is refused with its reason).
 // `mock.pr_seed` puts in the sample cards (every state the tab shows), `mock.pr_seed_tall` two
 // cards with a full-page phone picture (too tall to read: one posted after post_pr left such pictures
-// out, one stored before), `mock.pr_post` one new ready card ({n, repo, title}) or posts card `again`
-// again, `mock.pr_withdraw` withdraws card `id`; dev/mock.ts routes `pr.*` and `mock.pr_*` here. Every repo, name, commit and picture is invented: this repo is public.
+// out, one stored before), `mock.pr_post` one new ready card ({n, repo, title}) or posts open card `again`
+// again (both unread, as the daemon posts them: `pr.refresh` gives their read), `mock.pr_withdraw` withdraws card `id`; dev/mock.ts routes `pr.*` and `mock.pr_*` here. Every repo, name, commit and picture is invented: this repo is public.
 
 import type { Pr, PrRead, PrVerdict } from "../src/types.ts";
 
@@ -233,6 +233,8 @@ export function prMock(d: PrDeps) {
   /** Picture SVGs by `<id>:<index>`. */
   const svgs = new Map<string, string>();
   let next = 1;
+  /** Cards posted unread (as the daemon posts them): their made-up read, given by `pr.refresh`. */
+  const unread = new Map<number, PrRead>();
 
   const publish = (p: Pr) => d.broadcast("pr_upserted", p);
   const get = (id: number) => {
@@ -268,7 +270,7 @@ export function prMock(d: PrDeps) {
     return { ok: !reason, state, commit, base, checks, ...(reason ? { reason } : {}) };
   }
 
-  function seed(samples = SAMPLES): Pr[] {
+  function seed(samples = SAMPLES, fresh = false): Pr[] {
     const out: Pr[] = [];
     for (const s of samples) {
       const id = next++;
@@ -303,6 +305,12 @@ export function prMock(d: PrDeps) {
         details: s.kind === "ready" ? "Files: src/editor/count.ts, src/list/row.tsx. Reviewed twice; both found nothing." : undefined,
       };
       if (!p.details) delete p.details;
+      // Posted just now: no read yet, so no title, rules or Merge until the window asks.
+      if (fresh) {
+        unread.set(id, p.github!);
+        delete p.github;
+        delete p.verdict;
+      }
       s.pics.forEach(([side, , shot], i) => !s.leftOut?.some((x) => x.index === i) && svgs.set(`${id}:${i}`, SHOTS[shot](side === "after")));
       all.set(id, p);
       publish(p);
@@ -330,12 +338,13 @@ export function prMock(d: PrDeps) {
   /** A card posted again: a new commit, words and pictures; what Muster read and what the human
    * did with the old post start over (src/prs.rs `post`). */
   function postAgain(c: Pr): Pr {
+    if (c.status !== "waiting" && c.status !== "stale") throw new Error(`${c.repo} #${c.number} is ${c.status}: only an open card is posted again`);
     const posted = sha((c.post + 1).toString(16) + "e4d2c1");
-    const read: PrRead = { ...c.github!, at: d.now(), state: "OPEN", head_sha: posted, mergeable: "MERGEABLE",
+    const read: PrRead = { ...(c.github ?? unread.get(c.id)!), at: d.now(), state: "OPEN", head_sha: posted, mergeable: "MERGEABLE",
       checks: { total: 2, passed: 2, failed: 0, running: 0 } };
-    for (const k of ["refused", "merge", "later", "changes", "closed", "stale_told"] as const) delete c[k];
-    Object.assign(c, { status: "waiting", post: c.post + 1, created_at: d.now(), head_sha: posted, github: read,
-      verdict: verdictOf(read, posted) });
+    for (const k of ["refused", "merge", "later", "changes", "closed", "stale_told", "github", "verdict"] as const) delete c[k];
+    Object.assign(c, { status: "waiting", post: c.post + 1, created_at: d.now(), head_sha: posted });
+    unread.set(c.id, read);
     const pics = c.pictures ?? [];
     pics.forEach((x, i) => svgs.has(`${c.id}:${i}`) || svgs.set(`${c.id}:${i}`, SHOTS.editor(x.side === "after")));
     touch(c);
@@ -368,8 +377,14 @@ export function prMock(d: PrDeps) {
           // The made-up reads don't change: only their time moves on.
           const cards = p.id != null ? [get(p.id)] : listed().filter((c) => c.status === "waiting" || c.status === "stale");
           for (const c of cards) {
-            if (!c.github || (c.status !== "waiting" && c.status !== "stale")) continue;
-            c.github = { ...c.github, at: d.now() };
+            if (c.status !== "waiting" && c.status !== "stale") continue;
+            const first = unread.get(c.id);
+            if (first) {
+              unread.delete(c.id);
+              c.github = { ...first, at: d.now() };
+              c.verdict = verdictOf(c.github, c.head_sha);
+            } else if (!c.github) continue;
+            else c.github = { ...c.github, at: d.now() };
             touch(c);
             publish(c);
           }
@@ -417,7 +432,7 @@ export function prMock(d: PrDeps) {
           return c;
         }
         case "mock.pr_post":
-          return p.again != null ? postAgain(get(p.again)) : seed([newSample(p)])[0];
+          return p.again != null ? postAgain(get(p.again)) : seed([newSample(p)], true)[0];
       }
       throw new Error(`unknown method: ${method}`);
     },

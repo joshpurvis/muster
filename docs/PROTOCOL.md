@@ -720,9 +720,10 @@ agent's reason) or `failed`. The reply is the agent's final message for that tur
 way), taken as for a waiting `ask_agent`: only one that brings no origin the message's chain didn't
 have (docs/MCP.md "Late replies"; a lead's reply to its scheduled work qualifies, and the "Then…"
 step still goes on the schedule's own chain). A `reply` that comes after the run stopped waiting,
-while the turn left no final message, is the run's late reply, as a late final message is: the
-history shows the run `replied` with a `late reply` chip, the note gets it, and a "Then…" step
-that already ran for the recorded outcome stays. Whichever the run took is its one reply for
+while the turn left no final message, is the run's late reply, as a late final message is: a run
+that ended `no_reply` or `timed_out` shows `replied` with a `late reply` chip in its history, a
+schedule's own run (not a step) puts it in the note, and a "Then…" step that already ran for the
+recorded outcome stays. Whichever the run took is its one reply for
 `{reply}`, `{last_reply}` and the note, also when the agent sends both. A reply is also appended to the schedule's note, if it has one,
 under a `## Tue 21 Oct 2026 09:00 · <name>` heading, written as the agent, exactly once per run, also
 when the reply comes after the run stopped waiting for it. "Notify me": an in-app

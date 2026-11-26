@@ -2116,11 +2116,13 @@ pub fn not_submitted(hub: &Arc<Hub>, source: &crate::agents::Source, action: pla
 
 /// A reply arrived for agent message `msg` (the hook handler's final message, or a `reply` the
 /// run took after it stopped waiting: `agent_reply::finish`): a schedule run's reply goes to its
-/// note even when the run had stopped waiting for it, once.
+/// note even when the run had stopped waiting for it, once. A run still waiting files it itself
+/// when it ends (`run::finish`), with the reply it took: a final message and a `reply` that both
+/// arrive in its wait can't put one text in the note and the other in `{reply}`.
 pub fn on_reply(hub: &Hub, msg: i64) {
     let Ok(Some(r)) = hub.store().run_by_msg(msg) else { return };
     let Some(s) = hub.schedules.get(r.schedule_id) else { return };
-    if r.kind != RunKind::Chain {
+    if r.kind != RunKind::Chain && r.outcome != Outcome::Pending {
         run::reply_to_note_once(hub, &s, &r);
     }
     if r.outcome != Outcome::Pending {

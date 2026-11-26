@@ -812,7 +812,8 @@ lifted, and what isn't:
 - a message on `lead` work can't wait for a later turn, since only a `lead` turn could show it:
   `tell_agent`, `send_message`, and a `reply` to an existing agent or a live session (even one
   whose ask is still waiting) are refused with `wake: false` before anything is kept or counted; send it with
-  `wake: true`. A `reply` the human or a schedule asked is shown in the message log either way;
+  `wake: true`. A `reply` the human or a schedule asked is shown in the message log (or taken as the
+  schedule run's reply) either way;
 - what reaches a lead is unchanged: its accepted origins decide what it takes.
 
 An Antigravity lead works the same way: it calls these tools through `call_mcp_tool` (its persona
@@ -873,7 +874,7 @@ long job finishes: it says so in that turn's reply, then calls `reply {msg_id, t
   | An ask still waiting for that message (`ask_agent`, `muster ask`, `agent.ask`) | It returns the text as its `reply` (it re-checks every second; after 30 s untaken, e.g. the ask was cancelled, the next row applies: `WAITER_MAX`). Only a reply that brings no origin the question's chain didn't have, and is no deeper in the chain than an answer in the question's own turn (one hop past it); any other goes as the next row says. | `returned` |
   | A named agent | A new agent message: `[muster msg <new id> from <replier> origin=<o> hop=<n>]`, then `Late reply to your message <id> ("<first line of the question>"):` and the text, with `reply_to` = the message answered. Through `agents::send_checked`: the asker's accepted origins, the hop limit, the daily and unattended caps, the OpenRouter spend caps, the injection queue; a stopped agent is started as for any message. A refusal is logged like any refused message. | `delivered` (`delivered_as`), else `refused` |
   | Another Claude, Codex or Antigravity session (live) | Typed in through its injection queue after `[muster reply to msg <id> from <replier> origin=<o> hop=<n>]` (no message row of its own, so not an envelope the agents' attribution acts on); the session takes the reply's origin and hop. A Claude session takes only `human`-origin replies (`send_message`'s rule). | `delivered` (`session_id`), else `refused` |
-  | A schedule's, trigger's or "Then…" step's run, when the turn left no final message for it | The run's reply, under the first row's rule: in its wait it ends the run `replied`; after the run stopped waiting it is the run's late reply (its history shows `replied` with a `late reply` chip, its note gets it once). Any other reply goes as the next row says. | `returned` |
+  | A schedule's, trigger's or "Then…" step's run, when the turn left no final message for it | The run's reply, under the first row's rule: in its wait it ends the run `replied`; after the run stopped waiting it is the run's late reply (a run that ended `no_reply` or `timed_out` shows `replied` with a `late reply` chip in its history; a schedule's own run, not a step, puts it in its note once). Any other reply goes as the next row says. | `returned` |
   | The human (a client, `muster ask` outside a session or in a shell tab), or a schedule | Shown in the sidebar's message log (the message's entry gets a `late reply` chip; its overlay shows the text and how it was delivered); a desktop notification when the human asked. | `shown` |
   | An agent since removed, a session that ended | Kept in the log only. | `undelivered` |
 
@@ -886,7 +887,7 @@ long job finishes: it says so in that turn's reply, then calls `reply {msg_id, t
   origin, at most one hop past the question; `agent_reply::returnable`), and the human's and a schedule's rows
   are unchanged. On `lead` work a quiet reply to an existing agent or a live session is refused before it is
   stored, even while an ask waits for it (rare: the retry with `wake: true` still reaches that
-  ask); one the human or a schedule asked is shown as usual, and one whose asker is gone is kept
+  ask); one the human or a schedule asked is shown (or taken as the run's reply) as usual, and one whose asker is gone is kept
   as usual. Same checks as the waking way: for an asking agent, its accepted origins for the
   reply's origin and every origin it is rooted in, and the hop limit; for a plain session, the
   hop limit and the plain Claude rule on the reply's route; all before anything is kept. A reply

@@ -260,18 +260,46 @@ async fn a_reply_finished_after_a_restart_is_the_runs_late_reply() {
     let s = schedule(&hub, "agy");
     let (mut run, msg) = sent(&hub, &s, Origin::Schedule);
     run::finish(&hub, &s, &mut run, Outcome::NoReply, Some("the turn ended without a final message for this run".into())).unwrap();
-    let m = hub.store().agent_message(msg).unwrap().unwrap();
-    let now = Some(Prov { origin: Origin::Schedule, hop: 0, msg_id: Some(msg) });
-    let route = agent_reply::answer_route(&m, now, false);
-    let a = agent_reply::Answer {
-        text: "kept across".into(), at: now_ms(), from_session: 1, origin: route.origin, hop: route.hop,
-        origins: agent_reply::answer_origins(&m, now, false), status: AnswerStatus::Pending, note: None, msg: None,
-        session: None, quiet: false,
-    };
-    assert!(hub.store().set_agent_answer(msg, &a).unwrap());
+    keep_reply(&hub, msg, 1, "kept across");
     agent_reply::resume(&hub, agent_reply::unfinished(&hub)).await;
     let m = hub.store().agent_message(msg).unwrap().unwrap();
     assert_eq!(m.answer.as_ref().unwrap().status, AnswerStatus::Returned);
     assert_eq!(run_json(&hub, &stored(&hub, &run))["late_reply"], true);
     assert_eq!(note_body(&hub, &s).matches("kept across").count(), 1);
+}
+
+/// Session `sid`'s `reply` to message `msg` (handling it), kept and not yet taken by anything.
+fn keep_reply(hub: &Hub, msg: i64, sid: SessionId, text: &str) {
+    let m = hub.store().agent_message(msg).unwrap().unwrap();
+    let now = Some(Prov { origin: m.origin, hop: m.hop, msg_id: Some(msg) });
+    let route = agent_reply::answer_route(&m, now, false);
+    let a = agent_reply::Answer {
+        text: text.into(), at: now_ms(), from_session: sid, origin: route.origin, hop: route.hop,
+        origins: agent_reply::answer_origins(&m, now, false), status: AnswerStatus::Pending, note: None, msg: None,
+        session: None, quiet: false,
+    };
+    assert!(hub.store().set_agent_answer(msg, &a).unwrap());
+}
+
+/// A `reply` kept and a final message filed (the Stop hook) while the run waits, before its next
+/// check: the note, `{reply}` and `{last_reply}` all carry the one text the run took.
+#[tokio::test]
+async fn a_reply_and_a_final_message_in_one_wait_agree_everywhere() {
+    let hub = fixture();
+    let s = schedule(&hub, "cleo");
+    let (run, msg) = sent(&hub, &s, Origin::Schedule);
+    turn(&hub, 2, true);
+    keep_reply(&hub, msg, 2, "from the tool");
+    hub.store().set_agent_message_reply(msg, "final text", now_ms()).unwrap();
+    on_reply(&hub, msg);
+    // The run is still waiting: it files the note itself, with the reply it takes.
+    assert_eq!(note_body(&hub, &s), "");
+    let run = wait(&hub, &s, run).await.unwrap();
+    assert_eq!(stored(&hub, &run).outcome, Outcome::Replied);
+    let taken = hub.store().agent_message(msg).unwrap().unwrap().run_reply().unwrap().to_string();
+    let body = note_body(&hub, &s);
+    assert_eq!(body.matches(taken.as_str()).count(), 1, "{body}");
+    assert_eq!(body.matches("final text").count() + body.matches("from the tool").count(), 1, "{body}");
+    assert_eq!(hub.store().last_runs_for_prompt(s.id, i64::MAX).unwrap().1, Some(taken.clone()));
+    assert!(step_text(&hub, &s, &run).contains(&format!("> {taken}")));
 }

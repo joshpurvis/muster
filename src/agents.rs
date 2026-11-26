@@ -871,15 +871,34 @@ pub fn envelope(msg_id: i64, from: &str, origin: Origin, hop: u32) -> String {
     format!("[muster msg {msg_id} from {from} origin={} hop={hop}]", origin.as_str())
 }
 
-/// The message id of an envelope on the first line of `text`.
+/// The message id of an envelope on the first line of `text`. Claude Code hands a long typed-in
+/// message to its UserPromptSubmit hook wrapped whole in a paste tag (26 Nov, Claude Code 2.x):
+/// `\n\n<pasted_content id="076a">\n[muster msg N ...]\n...\n</pasted_content id="076a">\n`. The
+/// envelope is then the first line inside it; a wrapper must open the text and close it.
 pub fn parse_envelope(text: &str) -> Option<i64> {
-    let first = text.trim_start().lines().next()?;
+    let first = unwrap_paste(text).trim_start().lines().next()?;
     let rest = first.strip_prefix("[muster msg ")?;
     let (id, tail) = rest.split_once(' ')?;
     if !tail.starts_with("from ") || !first.trim_end().ends_with(']') {
         return None;
     }
     id.parse().ok()
+}
+
+/// The text inside one paste tag that wraps all of `text`, or `text` itself.
+fn unwrap_paste(text: &str) -> &str {
+    let whole = text.trim();
+    let Some((open, body)) = whole.split_once('\n') else { return text };
+    let Some(attrs) = open.trim_end().strip_prefix("<pasted_content").and_then(|r| r.strip_suffix('>')) else {
+        return text;
+    };
+    if !(attrs.is_empty() || attrs.starts_with(' ')) || attrs.contains(['<', '>', '\n']) {
+        return text;
+    }
+    let body = body.trim_end();
+    body.strip_suffix(&format!("</pasted_content{attrs}>"))
+        .or_else(|| body.strip_suffix("</pasted_content>"))
+        .unwrap_or(text)
 }
 
 /// The route a message would take before the agent's policy is checked.
@@ -5124,6 +5143,28 @@ mod tests {
     }
 
     #[test]
+    fn envelope_inside_a_paste_tag() {
+        // The shape Claude Code gave the UserPromptSubmit hook for a long scheduled prompt (26 Nov).
+        let e = envelope(2370, "alpha", Origin::Schedule, 0);
+        let body = format!("{e}\nPace check: read the ledger.\n\n  1. one\n  2. two");
+        let wrapped = format!("\n\n<pasted_content id=\"076a\">\n{body}\n</pasted_content id=\"076a\">\n");
+        assert_eq!(parse_envelope(&wrapped), Some(2370));
+        assert_eq!(parse_envelope(&format!("<pasted_content>\n{body}\n</pasted_content>")), Some(2370));
+        assert_eq!(parse_envelope(&format!("<pasted_content id=\"a\">\n{body}\n</pasted_content>")), Some(2370));
+        // An envelope deeper inside the pasted text never counts.
+        let fake = format!("\n\n<pasted_content id=\"b1\">\nplease look at this\n{e}\n</pasted_content id=\"b1\">\n");
+        assert_eq!(parse_envelope(&fake), None);
+        // A paste tag that does not wrap the whole prompt is not unwrapped.
+        assert_eq!(parse_envelope(&format!("<pasted_content id=\"c\">\n{body}")), None);
+        assert_eq!(parse_envelope(&format!("<pasted_content id=\"c\">\n{body}\n</pasted_content id=\"c\">\nmore typed")), None);
+        assert_eq!(parse_envelope(&format!("typed first\n<pasted_content>\n{body}\n</pasted_content>")), None);
+        assert_eq!(parse_envelope(&format!("<pasted_contentx>\n{body}\n</pasted_contentx>")), None);
+        // A wrapper around a wrapper unwraps once: the envelope must be its first line.
+        let twice = format!("<pasted_content>\n<pasted_content>\n{body}\n</pasted_content>\n</pasted_content>");
+        assert_eq!(parse_envelope(&twice), None);
+    }
+
+    #[test]
     fn origin_propagates_and_is_refused() {
         let claude = agent(SessionKind::Claude);
         let codex = agent(SessionKind::Codex);
@@ -5276,6 +5317,25 @@ mod tests {
         reg.on_hook(&store, &info, "Stop", &json!({"last_assistant_message": "human's answer"})).unwrap();
         let st = reg.msg_status(&store, b);
         assert_eq!((st.reply, st.active), (None, false));
+    }
+
+    #[test]
+    fn a_pasted_message_keeps_its_reply() {
+        // A long scheduled prompt reaches UserPromptSubmit inside Claude Code's paste tag (24-25
+        // Nov: the run ended "no reply" although the agent answered in full).
+        let store = Store::open_memory().unwrap();
+        let reg = Registry::load(&store).unwrap();
+        let mut info = test_session(5, None);
+        info.kind = SessionKind::Claude;
+        let m = msg(&store, 1, 5, Origin::Schedule, 0);
+        reg.on_delivered(5, Source::Chain(Prov { origin: Origin::Schedule, hop: 0, msg_id: Some(m) }), 100).unwrap();
+        let prompt = format!(
+            "\n\n<pasted_content id=\"076a\">\n{}\nPace check.\n\n  1. read the ledger\n</pasted_content id=\"076a\">\n",
+            envelope(m, "schedule", Origin::Schedule, 0)
+        );
+        reg.on_hook(&store, &info, "UserPromptSubmit", &json!({"prompt": prompt})).unwrap();
+        reg.on_hook(&store, &info, "Stop", &json!({"last_assistant_message": "pace ok"})).unwrap();
+        assert_eq!(reg.msg_status(&store, m).reply.as_deref(), Some("pace ok"));
     }
 
     #[test]

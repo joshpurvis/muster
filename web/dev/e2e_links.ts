@@ -136,9 +136,10 @@ export async function linkChecks(a: Browser, shots: string, ok: (m: string) => v
   await a.eval(`globalThis.__opened = []; globalThis.open = (...args) => { globalThis.__opened.push(args); return null; };
     globalThis.__asked = 0; globalThis.confirm = () => { globalThis.__asked++; return true; }`);
   const web = `clear; printf 'Docs: \\e]8;;https://example.org/guide\\e\\\\the guide\\e]8;;\\e\\\\.\\n` +
-    `Bad: \\e]8;;javascript:alert(1)\\e\\\\click me\\e]8;;\\e\\\\.\\n'\r`;
+    `Bad: \\e]8;;javascript:alert(1)\\e\\\\click me\\e]8;;\\e\\\\.\\n` +
+    `Fake: \\e]8;;https://docs.example@other.example/\\e\\\\the docs\\e]8;;\\e\\\\.\\n'\r`;
   await R("session.input", { id: sid, data: web });
-  await a.wait(`(${M}.termText(${sid}) ?? '').includes('Bad: click me')`, 6000);
+  await a.wait(`(${M}.termText(${sid}) ?? '').includes('Fake: the docs')`, 6000);
   const termEl = `document.querySelector('.term-el[data-sid="${sid}"]')`;
   await clickLink("Docs:", "the guide", "links-4-hover-web-hyperlink");
   check(await a.eval(`${termEl}.title`) === "https://example.org/guide", "hovering a web hyperlink shows its address");
@@ -155,6 +156,18 @@ export async function linkChecks(a: Browser, shots: string, ok: (m: string) => v
   check((await a.eval(`globalThis.__opened.length`)) === 1, "a javascript: hyperlink opens nothing");
   check(!(await a.eval(`${termEl}.title`)), "no address tooltip on a javascript: hyperlink");
   ok("a javascript: hyperlink does nothing");
+  // A middle-click (paste) on the web hyperlink opens nothing; nor does any click on an address
+  // whose user name reads as another host (`https://docs.example@other.example/`).
+  const [gx, gy] = await at("Docs:", "the guide");
+  await a.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: gx, y: gy });
+  await a.sleep(200);
+  await a.send("Input.dispatchMouseEvent", { type: "mousePressed", x: gx, y: gy, button: "middle", clickCount: 1, buttons: 4 });
+  await a.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: gx, y: gy, button: "middle", clickCount: 1 });
+  await clickLink("Fake:", "the docs");
+  await a.sleep(300);
+  check((await a.eval(`globalThis.__opened.length`)) === 1, "a middle-click, or a click on a user-name address, opens nothing");
+  check(!(await a.eval(`${termEl}.title`)), "no address tooltip on a user-name address");
+  ok("a middle-click on a web hyperlink, and a hyperlink with a user name before its host, open nothing");
 }
 
 /** Links in a note's text: hovering one says what Ctrl+click opens, Ctrl underlines it, Ctrl+click

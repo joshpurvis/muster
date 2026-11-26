@@ -16,7 +16,7 @@ import type { SessionInfo } from "./types.ts";
 import { isRightButtonReport, RIGHT_BUTTON } from "./mousereport.ts";
 import { copyText } from "./util.ts";
 import { measure, metricsEnabled, onMetricsFlush } from "./metrics.ts";
-import { linkRanges, MAX_LINK, type MusterLink, parseMusterLink } from "./links.ts";
+import { linkRanges, MAX_LINK, type MusterLink, parseMusterLink, webAddress } from "./links.ts";
 
 const MAX_WEBGL = 10;
 
@@ -135,17 +135,19 @@ interface LinkState {
 }
 
 /** Links a program marked up itself (OSC 8). A Muster link is followed on a left click
- * (`followClicks`). A web link (http, https) opens in the browser on a click, its address given
+ * (`followClicks`). A web link (http, https, with a host and no user name before it, as on a
+ * card: `webAddress`) opens in the browser on a left click, its address given
  * to `open` at once: the native window sends only that address to the system browser, so
  * xterm's default (ask, open a blank window, then set its address) opened nothing there. The
  * address shows as the terminal's tooltip on hover, since the text may say something else. Any
  * other kind (file://, ssh://…) is left alone. */
 function oscLinks(el: HTMLElement, state: LinkState) {
-  const web = (uri: string) => !parseMusterLink(uri) && /^https?:\/\//i.test(uri);
+  const web = (uri: string) => !parseMusterLink(uri) && webAddress(uri);
   return {
     allowNonHttpProtocols: true,
-    activate(_ev: MouseEvent, uri: string) {
-      if (web(uri)) globalThis.open(uri, "_blank", "noopener,noreferrer");
+    activate(ev: MouseEvent, uri: string) {
+      // xterm activates on any button's release: a middle-click (paste) opens nothing.
+      if (ev.button === 0 && web(uri)) globalThis.open(uri, "_blank", "noopener,noreferrer");
     },
     hover(_ev: MouseEvent, uri: string) {
       if (parseMusterLink(uri)) state.hovered = uri;

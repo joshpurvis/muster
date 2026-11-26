@@ -1,0 +1,23 @@
+  Done: the summary is in notes/summary.md.
+
+────────────────────────────────────────────────────────────
+> [muster msg 41 from planner origin=human hop=1]
+  planner: please fold the review into a second draft of the table.
+  Write it to notes/draft2.md and reply with the path.
+
+○ Thought for 12s (The review has four points; each one fits the table...)
+● Explored 1 file (review.md)
+● Edited 2 files (draft2.md, open-threads.md)
+● Called 1 MCP tool (muster/reply) (ctrl+o to expand)
+
+  Folded the review into notes/draft2.md and replied to planner (msg_id: 41).
+  • Checks: word budgets pass.
+pass.───────────────────────────────────────────────────────────────────────────────Notes upda────────────────ted in [op
+en...                                                                                                       -threads.
+  md](file:///home/user/demo-app/notes/open-threads.md)
+  notes/open-threads.md
+
+>
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+esc to cancel                                                                        accept-edits · Gemini 4 Neon · high
+? for shortcuts

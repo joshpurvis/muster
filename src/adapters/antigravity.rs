@@ -252,6 +252,35 @@ fn launch(ctx: &SpawnCtx, settings: bool, mcp: bool, user_settings: &Path, other
     })
 }
 
+/// The rules around agy's input box, walking up from `bottom`, the last rule above the footer.
+/// agy 1.5.13 draws status rows in their own ruled blocks between the box and the footer
+/// (`  ● [00:52:20] 25m timer running` while a timer runs). Such a block has no `>` prompt
+/// line and only indented rows that start with a symbol; anything else (an empty block in
+/// mid-redraw, a box whose `>` line is unreadable, a transcript) stops the walk, so a lost
+/// border never makes an older prompt read as the box.
+fn composer_rules(lines: &[String], mut bottom: usize) -> Option<(usize, usize, bool)> {
+    const MAX_STATUS_BLOCKS: usize = 4;
+    let status_block = |block: &[String]| {
+        let rows: Vec<&String> = block.iter().filter(|l| !l.trim().is_empty()).collect();
+        (1..=3).contains(&rows.len())
+            && rows.iter().all(|l| {
+                l.starts_with(char::is_whitespace)
+                    && l.trim_start().chars().next().is_some_and(|c| !c.is_ascii() && !c.is_alphanumeric())
+            })
+    };
+    let mut top = tui::rfind(&lines[..bottom], tui::is_solid_rule)?;
+    let mut walked = false;
+    for _ in 0..MAX_STATUS_BLOCKS {
+        let block = &lines[top + 1..bottom];
+        if block.iter().any(|l| l.starts_with('>')) || !status_block(block) {
+            break;
+        }
+        (bottom, walked) = (top, true);
+        top = tui::rfind(&lines[..bottom], tui::is_solid_rule)?;
+    }
+    Some((top, bottom, walked))
+}
+
 // The composer and modal content are separated from past turns by a solid rule.
 fn active_dialog_lines(lines: &[String]) -> &[String] {
     tui::rfind(lines, |l| !l.starts_with(char::is_whitespace) && tui::is_solid_rule(l)).map_or(lines, |i| &lines[i + 1..])
@@ -453,7 +482,7 @@ impl Adapter for AntigravityAdapter {
             .find_map(|l| l.trim_start().strip_prefix("? for shortcuts"))
             .or(status_only)
             .or(menu.then_some(""))?;
-        let top = tui::rfind(&lines[..bottom], tui::is_solid_rule)?;
+        let (top, bottom, walked) = composer_rules(lines, bottom)?;
         // Muster's copy of the screen can lose the box's top border (24 Nov: agy redrew a wrapped
         // line with a file link over it). The border found is then an older one, above an earlier
         // prompt in the transcript, and that prompt and its answer read as unsent text that held
@@ -461,6 +490,12 @@ impl Adapter for AntigravityAdapter {
         // further lines are indented, and so is everything agy prints between prompts.
         let start = (top + 1..bottom).rev().find(|&i| lines[i].starts_with('>')).unwrap_or(top + 1);
         let (first, rest) = lines[start..bottom].split_first()?;
+        // Above status rows, the box is only taken as it is drawn: a draft's further lines are
+        // indented and not blank. A submitted prompt in the transcript is followed by a blank
+        // line, so a box whose own `>` line was lost never borrows the prompt of the turn above.
+        if walked && rest.iter().any(|l| l.trim().is_empty() || !l.starts_with(char::is_whitespace)) {
+            return None;
+        }
         let first = if first.trim_end() == ">" {
             ""
         } else {
@@ -714,6 +749,42 @@ mod tests {
                 .approve_bytes(Decision::ApproveAlways, &snap(&persistent_only))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn composer_above_status_rows() {
+        // agy 1.5.13 with a timer running: the timer row sits in its own ruled block between
+        // the box and the footer (26 Nov, an agent that set a 25 minute timer stopped taking
+        // messages because the box read as missing).
+        let timer = include_str!("fixtures/antigravity_timer_row.txt");
+        let row = "  ● [00:52:20] 25m timer running";
+        let rule = "─".repeat(120);
+        let read = |text: &str| AntigravityAdapter.composer_text(&snap(text));
+        assert_eq!(read(timer).as_deref(), Some(""));
+        let draft = timer.replace("\n>\n", "\n> my draft\n  second line\n");
+        assert_eq!(read(&draft).as_deref(), Some("my draft\n  second line"));
+        // Two status rows: in one block, and each in its own block.
+        let task = "  ● 1 task running (/tasks)";
+        assert_eq!(read(&timer.replace(row, &format!("{row}\n{task}"))).as_deref(), Some(""));
+        let stacked = timer.replace(row, &format!("{row}\n{rule}\n{task}"));
+        assert_eq!(read(&stacked).as_deref(), Some(""));
+        assert_eq!(read(&stacked.replace("\n>\n", "\n> my draft\n")).as_deref(), Some("my draft"));
+        // A lost top border above the box still finds the box, not the previous prompt.
+        let lost = timer.replacen(&format!("\n{rule}\n>\n"), "\n>\n", 1);
+        assert_eq!(read(&lost).as_deref(), Some(""));
+        // Blocks that are not status rows stop the walk: the box is then not found.
+        for not_status in [
+            "",                             // mid-redraw: two rules with nothing between
+            "  my draft continues",          // indented text, not a status row
+            "● Scheduling 1 timer",          // a transcript line in column 0
+            &format!("{row}\n{row}\n{row}\n{row}"), // too many rows for a status block
+        ] {
+            let screen = timer.replace(&format!("{row}\n"), &format!("{not_status}\n"));
+            assert!(read(&screen).is_none(), "{not_status:?}");
+        }
+        // A box whose prompt line was lost does not borrow the prompt of the turn above it.
+        let no_prompt = timer.replace("\n>\n", "\n  ● stray\n");
+        assert!(read(&no_prompt).is_none());
     }
 
     #[test]

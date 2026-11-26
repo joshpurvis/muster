@@ -451,7 +451,8 @@ carries that session's origin (docs/MCP.md, \"Agents\").")]
     /// Inside an agent's session: answer a message it received, after the turn that received it.
     #[command(after_help = "Examples:\n  muster reply 42 the benchmarks finished: all green\n  cat report.md | muster reply 42 -\n\n\
 Runs the session's MCP `reply` tool: once per message, only for messages Muster delivered to this\n\
-agent. The asker gets it as a new message, or the human in the sidebar's message log (docs/MCP.md, \"Late replies\").\n\
+agent. The asker gets it as a new message, a schedule's run as its reply, or the human in the sidebar's\n\
+message log (docs/MCP.md, \"Late replies\").\n\
 With --no-wake an asker that stopped waiting gets it at the start of its next turn that can take it instead.")]
     Reply {
         /// The message's id, from its `[muster msg <id> ...]` line.

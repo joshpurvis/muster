@@ -270,6 +270,21 @@ pub struct AgentMessage {
     pub expired_at: Option<i64>,
 }
 
+impl AgentMessage {
+    /// The reply a schedule run counts as its own (src/schedules/run.rs): the agent's `reply`
+    /// when the run took it (`AnswerStatus::Returned`: in the run's wait, or after it while the
+    /// turn had left no final message), else the turn's final message. Every reader of a run's
+    /// reply (`{reply}`, `{last_reply}`, the note, the history) goes through here, so they all
+    /// see the one text the run counted.
+    pub fn run_reply(&self) -> Option<&str> {
+        self.answer
+            .as_ref()
+            .filter(|a| a.status == crate::agent_reply::AnswerStatus::Returned)
+            .map(|a| a.text.as_str())
+            .or(self.reply.as_deref())
+    }
+}
+
 /// A session's provenance: origin and hop of the message it is handling, and that message's
 /// id when it was an agent message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

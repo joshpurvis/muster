@@ -12,8 +12,12 @@
 //!   message;
 //! - another Claude or Codex session gets it typed in through its injection queue after a
 //!   `[muster reply to msg <id> …]` header, under `send_message`'s Claude origin rule;
-//! - the human (also through a shell tab) or a schedule sees it in the sidebar's message
-//!   log, with a desktop notification when the human asked.
+//! - a schedule run (or a trigger's, or a "Then…" step) takes it as the run's reply when the
+//!   turn left no final message and it brings no origin the message's chain didn't have
+//!   (`returnable`): `Returned`, as for a waiting ask, also after the run stopped waiting
+//!   (src/schedules: a late reply, as a late final message is);
+//! - the human (also through a shell tab) or a schedule otherwise sees it in the sidebar's
+//!   message log, with a desktop notification when the human asked.
 //!
 //! Its route is the stricter of the message's chain and the replier's current one (a non-human
 //! origin wins, so does the higher hop), one hop on: a reply chain ends at the hop limit like any
@@ -39,7 +43,8 @@ pub enum AnswerStatus {
     Pending,
     /// Being delivered to the asker.
     Delivering,
-    /// The ask that was waiting for the message returned it.
+    /// The ask that was waiting for the message returned it, or a schedule run took it as its
+    /// reply (`AgentMessage::run_reply`).
     Returned,
     /// Delivered to the asker (`msg` for an agent, `session` for where it was typed).
     Delivered,
@@ -419,6 +424,10 @@ pub async fn finish(hub: &Arc<Hub>, msg_id: i64) -> anyhow::Result<Answer> {
     let done = deliver(hub, &m, a).await;
     hub.store().update_agent_answer(msg_id, &[AnswerStatus::Delivering], |x| *x = done.clone())?;
     agents::publish_message(hub, msg_id);
+    if done.status == AnswerStatus::Returned {
+        // Taken by a schedule run after it stopped waiting: its note and its history line.
+        crate::schedules::on_reply(hub, msg_id);
+    }
     Ok(done)
 }
 
@@ -430,6 +439,11 @@ async fn deliver(hub: &Arc<Hub>, m: &AgentMessage, mut a: Answer) -> Answer {
         a.note = Some(note);
     };
     match asker(hub, m) {
+        // A schedule run's message whose turn left no final message: the reply is the run's, as
+        // it would have been had the run still waited (`status`), under the same rule.
+        Asker::Log { human: false } if crate::schedules::is_run_sender(&m.from) && m.reply.is_none() && returnable(m, &a) => {
+            set(&mut a, AnswerStatus::Returned, "taken as the reply of its schedule's run".into());
+        }
         Asker::Log { human } => {
             let who = if human { "the human".to_string() } else { m.from.clone() };
             set(&mut a, AnswerStatus::Shown, format!("{who} asked: shown in the sidebar's message log"));

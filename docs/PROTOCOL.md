@@ -719,7 +719,16 @@ the end of the hour for the reply. Every message muster delivers to an agent is 
 (control characters dropped), so stored text can't end a bracketed paste or press keys. The run
 then waits for the reply until an hour after the message was sent (across restarts) and ends `replied`, `blocked` (an approval prompt, a question
 or an error: never approved for you), `no_reply`, `ended`, `timed_out`, `refused` (with the
-agent's reason) or `failed`. A reply is also appended to the schedule's note, if it has one,
+agent's reason) or `failed`. The reply is the agent's final message for that turn, or its MCP
+`reply` to the run's message (an Antigravity agent's turn has no final message, so it answers this
+way), taken as for a waiting `ask_agent`: only one that brings no origin the message's chain didn't
+have (docs/MCP.md "Late replies"; a lead's reply to its scheduled work qualifies, and the "Then…"
+step still goes on the schedule's own chain). A `reply` that comes after the run stopped waiting,
+while the turn left no final message, is the run's late reply, as a late final message is: a run
+that ended `no_reply` or `timed_out` shows `replied` with a `late reply` chip in its history, a
+schedule's own run (not a step) puts it in the note, and a "Then…" step that already ran for the
+recorded outcome stays. Whichever the run took is its one reply for
+`{reply}`, `{last_reply}` and the note, also when the agent sends both. A reply is also appended to the schedule's note, if it has one,
 under a `## Tue 21 Oct 2026 09:00 · <name>` heading, written as the agent, exactly once per run, also
 when the reply comes after the run stopped waiting for it. "Notify me": an in-app
 notice and a desktop notification on failure (blocked, no reply, ended, timed out, refused,

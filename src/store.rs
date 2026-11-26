@@ -2695,7 +2695,8 @@ impl Store {
     }
 
     /// The newest delivered run of `schedule` (for `{last_run}` / `{last_reply}`), and the newest
-    /// one that got a reply, with that reply.
+    /// one that got a reply, with that reply (`AgentMessage::run_reply`: a `reply` the run took,
+    /// else the turn's final message).
     pub fn last_runs_for_prompt(&self, schedule: i64, before_run: i64) -> anyhow::Result<(Option<i64>, Option<String>)> {
         let conn = self.conn.lock();
         let last: Option<i64> = conn.query_row(
@@ -2704,8 +2705,13 @@ impl Store {
             |r| r.get(0),
         ).optional()?;
         let reply: Option<String> = conn.query_row(
-            "SELECT m.reply FROM schedule_runs r JOIN agent_messages m ON m.id = r.msg_id
-             WHERE r.schedule_id = ?1 AND r.id < ?2 AND m.reply IS NOT NULL AND r.kind != 'chain' ORDER BY r.id DESC LIMIT 1",
+            "SELECT x.reply FROM (
+               SELECT r.id, COALESCE(CASE WHEN json_extract(m.answer, '$.status') = 'returned'
+                 THEN json_extract(m.answer, '$.text') END, m.reply) AS reply
+               FROM schedule_runs r JOIN agent_messages m ON m.id = r.msg_id
+               WHERE r.schedule_id = ?1 AND r.id < ?2 AND r.kind != 'chain'
+                 AND (m.reply IS NOT NULL OR m.answer IS NOT NULL)
+             ) x WHERE x.reply IS NOT NULL ORDER BY x.id DESC LIMIT 1",
             params![schedule, before_run],
             |r| r.get(0),
         ).optional()?;

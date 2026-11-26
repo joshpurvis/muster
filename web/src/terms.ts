@@ -16,7 +16,7 @@ import type { SessionInfo } from "./types.ts";
 import { isRightButtonReport, RIGHT_BUTTON } from "./mousereport.ts";
 import { copyText } from "./util.ts";
 import { measure, metricsEnabled, onMetricsFlush } from "./metrics.ts";
-import { linkRanges, MAX_LINK, type MusterLink, parseMusterLink } from "./links.ts";
+import { linkRanges, MAX_LINK, type MusterLink, parseMusterLink, webAddress } from "./links.ts";
 
 const MAX_WEBGL = 10;
 
@@ -135,27 +135,27 @@ interface LinkState {
 }
 
 /** Links a program marked up itself (OSC 8). A Muster link is followed on a left click
- * (`followClicks`). A web link does what xterm does without a handler: it asks first, naming
- * the address, since the text may say something else. Any other kind (file://, ssh://…) is
- * left alone. */
-function oscLinks(state: LinkState) {
+ * (`followClicks`). A web link (http, https, with a host and no user name before it, as on a
+ * card: `webAddress`) opens in the browser on a left click, its address given
+ * to `open` at once: the native window sends only that address to the system browser, so
+ * xterm's default (ask, open a blank window, then set its address) opened nothing there. The
+ * address shows as the terminal's tooltip on hover, since the text may say something else. Any
+ * other kind (file://, ssh://…) is left alone. */
+function oscLinks(el: HTMLElement, state: LinkState) {
+  const web = (uri: string) => !parseMusterLink(uri) && webAddress(uri);
   return {
     allowNonHttpProtocols: true,
-    activate(_ev: MouseEvent, uri: string) {
-      if (parseMusterLink(uri) || !/^https?:\/\//i.test(uri)) return;
-      if (!confirm(`Do you want to navigate to ${uri}?\n\nWARNING: This link could potentially be dangerous`)) return;
-      const w = globalThis.open();
-      if (!w) return;
-      try {
-        w.opener = null;
-      } catch { /* some engines throw */ }
-      w.location.href = uri;
+    activate(ev: MouseEvent, uri: string) {
+      // xterm activates on any button's release: a middle-click (paste) opens nothing.
+      if (ev.button === 0 && web(uri)) globalThis.open(uri, "_blank", "noopener,noreferrer");
     },
     hover(_ev: MouseEvent, uri: string) {
       if (parseMusterLink(uri)) state.hovered = uri;
+      else if (web(uri)) el.title = uri;
     },
     leave() {
       state.hovered = null;
+      el.removeAttribute("title");
     },
   };
 }
@@ -321,7 +321,7 @@ function create(sid: number): Entry {
     disableStdin: connStatus.peek() !== "open",
     // App shortcuts use Alt; don't let xterm swallow Alt+letters on macOS.
     macOptionClickForcesSelection: true,
-    linkHandler: oscLinks(linkState),
+    linkHandler: oscLinks(el, linkState),
   });
   const fit = new FitAddon();
   const search = new SearchAddon();

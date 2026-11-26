@@ -128,6 +128,46 @@ export async function linkChecks(a: Browser, shots: string, ok: (m: string) => v
   const after = await R("note.get", { id: note.id });
   check(after.body === note.body && after.rev === note.rev, "the note's text is unchanged");
   ok(`the clicks only showed things (${calls.join(", ")})`);
+
+  // ---- a hyperlink (OSC 8) to a web address, as Antigravity prints a Markdown link: a plain
+  // click opens it in the browser at once, the address given to `open` (the native window hands
+  // only that address to the system browser), with no question first. Hovering shows the address.
+  // A `javascript:` hyperlink does nothing.
+  await a.eval(`globalThis.__opened = []; globalThis.open = (...args) => { globalThis.__opened.push(args); return null; };
+    globalThis.__asked = 0; globalThis.confirm = () => { globalThis.__asked++; return true; }`);
+  const web = `clear; printf 'Docs: \\e]8;;https://example.org/guide\\e\\\\the guide\\e]8;;\\e\\\\.\\n` +
+    `Bad: \\e]8;;javascript:alert(1)\\e\\\\click me\\e]8;;\\e\\\\.\\n` +
+    `Fake: \\e]8;;https://docs.example@other.example/\\e\\\\the docs\\e]8;;\\e\\\\.\\n'\r`;
+  await R("session.input", { id: sid, data: web });
+  await a.wait(`(${M}.termText(${sid}) ?? '').includes('Fake: the docs')`, 6000);
+  const termEl = `document.querySelector('.term-el[data-sid="${sid}"]')`;
+  await clickLink("Docs:", "the guide", "links-4-hover-web-hyperlink");
+  check(await a.eval(`${termEl}.title`) === "https://example.org/guide", "hovering a web hyperlink shows its address");
+  await a.wait(`globalThis.__opened.length === 1`, 3000);
+  const webOpened: unknown[][] = await a.eval(`globalThis.__opened`);
+  check(
+    webOpened[0][0] === "https://example.org/guide" && webOpened[0][1] === "_blank" && webOpened[0][2] === "noopener,noreferrer",
+    `opened: ${JSON.stringify(webOpened)}`,
+  );
+  check((await a.eval(`globalThis.__asked`)) === 0, "no question before opening");
+  ok("a plain click on a web hyperlink (OSC 8) opens its address in the browser at once; hovering shows the address");
+  await clickLink("Bad:", "click me");
+  await a.sleep(300);
+  check((await a.eval(`globalThis.__opened.length`)) === 1, "a javascript: hyperlink opens nothing");
+  check(!(await a.eval(`${termEl}.title`)), "no address tooltip on a javascript: hyperlink");
+  ok("a javascript: hyperlink does nothing");
+  // A middle-click (paste) on the web hyperlink opens nothing; nor does any click on an address
+  // whose user name reads as another host (`https://docs.example@other.example/`).
+  const [gx, gy] = await at("Docs:", "the guide");
+  await a.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: gx, y: gy });
+  await a.sleep(200);
+  await a.send("Input.dispatchMouseEvent", { type: "mousePressed", x: gx, y: gy, button: "middle", clickCount: 1, buttons: 4 });
+  await a.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: gx, y: gy, button: "middle", clickCount: 1 });
+  await clickLink("Fake:", "the docs");
+  await a.sleep(300);
+  check((await a.eval(`globalThis.__opened.length`)) === 1, "a middle-click, or a click on a user-name address, opens nothing");
+  check(!(await a.eval(`${termEl}.title`)), "no address tooltip on a user-name address");
+  ok("a middle-click on a web hyperlink, and a hyperlink with a user name before its host, open nothing");
 }
 
 /** Links in a note's text: hovering one says what Ctrl+click opens, Ctrl underlines it, Ctrl+click

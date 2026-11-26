@@ -788,7 +788,7 @@ provenance: `human`, hop 0):
 | `spawn_session` (or `muster new` run by an agent) | The new session starts with the spawner's provenance and keeps it until it receives another attributed prompt (a parent moving on to human work doesn't make its helper human-rooted). |
 | A prompt from the human through a client (UI, phone, `muster send` outside a session) is submitted | Cleared (human-rooted). |
 | UserPromptSubmit without an envelope | Cleared only if the daemon saw human input for that session through a client connection (keystrokes, paste, `session.input` without `from_session`) since its last attributed delivery; otherwise kept. A hook never lowers provenance on its own. |
-| UserPromptSubmit with an envelope | Counts only for an unanswered message muster delivered to that session; unknown, foreign or answered ids are ignored. |
+| UserPromptSubmit with an envelope | Counts only for an unanswered message muster delivered to that session; unknown, foreign or answered ids are ignored. The envelope is the prompt's first line, or the first line inside one `<pasted_content …>` tag that wraps the whole prompt (how Claude Code hands its hook a long typed-in message); one deeper in the text never counts. |
 | UserPromptSubmit that showed quiet messages | Raised to the stricter of the turn's and every shown message's (a non-human origin wins, then the higher hop), in the same transaction as the turn's attribution. A hop-3 message read during a turn the human started keeps the turn at hop 3. |
 
 **Lead agents.** The human can make a Claude or Antigravity agent a lead agent (`lead`; Edit agent > More

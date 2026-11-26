@@ -318,3 +318,51 @@ export function nextReady(list: Pr[], p: Pr): Pr | undefined {
 export function mergeCommand(p: Pr): string {
   return `gh pr merge ${p.number} --repo ${p.repo} --merge --match-head-commit ${p.head_sha}`;
 }
+
+// ---------- new cards (docs/UI.md "PRs to merge", "A new card") ----------
+
+/** One post of a card: posted again, the same card has a higher `post`. */
+export interface PrPost {
+  id: number;
+  post: number;
+}
+
+/** The posts a window has met, so each is new once: a refresh, a Not now or a reload of the list
+ * brings the same post again and is not new. */
+export class PostBook {
+  #known = new Map<number, number>();
+  /** Records card `p`'s post; true when this book hadn't met it (a new card, or posted again). */
+  note(p: Pr): boolean {
+    const was = this.#known.get(p.id);
+    if (was !== undefined && was >= p.post) return false;
+    this.#known.set(p.id, p.post);
+    return true;
+  }
+}
+
+/** A card still in the Waiting list (waiting, being merged, or with new commits). */
+export const stillWaits = (p: Pr) => p.status === "waiting" || p.status === "merging" || p.status === "stale";
+
+/** The new posts the human hasn't looked at yet, as cards: those still waiting at that post (one
+ * merged, closed or withdrawn meanwhile, or posted again since, drops out), oldest first. */
+export function stillNew(list: readonly PrPost[], cards: ReadonlyMap<number, Pr>): Pr[] {
+  return list.flatMap((a) => {
+    const p = cards.get(a.id);
+    return p && p.post === a.post && stillWaits(p) ? [p] : [];
+  });
+}
+
+/** A new card takes the stage when the tab shows nothing, or a card that is done with (merged,
+ * closed, withdrawn or changes asked); otherwise the bar says it came. */
+export function makesWay(shown: Pr | undefined): boolean {
+  if (!shown) return true;
+  const s = cardState(shown);
+  return s === "merged" || s === "closed" || s === "gone";
+}
+
+/** The toast's words: "New PR to merge: acme/app #12", or "3 new PRs to merge: acme/app #12 and 2
+ * more" (Show opens the first). */
+export function arrivalText(ps: readonly Pr[]): string {
+  if (ps.length === 1) return `New PR to merge: ${target(ps[0])}`;
+  return `${ps.length} new PRs to merge: ${target(ps[0])} and ${ps.length - 1} more`;
+}

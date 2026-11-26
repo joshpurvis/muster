@@ -1,4 +1,5 @@
 import {
+  arrivalText, makesWay, PostBook, stillNew,
   banner, canMerge, leftOutOf, leftOutText, cardState, dotClass, firstLine, pillMark, toldText, groupOf, nextReady, offReason, otherSide, pairs, pairText, rules, sortMerged,
   sortWaiting, stepPicture, tagText, viewOrder, worthShowing,
 } from "./prs_model.ts";
@@ -181,4 +182,42 @@ Deno.test("auto-merge and an incomplete reply fail the first rule; pills carry a
   equal(pillMark(pr(1, { status: "stale" })).glyph, "!");
   equal(pillMark(pr(1, { refused: { at: 1, reason: "x" }, verdict: { ...ok, ok: false, base: "fail" } })).glyph, "✕");
   equal(pillMark(pr(1, { later: 5 })).status, "not now, checks passed");
+});
+
+Deno.test("a post is new once: a refresh or a reload brings the same post again; posting again is new", () => {
+  const book = new PostBook();
+  equal(book.note(pr(1)), true);
+  equal(book.note(pr(1, { updated_at: 9000, later: 5 })), false);
+  equal(book.note(pr(1, { status: "merged" })), false);
+  equal(book.note(pr(1, { post: 2 })), true);
+  equal(book.note(pr(1, { post: 2 })), false);
+  // A late copy of an older post is not new either.
+  equal(book.note(pr(1, { post: 1 })), false);
+  equal(book.note(pr(2)), true);
+});
+
+Deno.test("new posts drop out once their card stops waiting or is posted again", () => {
+  const cards = new Map([
+    [1, pr(1)], [2, pr(2, { status: "merged" })], [3, pr(3, { status: "withdrawn" })], [4, pr(4, { post: 2 })],
+    [5, pr(5, { status: "stale" })], [6, pr(6, { status: "closed" })],
+  ]);
+  const list = [1, 2, 3, 4, 5, 6, 7].map((id) => ({ id, post: 1 }));
+  equal(stillNew(list, cards).map((p) => p.id), [1, 5]);
+});
+
+Deno.test("a new card takes the stage only from nothing or a card that is done with", () => {
+  equal(makesWay(undefined), true);
+  equal(makesWay(pr(1, { status: "merged" })), true);
+  equal(makesWay(pr(1, { status: "closed" })), true);
+  equal(makesWay(pr(1, { status: "withdrawn" })), true);
+  equal(makesWay(pr(1, { status: "changes_asked" })), true);
+  equal(makesWay(pr(1)), false);
+  equal(makesWay(pr(1, { status: "merging" })), false);
+  equal(makesWay(pr(1, { status: "stale" })), false);
+  equal(makesWay(pr(1, { refused: { at: 1, reason: "conflict" } })), false);
+});
+
+Deno.test("the toast names one new card, or counts several and names the first", () => {
+  equal(arrivalText([pr(1)]), "New PR to merge: acme/notes-app #201");
+  equal(arrivalText([pr(1), pr(2), pr(3)]), "3 new PRs to merge: acme/notes-app #201 and 2 more");
 });

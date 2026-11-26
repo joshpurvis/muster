@@ -458,6 +458,23 @@ merges, never a model.
   the number waiting in an amber badge. Shown while a card waits, or one was merged or closed in the
   last day, and the human hasn't hidden it; its menu (and Alt+W) **Hide PRs to merge tab**; the
   palette's **PRs to merge** shows it again. Not on the phone.
+- **A new card**: a card an agent posts, or posts again, while the window is open is new until
+  the human looks at it in the tab (`web/src/prs.ts` `arrivedPrs`). Cards there when the window
+  opened are not new, and a refresh or **Not now** brings no new one; a card posted while the
+  window was disconnected is new once the list is reloaded after the reconnect. One that arrives
+  with the tab on screen is read from GitHub at once. With the tab on screen: when it shows a card
+  that is done with (merged, closed, withdrawn) or nothing, the new card takes its place, unless
+  the pointer is on a button of the dock, the keyboard is in the dock or the strip, or the list or
+  a large picture is open; otherwise the bar shows **N new: <title>**, a button that shows it (on
+  a narrow tab, on a line of its own), and the strip scrolls to the new pill, ringed (and flashed
+  as it comes) until it is looked at. The card shown, posted again while shown, gets **Posted
+  again: <title>** until it is clicked. A screen reader hears each. Elsewhere (another tab in
+  front, the tab hidden, or its group covered by a zoomed one): a toast **New PR to merge: <repo>
+  #<n>** with **Show**, which opens the tab on that card; a hidden tab comes back only then
+  (`web/src/prs_notice.ts`). Several new cards share one toast ("3 new PRs to merge: <the first>
+  and 2 more"); a card that stops waiting leaves it, and a toast that has gone (timed out or
+  dismissed) isn't named again by the next. While the window is out of sight the toast waits
+  until it is back.
 - **Reading GitHub**: Muster reads every waiting card's pull request when the tab is shown and every
   2 minutes while it is (never in the background), and the card's **Check again** reads it now.
 - **Layout**: a bar with **Waiting N**, **Merged N** and **All N with titles ▾** (a list grouped
@@ -494,7 +511,8 @@ merges, never a model.
   was told, with **Next waiting** at the dock's other end), refused (a red banner with why and
   GitHub's first line; Merge off until a read passes), or "Not known yet" when Muster asked GitHub
   but couldn't confirm the result (Check again settles it). A result never takes focus, changes
-  the card shown or switches to **Merged**: wherever the human is typing stays focused, and a card
+  the card shown or switches to **Merged** (a new card posted afterwards may take a merged card's
+  place: "A new card"): wherever the human is typing stays focused, and a card
   sent to merge from here keeps its place in the Waiting strip (marked ✓ once merged) until the tab
   is shown again or the filter changes after its merge has ended. Esc with the large view or the
   list open closes that, not the countdown. Plain Enter and Space on Merge do nothing; Merge ignores clicks for 0.6 s

@@ -21,7 +21,7 @@ import {
   setPref,
   toast,
 } from "../state.ts";
-import { type HeldQueue, heldQueues, heldText, hideRun, needsYouItems } from "../sidebar.ts";
+import { expiredKey, failingLabel, type HeldQueue, heldQueues, heldText, hideRun, needsYouItems } from "../sidebar.ts";
 import * as A from "../actions.ts";
 import { notes } from "../notes.ts";
 import { UNATTENDED_WARNING } from "../agents.ts";
@@ -173,6 +173,8 @@ export function NeedsYou({ now, openAgent }: { now: number; openAgent: (agent: n
         {items.map((i) =>
           i.kind === "proposal"
             ? <NeedsProposal key={`p${i.schedule.id}`} s={i.schedule} now={now} openAgent={openAgent} />
+            : i.kind === "expired"
+            ? <NeedsExpired key={`x${i.schedule.id}`} s={i.schedule} openAgent={openAgent} />
             : <NeedsRun key={`r${i.schedule.id}`} s={i.schedule} now={now} />
         )}
       </div>
@@ -259,14 +261,84 @@ function NeedsProposal({ s, now, openAgent }: { s: Schedule; now: number; openAg
   );
 }
 
+/** An expired schedule in Needs you (a Claude subscription agent's, after 7 days): its name
+ * (opens its agent's card), "expired: renew or remove", **Renew**, **Remove…** and **Hide** (until
+ * it expires again); ⋯ is the schedule's menu. It goes once it is renewed or removed. */
+function NeedsExpired({ s, openAgent }: { s: Schedule; openAgent: (agent: number) => void }) {
+  const menuAt = (x: number, y: number, kb = false) => scheduleMenu(s, x, y, kb);
+  return (
+    <div
+      role="listitem"
+      class="ny-item ny-expired"
+      data-schedule={s.id}
+      aria-label={`${s.name}, on ${s.agent ?? "a removed agent"}: expired. Renew or remove it.`}
+      onKeyDown={(e) => {
+        if (e.key === "ContextMenu" || (e.key === "F10" && e.shiftKey)) {
+          e.preventDefault();
+          e.stopPropagation();
+          const r = (e.target as HTMLElement).getBoundingClientRect();
+          menuAt(r.left + 24, r.bottom - 4, true);
+        }
+      }}
+      onContextMenu={(e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        menuAt(e.clientX, e.clientY);
+      }}
+    >
+      {s.trigger ? <IconZap size={12} class="ny-icon sch-icon-trig" /> : <IconClock size={12} class="ny-icon" />}
+      <div class="ny-text">
+        <span class="ny-top">
+          <button type="button" class="ny-name" data-tip={`Show it in ${s.agent ?? "its agent"}'s card`}
+            onClick={() => openAgent(s.agent_id)}>
+            <span class="ny-label">{s.name}</span>
+          </button>
+          <button
+            type="button"
+            class="ap-icon-btn ny-more"
+            aria-label={`${s.name} menu`}
+            aria-haspopup="menu"
+            onClick={(e) => {
+              const r = e.currentTarget.getBoundingClientRect();
+              menuAt(r.left, r.bottom + 4);
+            }}
+          >
+            <IconMore size={12} />
+          </button>
+        </span>
+        <span class="ny-sub">
+          {s.agent ?? "removed agent"} ·{" "}
+          <span class="ny-bad" data-tip="Claude subscription agents' schedules stop after 7 days unless you renew them">
+            expired: renew or remove
+          </span>
+        </span>
+        <span class="ny-actions">
+          <button type="button" class="btn btn-sm btn-primary sch-approve" onClick={() => A.renewSchedule(s)}>Renew</button>
+          <button type="button" class="btn btn-sm" onClick={() => A.removeSchedule(s)}>Remove…</button>
+          <button
+            type="button"
+            class="btn btn-sm sch-dismiss"
+            data-tip="Take it out of Needs you until it expires again"
+            onClick={() => setPref("hiddenRuns", hideRun(prefs.value.hiddenRuns, s.id, expiredKey(s), schedules.peek().map((x) => x.id)))}
+          >
+            Hide
+          </button>
+        </span>
+      </div>
+    </div>
+  );
+}
+
 /** A schedule whose last run failed, in Needs you: name, agent and next run, the outcome; click
  * (or Enter) shows its runs under it; ⋯ is the schedule's menu; Hide takes it out of the box
- * until a run fails again. */
+ * until a run fails again. From the second failure in a row the chip says so ("failed twice")
+ * and the reason shows under it. */
 function NeedsRun({ s, now }: { s: Schedule; now: number }) {
   const open = scheduleHistoryOpen.value.has(s.id);
   const last = s.last_run!;
   const next = nextLabel(s, now);
   const reason = runReason(last);
+  const row = failingLabel(s);
   const toggle = () => A.toggleScheduleHistory(s.id);
   return (
     <>
@@ -295,7 +367,7 @@ function NeedsRun({ s, now }: { s: Schedule; now: number }) {
               type="button"
               class="ny-name"
               aria-expanded={open}
-              aria-label={`${s.name}, on ${s.agent ?? "a removed agent"}: last run ${OUTCOME_LABEL[last.outcome]}${reason ? ` (${reason})` : ""}. ${next.text}. Show its runs`}
+              aria-label={`${s.name}, on ${s.agent ?? "a removed agent"}: ${row ? `${row}: ${s.failing!.reason}` : `last run ${OUTCOME_LABEL[last.outcome]}${reason ? ` (${reason})` : ""}`}. ${next.text}. Show its runs`}
               onClick={toggle}
             >
               <IconChevron size={10} class={cx("ny-chev", open && "open")} />
@@ -326,9 +398,14 @@ function NeedsRun({ s, now }: { s: Schedule; now: number }) {
           <span class="ny-sub">
             <span class="ny-agent">{s.agent ?? "removed agent"} · {next.text}</span>
             <span class={cx("sch-chip", "sch-bad")} data-outcome={last.outcome} data-tip={reason ?? undefined}>
-              {OUTCOME_LABEL[last.outcome]}
+              {row ?? OUTCOME_LABEL[last.outcome]}
             </span>
           </span>
+          {row && (
+            <span class="ny-sub ny-why" data-tip={`${s.failing!.reason} (failing since ${new Date(s.failing!.since).toLocaleString()})`}>
+              {s.failing!.reason}
+            </span>
+          )}
         </div>
       </div>
       {open && <RunHistory s={s} now={now} />}

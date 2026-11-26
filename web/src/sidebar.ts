@@ -44,19 +44,44 @@ export type HiddenRuns = Readonly<Record<string, number>>;
  * human hasn't hidden that run. A newer run replaces it, so the next failure shows again. */
 export function failedRun(s: Schedule, hidden: HiddenRuns): boolean {
   const r = s.last_run;
-  return !!r && !isProposal(s) && outcomeTone(r.outcome) === "bad" && hidden[s.id] !== r.id;
+  return !!r && !isProposal(s) && s.status !== "expired" && outcomeTone(r.outcome) === "bad" && hidden[s.id] !== r.id;
 }
 
-export type NeedsItem = { kind: "proposal"; schedule: Schedule } | { kind: "run"; schedule: Schedule };
+/** The value Hide records for an expired schedule: below every run id, and new each time it
+ * expires (a renewal moves `expires_at`). */
+export function expiredKey(s: Schedule): number {
+  return -(s.expires_at ?? 0);
+}
 
-/** What the "Needs you" box holds: schedules waiting for approval, oldest first, then schedules
- * whose last run failed, newest failure first. Empty: the box isn't shown. */
+/** The schedule expired (a Claude subscription agent's, after 7 days) and the human hasn't hidden
+ * this expiry. It goes when they renew or remove it. */
+export function expiredShown(s: Schedule, hidden: HiddenRuns): boolean {
+  return s.status === "expired" && hidden[s.id] !== expiredKey(s);
+}
+
+/** A failed row in words: "failed twice", "failed 3 times"; null for a single failure. */
+export function failingLabel(s: Schedule): string | null {
+  const n = s.failing?.runs ?? 0;
+  return n < 2 ? null : n === 2 ? "failed twice" : `failed ${n} times`;
+}
+
+export type NeedsItem =
+  | { kind: "proposal"; schedule: Schedule }
+  | { kind: "expired"; schedule: Schedule }
+  | { kind: "run"; schedule: Schedule };
+
+/** What the "Needs you" box holds: schedules waiting for approval, oldest first, then expired
+ * schedules, first to expire first, then schedules whose last run failed, newest failure first.
+ * Empty: the box isn't shown. */
 export function needsYouItems(schedules: Schedule[], hidden: HiddenRuns): NeedsItem[] {
   const props = waitingProposals(schedules).map((s): NeedsItem => ({ kind: "proposal", schedule: s }));
+  const expired = schedules.filter((s) => expiredShown(s, hidden))
+    .sort((a, b) => ((a.expires_at ?? 0) - (b.expires_at ?? 0)) || a.id - b.id)
+    .map((s): NeedsItem => ({ kind: "expired", schedule: s }));
   const runs = schedules.filter((s) => failedRun(s, hidden))
     .sort((a, b) => (b.last_run!.started_at - a.last_run!.started_at) || a.id - b.id)
     .map((s): NeedsItem => ({ kind: "run", schedule: s }));
-  return [...props, ...runs];
+  return [...props, ...expired, ...runs];
 }
 
 /** A session whose queued messages are held, for Needs you: `who` is its agent's name, else the
@@ -107,18 +132,21 @@ export function rowChip(agentId: number, schedules: Schedule[], hidden: HiddenRu
   if (!own.length) return null;
   const waiting = own.filter(isProposal).length;
   const failed = own.filter((s) => failedRun(s, hidden)).length;
+  const expired = own.filter((s) => expiredShown(s, hidden)).length;
   const n = (k: number, one: string, many: string) => `${k} ${k === 1 ? one : many}`;
-  if (waiting || failed) {
+  if (waiting || failed || expired) {
     const parts = [
       waiting && `${n(waiting, "schedule waits", "schedules wait")} for your approval`,
+      expired && `${n(expired, "schedule", "schedules")} expired`,
       failed && `${n(failed, "schedule's", "schedules'")} last run failed`,
     ].filter(Boolean);
-    return { tone: failed ? "bad" : "wait", count: waiting + failed, label: parts.join("; ") };
+    return { tone: failed || expired ? "bad" : "wait", count: waiting + failed + expired, label: parts.join("; ") };
   }
   return { tone: "plain", count: own.length, label: n(own.length, "schedule", "schedules") };
 }
 
-/** Hide a schedule's failed run; entries of schedules that are gone are dropped. */
+/** Hide a schedule's failed run (`runId`), or its expiry (`expiredKey`); entries of schedules
+ * that are gone are dropped. */
 export function hideRun(hidden: HiddenRuns, scheduleId: number, runId: number, live: readonly number[]): Record<string, number> {
   const out: Record<string, number> = {};
   for (const [k, v] of Object.entries(hidden)) if (live.includes(Number(k))) out[k] = v;

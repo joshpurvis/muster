@@ -395,6 +395,8 @@ pub struct Schedule {
     pub renewed_at: i64,
     /// The "expires tomorrow" notice was given for this window.
     pub expiry_warned: bool,
+    /// The "expired: renew or remove" notice was given for this window (`run::tick`).
+    pub expired_told: bool,
     pub created_at: i64,
     pub updated_at: i64,
     /// The "Then…" steps after a run.
@@ -439,6 +441,7 @@ impl Default for Schedule {
             last_sent: None,
             renewed_at: 0,
             expiry_warned: false,
+            expired_told: false,
             created_at: 0,
             updated_at: 0,
             then: None,
@@ -896,13 +899,13 @@ pub fn schedule_json(hub: &Hub, s: &Schedule) -> Value {
         (When::Once { .. }, None) => "Once".into(),
         (w, _) => triggers::describe(hub, w),
     };
-    // Its own newest run ("Then…" steps are other agents' runs, shown in the history).
-    let last_run = hub
-        .store()
-        .runs(s.id, None, 10)
-        .ok()
-        .and_then(|r| r.into_iter().find(|r| r.kind != RunKind::Chain))
-        .map(|r| run_json(hub, &r));
+    // Its own newest run ("Then…" steps are other agents' runs, shown in the history), and
+    // whether its runs keep failing.
+    let recent = hub.store().runs(s.id, None, FAILING_LOOKBACK).unwrap_or_default();
+    let last_run = recent.iter().find(|r| r.kind != RunKind::Chain).map(|r| run_json(hub, r));
+    let failing = failing_of(hub, &recent)
+        .filter(|_| !s.waiting_approval())
+        .map(|f| json!({"runs": f.runs, "outcome": f.outcome.as_str(), "reason": f.reason, "since": f.since}));
     let note_title = s.note_id.and_then(|n| hub.store().load_note(n).ok().flatten()).map(|n| n.title);
     // A note trigger's note: its title, and whether the human allows triggers on it.
     let watched_note = match &s.when {
@@ -959,6 +962,75 @@ pub fn schedule_json(hub: &Hub, s: &Schedule) -> Value {
         "created_at": s.created_at,
         "updated_at": s.updated_at,
         "last_run": last_run,
+        // Its last runs that counted failed, at least two in a row (`failing_of`).
+        "failing": failing,
+    })
+}
+
+/// How many of a schedule's newest runs `failing_of` looks at.
+const FAILING_LOOKBACK: usize = 20;
+
+/// A schedule whose runs fail in a row: how many (the newest `FAILING_LOOKBACK` runs at most),
+/// the newest failure's outcome and reason, when the first of them started, and the newest's id.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Failing {
+    pub runs: u32,
+    pub outcome: Outcome,
+    pub reason: String,
+    pub since: i64,
+    pub last_run: i64,
+}
+
+impl Failing {
+    /// "refused: agent alpha accepts only webhook messages, …": the outcome and the first
+    /// sentence of its reason.
+    pub fn why(outcome: Outcome, reason: Option<&str>) -> String {
+        let Some(r) = reason.map(str::trim).filter(|r| !r.is_empty()) else { return outcome.label().to_string() };
+        let first = r.split_once(". ").map_or(r, |(a, _)| a).trim_end_matches('.');
+        let first = match first.char_indices().nth(200) {
+            Some((i, _)) => format!("{}…", &first[..i]),
+            None => first.to_string(),
+        };
+        if first.starts_with(outcome.label()) { first } else { format!("{}: {first}", outcome.label()) }
+    }
+}
+
+/// The outcome a run counts as: a reply that came after the run stopped waiting (a final message,
+/// or a `reply` the run took) still makes it a replied run. Also says whether it came late.
+pub(crate) fn counted_outcome(r: &Run, msg: Option<&crate::agents::AgentMessage>) -> (Outcome, bool) {
+    match (msg, r.outcome) {
+        (Some(m), Outcome::TimedOut | Outcome::NoReply) if m.run_reply().is_some() => (Outcome::Replied, true),
+        _ => (r.outcome, false),
+    }
+}
+
+/// Two or more of the schedule's own newest runs (`runs`, newest first) failed in a row (blocked,
+/// refused, no reply, timed out, agent ended, failed). Runs still going and skipped ones (quiet
+/// hours, a pause, busy) neither count nor break the row; a reply does. "Then…" steps are other
+/// agents' runs and are left out.
+pub fn failing_of(hub: &Hub, runs: &[Run]) -> Option<Failing> {
+    let mut row: Vec<(&Run, Outcome)> = Vec::new();
+    for r in runs.iter().filter(|r| r.kind != RunKind::Chain) {
+        let outcome = match r.outcome {
+            Outcome::Pending | Outcome::Skipped => continue,
+            Outcome::TimedOut | Outcome::NoReply => {
+                let msg = r.msg_id.and_then(|m| hub.store().agent_message(m).ok().flatten());
+                counted_outcome(r, msg.as_ref()).0
+            }
+            o => o,
+        };
+        if !outcome.is_failure() {
+            break;
+        }
+        row.push((r, outcome));
+    }
+    let (newest, outcome) = *row.first()?;
+    (row.len() >= 2).then(|| Failing {
+        runs: row.len() as u32,
+        outcome,
+        reason: Failing::why(outcome, newest.reason.as_deref()),
+        since: row.last().map_or(newest.started_at, |(r, _)| r.started_at),
+        last_run: newest.id,
     })
 }
 
@@ -967,10 +1039,7 @@ pub fn run_json(hub: &Hub, r: &Run) -> Value {
     let msg = r.msg_id.and_then(|m| hub.store().agent_message(m).ok().flatten());
     // A reply that came after the wait ended (a final message, or a `reply` the run took) still
     // counts as one.
-    let (outcome, late) = match (&msg, r.outcome) {
-        (Some(m), Outcome::TimedOut | Outcome::NoReply) if m.run_reply().is_some() => (Outcome::Replied, true),
-        _ => (r.outcome, false),
-    };
+    let (outcome, late) = counted_outcome(r, msg.as_ref());
     json!({
         "id": r.id,
         "schedule_id": r.schedule_id,
@@ -1429,6 +1498,7 @@ pub(crate) fn create_as(hub: &Hub, req: ScheduleInput, made_by: Option<MadeBy>, 
         last_sent: None,
         renewed_at: now,
         expiry_warned: false,
+        expired_told: false,
         created_at: now,
         updated_at: now,
         then,
@@ -1737,6 +1807,7 @@ pub fn approve(hub: &Hub, id: i64, seen: Option<i64>) -> anyhow::Result<Value> {
         if fresh {
             s.renewed_at = now;
             s.expiry_warned = false;
+            s.expired_told = false;
         }
         Ok(())
     })?;
@@ -1771,6 +1842,7 @@ pub fn renew(hub: &Hub, id: i64, outside: Option<&str>) -> anyhow::Result<Value>
     let s = hub.schedules.edit(id, |s| {
         s.renewed_at = now;
         s.expiry_warned = false;
+        s.expired_told = false;
         if let When::Cron { .. } = s.when {
             s.next_run = first_slot(&s.when, &s.tz, now)?;
             s.skip_slot = None;

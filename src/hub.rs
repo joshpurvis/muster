@@ -68,6 +68,9 @@ pub enum ServerEvent {
     Notice {
         level: String,
         text: String,
+        /// The notice is about this schedule: the window gives it a button that opens it.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        schedule: Option<i64>,
     },
     /// A named agent was created or its record changed (`agents::agent_json`).
     AgentUpserted(serde_json::Value),
@@ -1158,6 +1161,16 @@ impl Hub {
         self.emit(ServerEvent::Notice {
             level: level.to_string(),
             text: text.into(),
+            schedule: None,
+        });
+    }
+
+    /// A notice about schedule `id` (the window adds a button that opens it).
+    pub fn notice_schedule(&self, level: &str, text: impl Into<String>, id: i64) {
+        self.emit(ServerEvent::Notice {
+            level: level.to_string(),
+            text: text.into(),
+            schedule: Some(id),
         });
     }
 

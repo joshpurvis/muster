@@ -148,6 +148,8 @@ async fn a_reply_just_after_the_turn_went_idle_is_a_late_reply() {
     turn(&hub, 1, false);
     let run = wait(&hub, &s, run).await.unwrap();
     assert_eq!(stored(&hub, &run).outcome, Outcome::NoReply);
+    // An Antigravity turn has no final message: the reason names the reply tool.
+    assert!(stored(&hub, &run).reason.unwrap().contains("without the agent's `reply`"));
     assert_eq!(note_body(&hub, &s), "");
     // A moment later the agent replies: the run's reply, late, as a late final message is.
     let v = agent_reply::reply(&hub, 1, msg, "pace ok".into(), true).await.unwrap();

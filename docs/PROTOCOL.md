@@ -635,7 +635,9 @@ type Schedule = {
   next_run: number | null /* null: a one-off that ran */; last_slot: number | null;
   status: "active" | "paused" | "expired" | "done";
   expires_at: number | null /* Claude subscription agents' recurring schedules only */; expires_soon: boolean;
-  created_at: number; updated_at: number; last_run: Run | null };
+  created_at: number; updated_at: number; last_run: Run | null;
+  failing?: { runs: number; outcome: string; reason: string; since: number } | null
+    /* its newest runs failed, two or more in a row (below); absent otherwise */ };
 type Run = {
   id: number; schedule_id: number; slot: number /* the planned time; now for Run now */;
   kind: "scheduled" | "catch_up" | "manual"; started_at: number; finished_at: number | null;
@@ -680,8 +682,10 @@ so a slot never runs twice: not after a crash, a reload or the clock going back.
 
 **What a due slot does**, in this order: a Claude subscription agent's recurring schedule more
 than 7 days past its creation or renewal (at the time it would run, so a late catch-up counts) is
-`skipped: expired` (one notice, a `schedule_upserted` when it expires, and a notice and desktop
-notification the day before). The agent counts as on its subscription while either its record or
+`skipped: expired` (a `schedule_upserted` when it expires, and a notice and desktop
+notification the day before). When it expires, one notice `<agent>: "<name>" expired: renew or
+remove` (with `schedule`) and a desktop notification, once per 7-day window: kept with the
+schedule, so a restart doesn't repeat it, and renewing starts a new window. The agent counts as on its subscription while either its record or
 its running process is (a switch to OpenRouter applies from the next start); "Pause all" or the schedule's own pause skips it (recorded
 once per paused stretch); a slot more than 10 minutes late (Muster was off or asleep) follows
 "If missed": `auto` runs once (the newest missed slot, as a `catch_up` run) for one-offs and
@@ -732,7 +736,19 @@ recorded outcome stays. Whichever the run took is its one reply for
 under a `## Tue 21 Oct 2026 09:00 · <name>` heading, written as the agent, exactly once per run, also
 when the reply comes after the run stopped waiting for it. "Notify me": an in-app
 notice and a desktop notification on failure (blocked, no reply, ended, timed out, refused,
-failed), on every outcome (`always`), or never. A backend restart picks up unfinished runs: one
+failed), on every outcome (`always`), or never. **Failing in a row**: `failing` is set while two
+or more of the schedule's own newest runs (of its last 20) failed one after another; skipped runs
+and a run still going neither count nor break the row, a reply does (a late one too), and "Then…"
+steps are left out. `runs` is how many, `outcome` and `reason` the newest failure's (`reason`:
+the outcome and the first sentence of its reason, e.g. `refused: agent alpha accepts only webhook
+messages, and this one is origin=schedule (…)`), `since` when the first of them started. The
+second failure in a row, whatever "Notify me" says, gives one `notice` (warn) `<agent>:
+"<name>" has failed twice: <reason>` and a desktop notification, instead of that run's own
+notice; the third and later are not told again. It is worked out from the stored runs, so a
+restart neither repeats nor loses it. A `notice` about a schedule (this one, and "expired")
+carries `schedule: <id>`, and the window gives it an Open button. An Antigravity agent's run that
+ends without its `reply` reads `the turn ended without the agent's `reply` for this run (an
+Antigravity agent answers only with its reply tool)`: its turn has no final message to take. A backend restart picks up unfinished runs: one
 already sent waits for its reply again; one whose message was recorded but never typed and is in
 no prompt queue (the backend stopped in between) is `failed`; one still in line goes back in line
 until its hour is up. A schedule's own daily cap counts the runs that reached the agent by the

@@ -566,6 +566,10 @@ mod daily_cap;
 #[path = "tests_mcp_reply.rs"]
 mod mcp_reply;
 
+// A schedule that keeps failing, or expired, is told once.
+#[path = "tests_failing.rs"]
+mod failing;
+
 /// A schedule made before its agent switched from Claude to Antigravity still runs for that agent
 /// afterwards (same id), now by Antigravity's rules: no 7-day expiry.
 #[test]

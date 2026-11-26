@@ -249,6 +249,9 @@ export interface RunHistory {
 export const scheduleRuns = signal<Map<number, RunHistory>>(new Map());
 /** Schedules whose history is shown under their row. */
 export const scheduleHistoryOpen = signal<ReadonlySet<number>>(new Set());
+/** A notice's Open button asked to show this schedule (its agent's card, its runs); `n` makes
+ * the same one asked again a change. Handled in components/AgentCard.tsx. */
+export const scheduleToOpen = signal<{ id: number; n: number } | null>(null);
 /** Bumped when histories are thrown away (each hello): loads started before are ignored. */
 let runsEpoch = 0;
 
@@ -1107,9 +1110,18 @@ export function applyEvent(ev: ServerEvent) {
       });
       break;
     }
-    case "notice":
-      toast(ev.data.level === "error" ? "error" : ev.data.level === "warn" ? "warn" : "info", ev.data.text);
+    case "notice": {
+      const level = ev.data.level === "error" ? "error" : ev.data.level === "warn" ? "warn" : "info";
+      const id = ev.data.schedule;
+      // About a schedule (failed twice, expired): an Open button, and long enough to reach it.
+      if (typeof id === "number") {
+        toast(level, ev.data.text, 15000, undefined, {
+          label: "Open",
+          run: () => (scheduleToOpen.value = { id, n: (scheduleToOpen.peek()?.n ?? 0) + 1 }),
+        });
+      } else toast(level, ev.data.text);
       break;
+    }
     case "agent_upserted":
       agents.value = sortAgents([...agents.value.filter((a) => a.id !== ev.data.id), ev.data]);
       break;

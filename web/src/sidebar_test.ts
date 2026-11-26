@@ -1,4 +1,7 @@
-import { cardKey, failedRun, heldFor, heldQueues, heldText, hideRun, needsYouItems, otherName, ownerOf, rowChip, sidebarRows } from "./sidebar.ts";
+import {
+  cardKey, expiredKey, failedRun, failingLabel, heldFor, heldQueues, heldText, hideRun, needsYouItems, otherName, ownerOf, rowChip,
+  sidebarRows,
+} from "./sidebar.ts";
 import type { Agent, Channel, QueueHeld, RunOutcome, Schedule, ScheduleRun, SessionInfo } from "./types.ts";
 
 function equal<T>(a: T, b: T) {
@@ -64,6 +67,27 @@ Deno.test("Needs you holds proposals oldest first, then failed runs newest first
   // A newer failed run of a hidden schedule shows again; hiding one schedule's run hides no other's.
   equal(failedRun(sch(2, 1, { last_run: run(105, "timed_out") }), { 2: 101 }), true);
   equal(failedRun(sch(2, 1, { last_run: run(102, "failed") }), { 4: 102 }), true);
+});
+
+Deno.test("an expired schedule waits in Needs you until renewed, removed or hidden; it is not also a failed run", () => {
+  const expired = sch(8, 1, { status: "expired", expires_at: 5000, last_run: run(110, "no_reply") });
+  const list = [sch(2, 1, { last_run: run(101, "blocked", 500) }), expired, proposal(5, 1, 100), sch(9, 2, { status: "expired", expires_at: 4000 })];
+  equal(needsYouItems(list, {}).map((i) => [i.kind, i.schedule.id]), [["proposal", 5], ["expired", 9], ["expired", 8], ["run", 2]]);
+  // Hidden until it expires again (a renewal moves its expiry).
+  const hidden = hideRun({}, 8, expiredKey(expired), [8]);
+  equal(needsYouItems(list, hidden).map((i) => i.schedule.id), [5, 9, 2]);
+  equal(needsYouItems([{ ...expired, expires_at: 9000 }], hidden).map((i) => i.kind), ["expired"]);
+  equal(rowChip(1, list, {}), {
+    tone: "bad", count: 3,
+    label: "1 schedule waits for your approval; 1 schedule expired; 1 schedule's last run failed",
+  });
+});
+
+Deno.test("a schedule failing in a row says how many times", () => {
+  const f = (runs: number) => sch(1, 1, { failing: { runs, outcome: "refused", reason: "refused: x", since: 1 } });
+  equal(failingLabel(sch(1, 1)), null);
+  equal(failingLabel(f(2)), "failed twice");
+  equal(failingLabel(f(5)), "failed 5 times");
 });
 
 Deno.test("an agent's row chip: red for a failed run, amber for a proposal, else its schedule count", () => {

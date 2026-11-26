@@ -1331,7 +1331,30 @@ prompt and anything queued. It does this only on an unused startup screen with a
 box; once a turn shows (the human typed first), the step is dropped. The input box is read with
 "? for shortcuts" under it, with only the status line under it (agy hides the hint while the box
 holds text), or with agy's command menu under it (a typed `/command`); the accept-edits
-placeholder counts as empty, like the auto and plan ones.
+placeholder counts as empty, like the auto and plan ones. Between the box and its footer agy can draw ruled blocks of status rows (`● [00:52:20] 25m
+timer running` while a timer runs): the box is the nearest ruled block above them with a `>`
+prompt line; at most four such blocks are passed, each one to three indented rows that start with
+a symbol, and above them a draft's further lines must be indented and not blank.
+
+**The owner's guards** (src/agy_guard.rs). Claude Code `PreToolUse` hooks the owner registered
+(a guard that stops private details leaving the machine, one that refuses unclear cards) run for
+Antigravity agents too. At each launch with the private workspace, Muster reads the command hooks
+under `hooks.PreToolUse` of `~/.claude/settings.json` (or of the Claude Code settings file
+`MUSTER_ANTIGRAVITY_GUARDS` names on the daemon; `off` for none) and writes them, with the tab's
+folder, to `<session>/antigravity-guards.json` (outside the agent's workspace), and an agy hook
+file `antigravity-workspace/.agents/hooks.json` (agy 1.5.13 loads it from an added directory, at
+the start of the session) that runs `muster hook antigravity guard <that file>` before agy's
+`run_command`, `call_mcp_tool`, `read_url_content`, `search_web`, `write_to_file`,
+`replace_file_content`, `multi_replace_file_content` and `ask_question`. The command maps the
+call to Claude Code's tool and arguments (`Bash` `{command}`, `mcp__<server>__<tool>` with the
+call's `Arguments`, `WebFetch`, `WebSearch`, `Write`, `Edit`, `MultiEdit`, `AskUserQuestion`),
+runs each guard whose matcher names that tool, unchanged and in parallel, with Claude Code's
+`PreToolUse` input on stdin, in the tab's folder with `CLAUDE_PROJECT_DIR` set to it, and reads
+the answers as Claude Code does: exit 2 or `permissionDecision: "deny"` refuses (agy shows the
+agent "tool call denied by pre-tool hook: <reason>"), `"ask"` asks the human every time
+(`force_ask`), and a guard that fails or passes its timeout lets the call go on. It always answers
+agy with JSON within the slowest guard's timeout (agy 1.5.13 blocks a call whose hook fails);
+when it can't read agy's input or the guard list it asks. No guards configured: no hook file.
 
 On 23 Nov 2026, a signed-in check with agy 1.5.13 verified the title callback, hidden account
 information, conversation resume and command approval. A second check that day, in a real

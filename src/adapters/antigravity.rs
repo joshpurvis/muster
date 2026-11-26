@@ -507,9 +507,14 @@ impl Adapter for AntigravityAdapter {
         let start = (top + 1..bottom).rev().find(|&i| lines[i].starts_with('>')).unwrap_or(top + 1);
         let (first, rest) = lines[start..bottom].split_first()?;
         // Above status rows, the box is only taken as it is drawn: a draft's further lines are
-        // indented and not blank. A submitted prompt in the transcript is followed by a blank
-        // line, so a box whose own `>` line was lost never borrows the prompt of the turn above.
-        if walked && rest.iter().any(|l| l.trim().is_empty() || !l.starts_with(char::is_whitespace)) {
+        // indented or blank (a paragraph break), and its last line is not blank. A submitted
+        // prompt in the transcript is followed by agy's column-0 `○`/`●` rows or by the blank line
+        // before the next box, so a box whose own `>` line was lost never borrows the prompt of
+        // the turn above.
+        if walked
+            && (rest.iter().any(|l| !l.trim().is_empty() && !l.starts_with(char::is_whitespace))
+                || rest.last().is_some_and(|l| l.trim().is_empty()))
+        {
             return None;
         }
         let first = if first.trim_end() == ">" {
@@ -801,6 +806,16 @@ mod tests {
         // A box whose prompt line was lost does not borrow the prompt of the turn above it.
         let no_prompt = timer.replace("\n>\n", "\n  ● stray\n");
         assert!(read(&no_prompt).is_none());
+        // A pasted message with a paragraph break: agy 1.5.13 draws the blank line as a blank row
+        // in the box (captured 26 Nov), and Muster reads the box right after pasting.
+        let paragraphs = "[muster msg 7 from human origin=human hop=0]\n  First paragraph here.\n\n  Second paragraph after a blank line.";
+        assert_eq!(read(&timer.replace("\n>\n", &format!("\n> {paragraphs}\n"))).as_deref(), Some(paragraphs));
+        // The box's top border and `>` line both lost, over an answer of indented text only: the
+        // blank line agy leaves before the box keeps the older prompt out.
+        let thoughts = "○ Thought for 4.1s (A timer fits: the build takes about 20 minutes...)\n● Scheduling 1 timer (1500s: check the build) (ctrl+o to expand)\n\n";
+        let lost_both = timer.replacen(thoughts, "", 1).replacen(&format!("{rule}\n>\n"), "", 1);
+        assert_eq!(lost_both.matches(&rule).count(), 3, "fixture shape changed");
+        assert!(read(&lost_both).is_none());
     }
 
     #[test]

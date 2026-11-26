@@ -112,16 +112,16 @@ pub fn hooks_json(bin: &Path, config_file: &Path, config: &Config) -> Value {
     }]}})
 }
 
-/// Does Claude Code's `matcher` name `tool`? Alternatives split on `|`, anchors and grouping
-/// dropped, `.*` as a wildcard. Any other regular-expression syntax counts as a match: running a
-/// guard for a tool it doesn't check is harmless (each checks the tool name itself), skipping one
-/// is not.
+/// Does Claude Code's `matcher` name `tool`? Alternatives split on `|` (or `,`), anchors dropped,
+/// `.*` as a wildcard. Any other regular-expression syntax, grouping too, counts as a match:
+/// running a guard for a tool it doesn't check is harmless (each checks the tool name itself),
+/// skipping one is not.
 pub fn matches(matcher: &str, tool: &str) -> bool {
-    let m: String = matcher.trim().chars().filter(|c| !matches!(c, '(' | ')' | '^' | '$')).collect();
-    if m.is_empty() || m == "*" {
+    let m: String = matcher.trim().chars().filter(|c| !matches!(c, '^' | '$')).collect();
+    if m.is_empty() || m == "*" || m.contains(['(', ')']) {
         return true;
     }
-    m.split('|').map(str::trim).any(|alt| {
+    m.split(['|', ',']).map(str::trim).any(|alt| {
         let plain = alt.replace(".*", "");
         if plain.chars().any(|c| "[]{}+?*.\\".contains(c)) {
             return true;
@@ -215,6 +215,11 @@ pub fn answer(code: Option<i32>, stdout: &[u8], stderr: &[u8]) -> (Decision, Opt
                     Some("ask") => return (Decision::Ask, reason("permissionDecisionReason", h)),
                     _ => {}
                 }
+                // A rewrite of the call (a redaction, say) can't be passed on to agy, which would
+                // run the call as it was: a human looks instead.
+                if h.get("updatedInput").is_some_and(|u| !u.is_null()) {
+                    return (Decision::Ask, Some("a guard changed this call, which Muster can't pass on to Antigravity".into()));
+                }
             }
             match v.get("decision").and_then(Value::as_str) {
                 Some("block") => (Decision::Deny, reason("reason", &v)),
@@ -259,18 +264,9 @@ fn run_guard(g: &Guard, input: &[u8], cwd: &Path) -> (Decision, Option<String>) 
     }
     let Ok(mut child) = cmd.spawn() else { return (Decision::Allow, None) };
     let pid = child.id() as i32;
-    let (mut stdin, mut out, mut err) = (child.stdin.take(), child.stdout.take(), child.stderr.take());
-    let collect = |r: Option<std::process::ChildStdout>| std::thread::spawn(move || {
-        let mut b = Vec::new();
-        if let Some(r) = r { let _ = r.take(MAX_OUTPUT as u64).read_to_end(&mut b); }
-        b
-    });
-    let stdout = collect(out.take());
-    let stderr = std::thread::spawn(move || {
-        let mut b = Vec::new();
-        if let Some(r) = err.take() { let _ = r.take(MAX_OUTPUT as u64).read_to_end(&mut b); }
-        b
-    });
+    let (mut stdin, out, err) = (child.stdin.take(), child.stdout.take(), child.stderr.take());
+    let stdout = std::thread::spawn(move || capped(out));
+    let stderr = std::thread::spawn(move || capped(err));
     let data = input.to_vec();
     std::thread::spawn(move || {
         if let Some(mut w) = stdin.take() { let _ = w.write_all(&data); }
@@ -292,8 +288,23 @@ fn run_guard(g: &Guard, input: &[u8], cwd: &Path) -> (Decision, Option<String>) 
     // Its group too: a guard that left a child holding the pipes open can't hold this answer.
     // SAFETY: as above.
     unsafe { libc::kill(-pid, libc::SIGKILL) };
-    let (stdout, stderr) = (stdout.join().unwrap_or_default(), stderr.join().unwrap_or_default());
+    let ((stdout, too_long), (stderr, _)) = (stdout.join().unwrap_or_default(), stderr.join().unwrap_or_default());
+    if code == Some(0) && too_long {
+        // Its decision is past what this reads: a human looks instead of guessing it was allow.
+        return (Decision::Ask, Some("a guard's answer was too long to read".into()));
+    }
     answer(code, &stdout, &stderr)
+}
+
+/// The first `MAX_OUTPUT` bytes of a guard's pipe, and whether it wrote more. The rest is read
+/// and dropped: a guard that writes past the cap and then exits 2 must not die of a closed pipe
+/// first, which would read as a guard error and let the call go on.
+fn capped(r: Option<impl Read>) -> (Vec<u8>, bool) {
+    let mut b = Vec::new();
+    let Some(mut r) = r else { return (b, false) };
+    let _ = r.by_ref().take(MAX_OUTPUT as u64).read_to_end(&mut b);
+    let more = std::io::copy(&mut r, &mut std::io::sink()).unwrap_or(0) > 0;
+    (b, more)
 }
 
 /// The answer for agy's `payload`, with the session's `config` (None: it couldn't be read).

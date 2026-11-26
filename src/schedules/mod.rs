@@ -996,10 +996,11 @@ impl Failing {
 }
 
 /// The outcome a run counts as: a reply that came after the run stopped waiting (a final message,
-/// or a `reply` the run took) still makes it a replied run. Also says whether it came late.
+/// or a `reply` the run took) still makes it a replied run, also after a block the human then
+/// approved. Also says whether it came late.
 pub(crate) fn counted_outcome(r: &Run, msg: Option<&crate::agents::AgentMessage>) -> (Outcome, bool) {
     match (msg, r.outcome) {
-        (Some(m), Outcome::TimedOut | Outcome::NoReply) if m.run_reply().is_some() => (Outcome::Replied, true),
+        (Some(m), Outcome::TimedOut | Outcome::NoReply | Outcome::Blocked) if m.run_reply().is_some() => (Outcome::Replied, true),
         _ => (r.outcome, false),
     }
 }
@@ -1013,7 +1014,7 @@ pub fn failing_of(hub: &Hub, runs: &[Run]) -> Option<Failing> {
     for r in runs.iter().filter(|r| r.kind != RunKind::Chain) {
         let outcome = match r.outcome {
             Outcome::Pending | Outcome::Skipped => continue,
-            Outcome::TimedOut | Outcome::NoReply => {
+            Outcome::TimedOut | Outcome::NoReply | Outcome::Blocked => {
                 let msg = r.msg_id.and_then(|m| hub.store().agent_message(m).ok().flatten());
                 counted_outcome(r, msg.as_ref()).0
             }

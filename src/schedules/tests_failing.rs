@@ -143,6 +143,10 @@ fn a_row_of_failures_counts_what_ran() {
     add(Outcome::NoReply, RunKind::Scheduled, None);
     add(Outcome::Refused, RunKind::Scheduled, None);
     assert_eq!(row().map(|r| (r.runs, r.reason)), Some((2, "refused: why 9".to_string())));
+    // A blocked run the human approved, whose reply then came, counts as replied too.
+    add(Outcome::Blocked, RunKind::Scheduled, Some("answered after approval"));
+    add(Outcome::Refused, RunKind::Scheduled, None);
+    assert_eq!(row(), None, "one failure after a replied run is not a row");
     // The first sentence of a long reason, cut at 200 characters.
     let long = format!("{}. And more.", "x".repeat(300));
     let why = Failing::why(Outcome::Refused, Some(&long));

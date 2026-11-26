@@ -55,6 +55,10 @@ fn matchers_read_as_claude_code_reads_them() {
         ("mcp__.*__post_.*", "mcp__muster__reply", false),
         // Other regular-expression syntax runs the guard: it checks the tool itself.
         ("Notebook[A-Z]+", "Bash", true),
+        ("^mcp__(alpha|beta)__send$", "mcp__alpha__send", true),
+        // A comma list, as some settings files write it.
+        ("Bash, WebFetch", "WebFetch", true),
+        ("Bash, WebFetch", "Write", false),
     ] {
         assert_eq!(matches(m, tool), yes, "{m} {tool}");
     }
@@ -90,6 +94,9 @@ fn answers_are_read_as_claude_code_reads_them() {
     assert_eq!(answer(Some(0), br#"{"decision":"block","reason":"old style"}"#, b""), (Decision::Deny, Some("old style".into())));
     assert_eq!(answer(Some(2), b"", b"  refused: why  \n"), (Decision::Deny, Some("refused: why".into())));
     assert_eq!(answer(Some(2), b"", b"").0, Decision::Deny);
+    // A guard that rewrites the call: agy can't take the rewrite, so a human looks.
+    let rewrite = br#"{"hookSpecificOutput":{"permissionDecision":"allow","updatedInput":{"command":"redacted"}}}"#;
+    assert_eq!(answer(Some(0), rewrite, b"").0, Decision::Ask);
     // Nothing said, words that aren't JSON, an error exit or no exit at all: the call goes on.
     for (code, out) in [(Some(0), &b""[..]), (Some(0), b"just text"), (Some(1), deny), (None, deny)] {
         assert_eq!(answer(code, out, b"").0, Decision::Allow);
@@ -155,6 +162,21 @@ fn a_guard_past_its_timeout_lets_the_call_go_in_time() {
     assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
     assert_eq!(v, json!({"decision": "force_ask", "reason": "check it"}));
     let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn output_past_the_cap_keeps_the_guards_answer() {
+    // `set -e` with a pipe closed after the cap would die of SIGPIPE before `exit 2`.
+    let flood = |fd: &str, then: &str| format!("set -e; head -c 3000000 /dev/zero {fd}; {then}");
+    let run = |command: String| {
+        let config = Config { cwd: "/".into(), guards: vec![guard("Bash", &command)] };
+        decide(&payload("run_command", json!({"CommandLine": "ls"})), Some(config))
+    };
+    let refused = run(flood(">&2", "echo 'private string' >&2; exit 2"));
+    assert_eq!(refused["decision"], "deny");
+    assert!(refused["reason"].as_str().unwrap().len() <= MAX_REASON * 4 + 3);
+    // An answer on stdout past the cap can't be read: asked about, never taken as allow.
+    assert_eq!(run(flood("", "exit 0"))["decision"], "force_ask");
 }
 
 #[test]

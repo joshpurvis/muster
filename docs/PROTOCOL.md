@@ -729,7 +729,8 @@ way), taken as for a waiting `ask_agent`: only one that brings no origin the mes
 have (docs/MCP.md "Late replies"; a lead's reply to its scheduled work qualifies, and the "Then…"
 step still goes on the schedule's own chain). A `reply` that comes after the run stopped waiting,
 while the turn left no final message, is the run's late reply, as a late final message is: a run
-that ended `no_reply` or `timed_out` shows `replied` with a `late reply` chip in its history, a
+that ended `no_reply`, `timed_out` or `blocked` (the human then approved) shows `replied` with a
+`late reply` chip in its history and breaks a row of failures, a
 schedule's own run (not a step) puts it in the note, and a "Then…" step that already ran for the
 recorded outcome stays. Whichever the run took is its one reply for
 `{reply}`, `{last_reply}` and the note, also when the agent sends both. A reply is also appended to the schedule's note, if it has one,
@@ -1311,7 +1312,8 @@ Visible dialogs take precedence. A trust or settings dialog needs an answer in t
 
 Muster supplies its bearer-authenticated MCP server through a private
 `antigravity-workspace/.agents/mcp_config.json` in the session directory. Set
-`MUSTER_ANTIGRAVITY_MCP=0` on the daemon to omit that folder (and the allow rule). A named
+`MUSTER_ANTIGRAVITY_MCP=0` on the daemon to omit that folder (and the allow rule, and the owner's
+guards below, which live in it). A named
 agent working in a project also gets its `memory/` directory as an added directory.
 
 agy 1.5.13 loads MCP tools lazily: the model gets each server's tool names, a schema file per
@@ -1334,7 +1336,8 @@ holds text), or with agy's command menu under it (a typed `/command`); the accep
 placeholder counts as empty, like the auto and plan ones. Between the box and its footer agy can draw ruled blocks of status rows (`● [00:52:20] 25m
 timer running` while a timer runs): the box is the nearest ruled block above them with a `>`
 prompt line; at most four such blocks are passed, each one to three indented rows that start with
-a symbol, and above them a draft's further lines must be indented and not blank.
+a symbol, and above them a draft's further lines must be indented or blank (a paragraph break),
+with no blank last line.
 
 **The owner's guards** (src/agy_guard.rs). Claude Code `PreToolUse` hooks the owner registered
 (a guard that stops private details leaving the machine, one that refuses unclear cards) run for
@@ -1348,13 +1351,16 @@ the start of the session) that runs `muster hook antigravity guard <that file>` 
 `replace_file_content`, `multi_replace_file_content` and `ask_question`. The command maps the
 call to Claude Code's tool and arguments (`Bash` `{command}`, `mcp__<server>__<tool>` with the
 call's `Arguments`, `WebFetch`, `WebSearch`, `Write`, `Edit`, `MultiEdit`, `AskUserQuestion`),
-runs each guard whose matcher names that tool, unchanged and in parallel, with Claude Code's
+runs each guard whose matcher names that tool (`|` or `,` lists, `.*`; any other regular
+expression, grouping too, runs the guard, which checks the tool itself), unchanged and in parallel, with Claude Code's
 `PreToolUse` input on stdin, in the tab's folder with `CLAUDE_PROJECT_DIR` set to it, and reads
 the answers as Claude Code does: exit 2 or `permissionDecision: "deny"` refuses (agy shows the
 agent "tool call denied by pre-tool hook: <reason>"), `"ask"` asks the human every time
 (`force_ask`), and a guard that fails or passes its timeout lets the call go on. It always answers
 agy with JSON within the slowest guard's timeout (agy 1.5.13 blocks a call whose hook fails);
-when it can't read agy's input or the guard list it asks. No guards configured: no hook file.
+when it can't read agy's input or the guard list it asks, and when a guard's answer on stdout is
+past 1 MiB, or rewrites the call (`updatedInput`, which agy can't take). No guards configured: no
+hook file.
 
 On 23 Nov 2026, a signed-in check with agy 1.5.13 verified the title callback, hidden account
 information, conversation resume and command approval. A second check that day, in a real

@@ -581,8 +581,18 @@ enum AgentCmd {
         /// Without --now a running agent keeps its current account until it next starts.
         #[arg(long, value_name = "PROFILE")]
         profile: Option<String>,
-        /// Restart it now on the new account if it is idle (nothing running, nothing queued); a
-        /// busy agent moves at its next start. Without --profile: apply the move already waiting.
+        /// Switch this agent between Claude and Antigravity. It keeps its name, tab, memory/,
+        /// schedules, reminders, waiting messages and lead flag; its next start is a new
+        /// conversation in the new CLI, its persona file is written for that CLI (the old one is
+        /// kept beside it as `<file>.before-<kind>`), and what the new CLI can't use is cleared
+        /// (model and effort unless given here, account profile, OpenRouter, tools up front, self
+        /// handoff). A running agent keeps its current CLI until it next starts; add --now to
+        /// restart it at once if it is idle. Only the human switches (refused inside a Muster tab).
+        #[arg(long, value_name = "KIND", value_parser = ["claude", "antigravity"])]
+        kind: Option<String>,
+        /// Restart it now on the new account (with --profile) or in the new CLI (with --kind) if it
+        /// is idle (nothing running, nothing queued); a busy agent changes at its next start.
+        /// Without either: apply the move already waiting.
         #[arg(long)]
         now: bool,
         /// With --profile: first ask a running, idle agent to write what it needs into memory/
@@ -635,13 +645,14 @@ enum AgentCmd {
         /// it off. Claude agents only.
         #[arg(long, value_name = "on|off", value_parser = ["on", "off"])]
         tools_up_front: Option<String>,
-        /// Make this Claude agent a lead agent: in a turn a reminder or a schedule started, what it
-        /// sends (ask_agent, tell_agent, reply, send_message) and the sessions it starts go as
-        /// origin=lead, which Claude agents and sessions take like the human's, so it can start
-        /// Claude builders and message Claude agents from those turns. Each message still counts
+        /// Make this Claude or Antigravity agent a lead agent: in a turn a reminder or a schedule
+        /// started, what it sends (ask_agent, tell_agent, reply, send_message) and the sessions it
+        /// starts go as origin=lead, which agents and sessions take like the human's, so it can
+        /// start builders and message other agents from those turns. Each message still counts
         /// one hop (8 at most). A trigger's work keeps the usual rules, and nothing scheduled
         /// work reaches can set reminders or schedules. Off by default. Only the human turns it on
-        /// (refused inside a Muster tab); anyone may turn it off. Claude agents only.
+        /// (refused inside a Muster tab); anyone may turn it off. Claude and Antigravity agents
+        /// only.
         #[arg(long, value_name = "on|off", value_parser = ["on", "off"])]
         lead: Option<String>,
         #[command(flatten)]
@@ -884,6 +895,7 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
             ),
             AgentCmd::Edit {
                 name,
+                kind,
                 profile,
                 now,
                 save_notes,
@@ -905,7 +917,7 @@ fn agent_cmd(d: &Discovery, cmd: Cmd) -> anyhow::Result<()> {
                 d,
                 cli::AgentOpts {
                     name,
-                    kind: None,
+                    kind,
                     profile,
                     switch: cli::SwitchOpts { now, save_notes, reason },
                     provider,

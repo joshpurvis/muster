@@ -1564,10 +1564,15 @@ fn agent_send<B: Backend>(st: &McpState<B>, caller: SessionId, name: &str, text:
     };
     // The widest profile the message could reach: the agent session's current tab and the agent's
     // own tab (what its next restart gets), else the profile its tab will get.
-    let session_ch = agent.session_id.and_then(|s| st.backend.session(s)).and_then(|s| st.backend.channel(s.channel_id));
+    let session = agent.session_id.and_then(|s| st.backend.session(s));
+    let session_ch = session.as_ref().and_then(|s| st.backend.channel(s.channel_id));
     let own_ch = agent.channel_id.and_then(|c| st.backend.channel(c));
     let (_, perms) = crate::agents::reach_profile(&agent, session_ch.as_ref(), own_ch.as_ref());
-    check_perms_not_wider(st, &me, &perms, agent.kind, &format!("agent {}'s tab", agent.name)).map_err(refused)?;
+    // Checked for the kind it is saved as and, after a switch not yet applied, the kind its tab
+    // still runs (`agents::reach_kinds`): the message may reach either.
+    for kind in crate::agents::reach_kinds(&agent, session.as_ref()) {
+        check_perms_not_wider(st, &me, &perms, kind, &format!("agent {}'s tab", agent.name)).map_err(refused)?;
+    }
     let recent = st
         .backend
         .agent_messages_since(agent.id, now_ms() - guard::AGENT_CAP_WINDOW_MS);

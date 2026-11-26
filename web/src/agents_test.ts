@@ -39,6 +39,8 @@ import {
   unattendedWarning,
   upsertMessage,
   vendorGroups,
+  kindSwitchMessage,
+  switchPermissions,
 } from "./agents.ts";
 import type { Agent, AgentMessage, LateAnswer, ModelCatalog, OpenRouterModel, SessionInfo } from "./types.ts";
 
@@ -577,4 +579,25 @@ Deno.test("a busy tab's Restart confirmation asks again when its run or move cha
   const plain = restartShown(agent({ session_id: 7 }), run);
   assertEquals(plain, { pid: 100, move: null, to: null });
   assertEquals(restartShownChanged(plain, restartShown(moving, run)), true);
+});
+
+Deno.test("kind switch: modes map to the nearest no wider, as the backend does", () => {
+  const base = { codex_sandbox: "workspace_write", claude_mode: "default", antigravity_mode: "auto" } as const;
+  const toAgy = (c: "plan" | "default" | "accept_edits" | "bypass") =>
+    switchPermissions({ ...base, claude_mode: c }, "claude", "antigravity").antigravity_mode;
+  assertEquals([toAgy("plan"), toAgy("default"), toAgy("accept_edits"), toAgy("bypass")],
+    ["plan", "accept_edits", "accept_edits", "full_access"]);
+  const toClaude = (a: "plan" | "accept_edits" | "auto" | "full_access") =>
+    switchPermissions({ ...base, antigravity_mode: a }, "antigravity", "claude").claude_mode;
+  assertEquals([toClaude("plan"), toClaude("accept_edits"), toClaude("auto"), toClaude("full_access")],
+    ["plan", "accept_edits", "accept_edits", "bypass"]);
+});
+
+Deno.test("kind switch: the toast says when it switches and where the old persona went", () => {
+  const ks = { from: "claude" as const, to: "antigravity" as const, now: false, running: true, kept_aside: ["CLAUDE.md.before-antigravity"] };
+  const later = kindSwitchMessage("alpha", { ...ks, outcome: "next_start" });
+  check(later.text.includes("switches to Antigravity at its next start") && later.text.includes("CLAUDE.md.before-antigravity"), later.text);
+  assertEquals(kindSwitchMessage("alpha", { ...ks, now: true, outcome: "restarted" }).level, "success");
+  const busy = kindSwitchMessage("alpha", { ...ks, now: true, outcome: "busy", why: "unsent text is in the input box" });
+  check(busy.level === "warn" && busy.text.includes("(unsent text is in the input box)"), busy.text);
 });

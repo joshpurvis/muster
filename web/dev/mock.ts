@@ -846,7 +846,10 @@ function checkProvider(kind: string, provider: string, model: string | null, nee
 
 function agentJson(a: MockAgent) {
   const s = a.session_id !== null ? sessions.get(a.session_id) : undefined;
-  return { ...a, state: s?.state ?? null, detail: s?.state_detail ?? null };
+  return {
+    ...a, state: s?.state ?? null, detail: s?.state_detail ?? null,
+    switch_kinds: a.kind === "codex" ? [] : ["claude", "antigravity"],
+  };
 }
 
 function agentNamed(name: string): MockAgent {
@@ -1341,8 +1344,33 @@ async function agentMethod(method: string, p: any): Promise<unknown> {
         a.self_handoff = !!p.self_handoff;
       }
       if ("tools_up_front" in p) a.tools_up_front = !!p.tools_up_front;
+      // A switch between Claude and Antigravity (src/agents.rs `switch_kind`, loosely).
+      let ks: Record<string, unknown> | undefined;
+      if ("kind" in p && p.kind !== a.kind) {
+        const ok = (k: string) => k === "claude" || k === "antigravity";
+        if (!ok(a.kind) || !ok(p.kind)) throw new Error(`an agent switches only between Claude and Antigravity: ${a.name} uses ${a.kind}`);
+        const from = a.kind;
+        a.kind = p.kind;
+        a.reset_on_next_start = true;
+        a.handoff = null;
+        if (!("model" in p)) a.model = null;
+        if (!("effort" in p)) a.effort = null;
+        if (a.kind !== "claude") {
+          a.account_profile_id = null;
+          a.provider = "subscription";
+          a.tools_up_front = false;
+          a.self_handoff = false;
+        }
+        const s = a.session_id !== null ? sessions.get(a.session_id) : undefined;
+        const live = !!s && s.state !== "exited";
+        const persona = (k: string) => k === "claude" ? "CLAUDE.md" : "AGENTS.md";
+        ks = {
+          from, to: a.kind, now: !!p.now, running: live, kept_aside: [`${persona(from)}.before-${a.kind}`],
+          outcome: p.now && live ? (s.state === "idle" && s.queued === 0 ? "restarted" : "busy") : "next_start",
+        };
+      }
       if ("lead" in p) {
-        if (p.lead && a.kind !== "claude") throw new Error(`only Claude agents can be lead agents: ${a.name} uses ${a.kind}`);
+        if (p.lead && a.kind === "codex") throw new Error(`only Claude and Antigravity agents can be lead agents: ${a.name} uses ${a.kind}`);
         a.lead = !!p.lead;
       }
       if ("permissions" in p) a.permissions = { ...a.permissions, ...p.permissions };
@@ -1391,7 +1419,7 @@ async function agentMethod(method: string, p: any): Promise<unknown> {
         }
       }
       broadcast("agent_upserted", agentJson(a));
-      return sw ? { ...agentJson(a), switch: sw } : agentJson(a);
+      return { ...agentJson(a), ...(sw ? { switch: sw } : {}), ...(ks ? { kind_switch: ks } : {}) };
     }
     case "agent.remove": {
       const a = agentNamed(p.name);

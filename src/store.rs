@@ -1563,7 +1563,7 @@ impl Store {
                     asleep_autostart = CASE WHEN asleep_at IS NULL THEN NULL ELSE ?7 END,
                     provider = ?8, sleep_after_min = ?9, working_location = ?10, reset_on_next_start = ?11,
                     account_profile_id = ?12, handoff_from = ?13, self_handoff = ?14, tools_up_front = ?15,
-                    lead = ?16 WHERE id = ?1",
+                    lead = ?16, kind = ?17 WHERE id = ?1",
             params![
                 b.id,
                 b.model,
@@ -1580,7 +1580,8 @@ impl Store {
                 b.handoff.as_ref().map(serde_json::to_string).transpose()?,
                 b.self_handoff as i64,
                 b.tools_up_front as i64,
-                b.lead as i64
+                b.lead as i64,
+                b.kind.as_str()
             ],
         )?;
         Ok(())
@@ -1863,6 +1864,35 @@ impl Store {
             |r| r.get(0),
         )?;
         Ok(n.max(0) as usize)
+    }
+
+    /// Agent `agent`'s quiet messages still waiting (never shown, expired or refused) whose send
+    /// was checked against a permission mode at least `width` wide (`quiet::width`), oldest
+    /// first: what a switch to Antigravity hands over (`agents::hand_over_quiet`).
+    pub fn waiting_quiet_for_agent(&self, agent: i64, width: i64) -> anyhow::Result<Vec<crate::agents::AgentMessage>> {
+        let conn = self.conn.lock();
+        let mut st = conn.prepare(&format!(
+            "{AGENT_MESSAGE_SELECT} WHERE m.to_agent = ?1 AND m.quiet = 1 AND m.shown_at IS NULL
+             AND m.expired_at IS NULL AND m.refused IS NULL AND m.width >= ?2 ORDER BY m.id"
+        ))?;
+        let rows = st.query_map(params![agent, width], Self::row_agent_message)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Quiet message `id` is given up at `at` (marked expired), if it still waits. Whether it did.
+    pub fn expire_agent_quiet(&self, id: i64, at: i64) -> anyhow::Result<bool> {
+        Ok(self.conn.lock().execute(
+            "UPDATE agent_messages SET expired_at = ?2 WHERE id = ?1 AND quiet = 1 AND shown_at IS NULL
+             AND expired_at IS NULL AND refused IS NULL",
+            params![id, at],
+        )? == 1)
+    }
+
+    /// Quiet message `id`, given up by `expire_agent_quiet`, waits again (its new send failed).
+    pub fn unexpire_agent_quiet(&self, id: i64) -> anyhow::Result<()> {
+        self.conn.lock().execute(
+            "UPDATE agent_messages SET expired_at = NULL WHERE id = ?1 AND quiet = 1 AND shown_at IS NULL", params![id])?;
+        Ok(())
     }
 
     /// A session's quiet messages for its run `run` (those for an earlier run never count).
@@ -3197,6 +3227,15 @@ impl Store {
     pub fn set_session_account_profile(&self, id: SessionId, profile: Option<i64>) -> anyhow::Result<()> {
         anyhow::ensure!(self.conn.lock().execute(
             "UPDATE sessions SET account_profile_id = ?2 WHERE id = ?1", params![id, profile])? == 1,
+            "no such session: {id}");
+        Ok(())
+    }
+
+    /// Session `id` runs `kind` from its next start, on Claude profile `profile` (a named agent's tab
+    /// after its agent switched kind: `agents::follow_kind`).
+    pub fn set_session_kind(&self, id: SessionId, kind: SessionKind, profile: Option<i64>) -> anyhow::Result<()> {
+        anyhow::ensure!(self.conn.lock().execute(
+            "UPDATE sessions SET kind = ?2, account_profile_id = ?3 WHERE id = ?1", params![id, kind.as_str(), profile])? == 1,
             "no such session: {id}");
         Ok(())
     }

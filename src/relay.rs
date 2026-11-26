@@ -200,12 +200,13 @@ pub fn target(hub: &Hub, poster: &Who, recorder: Option<&Who>, live: &HashSet<Se
 /// would steer an agent with wider permissions).
 pub fn check_reach(hub: &Hub, recorder: SessionId, t: &Target) -> Result<(), String> {
     let mine = hub.session(recorder).and_then(|s| hub.channel(s.channel_id)).ok_or("the recorder's channel no longer exists")?;
-    let (ch, perms, kind, what) = match t {
+    let (ch, perms, kinds, what) = match t {
         Target::Agent(a, _) => {
-            let session_ch = a.session_id.and_then(|s| hub.session(s)).and_then(|s| hub.channel(s.channel_id));
+            let session = a.session_id.and_then(|s| hub.session(s));
+            let session_ch = session.as_ref().and_then(|s| hub.channel(s.channel_id));
             let own = a.channel_id.and_then(|c| hub.channel(c));
             let (ch, p) = agents::reach_profile(a, session_ch.as_ref(), own.as_ref());
-            (ch, p, a.kind, format!("agent {}'s tab", a.name))
+            (ch, p, agents::reach_kinds(a, session.as_ref()), format!("agent {}'s tab", a.name))
         }
         Target::Session(s, _) => {
             // What `send_message` refuses, an answer may not do either.
@@ -223,11 +224,11 @@ pub fn check_reach(hub: &Hub, recorder: SessionId, t: &Target) -> Result<(), Str
                     "session {} is in another workspace and messaging it isn't shared with yours, so an answer can't reach it. \
                      The human can add a sharing rule in Muster's sidebar: Channels ⋯ → Session communication", s.id));
             }
-            (Some(c.id), c.permissions, s.kind, format!("session {}'s channel", s.id))
+            (Some(c.id), c.permissions, vec![s.kind], format!("session {}'s channel", s.id))
         }
         Target::NotNeeded(_) | Target::Gone(_) => return Ok(()),
     };
-    if ch != Some(mine.id) && perms.exceeds_for(&mine.permissions, kind) {
+    if ch != Some(mine.id) && let Some(kind) = kinds.into_iter().find(|k| perms.exceeds_for(&mine.permissions, *k)) {
         return Err(format!(
             "{what} lets {} do more than your channel does, so an answer can't carry your words into it. \
              Ask the human to answer it there (or the asker's own lead to record it)", kind.as_str()));

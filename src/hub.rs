@@ -3830,6 +3830,26 @@ impl Hub {
         Ok(())
     }
 
+    /// A stopped session runs `kind` from its next start, on Claude profile `profile` (None for
+    /// any other kind): a named agent's tab after its agent switched kind (`agents::follow_kind`).
+    /// What the old CLI's run left on the entry (its conversation, a saved thread, an Antigravity
+    /// state) is dropped with it.
+    pub(crate) fn set_session_kind(&self, id: SessionId, kind: SessionKind, profile: Option<i64>) -> anyhow::Result<()> {
+        let profile = profile.filter(|_| kind == SessionKind::Claude);
+        let mut g = self.inner.lock();
+        let e = g.sessions.get_mut(&id).ok_or_else(|| anyhow::anyhow!("no such session: {id}"))?;
+        anyhow::ensure!(e.pty.as_ref().is_none_or(|p| !p.is_alive()), "session {id} is still running");
+        self.store.set_session_kind(id, kind, profile)?;
+        e.info.kind = kind;
+        e.info.account_profile_id = profile;
+        e.conversation = None;
+        e.conversation_sure = false;
+        e.codex_thread = None;
+        e.antigravity_callback = None;
+        self.publish_session(&e.info);
+        Ok(())
+    }
+
     /// Replace a session's agent arguments for its next (re)start (an agent's `--resume`). Checked
     /// against the allowlist like any extra args.
     pub fn set_session_extra_args(&self, id: SessionId, args: Vec<String>) -> anyhow::Result<()> {
@@ -3851,7 +3871,14 @@ impl Hub {
         self.ensure_not_shutting_down()?;
         // Fail before interrupting a live process if its selected profile cannot start.
         let info = self.session(id).ok_or_else(|| anyhow::anyhow!("no such session: {id}"))?;
-        self.check_account_profile(info.account_profile_id)?;
+        // A named agent's tab that switches kind on this start (`agents::follow_kind`) starts on
+        // the agent's account, not the old kind's: a disabled Claude profile can't keep it from
+        // switching to Antigravity.
+        let profile = match self.agents.by_session(id) {
+            Some(a) if a.kind != info.kind => a.account_profile_id.filter(|_| a.kind == SessionKind::Claude),
+            _ => info.account_profile_id,
+        };
+        self.check_account_profile(profile)?;
         self.check_session_provider(id)?;
         {
             let mut g = self.inner.lock();
@@ -3991,6 +4018,8 @@ impl Hub {
                 self.agents.update(&self.store, agent.id, |a| a.channel_id = Some(channel_id))?;
             }
         }
+        // A named agent that switched kind runs its new CLI in the same tab (its queue kept).
+        crate::agents::follow_kind(self, id)?;
         self.prepare_restart_args(id)?;
         match self.start_process(id, None, None) {
             Ok(Started {

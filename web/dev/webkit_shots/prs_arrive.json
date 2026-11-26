@@ -1,0 +1,23 @@
+[
+  {"until": "globalThis.__muster?.windowId?.value != null", "settle": 0.8},
+  {"js": "const M = globalThis.__muster; const w = await M.rpc.call('workspace.add', {path: '/tmp', name: 'notes-app'}); await M.rpc.call('channel.create', {workspace_id: w.id, name: 'notes-app', agent: 'shell', window_id: M.windowId.value}); return 'channel';", "until": "globalThis.__muster.activeChannelId.value != null && document.querySelector('.pane .tab')", "settle": 1.0},
+  {"js": "const M = globalThis.__muster; const v = M.channelLayout.value; M.channelLayout.value = {...v, sidebar: {...v.sidebar, hidden: true}};", "until": "globalThis.__muster.channelLayout.value?.sidebar.hidden === true", "settle": 0.6},
+  {"js": "await globalThis.__muster.rpc.call('mock.pr_seed', {}); setTimeout(() => location.reload(), 100); return 'seeded; the window opens again on them';", "settle": 1.5},
+  {"until": "globalThis.__muster?.windowId?.value != null && document.querySelector('.prs-tab')", "settle": 1.0},
+  {"js": "document.querySelector('.prs-tab').click();", "until": "document.querySelector('.prs-view .pb-dock')", "settle": 0.8},
+  {"js": "[...document.querySelectorAll('.pb-pill')].find((b) => b.textContent.includes('#214')).click();", "until": "document.querySelector('.prs-view .pm-merge:not(:disabled)')", "settle": 1.0},
+  {"js": "document.querySelector('.pm-merge').dispatchEvent(new MouseEvent('click', {bubbles: true, detail: 1, button: 0}));", "until": "document.querySelector('.qv-answered')", "timeout": 15, "settle": 0.8, "shot": "1-merged"},
+  {"js": "await globalThis.__muster.rpc.call('mock.pr_post', {n: 241, title: \"Sort notes by last edit\"}); return 'posted #241';", "settle": 1.2, "shot": "1-new-card-arrives"},
+  {"js": "[...document.querySelectorAll('.qv-chip')].find((b) => b.textContent.includes('Waiting')).click();", "settle": 0.6},
+  {"js": "[...document.querySelectorAll('.pb-pill')].find((b) => b.textContent.includes('#58')).click(); document.querySelector('.pb-strip').scrollLeft = 0;", "until": "document.querySelector('.prs-view .qv-q')?.textContent.includes('footer')", "settle": 0.8},
+  {"js": "await globalThis.__muster.rpc.call('mock.pr_post', {n: 242, title: \"Show the note's last edit time on hover\"}); return 'posted #242';", "settle": 1.6, "shot": "2-waiting-card-new-arrives"},
+  {"shot": "2-bar", "crop": ".prs-view .qv-bar", "pad": 0},
+  {"js": "document.querySelector('.pb-new').click();", "until": "!document.querySelector('.pb-new')", "settle": 0.6},
+  {"js": "const t = [...document.querySelectorAll('.pane .tab')].find((t) => !t.matches('.prs-tab, .questions-tab, .addon-tab')); const r = t.getBoundingClientRect(); const o = {bubbles: true, clientX: r.x + 12, clientY: r.y + 10, button: 0, buttons: 1, pointerId: 1, isPrimary: true}; t.dispatchEvent(new PointerEvent('pointerdown', o)); dispatchEvent(new PointerEvent('pointerup', {...o, buttons: 0}));", "until": "!document.querySelector('.prs-tab.active')", "settle": 0.6},
+  {"js": "await globalThis.__muster.rpc.call('mock.pr_post', {n: 243, title: \"Export a note as Markdown\"}); return 'posted #243';", "settle": 1.2, "shot": "3-tab-in-background"},
+  {"js": "[...document.querySelectorAll('.toast')].find((t) => t.textContent.includes('PR to merge')).querySelector('.toast-action').click();", "until": "document.querySelector('.prs-tab.active') && document.querySelector('.prs-view .qv-q')?.textContent.includes('Markdown')", "settle": 0.8, "shot": "3-after-show"},
+  {"js": "(document.activeElement || document.body).dispatchEvent(new KeyboardEvent('keydown', {key: 'w', code: 'KeyW', altKey: true, bubbles: true}));", "until": "!document.querySelector('.prs-tab')", "settle": 0.6},
+  {"js": "document.querySelectorAll('.toast .toast-x').forEach((b) => b.click());", "settle": 0.4},
+  {"js": "await globalThis.__muster.rpc.call('mock.pr_post', {n: 244, title: \"Undo a deleted note for a minute\"}); return 'posted #244';", "settle": 1.2, "shot": "4-tab-hidden"},
+  {"js": "return {theme: document.documentElement.dataset.theme, tab: !!document.querySelector('.prs-tab'), toasts: [...document.querySelectorAll('.toast-text')].map((t) => t.textContent)};"}
+]

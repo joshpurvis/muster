@@ -14,12 +14,18 @@
 // a reorder or the large view or list closing (the dock says so when it ignores one); the
 // countdown keeps the dock's layout, so a double click lands its second click on Cancel; Merge
 // and "Next waiting" are at opposite ends of the dock.
+//
+// A new card (posted, or posted again, while the tab is open: `arrivedPrs`) takes the stage when
+// the tab shows nothing or a card that is done with (merged, closed, withdrawn), unless the pointer
+// or the keyboard is on the dock, the list or a large picture is open. Otherwise the bar says it
+// came ("1 new: <title>", a button that shows it), and the strip scrolls to its pill, marked until
+// it is looked at. Off screen, prs_notice.ts posts a toast instead.
 import { signal } from "@preact/signals";
 import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
 import {
-  askChanges, banner, baseName, canMerge, cardState, CLICK_GUARD_MS, COUNTDOWN_S, GROUPS, groupOf, leftOut, leftOutText, loadPrPicture,
-  mergeCommand, mergedPrs, nb, nextReady, offReason, otherSide, pairs, pairText, pictureKey, pillMark, prPictures,
-  prs, prsFilter, refreshPrs, REFRESH_EVERY_MS, repoName, type Rule, rules, selectedPr, setLater, shortSha, sizeOf,
+  arrivedPrs, askChanges, banner, baseName, canMerge, cardState, CLICK_GUARD_MS, COUNTDOWN_S, GROUPS, groupOf, leftOut, leftOutText, loadPrPicture,
+  makesWay, mergeCommand, mergedPrs, nb, nextReady, offReason, otherSide, pairs, pairText, pictureKey, pillMark, prPictures,
+  prs, prsFilter, prsInView, seenPr, refreshPrs, REFRESH_EVERY_MS, repoName, type Rule, rules, selectedPr, setLater, shortSha, sizeOf,
   sortWaiting, stepPicture, tagText, target, titleOf, toldText, waitingPrs,
 } from "../prs.ts";
 import { cancelMerge, clearSettled, failedMerges, mergedHere, queuedMerges, startMerge } from "../prs_merges.ts";
@@ -93,6 +99,21 @@ export function PrsView() {
   // A new visit to the tab starts the Waiting strip afresh (cards merged meanwhile leave it).
   useEffect(() => clearSettled(), []);
 
+  // On screen or not (a group zoomed or full screen over this one hides it): off screen, a new
+  // card gets a toast instead (prs_notice.ts).
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    // Known at once (a hidden group is display: none, so it has no boxes); then as it changes.
+    prsInView.value = el.getClientRects().length > 0;
+    const io = new IntersectionObserver((es) => { prsInView.value = es.some((e) => e.isIntersecting); });
+    io.observe(el);
+    return () => {
+      io.disconnect();
+      prsInView.value = false;
+    };
+  }, []);
+
   // GitHub is read when the tab is shown and every 2 minutes while it is and the window is in
   // view (never in the background).
   useEffect(() => {
@@ -121,6 +142,37 @@ export function PrsView() {
   const current = chosen && cardState(chosen) !== "gone" ? chosen : list[0];
   // A reorder of the list moves what is under the pointer: Merge ignores clicks for a moment.
   const order = waiting.map((p) => p.id).join(",");
+  const inView = prsInView.value;
+  // New cards not looked at yet, but the one shown.
+  const fresh = arrivedPrs.value.filter((p) => p.id !== current?.id);
+  const freshKey = fresh.map((p) => `${p.id}:${p.post}`).join(",");
+  const [said, setSaid] = useState("");
+
+  // The card shown stays shown: one the list put first (nothing picked yet, or the one picked was
+  // withdrawn) is held, so a new card sorting ahead of it doesn't take its place.
+  useLayoutEffect(() => {
+    if (current && selectedPr.peek() !== current.id) selectedPr.value = current.id;
+  }, [current?.id]);
+  // The card shown, on screen, is new no longer (as soon as it is drawn).
+  useLayoutEffect(() => {
+    if (current && (inView || !!ref.current?.getClientRects().length)) seenPr(current.id);
+  }, [current?.id, current?.post, inView, freshKey]);
+  // A new card takes the stage from one that is done with, unless something is in hand there;
+  // otherwise it waits in the bar's cue. Before paint, so the old card isn't drawn again.
+  useLayoutEffect(() => {
+    if (!fresh.length || !makesWay(current)) return;
+    const root = ref.current;
+    // The pointer resting on the dock after a Merge is fine (no button under it; Merge on the new
+    // card ignores clicks for a moment); on a button there ("Next waiting") it waits.
+    if (zoom || menu || root?.querySelector(".pb-dock button:hover, .pb-dock :focus")) return;
+    const to = fresh[0];
+    const hadFocus = !!root?.querySelector(".pb-scroll")?.contains(document.activeElement);
+    selectedPr.value = to.id;
+    prsFilter.value = "waiting";
+    root?.querySelector(".pb-scroll")?.scrollTo(0, 0);
+    setSaid(`New pull request shown: ${target(to)}, ${titleOf(to)}`);
+    if (hadFocus) focusTitle();
+  }, [freshKey]);
 
   const pick = (p: Pr) => {
     selectedPr.value = p.id;
@@ -173,6 +225,12 @@ export function PrsView() {
           onClick={() => showFilter("merged")}>
           Merged <span class="qv-n">{merged.length}</span>
         </button>
+        {fresh.length > 0 && (
+          <button type="button" class="pb-new" data-tip={`${target(fresh[0])} · ${titleOf(fresh[0])}`}
+            aria-label={`${fresh.length} new: ${target(fresh[0])}, ${titleOf(fresh[0])}. Show it`} onClick={() => pick(fresh[0])}>
+            <span class="pb-new-n">{fresh.length} new:</span> <span class="pb-new-t">{titleOf(fresh[0])}</span>
+          </button>
+        )}
         {list.length > 0 && (
           <span class="pb-pager">
             <button type="button" aria-expanded={menu} aria-controls="prs-all" onClick={toggleMenu}>
@@ -181,8 +239,11 @@ export function PrsView() {
           </span>
         )}
       </div>
+      <span class="sr-only" role="status" aria-live="polite">
+        {fresh.length ? `${fresh.length} new pull request${fresh.length === 1 ? "" : "s"}: ${target(fresh[0])}, ${titleOf(fresh[0])}` : said}
+      </span>
       <div class="pb-wrap" {...inert}>
-        {list.length > 0 && <Strip list={list} current={current} onPick={pick} />}
+        {list.length > 0 && <Strip list={list} current={current} fresh={fresh} onPick={pick} />}
         {current
           ? (
             <div class="pb-scroll">
@@ -209,11 +270,21 @@ export function PrsView() {
 
 /** One pill per pull request; one Tab stop (← → move and pick, Home and End jump). Each pill
  * carries a mark (✓ ○ … ! ✕), not colour alone, and says its title and state to a screen reader. */
-function Strip({ list, current, onPick }: { list: Pr[]; current: Pr | undefined; onPick: (p: Pr) => void }) {
+function Strip({ list, current, fresh, onPick }: { list: Pr[]; current: Pr | undefined; fresh: Pr[]; onPick: (p: Pr) => void }) {
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {
     ref.current?.querySelector<HTMLElement>(".pb-pill.on")?.scrollIntoView({ block: "nearest", inline: "nearest" });
   }, [current?.id]);
+  // A new card's pill comes into view (marked .new until it is looked at). Only the strip scrolls.
+  const newest = fresh.at(-1);
+  const newestKey = newest ? `${newest.id}:${newest.post}` : "";
+  useEffect(() => {
+    const strip = ref.current, pill = newest && strip?.querySelector<HTMLElement>(`#prs-pill-${newest.id}`);
+    if (!strip || !pill) return;
+    const s = strip.getBoundingClientRect(), r = pill.getBoundingClientRect();
+    const by = r.left < s.left ? r.left - s.left - 14 : r.right > s.right ? r.right - s.right + 14 : 0;
+    if (by) strip.scrollBy({ left: by, behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" });
+  }, [newestKey]);
   const onKey = (e: KeyboardEvent) => {
     const i = list.findIndex((p) => p.id === current?.id);
     const to = e.key === "ArrowRight" ? Math.min(list.length - 1, i + 1) : e.key === "ArrowLeft" ? Math.max(0, i - 1)
@@ -231,8 +302,9 @@ function Strip({ list, current, onPick }: { list: Pr[]; current: Pr | undefined;
         return (
           <button key={p.id} id={`prs-pill-${p.id}`} type="button" role="tab" aria-selected={on} aria-controls="prs-stage"
             tabIndex={on || (!list.some((x) => x.id === current?.id) && p === list[0]) ? 0 : -1}
-            aria-label={`#${p.number} ${p.repo}: ${titleOf(p)}. ${mark.status}`}
-            class={cx("pb-pill", on && "on", p.status === "merged" && "done", p.later != null && p.status !== "merged" && "later")}
+            aria-label={`#${p.number} ${p.repo}: ${titleOf(p)}. ${!on && fresh.some((x) => x.id === p.id) ? "New. " : ""}${mark.status}`}
+            class={cx("pb-pill", on && "on", p.status === "merged" && "done", p.later != null && p.status !== "merged" && "later",
+              !on && fresh.some((x) => x.id === p.id) && "new")}
             data-tip={`${p.repo} · ${titleOf(p)}`}
             onClick={() => { if (!on) onPick(p); }}>
             <span class={cx("pm-mark", mark.cls)} aria-hidden="true">{mark.glyph}</span>

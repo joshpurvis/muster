@@ -66,6 +66,7 @@ import { LaunchButtons } from "./layout/Pane.tsx";
 import { focusPane, paneOfSession } from "./layout/tree.ts";
 import { windowParam } from "./model.ts";
 import { RESTART_WAIT_MS } from "./updates.ts";
+import "./prs_notice.ts";
 import type { SessionKind } from "./types.ts";
 import { tildify } from "./util.ts";
 

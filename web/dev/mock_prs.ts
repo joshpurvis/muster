@@ -3,7 +3,8 @@
 // `pr.merge` "merges" a ready card after a moment (any other is refused with its reason).
 // `mock.pr_seed` puts in the sample cards (every state the tab shows), `mock.pr_seed_tall` two
 // cards with a full-page phone picture (too tall to read: one posted after post_pr left such pictures
-// out, one stored before); dev/mock.ts routes `pr.*` and `mock.pr_*` here. Every repo, name, commit and picture is invented: this repo is public.
+// out, one stored before), `mock.pr_post` one new ready card ({n, repo, title}) or posts card `again`
+// again, `mock.pr_withdraw` withdraws card `id`; dev/mock.ts routes `pr.*` and `mock.pr_*` here. Every repo, name, commit and picture is invented: this repo is public.
 
 import type { Pr, PrRead, PrVerdict } from "../src/types.ts";
 
@@ -207,6 +208,19 @@ const TALL_SAMPLES: Sample[] = [231, 232].map((n): Sample => ({
   ...(n === 231 ? { leftOut: [{ index: 1, width: 390, height: 8000 }] } : {}),
 }));
 
+/** A ready card posted just now (`mock.pr_post`): `n`, `repo` and `title` as given. */
+function newSample(p: { n?: number; repo?: string; title?: string }): Sample {
+  const n = Number(p.n ?? 240);
+  return {
+    n, repo: String(p.repo ?? "acme/notes-app"), title: String(p.title ?? "Pin a note to the top of the list"), agent: "builder-4",
+    age_min: 0, sha: `${n.toString(16)}d7e1f`.slice(0, 7), files: 2, add: 31, del: 4, kind: "ready", checks: [2, 2, 0, 0],
+    summary: "A note can be pinned: it stays at the top of the notes list until it is unpinned.",
+    who: "Everyone with more than a screen of notes.", tests: "deno test: 64 passed. Pinned and unpinned three notes by hand.",
+    undo: "Revert the merge commit.", after: "Nothing: the next release picks it up.",
+    pics: [["before", "The notes list", "list"], ["after", "A pinned note on top", "list"]],
+  };
+}
+
 /** The width and height attributes of an `<svg>` (the mock's pictures all have them). */
 function svgSize(body: string): { width: number; height: number } | null {
   const tag = body.slice(0, body.indexOf(">"));
@@ -313,6 +327,22 @@ export function prMock(d: PrDeps) {
     publish(c);
   }
 
+  /** A card posted again: a new commit, words and pictures; what Muster read and what the human
+   * did with the old post start over (src/prs.rs `post`). */
+  function postAgain(c: Pr): Pr {
+    const posted = sha((c.post + 1).toString(16) + "e4d2c1");
+    const read: PrRead = { ...c.github!, at: d.now(), state: "OPEN", head_sha: posted, mergeable: "MERGEABLE",
+      checks: { total: 2, passed: 2, failed: 0, running: 0 } };
+    for (const k of ["refused", "merge", "later", "changes", "closed", "stale_told"] as const) delete c[k];
+    Object.assign(c, { status: "waiting", post: c.post + 1, created_at: d.now(), head_sha: posted, github: read,
+      verdict: verdictOf(read, posted) });
+    const pics = c.pictures ?? [];
+    pics.forEach((x, i) => svgs.has(`${c.id}:${i}`) || svgs.set(`${c.id}:${i}`, SHOTS.editor(x.side === "after")));
+    touch(c);
+    publish(c);
+    return c;
+  }
+
   const listed = () => [...all.values()].filter((p) => p.status !== "withdrawn" && p.status !== "changes_asked");
 
   return {
@@ -379,6 +409,15 @@ export function prMock(d: PrDeps) {
           return { prs: seed() };
         case "mock.pr_seed_tall":
           return { prs: seed(TALL_SAMPLES) };
+        case "mock.pr_withdraw": {
+          const c = get(p.id);
+          c.status = "withdrawn";
+          touch(c);
+          publish(c);
+          return c;
+        }
+        case "mock.pr_post":
+          return p.again != null ? postAgain(get(p.again)) : seed([newSample(p)])[0];
       }
       throw new Error(`unknown method: ${method}`);
     },

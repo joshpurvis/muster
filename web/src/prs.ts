@@ -5,12 +5,16 @@
 // which the daemon accepts only from a click in this window; `pr.merge` is sent only once that
 // card's 5 second countdown has run out (prs_merges.ts: each card's own, in the background).
 //
+// A card posted (or posted again) after this window's first list is new until the tab shows it:
+// `arrivedPrs`. The tab moves to it or says so in its bar (PrsView.tsx); elsewhere a toast says so
+// (prs_notice.ts).
+//
 // The pure part (states, order, the rules and the words) is prs_model.ts, re-exported here.
 
 import { computed, signal } from "@preact/signals";
 import { rpc } from "./rpc.ts";
 import type { Pr, PrSize } from "./types.ts";
-import { type LeftOut, leftOutOf, sortMerged, sortWaiting } from "./prs_model.ts";
+import { type LeftOut, leftOutOf, PostBook, type PrPost, sortMerged, sortWaiting, stillNew } from "./prs_model.ts";
 import type { Seen } from "./prs_merge_queue.ts";
 
 export * from "./prs_model.ts";
@@ -30,6 +34,28 @@ export const waitingPrCount = computed(() => (prsSupported.value ? waitingPrs.va
 
 let changedDuringLoad: Map<number, Pr> | null = null;
 
+/** Posts met after the first list, not shown in the tab yet (oldest first). */
+const newPosts = signal<PrPost[]>([]);
+/** Cards posted, or posted again, while this window was open that the human hasn't looked at in
+ * the tab yet, oldest first (one merged, closed or withdrawn meanwhile drops out). */
+export const arrivedPrs = computed(() => stillNew(newPosts.value, prs.value));
+/** The PRs to merge tab is on screen in this window (PrsView.tsx keeps it). */
+export const prsInView = signal(false);
+const book = new PostBook();
+/** The first list arrived: cards met before it were there when the window opened. */
+let listed = false;
+
+function noteArrival(p: Pr) {
+  if (!book.note(p) || !listed || p.status !== "waiting") return;
+  const keep = new Set(stillNew(newPosts.peek(), prs.peek()).map((x) => x.id));
+  newPosts.value = [...newPosts.peek().filter((a) => a.id !== p.id && keep.has(a.id)), { id: p.id, post: p.post }];
+}
+
+/** The tab showed card `id`: it is new no longer. */
+export function seenPr(id: number) {
+  if (newPosts.peek().some((a) => a.id === id)) newPosts.value = newPosts.peek().filter((a) => a.id !== id);
+}
+
 /** Record card `p` unless this window has a newer copy (every change raises `updated_at`). */
 export function applyPr(p: Pr) {
   const have = prs.value.get(p.id);
@@ -39,6 +65,7 @@ export function applyPr(p: Pr) {
   const next = new Map(prs.value);
   next.set(p.id, p);
   prs.value = next;
+  noteArrival(p);
 }
 
 function applyList(list: Pr[]) {
@@ -60,6 +87,9 @@ export async function loadPrs() {
     }
     prs.value = loaded;
     prsSupported.value = true;
+    // Cards posted while the window was away (a reconnect) are new; on the first list none are.
+    for (const p of [...loaded.values()].sort((a, b) => a.id - b.id)) noteArrival(p);
+    listed = true;
   } catch (e) {
     if (/unknown method/i.test(e instanceof Error ? e.message : String(e))) prsSupported.value = false;
   } finally {

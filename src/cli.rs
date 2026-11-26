@@ -2477,9 +2477,52 @@ fn usage_cell(w: &Value) -> String {
     }
 }
 
+/// One Antigravity window (`antigravity_usage.get`) for `muster profile usage`.
+fn antigravity_cell(w: &Value, now: i64) -> String {
+    let at = |s: i64| jiff::Timestamp::from_second(s).map(|t| t.to_zoned(jiff::tz::TimeZone::system())
+        .strftime("%a %H:%M").to_string()).unwrap_or_default();
+    let Some(used) = w["used_percentage"].as_f64() else { return "unknown".into() };
+    let pct = format!("{}%", used.round() as i64);
+    let stale = w["observed_at"].as_i64().is_none_or(|t| now - t > crate::usage::STALE_AFTER_MS);
+    match w["resets_at"].as_i64() {
+        Some(r) if r * 1000 <= now => format!("unknown (reset {})", at(r)),
+        Some(r) if stale => format!("{pct} (stale), resets {}", at(r)),
+        Some(r) => format!("{pct}, resets {}", at(r)),
+        None if stale => format!("{pct} (stale)"),
+        None => pct,
+    }
+}
+
+/// The Antigravity pools as a table after Claude's (nothing when no tab has reported any).
+fn print_antigravity_usage(agy: &Value, now: i64) {
+    let Some(pools) = agy["pools"].as_array().filter(|p| !p.is_empty()) else { return };
+    let mut table = vec![["Antigravity".to_string(), "5-hour".into(), "Weekly".into(), "Last observed".into()]];
+    for p in pools {
+        let empty = Vec::new();
+        let windows = p["windows"].as_array().unwrap_or(&empty);
+        let cell = |minutes: i64| windows.iter().find(|w| w["window_minutes"].as_i64() == Some(minutes))
+            .map_or_else(|| "unknown".into(), |w| antigravity_cell(w, now));
+        let seen = windows.iter().filter_map(|w| w["observed_at"].as_i64()).max()
+            .map_or_else(|| "never".into(), |t| usage_age(t, now));
+        table.push([p["name"].as_str().unwrap_or("?").to_string(), cell(300), cell(10080), seen]);
+    }
+    let width = |i: usize| table.iter().map(|r| r[i].chars().count()).max().unwrap_or(0);
+    let (w0, w1, w2) = (width(0), width(1), width(2));
+    println!();
+    for r in &table {
+        println!("{:w0$}  {:w1$}  {:w2$}  {}", r[0], r[1], r[2], r[3]);
+    }
+    println!("Antigravity's figures are what agy last told its tabs in Muster; a pool shows once a tab has reported it.");
+}
+
 pub fn profile_usage(d: &Discovery, json_output: bool) -> anyhow::Result<()> {
-    let u = client::rpc(d, "account_usage.get", json!({}))?;
+    let mut u = client::rpc(d, "account_usage.get", json!({}))?;
+    // An older backend has no Antigravity figures: then there are none to show.
+    let agy = client::rpc(d, "antigravity_usage.get", json!({})).unwrap_or(Value::Null);
     if json_output {
+        if let Some(o) = u.as_object_mut() {
+            o.insert("antigravity".into(), agy);
+        }
         println!("{}", serde_json::to_string_pretty(&u)?);
         return Ok(());
     }
@@ -2510,6 +2553,7 @@ pub fn profile_usage(d: &Discovery, json_output: bool) -> anyhow::Result<()> {
         _ => {}
     }
     println!("Usage comes from Claude Code's status line in sessions Muster started; an account nobody used here stays unknown.");
+    print_antigravity_usage(&agy, now);
     Ok(())
 }
 

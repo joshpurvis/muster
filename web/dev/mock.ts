@@ -636,9 +636,19 @@ const AGENT_MODELS = {
     efforts: ["low", "medium", "high", "xhigh", "max"],
   },
   antigravity: {
-    models: ["gemini-4-neon-high", "gemini-4-neon-xhigh", "gemini-4-neon-medium", "gemini-4-carbon-high",
-      "gemini-4-argon-high", "gemini-4-hydrogen-high", "gemini-pro-orchestrator", "gemini-3.8-flash-high"]
-      .map((id) => ({ id, note: null, efforts: null })),
+    models: [
+      { id: "gemini-4-neon", note: null, efforts: ["low", "medium", "high", "xhigh"] },
+      { id: "gemini-4-carbon", note: null, efforts: ["low", "medium", "high"] },
+      { id: "gemini-4-argon", note: null, efforts: ["low", "medium", "high"] },
+      { id: "gemini-4-hydrogen", note: null, efforts: ["low", "medium", "high", "xhigh"] },
+      { id: "gemini-3.8-flash", note: null, efforts: ["low", "medium", "high"] },
+      { id: "gemini-pro-orchestrator-neon", note: "Neon plans, Hydrogen works", efforts: [] },
+      { id: "gemini-pro-orchestrator", note: "Carbon plans, Hydrogen works", efforts: [] },
+      { id: "gemini-pro-orchestrator-argon", note: "Argon plans, Hydrogen works", efforts: [] },
+      { id: "claude-opus-5-5", note: "Claude and GPT quota", efforts: ["low", "medium", "high"] },
+      { id: "claude-sonnet-5-5", note: "Claude and GPT quota", efforts: ["low", "medium", "high"] },
+      { id: "gpt-oss-120b", note: "Claude and GPT quota", efforts: ["medium"] },
+    ],
     efforts: [],
   },
   codex: {
@@ -930,7 +940,7 @@ const sched = scheduleMock({
 // with a weekday summary (mixed history) and a paused hourly check, and a Claude subscription
 // agent that opted in to scheduled work, whose schedule expires tomorrow.
 {
-  newAgent({ name: "demo-gemini", kind: "antigravity", model: "gemini-4-neon-high" });
+  newAgent({ name: "demo-gemini", kind: "antigravity", model: "gemini-4-neon", effort: "high" });
   const worker = newAgent({ ...AGENT_TEMPLATES[5], autostart: false });
   const digest = newAgent({
     name: "digest",
@@ -1716,6 +1726,23 @@ async function handle(method: string, p: any, ws?: WebSocket): Promise<unknown> 
       observed_at: t - 6 * 60_000,
       plan: "pro",
       windows: [{ window_minutes: 10080, used_percentage: 47, resets_at: Math.floor(t / 1000) + 4 * 86_400 }],
+    };
+  }
+  // Antigravity's two quota pools as its tabs last reported them (src/antigravity_usage.rs).
+  if (method === "antigravity_usage.get") {
+    const t = now();
+    const s = Math.floor(t / 1000);
+    const w = (window_minutes: number, used_percentage: number, resets_at: number | null) => ({
+      window_minutes,
+      used_percentage,
+      resets_at,
+      observed_at: t - 3 * 60_000,
+    });
+    return {
+      pools: [
+        { id: "gemini", name: "Gemini models", windows: [w(300, 30, s + 3 * 3600), w(10080, 84, s + 4 * 86_400)] },
+        { id: "3p", name: "Claude and GPT models", windows: [w(300, 12, s + 2 * 3600), w(10080, 0, null)] },
+      ],
     };
   }
   if (method === "openrouter.models") {

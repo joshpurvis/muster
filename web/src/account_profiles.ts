@@ -1,6 +1,7 @@
 import type {
   AccountProfile,
   AccountUsage,
+  AntigravityUsage,
   CodexUsage,
   ProfileChoice,
   SessionInfo,
@@ -183,9 +184,12 @@ export interface UsageBar {
 
 export interface AccountBars {
   key: string;
-  tool: "claude" | "codex";
-  /** Every profile on this account, Default first; "Codex" for Codex. */
+  tool: "claude" | "codex" | "antigravity";
+  /** Every profile on this account, Default first; "Codex" for Codex; an Antigravity pool's short
+   * name ("Gemini", "Claude+GPT"). */
   name: string;
+  /** The name in full where `name` is short (an Antigravity pool), for the tip and screen readers. */
+  full?: string;
   /** Shortest window first: "5h", "Wk". */
   bars: { label: string; bar: UsageBar }[];
 }
@@ -252,6 +256,31 @@ export function codexBars(u: CodexUsage | null, now: number, staleAfterMs: numbe
   return { key: "codex", tool: "codex", name: "Codex", bars };
 }
 
+/** An Antigravity pool's short row name: the sidebar's name column fits about ten characters. */
+const POOL_SHORT: Record<string, string> = { gemini: "Gemini", "3p": "Claude+GPT" };
+
+/** Antigravity's two quota pools (Gemini models; Claude and GPT models), one row each, aged like
+ * Codex's figures. A pool nobody has used yet has no window running: 0%, nothing to reset. */
+export function antigravityBars(u: AntigravityUsage | null, now: number, staleAfterMs: number): AccountBars[] {
+  return (u?.pools ?? []).filter((p) => p.windows.length).map((p) => {
+    const bars = [...p.windows].sort((a, b) => a.window_minutes - b.window_minutes).map((w) => {
+      const n = windowName(w.window_minutes);
+      const win = ageWindow({
+        status: "current",
+        used_percentage: w.used_percentage,
+        resets_at: w.resets_at,
+        observed_at: w.observed_at,
+        reported_at: w.observed_at,
+        reported_by: null,
+      }, now, staleAfterMs);
+      const b = bar(n.title, win, now);
+      const idle = w.resets_at == null && win.status === "current";
+      return { label: n.label, bar: idle ? { ...b, tip: `${n.title}: ${b.label} · no window running` } : b };
+    });
+    return { key: `antigravity:${p.id}`, tool: "antigravity" as const, name: POOL_SHORT[p.id] ?? p.name, full: `Antigravity ${p.name}`, bars };
+  });
+}
+
 export interface UsagePeak {
   /** The account it belongs to. */
   name: string;
@@ -271,7 +300,7 @@ export function peakUsage(accounts: AccountBars[]): UsagePeak | null {
     for (const { bar: b } of a.bars) {
       if (!b.current || b.fill == null || b.fill <= max) continue;
       max = b.fill;
-      best = { name: a.name, label: b.label, level: b.level, tip: `Highest now: ${a.name} · ${b.tip}` };
+      best = { name: a.name, label: b.label, level: b.level, tip: `Highest now: ${a.full ?? a.name} · ${b.tip}` };
     }
   }
   return best;

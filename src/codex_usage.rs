@@ -97,7 +97,7 @@ fn parse_line(line: &str) -> Option<CodexUsage> {
 }
 
 /// "2026-11-11T07:48:58.963Z" as Unix ms (UTC only, as Codex writes it).
-fn parse_ts(s: &str) -> Option<i64> {
+pub(crate) fn parse_ts(s: &str) -> Option<i64> {
     let s = s.strip_suffix('Z')?;
     let (date, time) = s.split_once('T')?;
     let mut d = date.splitn(3, '-').map(|x| x.parse::<i64>().ok());

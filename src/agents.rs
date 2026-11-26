@@ -4213,6 +4213,12 @@ pub struct KindModels {
 ///   printing the CLI's cached catalog: fine for a person to read, not for Muster to depend on),
 ///   and the union of their `supported_reasoning_levels` (a model whose own list is shorter
 ///   gets it as `efforts`).
+/// - Antigravity: `agy models` prints one slug per model and level (`claude-opus-5-5-high`).
+///   Listed here is each base name, which `agy --model <base> --effort <level>` resolves to
+///   that slug, with the levels agy accepts for it (`agy -p /model --model <base> --effort
+///   <level>` says so without starting a turn). The CLI list is empty: Default (agy's own model)
+///   gets no effort, since a bare `--effort` applies to whichever model agy last used, which may
+///   not have that level. Checked with agy 1.5.13 on 25 Nov 2026.
 pub fn model_catalog() -> Value {
     let m = |id, note| ModelChoice { id, note, efforts: None };
     let only = |id, efforts| ModelChoice { id, note: None, efforts: Some(efforts) };
@@ -4241,10 +4247,25 @@ pub fn model_catalog() -> Value {
         ],
         efforts: vec!["low", "medium", "high", "xhigh", "max", "ultra"],
     };
+    let agy = |id, note, efforts| ModelChoice { id, note, efforts: Some(efforts) };
+    let lmh = || vec!["low", "medium", "high"];
+    let lmhx = || vec!["low", "medium", "high", "xhigh"];
+    // The Claude and GPT models draw on their own quota pool, apart from the Gemini models'.
+    let pool = Some("Claude and GPT quota");
     let antigravity = KindModels {
-        models: ["gemini-4-neon-high", "gemini-4-neon-xhigh", "gemini-4-neon-medium",
-            "gemini-4-carbon-high", "gemini-4-argon-high", "gemini-4-hydrogen-high",
-            "gemini-pro-orchestrator", "gemini-3.8-flash-high"].into_iter().map(|id| m(id, None)).collect(),
+        models: vec![
+            agy("gemini-4-neon", None, lmhx()),
+            agy("gemini-4-carbon", None, lmh()),
+            agy("gemini-4-argon", None, lmh()),
+            agy("gemini-4-hydrogen", None, lmhx()),
+            agy("gemini-3.8-flash", None, lmh()),
+            agy("gemini-pro-orchestrator-neon", Some("Neon plans, Hydrogen works"), vec![]),
+            agy("gemini-pro-orchestrator", Some("Carbon plans, Hydrogen works"), vec![]),
+            agy("gemini-pro-orchestrator-argon", Some("Argon plans, Hydrogen works"), vec![]),
+            agy("claude-opus-5-5", pool, lmh()),
+            agy("claude-sonnet-5-5", pool, lmh()),
+            agy("gpt-oss-120b", pool, vec!["medium"]),
+        ],
         efforts: vec![],
     };
     json!({ "claude": claude, "codex": codex, "antigravity": antigravity })
@@ -6206,6 +6227,28 @@ mod tests {
                 }
             }
         }
+        // Antigravity: base names with each model's own levels (`agy models` with agy 1.5.13 lists
+        // `claude-opus-5-5-{low,medium,high}`, `gpt-oss-120b-medium`, ...), reaching agy as
+        // `--model <base> --effort <level>`; no CLI-wide list, so Default gets no effort.
+        let agy = c["antigravity"]["models"].as_array().unwrap();
+        assert_eq!(c["antigravity"]["efforts"], json!([]));
+        let ids: HashSet<&str> = agy.iter().map(|m| m["id"].as_str().unwrap()).collect();
+        assert_eq!(ids.len(), agy.len(), "no duplicates");
+        for m in agy {
+            let id = m["id"].as_str().unwrap();
+            assert!(!["-low", "-medium", "-high", "-xhigh", "-max"].iter().any(|s| id.ends_with(s)), "{id}: a base name");
+            for e in m["efforts"].as_array().unwrap() {
+                let e = e.as_str().unwrap();
+                assert!(["low", "medium", "high", "xhigh", "max"].contains(&e), "{id}: {e}");
+                assert_eq!(agent_args(SessionKind::Antigravity, Some(id), Some(e), None).unwrap(), ["--model", id, "--effort", e]);
+            }
+        }
+        let levels = |id: &str| agy.iter().find(|m| m["id"] == id).unwrap()["efforts"].clone();
+        assert_eq!(levels("claude-opus-5-5"), json!(["low", "medium", "high"]));
+        assert_eq!(levels("claude-sonnet-5-5"), json!(["low", "medium", "high"]));
+        assert_eq!(levels("gpt-oss-120b"), json!(["medium"]));
+        assert_eq!(levels("gemini-4-neon"), json!(["low", "medium", "high", "xhigh"]));
+        assert_eq!(levels("gemini-pro-orchestrator"), json!([]), "agy refuses --effort for an Orchestrator");
         let luna = c["codex"]["models"].as_array().unwrap().iter().find(|m| m["id"] == "gpt-6-luna").unwrap();
         assert!(!luna["efforts"].as_array().unwrap().iter().any(|e| e == "ultra"));
         // The templates only pick what the dialog lists.

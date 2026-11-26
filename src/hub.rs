@@ -1253,6 +1253,34 @@ impl Hub {
         }
     }
 
+    /// Antigravity's plan quota as its tabs last reported it (src/antigravity_usage.rs).
+    pub fn antigravity_usage(&self) -> anyhow::Result<Option<crate::antigravity_usage::AntigravityUsage>> {
+        let stored = self.store.load_runtime(crate::antigravity_usage::STATE_KEY)?.unwrap_or_default();
+        Ok(crate::antigravity_usage::view(&stored))
+    }
+
+    /// An Antigravity tab's quota report (`POST /usage/antigravity`). Its token must belong to an
+    /// Antigravity session; every one shares the machine's agy login, so the newest report wins.
+    pub fn record_antigravity_usage(&self, token: &str, body: &serde_json::Value) -> anyhow::Result<()> {
+        {
+            let g = self.inner.lock();
+            let id = *g.tokens.get(token).context("unknown session token")?;
+            let e = g.sessions.get(&id).context("unknown session token")?;
+            anyhow::ensure!(e.info.kind == SessionKind::Antigravity, "Antigravity usage comes from Antigravity sessions");
+        }
+        let report = crate::antigravity_usage::parse_report(body);
+        if report.is_empty() {
+            return Ok(());
+        }
+        // One read-modify-write at a time: tabs report at once when they start together.
+        static WRITE: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+        let _w = WRITE.lock();
+        let key = crate::antigravity_usage::STATE_KEY;
+        let mut stored: crate::antigravity_usage::Stored = self.store.load_runtime(key).ok().flatten().unwrap_or_default();
+        crate::antigravity_usage::merge(&mut stored, &report, now_ms());
+        self.store.save_runtime(key, &stored)
+    }
+
     /// A status-line report (`POST /usage/claude`), attributed only by its run's session token:
     /// to that session, its current run and the configuration folder that run was launched with
     /// (its pinned profile's, or Default's at the time).
@@ -5643,6 +5671,35 @@ mod tests {
         late["context"]["tokens"] = serde_json::json!(40_000);
         hub.record_usage("claude-run", &late).unwrap();
         assert_eq!(hub.agents.context_size(&hub.agents.by_id(a.id).unwrap()), Some(216_003));
+    }
+
+    /// Antigravity quota reports come only from an Antigravity tab's token, keep the newest
+    /// reading of each bucket and survive a restart (`runtime_state`).
+    #[test]
+    fn antigravity_quota_reports_keep_the_newest_reading_per_bucket() {
+        let hub = fixture(None);
+        hub.inner.lock().tokens.insert("agy-run".into(), 2);
+        hub.inner.lock().tokens.insert("shell-run".into(), 1);
+        let real: serde_json::Value = serde_json::from_str(include_str!("fixtures/antigravity_title_1.5.13.json")).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&crate::antigravity_usage::hook_body(&real).unwrap()).unwrap();
+        // A Claude tab, a shell and an unknown token are refused; nothing is kept.
+        assert!(hub.record_antigravity_usage("agy-run", &body).unwrap_err().to_string().contains("Antigravity sessions"));
+        assert!(hub.record_antigravity_usage("shell-run", &body).is_err());
+        assert!(hub.record_antigravity_usage("nobody", &body).is_err());
+        assert_eq!(hub.antigravity_usage().unwrap(), None);
+        hub.inner.lock().sessions.get_mut(&2).unwrap().info.kind = SessionKind::Antigravity;
+        hub.record_antigravity_usage("agy-run", &body).unwrap();
+        let u = hub.antigravity_usage().unwrap().unwrap();
+        assert_eq!(u.pools.iter().map(|p| p.id).collect::<Vec<_>>(), ["gemini", "3p"]);
+        assert_eq!(u.pools[0].windows[0].used_percentage, 29.9);
+        // A later partial report changes only its own bucket; an empty one changes nothing.
+        hub.record_antigravity_usage("agy-run", &serde_json::json!({"quota": {"3p-5h": {"used_percentage": 12.5, "resets_at": 1_795_676_000}}})).unwrap();
+        hub.record_antigravity_usage("agy-run", &serde_json::json!({"email": "someone@example.invalid"})).unwrap();
+        let u = hub.antigravity_usage().unwrap().unwrap();
+        assert_eq!((u.pools[1].windows[0].used_percentage, u.pools[1].windows[0].resets_at), (12.5, Some(1_795_676_000)));
+        assert_eq!(u.pools[0].windows[0].used_percentage, 29.9);
+        let saved = hub.store.load_runtime::<serde_json::Value>(crate::antigravity_usage::STATE_KEY).unwrap().unwrap();
+        assert!(!saved.to_string().contains("example.invalid"), "{saved}");
     }
 
     /// Usage reports are attributed by the run's token alone: to that session's pinned profile,

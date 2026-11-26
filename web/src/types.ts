@@ -67,6 +67,26 @@ export interface CodexUsage {
   plan: string | null;
 }
 
+/** `antigravity_usage.get`: Antigravity's plan quota as its tabs in Muster last reported it
+ * (src/antigravity_usage.rs). Two pools, each with a 5-hour and a weekly window. */
+export interface AntigravityUsage {
+  pools: {
+    /** "gemini" or "3p" (the Claude and GPT models). */
+    id: string;
+    /** "Gemini models", "Claude and GPT models". */
+    name: string;
+    /** Shortest window first. */
+    windows: {
+      window_minutes: number;
+      used_percentage: number;
+      /** Unix seconds; null while no window is running (the pool is unused). */
+      resets_at: number | null;
+      /** Unix ms: when a tab last reported it. */
+      observed_at: number;
+    }[];
+  }[];
+}
+
 /** `account_usage.get` / `hello.account_usage`. */
 export interface AccountUsage {
   evaluated_at: number;

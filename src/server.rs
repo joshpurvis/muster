@@ -627,12 +627,13 @@ async fn quiet_take(State(hub): State<Arc<Hub>>, headers: HeaderMap, body: Bytes
 
 /// `POST /usage/claude` with the run's session token: attributed by the token alone (to that
 /// session, run and pinned profile), kept out of hooks, events and agent state.
+/// `POST /usage/antigravity`: an Antigravity tab's plan quota (src/antigravity_usage.rs).
 async fn usage_report(State(hub): State<Arc<Hub>>, Path(agent): Path<String>, headers: HeaderMap, body: Bytes) -> Response {
     let Some(token) = bearer(&headers) else {
         return unauthorized();
     };
-    if agent != "claude" {
-        return (StatusCode::NOT_FOUND, axum::Json(json!({ "error": { "message": "usage reports come from Claude" } }))).into_response();
+    if agent != "claude" && agent != "antigravity" {
+        return (StatusCode::NOT_FOUND, axum::Json(json!({ "error": { "message": "usage reports come from Claude or Antigravity" } }))).into_response();
     }
     if hub.session_by_token(token).is_none() {
         return unauthorized();
@@ -640,7 +641,8 @@ async fn usage_report(State(hub): State<Arc<Hub>>, Path(agent): Path<String>, he
     let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&body) else {
         return (StatusCode::BAD_REQUEST, axum::Json(json!({ "error": { "message": "send JSON" } }))).into_response();
     };
-    match hub.record_usage(token, &payload) {
+    let recorded = if agent == "antigravity" { hub.record_antigravity_usage(token, &payload) } else { hub.record_usage(token, &payload) };
+    match recorded {
         Ok(()) => axum::Json(json!({})).into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, axum::Json(json!({ "error": { "message": format!("{e:#}") } }))).into_response(),
     }
@@ -1002,13 +1004,14 @@ mod tests {
             // Usage reports need a session token: not the client's, not none.
             for auth in [&["Authorization: Bearer tok"][..], &[]] {
                 assert_eq!(http(port, "POST", "/usage/claude", auth, "{}").0, 401);
+                assert_eq!(http(port, "POST", "/usage/antigravity", auth, "{}").0, 401);
             }
             assert_eq!(http(port, "POST", "/api/rpc", &["Authorization: Bearer tok", FWD], hello).0, 401);
             // Quiet messages need a session token too.
             for auth in [&["Authorization: Bearer tok"][..], &[]] {
                 assert_eq!(http(port, "POST", "/quiet/take", auth, "{}").0, 401);
             }
-            for path in ["/api/events", "/", "/mcp", "/api/launch-code", "/hook/x", "/usage/claude", "/quiet/take"] {
+            for path in ["/api/events", "/", "/mcp", "/api/launch-code", "/hook/x", "/usage/claude", "/usage/antigravity", "/quiet/take"] {
                 assert_eq!(http(port, "GET", path, &[FWD], "").0, 404, "{path}");
             }
             assert_eq!(http(port, "GET", "/m/", &["Tailscale-Funnel-Request: ?1"], "").0, 403);

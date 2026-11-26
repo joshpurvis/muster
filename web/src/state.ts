@@ -9,6 +9,7 @@ import { batch, computed, effect, signal } from "@preact/signals";
 import type {
   AccountProfile,
   AccountUsage,
+  AntigravityUsage,
   CodexUsage,
   Agent,
   AgentMessage,
@@ -83,6 +84,8 @@ export const accountProfilesSupported = signal(false);
 export const accountUsage = signal<AccountUsage | null>(null);
 /** Codex's plan usage (`codex_usage.get`); null when unknown or the backend can't say. */
 export const codexUsage = signal<CodexUsage | null>(null);
+/** Antigravity's plan quota (`antigravity_usage.get`); null when unknown or the backend can't say. */
+export const antigravityUsage = signal<AntigravityUsage | null>(null);
 /** `hello.openrouter`: null when the backend has no OpenRouter support. */
 export const openRouter = signal<{ key_present: boolean } | null>(null);
 export const channels = signal<Channel[]>([]);

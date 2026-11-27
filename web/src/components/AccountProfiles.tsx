@@ -303,7 +303,8 @@ export function ProfilePill({ value, onChange, disabled = false, tip, selectRef,
           ...(missing ? [{ value: String(shown), label: `Unavailable profile #${shown}`, disabled: true }] : []),
           ...profiles.map((p) => ({
             value: String(p.id),
-            label: p.name + (p.enabled ? "" : " (disabled)"),
+            label: p.name + (p.is_default ? " · Default" : "") + (p.enabled ? "" : " (disabled)"),
+            short: p.name,
             disabled: !p.enabled,
           })),
         ]}
@@ -406,6 +407,7 @@ function ProfileRow({ profile, open, onToggle }: { profile: AccountProfile; open
       >
         <span class="pf-name">{profile.name}</span>
         <span class="pf-path">{tildify(profile.config_dir, meta.value.home)}</span>
+        {profile.is_default && <span class="pf-default" title="Sessions without a profile use this one">Default</span>}
         {!profile.enabled && <span class="pf-note">Disabled</span>}
         {sameAs.length > 0 && <span class="pf-note">same account as {sameAs.map((p) => p.name).join(", ")}</span>}
         <IconChevron size={12} class="pf-chev" />

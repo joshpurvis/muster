@@ -2859,6 +2859,10 @@ async fn run_agent(hub: &Arc<Hub>, mut agent: Agent, fresh: bool, window: Option
         })
         .await?;
     agent.session_id = Some(session.id);
+    // Its launch may have recorded another account on it (`Hub::launch_account`).
+    if let Some(now) = hub.agents().by_id(agent.id) {
+        agent.account_profile_id = now.account_profile_id;
+    }
     Ok(AgentSession { agent, session, started: true, woke, new_conversation: false })
 }
 

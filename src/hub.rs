@@ -1221,7 +1221,7 @@ impl Hub {
     /// The registered profiles, the one Default folds into marked `is_default`.
     pub fn account_profiles(&self) -> anyhow::Result<Vec<crate::account_profiles::AccountProfile>> {
         let mut profiles = self.store.account_profiles()?;
-        let home = crate::account_profiles::launch_home(&std::env::vars().collect());
+        let home = crate::account_profiles::own_home();
         if let Some(id) = crate::account_profiles::folded_default(&profiles, home.as_deref()).map(|p| p.id) {
             for p in &mut profiles { p.is_default = p.id == id; }
         }
@@ -1241,26 +1241,33 @@ impl Hub {
     pub fn fold_default_records(&self) -> anyhow::Result<()> {
         let profiles = self.account_profiles()?;
         let target = profiles.iter().find(|p| p.is_default).map(|p| p.id);
-        let at_folder = |dir: &Path| profiles.iter().filter(|p| p.enabled)
-            .find(|p| std::fs::canonicalize(&p.config_dir).is_ok_and(|c| c == dir)).map(|p| p.id);
-        let unset: Vec<SessionId> = self.inner.lock().sessions.values()
+        let at_folder = |dir: &Path| profiles.iter()
+            .filter(|p| p.enabled && crate::account_profiles::in_place(p))
+            .find(|p| Path::new(&p.config_dir) == dir).map(|p| p.id);
+        let unset: Vec<(SessionId, bool)> = self.inner.lock().sessions.values()
             .filter(|e| e.info.kind == SessionKind::Claude && e.info.account_profile_id.is_none())
-            .map(|e| e.info.id).collect();
-        for id in unset {
-            let live = self.terminal_records.lock().get(&id).filter(|r| !r.retired)
-                .map(|r| crate::usage::effective_config_dir(&r.spec.env));
+            .map(|e| (e.info.id, e.info.state != AgentState::Exited)).collect();
+        // Live runs on a folder no profile has: they and their agents stay Default until next start.
+        let mut unmatched = HashSet::new();
+        for (id, running) in unset {
+            let live = running.then(|| self.terminal_records.lock().get(&id).filter(|r| !r.retired)
+                .map(|r| crate::usage::effective_config_dir(&r.spec.env))).flatten();
             let profile = match live {
                 Some(folder) => folder.as_deref().and_then(at_folder),
                 None => target,
             };
-            if profile.is_some() {
-                self.set_session_account_profile(id, profile)?;
+            match profile {
+                Some(_) => self.set_session_account_profile(id, profile)?,
+                None => { unmatched.insert(id); }
             }
         }
         for a in self.agents.list() {
             if a.kind != SessionKind::Claude || a.account_profile_id.is_some() { continue }
-            let tab = a.session_id.and_then(|s| self.session(s)).filter(|s| s.kind == SessionKind::Claude)
-                .and_then(|s| s.account_profile_id);
+            if a.session_id.is_some_and(|s| unmatched.contains(&s)) { continue }
+            // A move waiting for its next start goes to Default: that is the profile now, not
+            // the account its tab still runs on.
+            let tab = a.session_id.filter(|_| a.handoff.is_none()).and_then(|s| self.session(s))
+                .filter(|s| s.kind == SessionKind::Claude).and_then(|s| s.account_profile_id);
             if let Some(profile) = tab.or(target)
                 && let Some(a) = self.agents.set_account_profile(&self.store, a.id, Some(profile))? {
                 crate::agents::publish(self, &a);
@@ -3966,17 +3973,25 @@ impl Hub {
         if pinned.is_some() && !profiles.iter().any(|p| p.is_default) {
             candidates.push(None);
         }
-        let Some(found) = candidates.into_iter().find(|c| {
-            folder(*c).is_some_and(|d| Some(&d) != here.as_ref() && crate::account_profiles::has_conversation(&d, &conversation))
-                && self.check_account_profile(*c).is_ok()
-        }) else {
+        // Exactly one other folder has it (a copied config folder could hold it twice).
+        let mut found: Vec<(Option<i64>, PathBuf)> = Vec::new();
+        for c in candidates {
+            if let Some(d) = folder(c).filter(|d| Some(d) != here.as_ref())
+                && !found.iter().any(|(_, f)| *f == d)
+                && crate::account_profiles::has_conversation(&d, &conversation)
+                && self.check_account_profile(c).is_ok() {
+                found.push((c, d));
+            }
+        }
+        let [(found, _)] = found.as_slice() else {
             return Ok(pinned);
         };
+        let found = *found;
         let name = |id: Option<i64>| match id {
             Some(id) => profiles.iter().find(|p| p.id == id).map_or_else(|| format!("profile #{id}"), |p| p.name.clone()),
             None => "Default".to_string(),
         };
-        let text = format!("Muster started {} on Claude account {}, where its conversation is saved, instead of {}. \
+        let text = format!("Muster is starting {} on Claude account {}, where its conversation is saved, instead of {}. \
             It stays on {} from now on.", info.name, name(found), name(pinned), name(found));
         tracing::info!(session = info.id, "{text}");
         self.log_event(Some(info.channel_id), Some(info.id), EventKind::System, serde_json::json!({
@@ -5990,6 +6005,14 @@ mod tests {
         save("personal", "conv-personal");
         hub.update_account_profile(personal.id, None, Some(false)).unwrap();
         assert_eq!(account(&hub, "conv-personal"), Some(work.id));
+        // In two other folders (a copied config folder): ambiguous, so it stays.
+        std::fs::create_dir_all(base.join("copy")).unwrap();
+        let copy = hub.add_account_profile("Copy", base.join("copy").to_str().unwrap()).unwrap();
+        hub.update_account_profile(personal.id, None, Some(true)).unwrap();
+        save("copy", "conv-personal");
+        assert_eq!(account(&hub, "conv-personal"), Some(work.id));
+        hub.update_account_profile(personal.id, None, Some(false)).unwrap();
+        hub.update_account_profile(copy.id, None, Some(false)).unwrap();
         // A fresh start or `--continue` names no conversation: nothing to look for.
         assert_eq!(hub.launch_account(&hub.session(2).unwrap(), &["--continue".into()]).unwrap(), Some(work.id));
         while events.try_recv().is_ok() {}
@@ -6057,6 +6080,27 @@ mod tests {
         hub.update_account_profile(main.id, None, Some(false)).unwrap();
         assert_eq!(hub.fold_default(None), None);
         assert!(hub.account_profiles().unwrap().iter().all(|p| !p.is_default));
+        let _ = std::fs::remove_dir_all(&other);
+    }
+
+    /// An agent whose move to Default waits for its next start takes the profile Default becomes,
+    /// not the account its tab still runs on.
+    #[test]
+    fn a_pending_move_to_default_folds_to_the_new_default() {
+        let hub = agent_fixture();
+        let Some(default_dir) = crate::account_profiles::default_folder(&std::env::vars().collect()) else { return };
+        let other = std::env::temp_dir().join(format!("muster-hub-fold-move-{}", paths::random_token()));
+        std::fs::create_dir_all(&other).unwrap();
+        let spare = hub.add_account_profile("Spare", other.to_str().unwrap()).unwrap();
+        let ada = hub.agents.by_session(2).unwrap();
+        hub.agents.set_account_profile(&hub.store, ada.id, Some(spare.id)).unwrap();
+        hub.set_session_account_profile(2, Some(spare.id)).unwrap();
+        let req: crate::agents::AgentUpdate = serde_json::from_value(serde_json::json!({"name": "ada", "account_profile": "default"})).unwrap();
+        let moved = crate::agents::update(&hub, req, false).unwrap();
+        assert_eq!((moved.account_profile_id, moved.handoff.is_some()), (None, true));
+        let main = hub.add_account_profile("Main", default_dir.to_str().unwrap()).unwrap();
+        assert_eq!(hub.agents.by_session(2).unwrap().account_profile_id, Some(main.id));
+        assert_eq!(hub.session(2).unwrap().account_profile_id, Some(spare.id), "the tab keeps its run's account");
         let _ = std::fs::remove_dir_all(&other);
     }
 

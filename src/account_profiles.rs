@@ -198,7 +198,9 @@ pub fn inherited_removals<'a>(vars: impl Iterator<Item = (&'a str, &'a str)> + C
 
 /// At backend start, before any thread exists: drop [`inherited_removals`] from its environment.
 pub fn take_inherited_env() {
-    let vars: Vec<(String, String)> = std::env::vars().collect();
+    // Only variables with Unicode names and values can be ours; others are left as they are.
+    let vars: Vec<(String, String)> = std::env::vars_os()
+        .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?))).collect();
     for var in inherited_removals(vars.iter().map(|(k, v)| (k.as_str(), v.as_str()))) {
         // SAFETY: called from `run_daemon` before the runtime (or any other thread) starts, so
         // nothing reads the environment concurrently.
@@ -216,7 +218,14 @@ pub fn default_folder(env: &BTreeMap<String, String>) -> Option<std::path::PathB
 /// of `home` (the lowest id if several reach it). None keeps Default as its own choice.
 pub fn folded_default<'a>(profiles: &'a [AccountProfile], home: Option<&Path>) -> Option<&'a AccountProfile> {
     let home = home?;
-    profiles.iter().filter(|p| p.enabled && is_default_folder(Path::new(&p.config_dir), home)).min_by_key(|p| p.id)
+    profiles.iter().filter(|p| p.enabled && in_place(p) && is_default_folder(Path::new(&p.config_dir), home))
+        .min_by_key(|p| p.id)
+}
+
+/// Whether `profile`'s folder is still where it was registered (not moved or redirected by a
+/// link): only such a profile can launch ([`apply_environment`]).
+pub fn in_place(profile: &AccountProfile) -> bool {
+    std::fs::canonicalize(&profile.config_dir).is_ok_and(|c| c.is_dir() && c == Path::new(&profile.config_dir))
 }
 
 /// Whether Claude Code has conversation `id` saved in configuration folder `dir`. Claude Code
@@ -232,6 +241,13 @@ pub fn has_conversation(dir: &Path, id: &str) -> bool {
     let Ok(projects) = std::fs::read_dir(dir.join("projects")) else { return false };
     let file = format!("{id}.jsonl");
     projects.flatten().any(|p| p.path().join(&file).is_file())
+}
+
+/// The backend's own HOME as [`launch_home`] reads it (only that variable, so an unrelated
+/// non-Unicode one never matters).
+pub fn own_home() -> Option<std::path::PathBuf> {
+    let env: BTreeMap<String, String> = std::env::var("HOME").ok().map(|h| ("HOME".to_string(), h)).into_iter().collect();
+    launch_home(&env)
 }
 
 /// The HOME a child launched with `env` resolves `~/.claude` against: its own HOME, or the

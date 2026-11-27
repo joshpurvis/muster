@@ -792,9 +792,14 @@ function newAgent(p: any): MockAgent {
 let orKey = false;
 // Two Claude account profiles and their last reported usage, so the New tab and New agent
 // dialogs show the profile picker and the capacity table (src/account_profiles.rs, loosely).
+// MOCK_DEFAULT_PROFILE=1: "Work" is registered at ~/.claude, so it is Default (`is_default`) and
+// Usage has no Default row of its own.
+const FOLDED_DEFAULT = Deno.env.get("MOCK_DEFAULT_PROFILE") === "1";
 const accountProfiles = [
-  { id: 1, name: "Work", config_dir: HOME + "/.claude-work", enabled: true, created_at: now(), account_group: null },
-  { id: 2, name: "Personal", config_dir: HOME + "/.claude-personal", enabled: true, created_at: now(), account_group: null },
+  { id: 1, name: "Work", config_dir: HOME + (FOLDED_DEFAULT ? "/.claude" : "/.claude-work"), enabled: true,
+    created_at: now(), account_group: null, is_default: FOLDED_DEFAULT },
+  { id: 2, name: "Personal", config_dir: HOME + "/.claude-personal", enabled: true, created_at: now(), account_group: null,
+    is_default: false },
 ];
 function accountUsage() {
   const t = now();
@@ -813,7 +818,8 @@ function accountUsage() {
   return {
     evaluated_at: t,
     stale_after_ms: 15 * 60_000,
-    rows: [row("default", "Default", null, null), row(1, "Work", 82, 61), row(2, "Personal", 12, 30)],
+    rows: [...(FOLDED_DEFAULT ? [] : [row("default", "Default", null, null)]), row(1, "Work", 82, 61),
+      row(2, "Personal", 12, 30)],
     suggestion: { choice: 2, name: "Personal", choices: [2], reason: "It has the most known room in both windows." },
     no_suggestion: null,
   };

@@ -342,6 +342,8 @@ fn find(parent: &mut [usize], i: usize) -> usize {
 /// The rows (Default first, then every profile), each with its account's newest observation
 /// per window, and a suggestion among the eligible ones. `default_dir` is the folder new
 /// Default sessions would use now; observations filed under a folder no row uses are not shown.
+/// When Default is a profile (`is_default`, src/account_profiles.rs), there is no Default row:
+/// that profile's row stands for both.
 pub fn snapshot(profiles: &[AccountProfile], observations: &[(String, Window, Observation)],
     eligible: impl Fn(Option<ProfileId>) -> Result<(), String>, default_dir: Option<&Path>, now: i64) -> UsageSnapshot {
     // Row 0 is Default. Rows on one folder, or in one group the human declared, share an account.
@@ -364,7 +366,11 @@ pub fn snapshot(profiles: &[AccountProfile], observations: &[(String, Window, Ob
         }
     }
     let roots: Vec<usize> = (0..n).map(|i| find(&mut parent, i)).collect();
-    let name = |i: usize| if i == 0 { "Default".to_string() } else { profiles[i - 1].name.clone() };
+    let folded = profiles.iter().find(|p| p.is_default).map(|p| p.name.clone());
+    let name = |i: usize| match i {
+        0 => folded.clone().unwrap_or_else(|| "Default".to_string()),
+        _ => profiles[i - 1].name.clone(),
+    };
     let key = |i: usize| dirs[i].as_deref().map(folder_key);
     let rank = |o: &Observation| (o.observed_at.is_some(), o.observed_at, o.reported_at);
     let mut rows = Vec::with_capacity(n);
@@ -392,9 +398,18 @@ pub fn snapshot(profiles: &[AccountProfile], observations: &[(String, Window, Ob
         rows.push(UsageRow {
             choice, name: name(i), enabled, eligible: check.is_ok(), ineligible_reason: check.err(),
             account: format!("account-{}", roots[i]),
-            same_account_as: members.iter().copied().filter(|&j| j != i).map(name).collect(),
+            same_account_as: {
+                let mut names: Vec<String> = Vec::new();
+                for other in members.iter().copied().filter(|&j| j != i).map(name) {
+                    if other != name(i) && !names.contains(&other) { names.push(other); }
+                }
+                names
+            },
             five_hour: view(Window::FiveHour), seven_day: view(Window::SevenDay),
         });
+    }
+    if folded.is_some() {
+        rows.remove(0);
     }
     let (suggestion, no_suggestion) = match suggest(&rows) {
         Ok(s) => (Some(s), None),
@@ -892,7 +907,7 @@ mod tests {
 
     fn profile(id: i64, name: &str, dir: &str, group: Option<&str>) -> AccountProfile {
         AccountProfile { id, name: name.into(), config_dir: dir.into(), enabled: true, created_at: 0,
-            account_group: group.map(str::to_string) }
+            account_group: group.map(str::to_string), is_default: false }
     }
 
     fn obs(five: f64, seven: f64, at: i64, sid: SessionId) -> [(Window, Observation); 2] {
@@ -957,6 +972,25 @@ mod tests {
             default, NOW);
         assert!(s.no_suggestion.unwrap().contains("Only one Claude account"));
         assert_eq!(s.rows[2].ineligible_reason.as_deref(), Some("disabled"));
+    }
+
+    /// Default folded into the profile at its folder (`is_default`): one row for both, named for
+    /// the profile, and never suggested as "Default".
+    #[test]
+    fn a_folded_default_has_no_row_of_its_own() {
+        let mut main = profile(1, "Main", "/home/u/.claude", None);
+        main.is_default = true;
+        let profiles = [main, profile(2, "Spare", "/s", None)];
+        let mut o = filed("/home/u/.claude", obs(10.0, 20.0, NOW - 1000, 1));
+        o.extend(filed("/s", obs(50.0, 60.0, NOW - 1000, 2)));
+        let s = snapshot(&profiles, &o, |_| Ok(()), Some(Path::new("/home/u/.claude")), NOW);
+        assert_eq!(s.rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), ["Main", "Spare"]);
+        assert!(s.rows.iter().all(|r| r.choice != ProfileChoice::pinned(None) && r.same_account_as.is_empty()), "{:?}", s.rows);
+        assert_eq!(s.rows[0].five_hour.used_percentage, Some(10.0));
+        assert_eq!(s.rows[0].five_hour.reported_by, None);
+        let sug = s.suggestion.unwrap();
+        assert_eq!((sug.choice, sug.choices.clone()), (ProfileChoice::Id(1), vec![ProfileChoice::Id(1)]));
+        assert!(!sug.reason.contains("Default"), "{}", sug.reason);
     }
 
     /// Default's figures belong to the folder its sessions ran with: after the backend restarts

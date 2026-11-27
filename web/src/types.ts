@@ -17,9 +17,12 @@ export interface AccountProfile {
   created_at: number;
   /** Profiles with the same value were declared to sign in to one account. */
   account_group?: string | null;
+  /** Default means this profile: it is the enabled one at Claude Code's default folder
+   * (~/.claude), so it is shown wherever Default would be. Older backends omit it. */
+  is_default?: boolean;
 }
 
-/** Omitted: inherit. "default": explicitly use the ordinary inherited Claude environment. */
+/** Omitted: inherit. "default": Claude Code's default folder (~/.claude), or the profile there. */
 export type ProfileChoice = number | "default";
 
 /** src/usage.rs `Status`: only "current" counts as known room. */

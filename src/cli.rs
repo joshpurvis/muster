@@ -2414,7 +2414,10 @@ pub fn profile_list(d: &Discovery, json_output: bool) -> anyhow::Result<()> {
     if json_output { println!("{}", serde_json::to_string_pretty(&profiles)?); }
     else if profiles.is_empty() { println!("No Claude profiles registered. Set up a directory in Claude Code, then use `muster profile add NAME DIRECTORY`."); }
     else {
-        for p in profiles { println!("{}\t{}\t{}\t{}", p.id, p.name, if p.enabled { "enabled" } else { "disabled" }, p.config_dir); }
+        for p in profiles {
+            println!("{}\t{}\t{}\t{}{}", p.id, p.name, if p.enabled { "enabled" } else { "disabled" }, p.config_dir,
+                if p.is_default { "\tdefault" } else { "" });
+        }
     }
     Ok(())
 }
@@ -2432,13 +2435,13 @@ pub fn profile_add(d: &Discovery, name: &str, directory: &std::path::Path) -> an
     if crate::account_profiles::launch_home(&shell_env)
         .is_some_and(|home| crate::account_profiles::is_default_folder(std::path::Path::new(&directory), &home))
     {
-        println!("This is Claude Code's default folder (~/.claude for this shell's HOME). When Muster runs with the same HOME, its sessions start without CLAUDE_CONFIG_DIR, so Claude Code uses ~/.claude and ~/.claude.json. Sign in to it with plain `claude` (or `env -u CLAUDE_CONFIG_DIR claude`), never `CLAUDE_CONFIG_DIR=~/.claude claude`.");
+        println!("This is Claude Code's default folder (~/.claude for this shell's HOME). When Muster runs with the same HOME, its sessions start without CLAUDE_CONFIG_DIR, so Claude Code uses ~/.claude and ~/.claude.json. Sign in to it with plain `claude` (or `env -u CLAUDE_CONFIG_DIR claude`), never `CLAUDE_CONFIG_DIR=~/.claude claude`. While it is enabled it is Default: sessions without a profile, and choices of `default`, use it.");
     }
     Ok(())
 }
 
 pub fn profile_update(d: &Discovery, profile: &str, name: Option<String>, enabled: Option<bool>) -> anyhow::Result<()> {
-    let id = profile_choice(d, profile)?.as_i64().context("Default is inherited behavior, not an editable profile")?;
+    let id = profile_choice(d, profile)?.as_i64().context("Default is Claude Code's default folder (~/.claude), not an editable profile; register ~/.claude as a profile to name it")?;
     let p = client::rpc(d, "account_profile.update", json!({"id": id, "name": name, "enabled": enabled}))?;
     println!("{}: {}. Running sessions are unchanged.", p["name"].as_str().unwrap_or(profile), if p["enabled"] == true { "enabled" } else { "disabled" });
     Ok(())

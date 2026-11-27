@@ -42,22 +42,22 @@ directory, not a verified account identity.
   sessions and `--fresh`; moving it to another profile (Edit agent, or `muster agent edit NAME
   --profile PROFILE`) starts a new conversation there with a handoff note (see "Moving a named
   agent to another account" below).
-  The New Tab dialog starts with explicit **Default**; choose the profile for each new
+  The New Tab dialog starts with explicit **Default** (or the profile Default is, see "Default"
+  below); choose the profile for each new
   session. Profile settings do not show the backend's saved workspace history. Workspace
   defaults remain available through the CLI for launches that omit an explicit choice.
 - New Claude sessions resolve selection in this order: explicit choice, calling/parent
-  Claude session, workspace default, ordinary inherited Claude environment. Named agents
-  always supply their own pinned choice. `"default"` explicitly chooses the ordinary
-  environment; an omitted/null API field inherits. Non-Claude sessions reject a profile
-  choice and do not apply workspace profile defaults.
+  Claude session, workspace default, Default. Named agents always supply their own pinned
+  choice. `"default"` explicitly chooses Default; an omitted/null API field inherits.
+  Non-Claude sessions reject a profile choice and do not apply workspace profile defaults.
 - The resolved profile ID is persisted on the session. Restart, backend recovery and moving
   a session to another workspace do not re-resolve it. A disabled, missing or redirected
   directory blocks a launch; restart checks before interrupting the previous run. An
   already running named agent remains usable after its profile is disabled.
 - Known inherited authentication/endpoint overrides are refused for named-profile launches,
   with errors containing variable names only. Muster never unsets them silently or reads
-  settings files to determine effective authentication. Explicit Default preserves existing
-  behavior. Profile/project/managed settings and external login changes still belong to
+  settings files to determine effective authentication. Default (while no profile is
+  registered at `~/.claude`) keeps them as they are. Profile/project/managed settings and external login changes still belong to
   Claude Code: the human verifies the active account with `/status`.
 
 A named agent can also run on OpenRouter (docs/PROTOCOL.md "OpenRouter"): that is the owner's
@@ -117,7 +117,7 @@ A `CLAUDE_CONFIG_DIR` that is relative or empty, or (without one) a relative `HO
 Muster can't place: Claude Code would resolve it against the session's own working directory,
 not the backend's, and an empty value's meaning isn't documented. Such a session's status line is
 left to Claude Code (even when a project file decides it), its reports are filed nowhere, and
-Default shows unknown while the backend itself runs with one. Profiles always launch with an
+Default shows unknown while the backend itself runs with a relative HOME. Profiles always launch with an
 absolute folder.
 
 The repository root is found by reading `.git` entries, never by running git (a repository's own
@@ -158,7 +158,7 @@ process each time, which the composition above is built to avoid.)
 
 **Attribution and freshness.** The daemon maps the token to its session and current run
 (generation). At launch Muster records the configuration folder that run really uses (its
-profile's, or Default's `CLAUDE_CONFIG_DIR` / `~/.claude` at the time), and observations are
+profile's, or Default's `~/.claude`), and observations are
 filed per folder: one folder, one login. Nothing in the payload is trusted to name an account or
 a folder (a session can still misreport its own folder's numbers); a run without a launch record
 reports nothing. Claude Code redraws the status line with its cached numbers for many reasons
@@ -186,9 +186,8 @@ snapshot by its own timestamps every 30 seconds, so a window that can't reach Mu
 figures stale or reset on time and drops a suggestion older than 2.5 minutes. Accounts nobody used
 in Muster stay unknown: Muster never probes.
 
-**One account, several rows.** Default and a profile on the same folder are one account
-automatically; Default shows the folder its new sessions would use now, so after the backend
-restarts with another `CLAUDE_CONFIG_DIR` it no longer shows the old folder's figures. The human
+**One account, several rows.** A profile on Default's folder is Default (one row, see
+"Default"). The human
 can declare two profiles one account ("Signs in to: the same account as …",
 `muster profile same-account`); their newest observations are shared and never added together.
 "Login changed" (`muster profile login-changed`, for a profile or `default`) forgets the folder's
@@ -203,11 +202,45 @@ counts as room. The new-session flow shows the table and the suggestion with a *
 button; the selection never changes by itself, and there is no automatic choice or rollover. No
 workspace restrictions on eligible profiles exist yet, so none are applied.
 
-Shown in **Settings and more → Claude profiles** (Usage table, including Default) and under the
+Shown in **Settings and more → Claude profiles** (Usage table, including Default unless a
+profile is Default) and under the
 profile picker of New Tab and the named-agent dialog (when at least one profile is registered).
 CLI: `muster profile usage [--json]`. RPC and endpoint details: [PROTOCOL.md](PROTOCOL.md#claude-account-profiles).
 `scripts/account-profiles-smoke.py --browser` drives the reporter through a fake Claude that runs
 its status-line command like Claude Code does.
+
+### Default
+
+Default is Claude Code's default folder, `~/.claude` (`$HOME/.claude` with `CLAUDE_CONFIG_DIR`
+unset), whoever started or reloaded Muster:
+
+- The backend drops `CLAUDE_CONFIG_DIR` from its own environment when it starts, whatever started
+  it (`muster`, `muster reload`, the window's restart, a command that autostarts it). A backend
+  started from inside a Muster tab (`muster reload` typed in an agent's session) also drops that
+  tab's own variables (`MUSTER_SESSION_ID`, `MUSTER_TOKEN`, `MUSTER_URL`, `MUSTER_CHANNEL_ID`,
+  `MUSTER_HOOK_DB`, `MUSTER_RUN`, `MUSTER_BIN`, `MUSTER_PORT_BASE`, `MUSTER`, and `PORT` when it
+  is the tab's port). `CODEX_HOME` and other tools' variables stay: Muster never sets them per
+  session. The OpenRouter key keeps its own rule (see OPENROUTER.md). Default launches remove
+  `CLAUDE_CONFIG_DIR` as well. Before 27 Nov 2026 Default inherited the variable, so a reload
+  typed in a tab on another profile moved every later Default launch to that profile's folder,
+  and the next restart from a plain terminal moved them back, losing their conversations.
+- **A profile at `~/.claude` is Default.** When an enabled profile points at Claude Code's default
+  folder, Default and that profile are one choice: sessions, named agents and workspace defaults
+  saved as Default take that profile (at backend start and when the profile is registered or
+  enabled), new choices of Default resolve to it, the pickers show only its name, and Usage has
+  no separate Default row. A session whose run is live keeps the profile of the folder that run
+  really uses (from its launch record). Choosing Default for an agent already on that profile
+  moves nothing. Without such a profile, Default stays its own choice, shown as "Default".
+- **Every launch records its account.** A Claude session's record names the profile its run
+  started with, never Default once that is a profile.
+- **A resumed conversation runs where it is saved.** When a Claude launch reopens a conversation
+  (`--resume <id>` in its arguments, or a named agent's saved conversation) and that
+  conversation is saved only under another enabled profile's folder (or Default's, while no
+  profile is Default), the launch runs on that profile, the session and its agent record it, and
+  the owner is told once (a notice and a line in the tab's timeline). Saved in its own folder,
+  in both, or nowhere: nothing changes (nowhere: Claude Code says "No conversation found" as
+  before). A conversation is found by its file name only: Claude Code (checked with 2.1.331)
+  keeps it as `<folder>/projects/<project>/<id>.jsonl`, and any project folder counts.
 
 The rest of this document describes the full roadmap, including deferred features.
 
@@ -238,8 +271,8 @@ separate state file at `~/.claude/.claude.json` instead. Sign in to that folder 
 `claude` (or `env -u CLAUDE_CONFIG_DIR claude`), not `CLAUDE_CONFIG_DIR=~/.claude claude`. HOME is
 the session's own (else the daemon user's home); an empty or relative HOME never counts, and
 the profile then keeps its explicit `CLAUDE_CONFIG_DIR`. A `CLAUDE_CONFIG_DIR` in the daemon's
-own environment does not make its folder "the default": a profile there gets the same value
-set.
+own environment does not make its folder "the default" (the backend drops that variable at
+start anyway): a profile there gets the same value set.
 
 Preserve the credential boundary in PLAN.md: Muster never reads, copies, stores, refreshes,
 or proxies Claude credentials or tokens. Claude Code owns authentication. Profile setup
@@ -270,7 +303,7 @@ and account-group membership; a directory binding is not proof of account identi
 
 Persist the selected profile on the session so restarting it does not silently change
 accounts. A disabled or missing profile requires a visible selection or setup action. Existing
-sessions without a profile retain the current default-login behavior until explicitly changed.
+sessions without a profile run on Claude Code's default folder (see "Default").
 
 Workspace preferences can restrict eligible profiles and machines. An automatic suggestion
 must respect these preferences, including tasks that should stay on a particular account.

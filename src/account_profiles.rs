@@ -1,7 +1,15 @@
 //! Human-managed references to Claude Code configuration directories.
 //!
-//! This module may stat a directory, but never reads or writes its contents. Authentication,
-//! onboarding, settings and account identity belong to the official Claude Code binary.
+//! This module may stat a directory, but never reads or writes its contents; the one exception
+//! is [`has_conversation`], which lists a folder's `projects/` to see whether a conversation file
+//! exists (by name, never opened). Authentication, onboarding, settings and account identity
+//! belong to the official Claude Code binary.
+//!
+//! Default (no profile) is Claude Code's own default folder, `$HOME/.claude` with
+//! `CLAUDE_CONFIG_DIR` unset, whoever started or reloaded the backend: the backend drops the
+//! variable from its own environment at start ([`take_inherited_env`]) and Default launches
+//! remove it ([`apply_default`]). When a registered, enabled profile points at that folder,
+//! Default is that profile ([`folded_default`]): records, pickers and labels use it instead.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -23,10 +31,14 @@ pub struct AccountProfile {
     /// account, so they share its limits (src/usage.rs). Never derived from login files.
     #[serde(default)]
     pub account_group: Option<String>,
+    /// Computed when read, never stored: Default means this profile (it is the enabled one at
+    /// Claude Code's default folder, [`folded_default`]), so pickers show it instead of Default.
+    #[serde(default)]
+    pub is_default: bool,
 }
 
-/// Omitted/null on creation means inherit; "default" explicitly selects the ordinary
-/// daemon-inherited Claude environment. Once resolved, sessions persist an ID or null.
+/// Omitted/null on creation means inherit; "default" explicitly selects Default (Claude Code's
+/// default folder, or the profile there). Once resolved, sessions persist an ID or null.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ProfileChoice {
@@ -131,7 +143,7 @@ pub fn apply_environment(
         .collect();
     anyhow::ensure!(
         conflicts.is_empty(),
-        "Claude profile '{}' conflicts with inherited {}. Remove these overrides from Muster's launch environment, or explicitly choose Default to keep ordinary inherited behavior. No authentication files were changed",
+        "Claude profile '{}' conflicts with inherited {}. Remove these overrides from Muster's launch environment, or choose Default (while no profile is registered at ~/.claude) to keep them. No authentication files were changed",
         profile.name,
         conflicts.join(", ")
     );
@@ -155,6 +167,71 @@ pub fn apply_environment(
         env.insert("CLAUDE_CONFIG_DIR".into(), profile.config_dir.clone());
     }
     Ok(())
+}
+
+/// A Default launch: Claude Code's default folder, so any `CLAUDE_CONFIG_DIR` in `env` goes.
+pub fn apply_default(env: &mut BTreeMap<String, String>) {
+    env.remove("CLAUDE_CONFIG_DIR");
+}
+
+/// What a session's environment holds that Muster set for that session alone (src/hub.rs
+/// `start_process`). A backend started from inside a session (`muster reload` or `muster` typed
+/// in a tab) would otherwise keep them and hand them to every later session and command.
+const SESSION_VARS: &[&str] = &[
+    "MUSTER", "MUSTER_SESSION_ID", "MUSTER_CHANNEL_ID", "MUSTER_URL", "MUSTER_TOKEN", "MUSTER_HOOK_DB",
+    "MUSTER_RUN", "MUSTER_BIN", "MUSTER_PORT_BASE",
+];
+
+/// The variables the backend drops from the environment it was started with: always
+/// `CLAUDE_CONFIG_DIR` (Default never follows whoever started the backend), and when it was
+/// started from inside a Muster session, that session's own variables ([`SESSION_VARS`], and
+/// `PORT` when it is the session's port). `CODEX_HOME` and the other tools' variables stay:
+/// Muster never sets them per session, so they are the human's own setup.
+pub fn inherited_removals<'a>(vars: impl Iterator<Item = (&'a str, &'a str)> + Clone) -> Vec<String> {
+    let in_session = vars.clone().any(|(k, v)| matches!(k, "MUSTER_SESSION_ID" | "MUSTER_TOKEN") && !v.is_empty());
+    let port_base = vars.clone().find(|(k, _)| *k == "MUSTER_PORT_BASE").map(|(_, v)| v);
+    vars.filter(|(k, v)| *k == "CLAUDE_CONFIG_DIR"
+            || in_session && (SESSION_VARS.contains(k) || *k == "PORT" && port_base == Some(*v)))
+        .map(|(k, _)| k.to_string())
+        .collect()
+}
+
+/// At backend start, before any thread exists: drop [`inherited_removals`] from its environment.
+pub fn take_inherited_env() {
+    let vars: Vec<(String, String)> = std::env::vars().collect();
+    for var in inherited_removals(vars.iter().map(|(k, v)| (k.as_str(), v.as_str()))) {
+        // SAFETY: called from `run_daemon` before the runtime (or any other thread) starts, so
+        // nothing reads the environment concurrently.
+        unsafe { std::env::remove_var(var) };
+    }
+}
+
+/// Claude Code's default folder for a child launched with `env` (`$HOME/.claude`, canonical),
+/// if it exists.
+pub fn default_folder(env: &BTreeMap<String, String>) -> Option<std::path::PathBuf> {
+    std::fs::canonicalize(launch_home(env)?.join(".claude")).ok().filter(|d| d.is_dir())
+}
+
+/// The profile Default folds into: the enabled one registered at Claude Code's default folder
+/// of `home` (the lowest id if several reach it). None keeps Default as its own choice.
+pub fn folded_default<'a>(profiles: &'a [AccountProfile], home: Option<&Path>) -> Option<&'a AccountProfile> {
+    let home = home?;
+    profiles.iter().filter(|p| p.enabled && is_default_folder(Path::new(&p.config_dir), home)).min_by_key(|p| p.id)
+}
+
+/// Whether Claude Code has conversation `id` saved in configuration folder `dir`. Claude Code
+/// (checked with 2.1.331) keeps each one as `<dir>/projects/<project>/<id>.jsonl`, `<project>`
+/// being the working directory with every character but letters and digits turned into `-`;
+/// any project folder counts here, so the name rule is not repeated. Only names are looked at.
+/// `id` must be a plain conversation id ([`crate::agents::valid_resume_id`]); anything else is
+/// never found.
+pub fn has_conversation(dir: &Path, id: &str) -> bool {
+    if !crate::agents::valid_resume_id(id) {
+        return false;
+    }
+    let Ok(projects) = std::fs::read_dir(dir.join("projects")) else { return false };
+    let file = format!("{id}.jsonl");
+    projects.flatten().any(|p| p.path().join(&file).is_file())
 }
 
 /// The HOME a child launched with `env` resolves `~/.claude` against: its own HOME, or the
@@ -203,7 +280,7 @@ mod tests {
                 config_dir: config_directory(self.0.to_str().unwrap()).unwrap(),
                 enabled: true,
                 created_at: 1,
-                account_group: None,
+                account_group: None, is_default: false,
             }
         }
     }
@@ -283,7 +360,7 @@ mod tests {
         std::os::unix::fs::symlink(&default, home.0.join("link")).unwrap();
         std::fs::create_dir(home.0.join("other")).unwrap();
         let profile = |dir: &std::path::Path| AccountProfile {
-            id: 2, name: "Work".into(), enabled: true, created_at: 1, account_group: None,
+            id: 2, name: "Work".into(), enabled: true, created_at: 1, account_group: None, is_default: false,
             config_dir: config_directory(dir.to_str().unwrap()).unwrap(),
         };
         let launch = |p: &AccountProfile, home: String| {
@@ -338,6 +415,75 @@ mod tests {
         assert!(launch_home(&BTreeMap::new()).is_none_or(|h| h.is_absolute()));
         assert_eq!(launch_home(&BTreeMap::from([("HOME".to_string(), "rel".to_string())])), None);
         assert_eq!(launch_home(&BTreeMap::from([("HOME".to_string(), String::new())])), None);
+    }
+
+    /// `muster reload` (or `muster`) run from inside a Muster session on a profile hands the new
+    /// backend that session's environment: it drops CLAUDE_CONFIG_DIR and the session's own
+    /// variables, and keeps the rest (CODEX_HOME, Muster's own settings, a PORT of its own).
+    #[test]
+    fn a_backend_started_from_a_session_drops_its_account_and_session_variables() {
+        let removed = |vars: &[(&str, &str)]| {
+            let mut r = inherited_removals(vars.iter().copied());
+            r.sort();
+            r
+        };
+        let from_session = [
+            ("CLAUDE_CONFIG_DIR", "/home/u/.claude-second"), ("MUSTER", "1"), ("MUSTER_SESSION_ID", "719"),
+            ("MUSTER_CHANNEL_ID", "4"), ("MUSTER_URL", "http://127.0.0.1:7433"), ("MUSTER_TOKEN", "fixture-token"),
+            ("MUSTER_HOOK_DB", "/run/x/hooks.db"), ("MUSTER_RUN", "abc"), ("MUSTER_BIN", "/x/muster"),
+            ("MUSTER_PORT_BASE", "20040"), ("PORT", "20040"), ("CODEX_HOME", "/home/u/.codex-2"),
+            ("MUSTER_DATA_DIR", "/d"), ("MUSTER_PORT", "7433"), ("HOME", "/home/u"), ("PATH", "/usr/bin"),
+        ];
+        assert_eq!(removed(&from_session), ["CLAUDE_CONFIG_DIR", "MUSTER", "MUSTER_BIN", "MUSTER_CHANNEL_ID",
+            "MUSTER_HOOK_DB", "MUSTER_PORT_BASE", "MUSTER_RUN", "MUSTER_SESSION_ID", "MUSTER_TOKEN", "MUSTER_URL", "PORT"]);
+        // From a plain terminal: only CLAUDE_CONFIG_DIR; a PORT of the human's own stays.
+        assert_eq!(removed(&[("CLAUDE_CONFIG_DIR", "/p"), ("PORT", "3000"), ("MUSTER", "1"), ("HOME", "/h")]),
+            ["CLAUDE_CONFIG_DIR"]);
+        // A session's PORT that isn't its port base (changed in the tab) is the human's.
+        assert_eq!(removed(&[("MUSTER_SESSION_ID", "3"), ("PORT", "8080"), ("MUSTER_PORT_BASE", "20000")]),
+            ["MUSTER_PORT_BASE", "MUSTER_SESSION_ID"]);
+        assert!(removed(&[("HOME", "/h"), ("PATH", "/bin")]).is_empty());
+        // A Default launch never keeps one either.
+        let mut env = BTreeMap::from([("CLAUDE_CONFIG_DIR".into(), "/p".into()), ("HOME".into(), "/h".into())]);
+        apply_default(&mut env);
+        assert_eq!(env, BTreeMap::from([("HOME".into(), "/h".into())]));
+    }
+
+    #[test]
+    fn default_folds_into_the_enabled_profile_at_the_default_folder() {
+        let home = Fixture::new();
+        std::fs::create_dir(home.0.join(".claude")).unwrap();
+        std::fs::create_dir(home.0.join("other")).unwrap();
+        let p = |id, dir: &str, enabled| AccountProfile {
+            id, name: format!("p{id}"), enabled, created_at: 1, account_group: None, is_default: false,
+            config_dir: config_directory(home.0.join(dir).to_str().unwrap()).unwrap(),
+        };
+        let fold = |profiles: &[AccountProfile]| folded_default(profiles, Some(&home.0)).map(|p| p.id);
+        assert_eq!(fold(&[p(1, "other", true)]), None);
+        assert_eq!(fold(&[p(1, "other", true), p(4, ".claude", true)]), Some(4));
+        assert_eq!(fold(&[p(4, ".claude", false)]), None, "a disabled one is not Default");
+        assert_eq!(folded_default(&[p(4, ".claude", true)], None), None);
+        assert_eq!(default_folder(&BTreeMap::from([("HOME".into(), home.0.display().to_string())])),
+            Some(std::fs::canonicalize(home.0.join(".claude")).unwrap()));
+        assert_eq!(default_folder(&BTreeMap::from([("HOME".into(), home.0.join("other").display().to_string())])), None);
+    }
+
+    /// Laid out as Claude Code 2.1.331 saves conversations: `projects/<project>/<id>.jsonl`, with
+    /// a folder of the same id beside it for its subagents.
+    #[test]
+    fn a_conversation_is_found_by_its_file_in_any_project_folder() {
+        let f = Fixture::new();
+        let project = f.0.join("projects").join("-home-u-src--repo");
+        std::fs::create_dir_all(project.join("041b762e-eace-42ff-9d1e-3b9971d2f452")).unwrap();
+        std::fs::write(project.join("041b762e-eace-42ff-9d1e-3b9971d2f452.jsonl"), "").unwrap();
+        std::fs::create_dir_all(f.0.join("projects").join("-home-u").join("only-a-dir.jsonl")).unwrap();
+        assert!(has_conversation(&f.0, "041b762e-eace-42ff-9d1e-3b9971d2f452"));
+        assert!(!has_conversation(&f.0, "0556cc5a-10e6-4beb-900d-7abd965983f4"));
+        assert!(!has_conversation(&f.0, "only-a-dir"));
+        assert!(!has_conversation(&f.0.join("missing"), "041b762e-eace-42ff-9d1e-3b9971d2f452"));
+        for bad in ["", "../x", "a/b", "-r", "041b762e-eace-42ff-9d1e-3b9971d2f452.jsonl"] {
+            assert!(!has_conversation(&f.0, bad), "{bad:?}");
+        }
     }
 
     #[test]

@@ -77,7 +77,7 @@ import { Kbd, Spinner } from "./common.tsx";
 import { contextMenu } from "./Menu.tsx";
 import { PermissionsPanel, PermissionsPill } from "./Permissions.tsx";
 import { ProfilePill, ProfileUsage } from "./AccountProfiles.tsx";
-import { atLimit, profileName, sameChoice } from "../account_profiles.ts";
+import { atLimit, profileName, sameChoice, shownChoice } from "../account_profiles.ts";
 import { MoreOptions, PillSelect } from "./DialogKit.tsx";
 import {
   IconBranch,
@@ -765,7 +765,9 @@ export function AgentDialog(
   const locationChanged = !!agent && JSON.stringify(d.working_location) !== JSON.stringify(agent.working_location ?? { mode: "home" });
   /** Moving a Claude agent to another account (docs/ACCOUNT_PROFILES.md). */
   const profileChoice = agent && !profileTouched ? agent.account_profile_id ?? "default" : d.account_profile;
-  const moving = !!agent && agent.kind === "claude" && !sameChoice(profileChoice, agent.account_profile_id ?? "default");
+  // Default and the profile it means (one at ~/.claude) are one account: no move between them.
+  const moving = !!agent && agent.kind === "claude"
+    && !sameChoice(shownChoice(accountProfiles.value, profileChoice), shownChoice(accountProfiles.value, agent.account_profile_id));
   const agentSession = agent?.session_id != null ? sessions.value.get(agent.session_id) : undefined;
   // Where its conversation is: with an earlier move still pending, the account it moves from.
   const fromName = profileName(
@@ -778,7 +780,7 @@ export function AgentDialog(
   const notesBlocked = moving
     ? saveNotesBlocked(
       agentSession,
-      atLimit(accountUsage.value, runProfile ?? "default", Date.now()),
+      atLimit(accountUsage.value, shownChoice(accountProfiles.value, runProfile), Date.now()),
       profileName(accountProfiles.value, runProfile),
     )
     : null;

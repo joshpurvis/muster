@@ -6,7 +6,7 @@
 #   bash web/dev/webkit_shot.sh <steps.json> <out-dir> [--size WxH] [--theme dark|light]
 #
 # MOCK_PORT picks the port (default 17840; give each parallel run its own). MOCK_ADDONS=1 starts
-# the mock with the counter add-on registered. Steps format: web/dev/webkit_shot.py.
+# the mock with the counter add-on registered; MOCK_DEFAULT_PROFILE=1 with a profile at ~/.claude. Steps format: web/dev/webkit_shot.py.
 set -euo pipefail
 if [[ $# -lt 2 ]]; then
   echo 'usage: web/dev/webkit_shot.sh <steps.json> <out-dir> [--size WxH] [--theme dark|light]' >&2

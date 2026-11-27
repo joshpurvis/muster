@@ -323,7 +323,8 @@ muster new --kind antigravity -- --model claude-opus-5-5 --effort high")]
     New {
         /// Folder or repo (default: current directory).
         path: Option<PathBuf>,
-        /// Claude profile name/id, or "default" for ordinary inherited login behavior.
+        /// Claude profile name/id, or "default" for Claude Code's default folder (~/.claude, or the
+        /// profile registered there), whoever started Muster.
         #[arg(long, value_name = "PROFILE")]
         profile: Option<String>,
         /// What to start in the tab (none: an empty tab). `--agent` is an older alias.
@@ -429,6 +430,10 @@ See docs/ANDROID.md.")]
         action: AgentCmd,
     },
     /// Manage Muster's references to existing Claude configuration directories. Never logs in.
+    ///
+    /// Default (no profile) is Claude Code's default folder, ~/.claude, whoever started or
+    /// reloaded Muster. Register ~/.claude itself and that profile is Default: sessions saved as
+    /// Default, and new choices of Default, use it.
     Profile {
         #[command(subcommand)]
         action: ProfileCmd,
@@ -504,7 +509,8 @@ enum DevicesCmd {
 
 #[derive(Subcommand)]
 enum ProfileCmd {
-    /// List registered directories. Account identity is checked in Claude Code with /status.
+    /// List registered directories ("default" marks the one Default means). Account identity is
+    /// checked in Claude Code with /status.
     #[command(visible_alias = "list")]
     Ls {
         #[arg(long)]
@@ -1596,7 +1602,8 @@ fn reload() -> anyhow::Result<()> {
             println!("muster backend restarted by the backend itself, keeping its environment and OpenRouter key; terminals preserved");
             return Ok(());
         }
-        // The replacement gets this command's environment. When that has no OpenRouter key and
+        // The replacement gets this command's environment (less CLAUDE_CONFIG_DIR and a session's
+        // own variables, which it drops at start). When that has no OpenRouter key and
         // the backend has one (only in its memory), the backend restarts itself instead, so the
         // key carries over. OPENROUTER_API_KEY set here, even empty, replaces (or clears) it.
         if std::env::var_os(openrouter::ENV_KEY).is_none() && hello["openrouter"]["key_present"] == true {
@@ -1912,6 +1919,9 @@ async fn bind() -> anyhow::Result<tokio::net::TcpListener> {
 fn run_daemon(launch: Option<PathBuf>, lifecycle_locked: bool) -> anyhow::Result<()> {
     // First, while this is the only thread: the key leaves the process environment.
     let openrouter_key = openrouter::take_key_from_env();
+    // Likewise CLAUDE_CONFIG_DIR, and a session's own variables when a tab started this backend:
+    // Default never depends on who started or reloaded it (src/account_profiles.rs).
+    account_profiles::take_inherited_env();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_env("MUSTER_LOG")

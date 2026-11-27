@@ -866,8 +866,10 @@ happen in the official Claude CLI, never in Muster. The dialog does not inspect 
 or settings files. Directory bindings are fixed; disabling does not stop running sessions.
 
 New channel shows a Claude profile pill for Claude only. Its initial choice is explicit
-**Default** (the pill reads "Default profile"), which preserves the ordinary inherited Claude
-environment, regardless of saved CLI workspace defaults. With profiles registered, a suggestion
+**Default** (the pill reads "Default profile"): Claude Code's default folder, `~/.claude`,
+whoever started Muster, regardless of saved CLI workspace defaults. When `~/.claude` is itself a
+registered profile, Default is that profile: the pills, labels and Usage show only its name, the
+Claude profiles dialog has no Default row, and there is no separate Default choice. With profiles registered, a suggestion
 to switch to the one with the most known room shows under the pills (**Use <name>** picks it and
 leaves focus on the pill), and the **Usage** pill opens each profile's capacity table (with the
 "keep" or "no suggestion" reason). Choose a registered profile for that new session. New tabs

@@ -2419,3 +2419,83 @@ async fn a_shared_workspace_name_resolves_to_the_one_granted() {
     let (t, err) = call_as(&st, "tok4", "spawn_session", json!({"kind": "codex", "new_channel": {"workspace": "repo"}})).await;
     assert!(err && t.contains("2 workspaces are named \"repo\""), "{t}");
 }
+
+/// Owner, 27 Nov 2026: the permission check compares a sender of another kind by its OWN mode
+/// (`Permissions::exceeds_from`), not by its channel's field for the target's kind, which a Codex
+/// agent's form doesn't even show. A Codex agent with full access drives a Claude agent in
+/// bypass; a read-only one still can't; the same holds for spawning, plain messages and the
+/// other way round.
+#[tokio::test]
+async fn a_sender_of_another_kind_is_compared_by_its_own_mode() {
+    use crate::model::{ClaudeMode, CodexSandbox};
+    let (m, st) = state();
+    with_agents(&m);
+    {
+        let mut d = m.d.lock();
+        // Ada's tab (and cody's) is in bypass; a plain Claude session (11) runs there too.
+        let c20 = d.channels.get_mut(&20).unwrap();
+        c20.permissions.claude_mode = ClaudeMode::Bypass;
+        c20.permissions.codex_sandbox = CodexSandbox::FullAccess;
+        d.sessions.insert(11, session(11, 20, SessionKind::Claude, None));
+        d.live.insert(11);
+        for (sid, ch, kind, codex, claude) in [
+            // The real case: a Codex agent's tab, full access, its hidden Claude field accept-edits.
+            (8, 22, SessionKind::Codex, CodexSandbox::FullAccess, ClaudeMode::AcceptEdits),
+            // A read-only Codex sender.
+            (9, 23, SessionKind::Codex, CodexSandbox::ReadOnly, ClaudeMode::Default),
+            // A Claude sender in bypass whose hidden Codex field is the default.
+            (10, 24, SessionKind::Claude, CodexSandbox::WorkspaceWrite, ClaudeMode::Bypass),
+            // A Claude sender in plan mode.
+            (12, 25, SessionKind::Claude, CodexSandbox::WorkspaceWrite, ClaudeMode::Plan),
+        ] {
+            let mut c = channel(ch, &format!("c{ch}"));
+            c.workspace_id = 2;
+            c.permissions.codex_sandbox = codex;
+            c.permissions.claude_mode = claude;
+            d.channels.insert(ch, c);
+            d.sessions.insert(sid, session(sid, ch, kind, None));
+            d.live.insert(sid);
+            d.tokens.insert(format!("tok{sid}"), sid);
+        }
+    }
+    let wider = |r: &(String, bool)| r.1 && r.0.contains("more than");
+    // Codex full access -> Claude bypass: asked, told, messaged, spawned into.
+    for (tool, args) in [
+        ("ask_agent", json!({"agent": "ada", "text": "x"})),
+        ("tell_agent", json!({"agent": "ada", "text": "x"})),
+        ("send_message", json!({"session_id": 11, "text": "x"})),
+        ("spawn_session", json!({"kind": "claude", "channel_id": 20})),
+    ] {
+        let r = call_as(&st, "tok8", tool, args.clone()).await;
+        assert!(!wider(&r), "{tool}: {}", r.0);
+        // A read-only Codex sender: still refused for each.
+        let r = call_as(&st, "tok9", tool, args).await;
+        assert!(wider(&r), "{tool}: {}", r.0);
+    }
+    // ...and to a Claude agent in accept-edits too.
+    m.d.lock().channels.get_mut(&20).unwrap().permissions.claude_mode = ClaudeMode::AcceptEdits;
+    let r = call_as(&st, "tok8", "ask_agent", json!({"agent": "ada", "text": "x"})).await;
+    assert!(!r.1, "{}", r.0);
+    // The other way round: a Claude sender in bypass drives a Codex agent with full access,
+    // whatever its channel's (unseen) Codex field says; a Claude sender in plan mode doesn't.
+    let r = call_as(&st, "tok10", "ask_agent", json!({"agent": "cody", "text": "x"})).await;
+    assert!(!wider(&r), "{}", r.0);
+    let r = call_as(&st, "tok12", "ask_agent", json!({"agent": "cody", "text": "x"})).await;
+    assert!(wider(&r), "{}", r.0);
+    // Same kind: the field itself, as before (a Codex workspace-write sender can't drive a
+    // Codex agent with network access, though both sit on the same step of the shared scale).
+    {
+        let mut d = m.d.lock();
+        d.channels.get_mut(&20).unwrap().permissions.codex_sandbox = CodexSandbox::WorkspaceWriteNetwork;
+        let c = d.channels.get_mut(&23).unwrap();
+        c.permissions.codex_sandbox = CodexSandbox::WorkspaceWrite;
+        c.permissions.claude_mode = ClaudeMode::Bypass;
+    }
+    let r = call_as(&st, "tok9", "ask_agent", json!({"agent": "cody", "text": "x"})).await;
+    assert!(wider(&r), "{}", r.0);
+    // A sender's channel still counts for the other kinds, as before: a Codex sender whose tab
+    // sets Claude to bypass may drive a Claude agent in bypass (it could start one in its own tab).
+    m.d.lock().channels.get_mut(&20).unwrap().permissions.claude_mode = ClaudeMode::Bypass;
+    let r = call_as(&st, "tok9", "ask_agent", json!({"agent": "ada", "text": "x"})).await;
+    assert!(!wider(&r), "{}", r.0);
+}

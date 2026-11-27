@@ -3631,6 +3631,55 @@ mod tests {
         assert!(r["made_by"]["approved_at"].is_i64());
     }
 
+    /// `muster schedule pause <id>` follows `pause_schedule`'s rule (owner, 27 Nov 2026): from a
+    /// session working for the human (a plain session, an agent, a shell), any schedule, with a
+    /// notice; from scheduled work, only its own. Resuming stays the human's everywhere.
+    #[tokio::test]
+    async fn the_cli_pause_follows_the_pause_rule() {
+        let (hub, _st) = fixture();
+        for name in ["rpc-wk", "rpc-other"] {
+            crate::agents::create(&hub, NewAgent {
+                working_location: None,
+                account_profile: None, provider: None, name: name.into(), kind: Some(SessionKind::Codex), model: None,
+                effort: None, persona: None, accepts: None, permissions: None, autostart: false, sleep_after_min: None,
+            }).unwrap();
+        }
+        let wk = hub.agents().get("rpc-wk").unwrap();
+        hub.agents().link_session(hub.store(), wk.id, Some(3)).unwrap();
+        let s = call(&hub, "schedule.create", json!({"agent": "rpc-other", "name": "Scout", "prompt": "p", "when": {"kind": "cron", "cron": "0 9 * * *"}})).await.unwrap();
+        let id = s["id"].as_i64().unwrap();
+        let mut rx = hub.subscribe();
+        let pause = |from: SessionId| call(&hub, "schedule.pause", json!({"id": id, "from_session": from}));
+        let resume = || call(&hub, "schedule.pause", json!({"id": id, "on": false}));
+        // A plain Claude session (2), an agent (3) and a shell an agent typed into for the human
+        // (1): each pauses it, and Muster says who.
+        hub.agents().set_prov(1, Some(Prov { origin: Origin::Human, hop: 1, msg_id: None })).unwrap();
+        for (from, who) in [(2, "session:2"), (3, "rpc-wk"), (1, "session:1")] {
+            assert_eq!(pause(from).await.unwrap()["status"], "paused", "from {from}");
+            let mut said = vec![];
+            while let Ok(ev) = rx.try_recv() {
+                if let ServerEvent::Notice { text, .. } = ev { said.push(text); }
+            }
+            assert!(said.contains(&format!("{who} paused schedule {id} (Scout)")), "{said:?}");
+            resume().await.unwrap();
+        }
+        // From scheduled work: refused, for the agent, the plain session and the shell.
+        for from in [3, 2, 1] {
+            hub.agents().set_prov(from, Some(SCHED)).unwrap();
+            let e = pause(from).await.unwrap_err();
+            assert!(e.contains("only the human"), "from {from}: {e}");
+            assert!(!hub.schedules.get(id).unwrap().paused);
+            // Resuming: never from a session.
+            let e = call(&hub, "schedule.pause", json!({"id": id, "on": false, "from_session": from})).await.unwrap_err();
+            assert!(e.contains("can't be called from an agent's session"), "from {from}: {e}");
+        }
+        // A shell the human drives, and the human: as before.
+        hub.agents().set_prov(1, None).unwrap();
+        assert_eq!(pause(1).await.unwrap()["paused"], true);
+        resume().await.unwrap();
+        assert_eq!(call(&hub, "schedule.pause", json!({"id": id})).await.unwrap()["paused"], true);
+    }
+
     #[tokio::test]
     async fn approving_takes_a_click_in_a_window_never_a_script_or_an_agent() {
         let (hub, _st) = fixture();

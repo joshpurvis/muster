@@ -265,9 +265,12 @@ fn an_agent_pauses_its_own_or_its_schedules_and_deletes_only_what_it_made() {
     let ids: Vec<i64> = list["schedules"].as_array().unwrap().iter().map(|s| s["schedule_id"].as_i64().unwrap()).collect();
     assert_eq!(ids, vec![human_on_worker.id], "its own, not orla's");
     assert_eq!(list["takes_scheduled_work"], true);
-    // Pause: one that runs on it, yes; another agent's, no; resuming isn't a tool.
+    // Pause: one that runs on it, yes; another agent's, not from scheduled work (`who_may_pause_any_schedule`);
+    // resuming isn't a tool.
     assert_eq!(tool(&f, 41, "pause_schedule", json!({"schedule_id": human_on_worker.id})).unwrap()["status"], "paused");
+    f.hub.agents().set_prov(41, Some(Prov { origin: Origin::Schedule, hop: 0, msg_id: Some(1) })).unwrap();
     assert!(err(tool(&f, 41, "pause_schedule", json!({"schedule_id": human_on_orla.id}))).contains("only the human"));
+    f.hub.agents().set_prov(41, None).unwrap();
     // Delete: the human's, no; its proposal for orla, yes.
     assert!(err(tool(&f, 41, "delete_schedule", json!({"schedule_id": human_on_worker.id}))).contains("didn't make"));
     let p = tool(&f, 41, "propose_schedule", json!({"agent": "orla", "prompt": "p", "cron": "0 9 * * *", "reason": "r"})).unwrap()["schedule_id"].as_i64().unwrap();
@@ -275,6 +278,129 @@ fn an_agent_pauses_its_own_or_its_schedules_and_deletes_only_what_it_made() {
     assert_eq!(tool(&f, 44, "list_schedules", json!({})).unwrap()["schedules"].as_array().unwrap().len(), 2, "orla sees the proposal for it");
     tool(&f, 41, "delete_schedule", json!({"schedule_id": p})).unwrap();
     assert!(f.hub.schedules.get(p).is_none());
+}
+
+/// The notices sent since the last call.
+fn notices(rx: &mut tokio::sync::broadcast::Receiver<crate::hub::ServerEvent>) -> Vec<(String, Option<i64>)> {
+    let mut out = vec![];
+    while let Ok(ev) = rx.try_recv() {
+        if let crate::hub::ServerEvent::Notice { text, schedule, .. } = ev {
+            out.push((text, schedule));
+        }
+    }
+    out
+}
+
+fn paused(f: &Fixture, id: i64) -> bool {
+    f.hub.schedules.get(id).unwrap().paused
+}
+
+fn unpause(f: &Fixture, id: i64) {
+    set_paused(&f.hub, id, false, None).unwrap();
+}
+
+/// Owner, 27 Nov 2026: a lead agent, and any session working for the human (its turn the human's,
+/// or a lead's), pauses any schedule, and Muster says who paused what. A non-lead's scheduled or
+/// triggered turn still pauses only its own; resuming stays the human's.
+#[test]
+fn who_may_pause_any_schedule() {
+    let f = Fixture::new(at(LONDON, "2026-10-19T10:00"));
+    as_agent(&f, "worker", 41);
+    as_agent(&f, "cleo", 45);
+    let mut edit: crate::agents::AgentUpdate = serde_json::from_value(json!({"name": "cleo", "lead": true})).unwrap();
+    edit.by_owner = true;
+    crate::agents::update(&f.hub, edit, false).unwrap();
+    let orla = f.create(json!({"agent": "orla", "name": "Nightly scout", "prompt": "x", "when": {"kind": "cron", "cron": "0 3 * * *"}})).unwrap();
+    let mut rx = f.hub.subscribe();
+    let prov = |sid: SessionId, origin: Option<Origin>| {
+        f.hub.agents().set_prov(sid, origin.map(|origin| Prov { origin, hop: 1, msg_id: Some(1) })).unwrap();
+    };
+    let pause = |sid: SessionId| tool(&f, sid, "pause_schedule", json!({"schedule_id": orla.id}));
+    // The lead: in the human's turn, in its scheduled work (passed on as lead), not in a trigger's.
+    for origin in [None, Some(Origin::Schedule), Some(Origin::Lead)] {
+        prov(45, origin);
+        assert_eq!(pause(45).unwrap()["status"], "paused", "{origin:?}");
+        assert_eq!(notices(&mut rx), vec![(format!("cleo paused schedule {} (Nightly scout)", orla.id), Some(orla.id))]);
+        unpause(&f, orla.id);
+    }
+    prov(45, Some(Origin::Webhook));
+    assert!(err(pause(45)).contains("only the human"));
+    assert!(!paused(&f, orla.id));
+    // A non-lead agent: in the human's turn (typed, or asked by an agent the human started), yes.
+    for origin in [None, Some(Origin::Human), Some(Origin::Lead)] {
+        prov(41, origin);
+        assert_eq!(pause(41).unwrap()["status"], "paused", "{origin:?}");
+        assert_eq!(notices(&mut rx).len(), 1);
+        unpause(&f, orla.id);
+    }
+    // In scheduled or triggered work, no: as before.
+    for origin in [Origin::Schedule, Origin::Webhook] {
+        prov(41, Some(origin));
+        let e = err(pause(41));
+        assert!(e.contains("only the human") && e.contains("neither runs on you"), "{e}");
+        assert!(!paused(&f, orla.id));
+    }
+    let _ = notices(&mut rx); // the unpauses' own events aren't notices; drain anything else
+    // A session that isn't a named agent: when the human typed its turn, yes; scheduled work, no.
+    assert_eq!(pause(99).unwrap()["status"], "paused");
+    assert_eq!(notices(&mut rx), vec![(format!("session:99 paused schedule {} (Nightly scout)", orla.id), Some(orla.id))]);
+    // Already paused: nothing changes, nothing is said.
+    assert_eq!(pause(99).unwrap()["status"], "paused");
+    assert!(notices(&mut rx).is_empty());
+    unpause(&f, orla.id);
+    prov(99, Some(Origin::Schedule));
+    assert!(err(pause(99)).contains("only the human"));
+    // Listing, proposing and the rest stay a named agent's.
+    assert!(err(tool(&f, 98, "list_schedules", json!({}))).contains("only named agents"));
+    // Resuming is no tool, for a lead too.
+    prov(45, None);
+    assert!(err(tool(&f, 45, "resume_schedule", json!({"schedule_id": orla.id}))).contains("unknown schedule tool"));
+    assert!(tool(&f, 45, "pause_schedule", json!({"schedule_id": orla.id, "on": false})).is_err(), "no way to unpause");
+    assert!(err(tool(&f, 45, "pause_schedule", json!({"schedule_id": 99_999}))).contains("no schedule"));
+}
+
+/// Owner, 27 Nov 2026: a proposal may name a schedule it replaces; the human's click on Approve
+/// pauses that one too, in the same step, so the two never both run.
+#[test]
+fn approving_a_proposal_that_replaces_a_schedule_pauses_the_old_one() {
+    let f = Fixture::new(at(LONDON, "2026-10-19T10:00"));
+    as_agent(&f, "worker", 41);
+    let old = f.create(json!({"agent": "orla", "name": "Old scout", "prompt": "x", "when": {"kind": "cron", "cron": "0 3 * * *"}})).unwrap();
+    let propose = |replaces: Value| tool(&f, 41, "propose_schedule", json!({
+        "prompt": "scout v2", "cron": "0 4 * * *", "reason": "replaces the old scout", "replaces": replaces,
+    }));
+    // A schedule that isn't there is refused at once.
+    assert!(err(propose(json!(99_999))).contains("no schedule 99999"));
+    let id = propose(json!(old.id)).unwrap()["schedule_id"].as_i64().unwrap();
+    let j = schedule_json(&f.hub, &f.hub.schedules.get(id).unwrap());
+    assert_eq!(j["made_by"]["replaces"], json!({"id": old.id, "name": "Old scout", "gone": false, "paused": false}));
+    // Nothing is paused before the click: not by proposing, not by a dismissed proposal.
+    assert!(!paused(&f, old.id));
+    let other = propose(json!(old.id)).unwrap()["schedule_id"].as_i64().unwrap();
+    dismiss(&f.hub, other).unwrap();
+    assert!(!paused(&f, old.id));
+    // Approve: the new one runs and the old one is paused, both saved (read back from the database).
+    let mut rx = f.hub.subscribe();
+    let r = approve(&f.hub, id, None).unwrap();
+    assert_eq!(r["status"], "active");
+    assert_eq!(r["replaced"], json!({"id": old.id, "name": "Old scout", "paused": true}));
+    assert!(paused(&f, old.id));
+    let saved = f.hub.store().load_schedules().unwrap();
+    assert!(saved.iter().find(|s| s.id == old.id).unwrap().paused, "saved paused");
+    assert!(!saved.iter().find(|s| s.id == id).unwrap().waiting_approval(), "saved approved");
+    let said: Vec<String> = notices(&mut rx).into_iter().map(|(t, _)| t).collect();
+    assert!(said.iter().any(|t| t.contains(&format!("paused schedule {} (Old scout)", old.id))), "{said:?}");
+    // The replaced schedule was removed before the click: the approval still goes ahead.
+    unpause(&f, old.id);
+    let gone = f.create(json!({"agent": "orla", "name": "Gone scout", "prompt": "x", "when": {"kind": "cron", "cron": "0 5 * * *"}})).unwrap();
+    let id = propose(json!(gone.id)).unwrap()["schedule_id"].as_i64().unwrap();
+    remove(&f.hub, gone.id).unwrap();
+    let j = schedule_json(&f.hub, &f.hub.schedules.get(id).unwrap());
+    assert_eq!(j["made_by"]["replaces"], json!({"id": gone.id, "name": "Gone scout", "gone": true, "paused": false}));
+    let r = approve(&f.hub, id, None).unwrap();
+    assert_eq!(r["status"], "active");
+    assert_eq!(r["replaced"], json!({"id": gone.id, "name": "Gone scout", "paused": false, "gone": true}));
+    assert!(!paused(&f, old.id), "no other schedule touched");
 }
 
 // ----- the estimate -----

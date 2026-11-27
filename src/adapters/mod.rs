@@ -50,6 +50,8 @@ pub fn resumed_in_launch(kind: SessionKind, args: &[String]) -> Option<Option<St
         SessionKind::Claude => {
             let mut found = None;
             for (i, a) in args.iter().enumerate() {
+                // After "--" comes the prompt, never an option (src/adapters/claude.rs).
+                if a == "--" { break }
                 let value = match a.as_str() {
                     "--resume" | "-r" => Some(args.get(i + 1).filter(|v| !v.starts_with('-')).cloned()),
                     "--continue" | "-c" => Some(None),
@@ -434,6 +436,9 @@ mod tests {
         assert_eq!(resumed_in_launch(Claude, &a(&["--continue"])), Some(None));
         assert_eq!(resumed_in_launch(Claude, &a(&["--model", "opus"])), None);
         assert_eq!(resumed_in_launch(Shell, &a(&["--resume", "x"])), None);
+        // The prompt after "--" is never read as an option.
+        assert_eq!(resumed_in_launch(Claude, &a(&["--resume", "c-1", "--", "--continue"])), Some(Some("c-1".into())));
+        assert_eq!(resumed_in_launch(Claude, &a(&["--model", "opus", "--", "-rc-2"])), None);
         let codex = "Error: No saved session found with ID t-1. Run `codex resume` without an ID to choose from existing sessions.";
         assert!(says_conversation_missing(Codex, codex, Some("t-1")));
         assert!(!says_conversation_missing(Codex, codex, Some("t-2")), "another thread's message");

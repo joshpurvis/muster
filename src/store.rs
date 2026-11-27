@@ -2738,7 +2738,7 @@ impl Store {
         let mut statement = conn.prepare("SELECT id, name, config_dir, enabled, created_at, account_group FROM account_profiles ORDER BY name COLLATE NOCASE, id")?;
         let rows = statement.query_map([], |r| Ok(crate::account_profiles::AccountProfile {
             id: r.get(0)?, name: r.get(1)?, config_dir: r.get(2)?,
-            enabled: r.get::<_, i64>(3)? != 0, created_at: r.get(4)?, account_group: r.get(5)?,
+            enabled: r.get::<_, i64>(3)? != 0, created_at: r.get(4)?, account_group: r.get(5)?, is_default: false,
         }))?;
         Ok(rows.collect::<Result<_, _>>()?)
     }

@@ -13,6 +13,8 @@ import {
   parseProfileChoice,
   peakUsage,
   sameChoice,
+  shownChoice,
+  defaultProfile,
   suggestionView,
   type UsageBar,
   type WindowCell,
@@ -236,10 +238,12 @@ export function ProfileUsage({ value, onUse, table }: {
   const now = useUsageClock();
   if (!accountProfilesSupported.value || !accountProfiles.value.length || !accountUsage.value) return null;
   const usage = asOf(accountUsage.value, now);
-  const s = suggestionView(usage, value);
+  // Default folded into a profile has no row of its own: that profile's row is its row.
+  const selected = value === undefined ? undefined : shownChoice(accountProfiles.value, value);
+  const s = suggestionView(usage, selected);
   return (
     <div class="usage-hint">
-      {table && <UsageTable usage={usage} now={now} selected={value} />}
+      {table && <UsageTable usage={usage} now={now} selected={selected} />}
       <div class={cx("usage-suggestion", s.kind !== "switch" && "usage-none")} role="status">
         {s.kind === "switch" && (
           <>
@@ -277,7 +281,10 @@ export function ProfilePill({ value, onChange, disabled = false, tip, selectRef,
   const id = useId();
   if (!accountProfilesSupported.value) return null;
   const profiles = accountProfiles.value;
-  const missing = typeof value === "number" && !profiles.some((p) => p.id === value);
+  // Default is shown as the profile at its folder, when one is registered there: one choice.
+  const folded = defaultProfile(profiles);
+  const shown = value === undefined ? undefined : shownChoice(profiles, value);
+  const missing = typeof shown === "number" && !profiles.some((p) => p.id === shown);
   // The fixed-profile note (Edit agent) comes after the verification hint, never instead of it.
   const hint = ["Verify your account with /status inside Claude Code.", tip].filter(Boolean).join(" ");
   return (
@@ -285,24 +292,27 @@ export function ProfilePill({ value, onChange, disabled = false, tip, selectRef,
       <PillSelect
         icon={<IconUser size={13} />}
         label="Claude profile"
-        value={String(value ?? "default")}
+        value={String(shown ?? (folded ? folded.id : "default"))}
         disabled={disabled}
         tip={hint}
         describedBy={`${id}-hint`}
         selectRef={selectRef}
         onChange={(v) => onChange(parseProfileChoice(v))}
         options={[
-          { value: "default", label: "Default · ordinary Claude environment", short: "Default profile" },
-          ...(missing ? [{ value: String(value), label: `Unavailable profile #${value}`, disabled: true }] : []),
+          ...(folded ? [] : [{ value: "default", label: "Default · ~/.claude", short: "Default profile" }]),
+          ...(missing ? [{ value: String(shown), label: `Unavailable profile #${shown}`, disabled: true }] : []),
           ...profiles.map((p) => ({
             value: String(p.id),
-            label: p.name + (p.enabled ? "" : " (disabled)"),
+            label: p.name + (p.is_default ? " · Default" : "") + (p.enabled ? "" : " (disabled)"),
+            short: p.name,
             disabled: !p.enabled,
           })),
         ]}
       />
       <span id={`${id}-hint`} class="sr-only">
-        Default is the ordinary Claude environment. {hint}
+        {folded
+          ? `${folded.name} is Claude Code's default folder, ~/.claude.`
+          : "Default is Claude Code's default folder, ~/.claude."} {hint}
       </span>
       {profiles.length > 0 && !disabled && onUsage && (
         <PillToggle
@@ -397,6 +407,7 @@ function ProfileRow({ profile, open, onToggle }: { profile: AccountProfile; open
       >
         <span class="pf-name">{profile.name}</span>
         <span class="pf-path">{tildify(profile.config_dir, meta.value.home)}</span>
+        {profile.is_default && <span class="pf-default" title="Sessions without a profile use this one">Default</span>}
         {!profile.enabled && <span class="pf-note">Disabled</span>}
         {sameAs.length > 0 && <span class="pf-note">same account as {sameAs.map((p) => p.name).join(", ")}</span>}
         <IconChevron size={12} class="pf-chev" />
@@ -455,8 +466,8 @@ function ProfileRow({ profile, open, onToggle }: { profile: AccountProfile; open
   );
 }
 
-/** Default: Muster's own Claude environment, ~/.claude unless Muster itself was started with
- * CLAUDE_CONFIG_DIR set (sessions then inherit that folder). */
+/** Default: Claude Code's default folder, ~/.claude, whoever started Muster. Not shown once a
+ * profile is registered there: that profile is Default then. */
 function DefaultRow({ open, onToggle, hasUsage }: { open: boolean; onToggle: () => void; hasUsage: boolean }) {
   const [busy, setBusy] = useState(false);
   const id = useId();
@@ -482,18 +493,19 @@ function DefaultRow({ open, onToggle, hasUsage }: { open: boolean; onToggle: () 
         class="pf-head"
         aria-expanded={open}
         aria-controls={open ? `${id}-body` : undefined}
-        aria-label="Default, Muster's own Claude setup"
+        aria-label="Default, Claude Code's default folder"
         onClick={onToggle}
       >
         <span class="pf-name">Default</span>
-        <span class="pf-path pf-path-plain">Muster's own Claude setup</span>
+        <span class="pf-path">~/.claude</span>
         <IconChevron size={12} class="pf-chev" />
       </button>
       {open && (
         <div class="pf-body" id={`${id}-body`}>
           <span class="field-hint">
-            Sessions without a profile start with the Claude setup Muster itself was started with:{" "}
-            <code>~/.claude</code>, or the folder in <code>CLAUDE_CONFIG_DIR</code> if that was set.
+            Sessions without a profile start in Claude Code's default folder, <code>~/.claude</code>, whoever
+            started Muster. Register <code>~/.claude</code> as a profile to give it a name: Default is then that
+            profile.
           </span>
           <ActionLine hint={hasUsage ? LOGIN_CHANGED_HINT : "No usage to forget yet."}>
             <button class="btn" type="button" disabled={busy || !hasUsage} onClick={forget}>Login changed</button>
@@ -621,7 +633,9 @@ export function AccountProfilesDialog({ Modal, close, account }: {
             A profile is a Claude config folder that sessions start in. Muster never reads or changes login files.
           </p>
           <div class="pf-list">
-            <DefaultRow open={openRow === "default"} onToggle={() => toggle("default")} hasUsage={defaultHasUsage} />
+            {!defaultProfile(accountProfiles.value) && (
+              <DefaultRow open={openRow === "default"} onToggle={() => toggle("default")} hasUsage={defaultHasUsage} />
+            )}
             {accountProfiles.value.map((p) => (
               <ProfileRow key={p.id} profile={p} open={openRow === p.id} onToggle={() => toggle(p.id)} />
             ))}
@@ -673,7 +687,7 @@ export function AccountProfilesDialog({ Modal, close, account }: {
               Sign in with plain <code>claude</code> (or <code>env -u CLAUDE_CONFIG_DIR claude</code>) instead of
               step 1. A profile on <code>~/.claude</code> starts its sessions without{" "}
               <code>CLAUDE_CONFIG_DIR</code>, so Claude Code uses <code>~/.claude</code> and{" "}
-              <code>~/.claude.json</code>.
+              <code>~/.claude.json</code>. It then stands for Default everywhere.
             </p>
           </MoreOptions>
           {error && <p class="field-hint field-bad" role="alert">{error}</p>}

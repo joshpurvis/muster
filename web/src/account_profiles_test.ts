@@ -10,6 +10,7 @@ import {
   parseProfileChoice,
   peakUsage,
   profileName,
+  shownChoice,
   suggestionView,
   windowCell,
 } from "./account_profiles.ts";
@@ -126,6 +127,18 @@ Deno.test("a default-login Claude parent explicitly pins Default instead of inhe
   equal(parseProfileChoice(""), undefined);
   equal(parseProfileChoice("default"), "default");
   equal(parseProfileChoice("9"), 9);
+});
+
+Deno.test("Default is shown as the profile at the default folder, when there is one", () => {
+  const plain = [{ id: 4, name: "work", enabled: true }, { id: 6, name: "personal", enabled: true }] as AccountProfile[];
+  equal(profileName(plain, null), "Default");
+  equal(shownChoice(plain, null), "default");
+  equal(shownChoice(plain, "default"), "default");
+  const folded = [{ ...plain[0], is_default: true }, plain[1]];
+  equal(profileName(folded, null), "work");
+  equal(profileName(folded, 6), "personal");
+  for (const choice of [null, undefined, "default" as const, 4]) equal(shownChoice(folded, choice), 4);
+  equal(shownChoice(folded, 6), 6);
 });
 
 Deno.test("missing or disabled profile bindings stay visible instead of appearing as Default", () => {

@@ -432,7 +432,8 @@ pub struct SessionInfo {
     pub id: SessionId,
     pub channel_id: ChannelId,
     pub kind: SessionKind,
-    /// Immutable launch selection. None preserves ordinary inherited Claude behavior.
+    /// The Claude account this session runs on. None is Default: Claude Code's default folder
+    /// (src/account_profiles.rs), never left once a profile is Default.
     #[serde(default)]
     pub account_profile_id: Option<crate::account_profiles::ProfileId>,
     pub name: String,

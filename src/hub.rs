@@ -1057,6 +1057,10 @@ impl Hub {
         }
         crate::inject::restore(&hub)?;
         crate::adapters::shell::set_configured_shell(hub.ui_prefs().shell);
+        // Records saved as Default take the profile Default now is, before anything starts.
+        if let Err(error) = hub.fold_default_records() {
+            tracing::warn!("recording Default's profile: {error:#}");
+        }
         Ok(hub)
     }
 
@@ -1214,8 +1218,69 @@ impl Hub {
 
     // ----- queries -----
 
+    /// The registered profiles, the one Default folds into marked `is_default`.
     pub fn account_profiles(&self) -> anyhow::Result<Vec<crate::account_profiles::AccountProfile>> {
-        self.store.account_profiles()
+        let mut profiles = self.store.account_profiles()?;
+        let home = crate::account_profiles::own_home();
+        if let Some(id) = crate::account_profiles::folded_default(&profiles, home.as_deref()).map(|p| p.id) {
+            for p in &mut profiles { p.is_default = p.id == id; }
+        }
+        Ok(profiles)
+    }
+
+    /// Default as a record holds it: the profile at Claude Code's default folder when one is
+    /// registered and enabled (`account_profiles::folded_default`), else None (Default itself).
+    pub fn fold_default(&self, id: Option<i64>) -> Option<i64> {
+        id.or_else(|| self.account_profiles().ok()?.into_iter().find(|p| p.is_default).map(|p| p.id))
+    }
+
+    /// Records that say Default (None) while a profile is Default (`fold_default`) take that
+    /// profile: Claude sessions, Claude agents and workspace defaults. A session whose run is
+    /// live takes the profile of the folder that run really uses (from its launch record),
+    /// whichever that is, and an agent its tab's. Run at start and when profiles change.
+    pub fn fold_default_records(&self) -> anyhow::Result<()> {
+        let profiles = self.account_profiles()?;
+        let target = profiles.iter().find(|p| p.is_default).map(|p| p.id);
+        let at_folder = |dir: &Path| profiles.iter()
+            .filter(|p| p.enabled && crate::account_profiles::in_place(p))
+            .find(|p| Path::new(&p.config_dir) == dir).map(|p| p.id);
+        let unset: Vec<(SessionId, bool)> = self.inner.lock().sessions.values()
+            .filter(|e| e.info.kind == SessionKind::Claude && e.info.account_profile_id.is_none())
+            .map(|e| (e.info.id, e.info.state != AgentState::Exited)).collect();
+        // Live runs on a folder no profile has: they and their agents stay Default until next start.
+        let mut unmatched = HashSet::new();
+        for (id, running) in unset {
+            let live = running.then(|| self.terminal_records.lock().get(&id).filter(|r| !r.retired)
+                .map(|r| crate::usage::effective_config_dir(&r.spec.env))).flatten();
+            let profile = match live {
+                Some(folder) => folder.as_deref().and_then(at_folder),
+                None => target,
+            };
+            match profile {
+                Some(_) => self.set_session_account_profile(id, profile)?,
+                None => { unmatched.insert(id); }
+            }
+        }
+        for a in self.agents.list() {
+            if a.kind != SessionKind::Claude || a.account_profile_id.is_some() { continue }
+            if a.session_id.is_some_and(|s| unmatched.contains(&s)) { continue }
+            // A move waiting for its next start goes to Default: that is the profile now, not
+            // the account its tab still runs on.
+            let tab = a.session_id.filter(|_| a.handoff.is_none()).and_then(|s| self.session(s))
+                .filter(|s| s.kind == SessionKind::Claude).and_then(|s| s.account_profile_id);
+            if let Some(profile) = tab.or(target)
+                && let Some(a) = self.agents.set_account_profile(&self.store, a.id, Some(profile))? {
+                crate::agents::publish(self, &a);
+            }
+        }
+        if target.is_some() {
+            let unset: Vec<WorkspaceId> = self.inner.lock().workspaces.values()
+                .filter(|w| w.account_profile_id.is_none()).map(|w| w.id).collect();
+            for id in unset {
+                self.set_workspace_account_profile(id, target)?;
+            }
+        }
+        Ok(())
     }
 
     pub fn account_profile(&self, id: i64) -> anyhow::Result<crate::account_profiles::AccountProfile> {
@@ -1229,6 +1294,7 @@ impl Hub {
         let id = self.store.insert_account_profile(&name, &directory)?;
         self.emit(ServerEvent::AccountProfilesChanged(self.account_profiles()?));
         self.usage_changed();
+        self.fold_default_records()?;
         self.account_profile(id)
     }
 
@@ -1237,11 +1303,18 @@ impl Hub {
         self.store.update_account_profile(id, name.as_deref(), enabled)?;
         self.emit(ServerEvent::AccountProfilesChanged(self.account_profiles()?));
         self.usage_changed();
+        if enabled == Some(true) {
+            self.fold_default_records()?;
+        }
         self.account_profile(id)
     }
 
+    /// A Claude launch's account: profile `id`'s folder, or (None) Claude Code's default folder.
     pub fn apply_account_profile(&self, id: Option<i64>, env: &mut BTreeMap<String, String>) -> anyhow::Result<()> {
-        if let Some(id) = id { crate::account_profiles::apply_environment(&self.account_profile(id)?, env)?; }
+        match id {
+            Some(id) => crate::account_profiles::apply_environment(&self.account_profile(id)?, env)?,
+            None => crate::account_profiles::apply_default(env),
+        }
         Ok(())
     }
 
@@ -1254,7 +1327,7 @@ impl Hub {
         let profiles = self.account_profiles()?;
         let observations = self.store.usage_observations()?;
         let env: BTreeMap<String, String> = std::env::vars().collect();
-        let default_dir = crate::usage::effective_config_dir(&env);
+        let default_dir = crate::account_profiles::default_folder(&env);
         Ok(crate::usage::snapshot(&profiles, &observations,
             |id| self.check_account_profile(id).map_err(|e| format!("{e:#}")), default_dir.as_deref(), now_ms()))
     }
@@ -1343,7 +1416,7 @@ impl Hub {
     pub fn account_login_changed(&self, choice: crate::account_profiles::ProfileChoice) -> anyhow::Result<()> {
         let folder = match choice.id() {
             Some(id) => Some(self.account_profile(id)?.config_dir),
-            None => crate::usage::effective_config_dir(&std::env::vars().collect())
+            None => crate::account_profiles::default_folder(&std::env::vars().collect())
                 .map(|d| d.to_string_lossy().into_owned()),
         };
         let Some(folder) = folder else {
@@ -1374,11 +1447,13 @@ impl Hub {
             .map(|s| s.account_profile_id);
         let id = choice.map(|c| c.id()).or(inherited)
             .unwrap_or_else(|| self.workspace(workspace).and_then(|w| w.account_profile_id));
+        let id = self.fold_default(id);
         self.check_account_profile(id)?;
         Ok(id)
     }
 
     pub fn set_workspace_account_profile(&self, id: WorkspaceId, profile: Option<i64>) -> anyhow::Result<Workspace> {
+        let profile = self.fold_default(profile);
         // Default selection may be saved while the profile needs login, but it must exist
         // and be enabled. Directory metadata and launch environment are checked at launch.
         if let Some(profile) = profile {
@@ -3527,6 +3602,21 @@ impl Hub {
             let handoff = crate::agents::handoff_for(self, &agent)?;
             crate::agents::configure_project_command(&agent, &info.cwd, permissions, handoff.as_ref(), &mut spec)?;
         }
+        // The Claude account this run uses, recorded on the session (and its agent) before it
+        // starts: Default as its folded profile, and a conversation it reopens where it is saved.
+        let account = if info.kind == SessionKind::Claude {
+            let account = self.launch_account(&info, &spec.args)?;
+            if account != info.account_profile_id {
+                self.set_session_account_profile(id, account)?;
+                if let Some(a) = self.agents.by_session(id)
+                    && let Some(a) = self.agents.set_account_profile(&self.store, a.id, account)? {
+                    crate::agents::publish(self, &a);
+                }
+            }
+            account
+        } else {
+            None
+        };
         let continues = crate::cache::continues_conversation(info.kind, &ctx.extra_args) || ctx.resume.is_some();
         // A named agent resuming a conversation whose session row is gone (its task was
         // closed) takes the clock that conversation had.
@@ -3568,8 +3658,8 @@ impl Hub {
         // nor OpenRouter settings inherited from an OpenRouter session.
         crate::openrouter::scrub_inherited(&mut complete_env, self.openrouter_key());
         complete_env.extend(env);
-        self.apply_account_profile(info.account_profile_id, &mut complete_env)?;
         if info.kind == SessionKind::Claude {
+            self.apply_account_profile(account, &mut complete_env)?;
             // Its status line becomes Muster's usage reporter around the user's own one, found
             // with exactly the environment this run gets (src/usage.rs).
             crate::usage::install_reporter(&session_dir.join("claude-settings.json"), &self.cfg.muster_bin,
@@ -3855,10 +3945,68 @@ impl Hub {
         }
     }
 
+    /// The Claude account a launch of session `info` with `args` runs on: its own profile, Default
+    /// as the profile it folds into (`fold_default`). When the launch reopens a conversation
+    /// (`--resume <id>`, a named agent's saved one) that is saved only in another account's
+    /// folder (an enabled profile's, or Default's while no profile is Default), it runs there
+    /// instead, and the owner is told once (a toast and a line in the tab's timeline): it used
+    /// to die with "No conversation found". Saved nowhere, or in its own folder too: unchanged.
+    fn launch_account(&self, info: &SessionInfo, args: &[String]) -> anyhow::Result<Option<i64>> {
+        let pinned = self.fold_default(info.account_profile_id);
+        let Some(Some(conversation)) = crate::adapters::resumed_in_launch(SessionKind::Claude, args) else {
+            return Ok(pinned);
+        };
+        let profiles = self.account_profiles()?;
+        let env: BTreeMap<String, String> = std::env::vars().collect();
+        let folder = |id: Option<i64>| match id {
+            Some(id) => profiles.iter().find(|p| p.id == id).and_then(|p| std::fs::canonicalize(&p.config_dir).ok()),
+            None => crate::account_profiles::default_folder(&env),
+        };
+        let here = folder(pinned);
+        if here.as_deref().is_some_and(|d| crate::account_profiles::has_conversation(d, &conversation)) {
+            return Ok(pinned);
+        }
+        let mut candidates: Vec<&crate::account_profiles::AccountProfile> = profiles.iter()
+            .filter(|p| p.enabled && Some(p.id) != pinned).collect();
+        candidates.sort_by_key(|p| p.id);
+        let mut candidates: Vec<Option<i64>> = candidates.into_iter().map(|p| Some(p.id)).collect();
+        if pinned.is_some() && !profiles.iter().any(|p| p.is_default) {
+            candidates.push(None);
+        }
+        // Exactly one other folder has it (a copied config folder could hold it twice).
+        let mut found: Vec<(Option<i64>, PathBuf)> = Vec::new();
+        for c in candidates {
+            if let Some(d) = folder(c).filter(|d| Some(d) != here.as_ref())
+                && !found.iter().any(|(_, f)| *f == d)
+                && crate::account_profiles::has_conversation(&d, &conversation)
+                && self.check_account_profile(c).is_ok() {
+                found.push((c, d));
+            }
+        }
+        let [(found, _)] = found.as_slice() else {
+            return Ok(pinned);
+        };
+        let found = *found;
+        let name = |id: Option<i64>| match id {
+            Some(id) => profiles.iter().find(|p| p.id == id).map_or_else(|| format!("profile #{id}"), |p| p.name.clone()),
+            None => "Default".to_string(),
+        };
+        let text = format!("Muster is starting {} on Claude account {}, where its conversation is saved, instead of {}. \
+            It stays on {} from now on.", info.name, name(found), name(pinned), name(found));
+        tracing::info!(session = info.id, "{text}");
+        self.log_event(Some(info.channel_id), Some(info.id), EventKind::System, serde_json::json!({
+            "text": text, "level": "info",
+            "account_followed_conversation": {"from": pinned, "to": found, "conversation": conversation},
+        }));
+        self.notice("info", text);
+        Ok(found)
+    }
+
     /// Session `id`'s next (re)start runs on Claude profile `profile` (None: Default): a named
     /// agent's tab follows its agent's account (`agents::run_agent`). Its running process, if
     /// any, keeps the account it started with.
     pub fn set_session_account_profile(&self, id: SessionId, profile: Option<i64>) -> anyhow::Result<()> {
+        let profile = self.fold_default(profile);
         let mut g = self.inner.lock();
         let e = g.sessions.get_mut(&id).ok_or_else(|| anyhow::anyhow!("no such session: {id}"))?;
         if e.info.account_profile_id == profile {
@@ -3876,7 +4024,7 @@ impl Hub {
     /// What the old CLI's run left on the entry (its conversation, a saved thread, an Antigravity
     /// state) is dropped with it.
     pub(crate) fn set_session_kind(&self, id: SessionId, kind: SessionKind, profile: Option<i64>) -> anyhow::Result<()> {
-        let profile = profile.filter(|_| kind == SessionKind::Claude);
+        let profile = (kind == SessionKind::Claude).then(|| self.fold_default(profile)).flatten();
         let mut g = self.inner.lock();
         let e = g.sessions.get_mut(&id).ok_or_else(|| anyhow::anyhow!("no such session: {id}"))?;
         anyhow::ensure!(e.pty.as_ref().is_none_or(|p| !p.is_alive()), "session {id} is still running");
@@ -5574,6 +5722,10 @@ mod tests {
         provider_fixture(None, None, Default::default())
     }
 
+    fn agent_fixture_with(terminal_host: Option<Arc<TerminalService>>) -> Arc<Hub> {
+        provider_fixture(terminal_host, None, Default::default())
+    }
+
     /// `agent_fixture` with the agent on `provider`, a terminal host and an OpenRouter key.
     fn provider_fixture(terminal_host: Option<Arc<TerminalService>>, key: Option<crate::openrouter::ApiKey>,
         provider: crate::openrouter::Provider) -> Arc<Hub> {
@@ -5783,8 +5935,8 @@ mod tests {
     #[test]
     fn a_login_change_covers_every_row_on_the_folder() {
         let hub = fixture(None);
-        // Default's folder is the daemon's own (CLAUDE_CONFIG_DIR or ~/.claude); skip where none exists.
-        let Some(default_dir) = crate::usage::effective_config_dir(&std::env::vars().collect()) else { return };
+        // Default's folder is Claude Code's default, ~/.claude; skip where none exists.
+        let Some(default_dir) = crate::account_profiles::default_folder(&std::env::vars().collect()) else { return };
         let default_dir = default_dir.to_string_lossy().into_owned();
         let other = std::env::temp_dir().join(format!("muster-hub-usage-{}", paths::random_token()));
         std::fs::create_dir_all(&other).unwrap();
@@ -5805,15 +5957,155 @@ mod tests {
         let row = |hub: &Hub, name: &str| hub.account_usage().unwrap().rows.into_iter().find(|r| r.name == name).unwrap();
         assert_eq!(row(&hub, "Main").five_hour.used_percentage, Some(30.0));
         hub.account_login_changed(crate::account_profiles::ProfileChoice::pinned(None)).unwrap();
-        for name in ["Default", "Main", "Spare"] {
+        // Main is Default now (it is on Default's folder): one row stands for both.
+        assert!(hub.account_usage().unwrap().rows.iter().all(|r| r.name != "Default"));
+        for name in ["Main", "Spare"] {
             assert_eq!(row(&hub, name).five_hour.status, crate::usage::Status::Unknown, "{name}");
         }
         assert!(hub.account_profile(main.id).unwrap().account_group.is_none());
         std::fs::remove_dir_all(&other).unwrap();
     }
 
+    /// A Claude session (2, a named agent's tab) reopening a conversation (`--resume`) runs on
+    /// the account whose folder has it saved, says so once, and records it on the session and
+    /// the agent; saved in its own folder too, or nowhere, or only in a disabled profile's: it
+    /// stays. Folders laid out as Claude Code 2.1.331 keeps them (made-up ids, temp dirs).
     #[test]
-    fn default_profile_keeps_the_inherited_claude_config_dir() {
+    fn a_resumed_conversation_runs_on_the_account_that_has_it() {
+        let (service, directory, received) = crate::terminal::testing::serving_host("hub-resume-account");
+        let hub = agent_fixture_with(Some(service.clone()));
+        let base = std::env::temp_dir().join(format!("muster-hub-resume-{}", paths::random_token()));
+        for d in ["work", "personal"] { std::fs::create_dir_all(base.join(d)).unwrap(); }
+        let work = hub.add_account_profile("Work", base.join("work").to_str().unwrap()).unwrap();
+        let personal = hub.add_account_profile("Personal", base.join("personal").to_str().unwrap()).unwrap();
+        let save = |folder: &str, conversation: &str| {
+            let project = base.join(folder).join("projects").join("-w-repo");
+            std::fs::create_dir_all(project.join(conversation)).unwrap(); // its subagents' folder
+            std::fs::write(project.join(format!("{conversation}.jsonl")), "{}\n").unwrap();
+        };
+        // Where a launch reopening `conversation` would run (the folder's profile).
+        let account = |hub: &Hub, conversation: &str| {
+            hub.launch_account(&hub.session(2).unwrap(), &["--model".into(), "opus".into(), "--resume".into(), conversation.into()]).unwrap()
+        };
+        let agent = |hub: &Hub| hub.agents.by_session(2).unwrap().account_profile_id;
+        let mut events = hub.subscribe();
+        hub.set_session_account_profile(2, Some(work.id)).unwrap();
+        hub.agents.set_account_profile(&hub.store, hub.agents.by_session(2).unwrap().id, Some(work.id)).unwrap();
+
+        // Saved nowhere: today's behaviour (it starts on its own account and the CLI says why).
+        assert_eq!(account(&hub, "conv-nowhere"), Some(work.id));
+        // Saved only in a folder that holds a directory of that name, not the file: not saved.
+        std::fs::create_dir_all(base.join("personal/projects/-w-repo/conv-dir.jsonl")).unwrap();
+        assert_eq!(account(&hub, "conv-dir"), Some(work.id));
+        // In both folders: it stays where it is.
+        save("work", "conv-both");
+        save("personal", "conv-both");
+        assert_eq!(account(&hub, "conv-both"), Some(work.id));
+        // Only in a disabled profile's folder: it can't start there, so it stays.
+        save("personal", "conv-personal");
+        hub.update_account_profile(personal.id, None, Some(false)).unwrap();
+        assert_eq!(account(&hub, "conv-personal"), Some(work.id));
+        // In two other folders (a copied config folder): ambiguous, so it stays.
+        std::fs::create_dir_all(base.join("copy")).unwrap();
+        let copy = hub.add_account_profile("Copy", base.join("copy").to_str().unwrap()).unwrap();
+        hub.update_account_profile(personal.id, None, Some(true)).unwrap();
+        save("copy", "conv-personal");
+        assert_eq!(account(&hub, "conv-personal"), Some(work.id));
+        hub.update_account_profile(personal.id, None, Some(false)).unwrap();
+        hub.update_account_profile(copy.id, None, Some(false)).unwrap();
+        // A fresh start or `--continue` names no conversation: nothing to look for.
+        assert_eq!(hub.launch_account(&hub.session(2).unwrap(), &["--continue".into()]).unwrap(), Some(work.id));
+        while events.try_recv().is_ok() {}
+        // Only in the other profile's folder: the launch runs there, recorded on the tab and the
+        // agent before it starts.
+        hub.update_account_profile(personal.id, None, Some(true)).unwrap();
+        hub.set_session_extra_args(2, vec!["--resume".into(), "conv-personal".into()]).unwrap();
+        let _ = hub.start_process(2, None, None); // the fixture host refuses every launch
+        let spawn = received.spawns.lock().last().cloned().unwrap();
+        assert_eq!(spawn.env.get("CLAUDE_CONFIG_DIR"), Some(&personal.config_dir));
+        assert_eq!(hub.session(2).unwrap().account_profile_id, Some(personal.id));
+        assert_eq!(agent(&hub), Some(personal.id));
+        let mut told = 0;
+        while let Ok(event) = events.try_recv() {
+            if let ServerEvent::Notice { text, .. } = event
+                && text.contains("on Claude account Personal, where its conversation is saved, instead of Work") {
+                told += 1;
+            }
+        }
+        assert_eq!(told, 1, "the owner is told once");
+        // The next start finds it in its own folder now: nothing more to say.
+        assert_eq!(account(&hub, "conv-personal"), Some(personal.id));
+        while let Ok(event) = events.try_recv() {
+            assert!(!matches!(event, ServerEvent::Notice { .. }), "told once only");
+        }
+        // Ids that aren't plain conversation ids are never looked up as file names.
+        assert!(!crate::account_profiles::has_conversation(&base.join("personal"), "../personal/projects/-w-repo/conv-personal"));
+        drop((hub, service));
+        let _ = std::fs::remove_dir_all(directory);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// When a profile is registered at Claude Code's default folder, Default is that profile:
+    /// records saved as Default take it, new choices of Default resolve to it, and it is marked
+    /// `is_default` for the window. Uses the machine's own default folder (registered only in
+    /// this test's database); skipped where it doesn't exist.
+    #[test]
+    fn default_folds_into_the_profile_at_the_default_folder() {
+        let hub = agent_fixture();
+        let Some(default_dir) = crate::account_profiles::default_folder(&std::env::vars().collect()) else { return };
+        let other = std::env::temp_dir().join(format!("muster-hub-fold-{}", paths::random_token()));
+        std::fs::create_dir_all(&other).unwrap();
+        let spare = hub.add_account_profile("Spare", other.to_str().unwrap()).unwrap();
+        // No profile at the default folder yet: Default stays Default.
+        assert_eq!(hub.fold_default(None), None);
+        assert_eq!(hub.session(2).unwrap().account_profile_id, None);
+        assert!(hub.account_profiles().unwrap().iter().all(|p| !p.is_default));
+        let main = hub.add_account_profile("Main", &format!("{}/", default_dir.display())).unwrap();
+        let profiles = hub.account_profiles().unwrap();
+        assert!(profiles.iter().find(|p| p.id == main.id).unwrap().is_default);
+        assert!(!profiles.iter().find(|p| p.id == spare.id).unwrap().is_default);
+        // Saved records move to it: the Claude tab, its agent, the workspace; not the shell.
+        assert_eq!(hub.session(2).unwrap().account_profile_id, Some(main.id));
+        assert_eq!(hub.agents.by_session(2).unwrap().account_profile_id, Some(main.id));
+        assert!(hub.workspaces().iter().all(|w| w.account_profile_id == Some(main.id)));
+        assert_eq!(hub.session(1).unwrap().account_profile_id, None);
+        // New choices of Default resolve to it; a named profile stays itself.
+        let ws = hub.workspaces()[0].id;
+        assert_eq!(hub.resolve_account_profile(SessionKind::Claude, Some(crate::account_profiles::ProfileChoice::pinned(None)), None, ws).unwrap(), Some(main.id));
+        assert_eq!(hub.resolve_account_profile(SessionKind::Claude, Some(crate::account_profiles::ProfileChoice::Id(spare.id)), None, ws).unwrap(), Some(spare.id));
+        assert_eq!(hub.resolve_account_profile(SessionKind::Codex, None, None, ws).unwrap(), None);
+        hub.set_session_account_profile(2, None).unwrap();
+        assert_eq!(hub.session(2).unwrap().account_profile_id, Some(main.id));
+        // Disabled, it is no longer Default: Default is its own choice again.
+        hub.update_account_profile(main.id, None, Some(false)).unwrap();
+        assert_eq!(hub.fold_default(None), None);
+        assert!(hub.account_profiles().unwrap().iter().all(|p| !p.is_default));
+        let _ = std::fs::remove_dir_all(&other);
+    }
+
+    /// An agent whose move to Default waits for its next start takes the profile Default becomes,
+    /// not the account its tab still runs on.
+    #[test]
+    fn a_pending_move_to_default_folds_to_the_new_default() {
+        let hub = agent_fixture();
+        let Some(default_dir) = crate::account_profiles::default_folder(&std::env::vars().collect()) else { return };
+        let other = std::env::temp_dir().join(format!("muster-hub-fold-move-{}", paths::random_token()));
+        std::fs::create_dir_all(&other).unwrap();
+        let spare = hub.add_account_profile("Spare", other.to_str().unwrap()).unwrap();
+        let ada = hub.agents.by_session(2).unwrap();
+        hub.agents.set_account_profile(&hub.store, ada.id, Some(spare.id)).unwrap();
+        hub.set_session_account_profile(2, Some(spare.id)).unwrap();
+        let req: crate::agents::AgentUpdate = serde_json::from_value(serde_json::json!({"name": "ada", "account_profile": "default"})).unwrap();
+        let moved = crate::agents::update(&hub, req, false).unwrap();
+        assert_eq!((moved.account_profile_id, moved.handoff.is_some()), (None, true));
+        let main = hub.add_account_profile("Main", default_dir.to_str().unwrap()).unwrap();
+        assert_eq!(hub.agents.by_session(2).unwrap().account_profile_id, Some(main.id));
+        assert_eq!(hub.session(2).unwrap().account_profile_id, Some(spare.id), "the tab keeps its run's account");
+        let _ = std::fs::remove_dir_all(&other);
+    }
+
+    #[test]
+    fn a_default_launch_drops_an_inherited_claude_config_dir() {
         let hub = fixture(None);
         let home = std::env::temp_dir().join(format!("muster-hub-profile-{}", paths::random_token()));
         std::fs::create_dir_all(home.join(".claude")).unwrap();
@@ -5826,7 +6118,8 @@ mod tests {
             hub.apply_account_profile(id, &mut env).unwrap();
             env.get("CLAUDE_CONFIG_DIR").cloned()
         };
-        assert_eq!(env(None).as_deref(), Some("/previous"));
+        // Default is Claude Code's default folder, whatever the backend was started with.
+        assert_eq!(env(None), None);
         let at_default = hub.add_account_profile("Main", &format!("{}/.claude/", home.display())).unwrap();
         assert_eq!(env(Some(at_default.id)), None);
         let work = hub.add_account_profile("Work", home.join("work").to_str().unwrap()).unwrap();

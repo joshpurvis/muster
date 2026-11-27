@@ -9,8 +9,19 @@ import type {
   UsageWindow,
 } from "./types.ts";
 
+/** The profile Default means, when one is registered at Claude Code's default folder. */
+export function defaultProfile(profiles: AccountProfile[]): AccountProfile | undefined {
+  return profiles.find((p) => p.is_default);
+}
+
+/** A choice as the window shows and compares it: Default as the profile it means, if any. */
+export function shownChoice(profiles: AccountProfile[], choice: ProfileChoice | null | undefined): ProfileChoice {
+  return choice == null || choice === "default" ? defaultProfile(profiles)?.id ?? "default" : choice;
+}
+
 export function profileName(profiles: AccountProfile[], id: number | null | undefined): string {
-  return id == null ? "Default" : profiles.find((p) => p.id === id)?.name ?? `Unavailable profile #${id}`;
+  if (id == null) return defaultProfile(profiles)?.name ?? "Default";
+  return profiles.find((p) => p.id === id)?.name ?? `Unavailable profile #${id}`;
 }
 
 /** A new Claude tab/split follows the source Claude session, including its explicit Default.

@@ -1492,11 +1492,26 @@ reads a stored `lead` origin as `webhook`).
 
 ## Claude account profiles
 
-`AccountProfile` is `{id, name, config_dir, enabled, created_at}`. It references an existing
+`AccountProfile` is `{id, name, config_dir, enabled, created_at, is_default}`. It references an existing
 canonical directory, never credentials. `hello.account_profiles` and
 `account_profiles_changed` carry the complete list. These fields are additive; older clients
 may ignore them. `Workspace`, `SessionInfo`, and named-agent records include nullable
 `account_profile_id`. Migration v13 leaves all existing records null.
+
+Default (null, `"default"`) is Claude Code's default folder, `$HOME/.claude` with
+`CLAUDE_CONFIG_DIR` removed, whoever started or reloaded the backend: the backend drops that
+variable from its own environment at start, and a backend started from inside a Muster tab also
+drops the tab's own `MUSTER_*` variables (and `PORT` when it is the tab's port). `is_default` is
+computed, never stored: true for the enabled profile at that folder (the lowest id if several
+reach it), which Default then is. While one is, the backend saves its id instead of null
+(Claude sessions, Claude agents and workspace defaults, at start and when that profile is
+registered or enabled; a live run keeps the profile of the folder its launch used), resolves
+`"default"` and null choices to it, `agent.update` to it from Default is no move, and
+`UsageSnapshot` has no Default row. A Claude launch that reopens a conversation (`--resume <id>`
+in its arguments or an agent's resume id) saved only under another enabled profile's folder
+(`<folder>/projects/*/<id>.jsonl`) runs on that profile and saves it on the session and its
+agent, with one `notice` and one `system` event whose data has
+`account_followed_conversation: {from, to, conversation}`.
 
 | Method | Params | Result |
 |---|---|---|
@@ -1512,7 +1527,7 @@ may ignore them. `Workspace`, `SessionInfo`, and named-agent records include nul
 
 `AccountProfile` also has `account_group: string | null` (opaque; equal values were declared
 one account; migration v22). `UsageSnapshot` is `{evaluated_at, stale_after_ms, rows[],
-suggestion, no_suggestion}`: one row for Default, then one per profile, each `{choice, name,
+suggestion, no_suggestion}`: one row for Default (none while a profile `is_default`), then one per profile, each `{choice, name,
 enabled, eligible, ineligible_reason, account, same_account_as[], five_hour, seven_day}`.
 `account` is equal for rows on one account (a declared group, or Default and a profile on its
 folder). A window is `{status, used_percentage, resets_at (Unix s), observed_at (Unix ms of the
@@ -1547,7 +1562,7 @@ There is no login, token, configuration-file copy, or directory deletion API.
 `channel.create`, `session.spawn`, and `agent.create` accept `account_profile?: number |
 "default"`. It is valid only for Claude. For new sessions, absent/null inherits from a Claude
 parent/caller, then the workspace default; explicit `"default"` bypasses inheritance.
-`agent.create` instead defaults to ordinary inherited Claude behavior and pins its choice on
+`agent.create` instead defaults to Default and pins its choice on
 the agent record; `agent.update` moves it (below).
 
 #### Moving a named agent to another account
@@ -1609,8 +1624,8 @@ workspace defaults. Named-agent replacement sessions use the agent's pinned sele
 resume ID. Missing/disabled profiles, unavailable or redirected directories, and known
 inherited authentication/endpoint conflicts fail rather than falling back. Restart performs
 this preflight before interrupting the previous run. Error messages name conflicting
-environment variables without their values. Default/null-pinned sessions retain the legacy
-environment behavior, including any inherited `CLAUDE_CONFIG_DIR`.
+environment variables without their values. Default/null-pinned sessions keep the backend's
+environment except `CLAUDE_CONFIG_DIR`, which they never get (see above).
 
 The launcher sets only `CLAUDE_CONFIG_DIR` in the selected child's existing environment (or,
 for a profile at the canonical `$HOME/.claude` with an absolute HOME, removes it, so Claude

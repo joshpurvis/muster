@@ -1,0 +1,9 @@
+[
+  {"until": "globalThis.__muster?.windowId?.value != null", "settle": 0.8},
+  {"js": "(document.activeElement || document.body).dispatchEvent(new KeyboardEvent('keydown', {key: 'N', code: 'KeyN', altKey: true, shiftKey: true, bubbles: true}));", "until": "[...document.querySelectorAll('.modal select')].some((s) => [...s.options].some((o) => o.textContent === 'Personal'))", "settle": 0.6, "shot": "new-channel", "crop": ".modal", "pad": 12},
+  {"js": "const sel = [...document.querySelectorAll('.modal select')].find((s) => [...s.options].some((o) => o.textContent === 'Personal')); return {profile_options: [...sel.options].map((o) => o.textContent), selected: sel.options[sel.selectedIndex].textContent};"},
+  {"js": "document.querySelector('.modal').dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', bubbles: true}));", "until": "!document.querySelector('.modal')"},
+  {"js": "document.querySelector('[data-tip*=\"Click for Claude profiles\"]').click();", "until": "document.querySelector('.profiles-dialog')", "settle": 0.6, "shot": "usage", "crop": ".profiles-dialog", "pad": 12},
+  {"js": "[...document.querySelectorAll('.profiles-dialog [role=tab]')].find((t) => t.textContent.trim() === 'Profiles').click();", "until": "document.querySelector('.profiles-dialog .pf-list')", "settle": 0.5, "shot": "profiles", "crop": ".profiles-dialog", "pad": 12},
+  {"js": "return {rows: [...document.querySelectorAll('.profiles-dialog .pf-name')].map((e) => e.textContent)};"}
+]

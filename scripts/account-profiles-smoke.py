@@ -28,12 +28,14 @@ with socket.socket() as reserve:
 ENV = {
     "PATH": f"{FAKEBIN}:/usr/bin:/bin", "HOME": str(FIXTURE_HOME), "SHELL": "/bin/bash", "LANG": "C.UTF-8",
     "MUSTER_RUNTIME_DIR": str(RUNTIME), "MUSTER_DATA_DIR": str(DATA), "MUSTER_PORT": str(PORT),
-    "CLAUDE_CONFIG_DIR": str(BASE / "default"), "PROFILE_LAUNCH_LOG": str(BASE / "launches.jsonl"),
+    "PROFILE_LAUNCH_LOG": str(BASE / "launches.jsonl"),
     "STATUSLINE_DIR": str(BASE / "statusline"),
     # Save notes first waits this long for a reply (debug builds only), not 10 minutes.
     "MUSTER_TEST_SAVE_NOTES_WAIT_MS": "6000",
 }
 (BASE / "statusline").mkdir(mode=0o700)
+# Default is Claude Code's default folder of the backend's HOME, whatever started the backend.
+DEFAULT = FIXTURE_HOME / ".claude"
 if "--browser" in sys.argv:
     assert (PROJECT / "web/dist/app.js").is_file(), "deno task web first"
     ENV["MUSTER_WEB_DIR"] = str(PROJECT / "web/dist")
@@ -50,6 +52,15 @@ os.write(fd, (json.dumps(row) + "\\n").encode())
 os.close(fd)
 print("FAKE_CLAUDE " + json.dumps(row), flush=True)
 args = sys.argv[1:]
+# Like Claude Code: a conversation reopens only from the folder this run uses.
+if "--resume" in args:
+    conversation = args[args.index("--resume") + 1]
+    folder = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.environ["HOME"], ".claude")
+    projects = os.path.join(folder, "projects")
+    if not any(os.path.isfile(os.path.join(projects, p, conversation + ".jsonl"))
+               for p in (os.listdir(projects) if os.path.isdir(projects) else [])):
+        print(f"No conversation found with session ID: {conversation}", flush=True)
+        sys.exit(1)
 settings = args[args.index("--settings") + 1] if "--settings" in args else None
 trigger = os.path.join(os.environ["STATUSLINE_DIR"], f"{row['id']}.json")
 while True:
@@ -63,10 +74,10 @@ while True:
     time.sleep(0.05)
 ''')
 (FAKEBIN / "claude").chmod(0o700)
-for name in ("personal", "work", "default", "ui"):
-    (BASE / name).mkdir(mode=0o700)
+for folder in (BASE / "personal", BASE / "work", DEFAULT, BASE / "ui"):
+    folder.mkdir(mode=0o700)
     # Deliberately not an authentication document. Registering and launching must leave it alone.
-    (BASE / name / ".credentials.json").write_text("fixture: this is not a credential\n")
+    (folder / ".credentials.json").write_text("fixture: this is not a credential\n")
 # Each profile's own status line, which Muster's reporter must keep showing (exit code included).
 (BASE / "personal" / "settings.json").write_text(json.dumps(
     {"statusLine": {"type": "command", "command": "cat > /dev/null; echo HOME-USER-LINE; exit 3"}}))
@@ -125,11 +136,12 @@ def cli(*args, session=None):
                           capture_output=True, check=True, timeout=20).stdout
 
 
-def start():
+def start(env=None):
+    """A backend with `env` (default: ENV, a plain terminal's)."""
     global current, token
     log = open(BASE / f"backend-{len(logs)}.log", "wb")
     logs.append(log)
-    current = subprocess.Popen([str(BIN), "daemon", "--foreground"], env=ENV, cwd=REPO,
+    current = subprocess.Popen([str(BIN), "daemon", "--foreground"], env=env or ENV, cwd=REPO,
                                stdin=subprocess.DEVNULL, stdout=log, stderr=log)
 
     def ready():
@@ -178,6 +190,16 @@ def usage_row(name):
     return next(r for r in rpc("account_usage.get")["rows"] if r["name"] == name)
 
 
+def save_conversation(sid, conversation):
+    """What Claude Code does once a turn ends: the conversation is saved in the folder session
+    `sid`'s current run uses, as <folder>/projects/<project>/<id>.jsonl."""
+    run = launched(sid)
+    folder = Path(run["config_dir"]) if run["config_dir"] else DEFAULT
+    project = folder / "projects" / "".join(c if c.isalnum() else "-" for c in str(REPO))
+    project.mkdir(parents=True, exist_ok=True)
+    (project / f"{conversation}.jsonl").write_text("{}\n")
+
+
 def spawn(channel, **params):
     result = rpc("session.spawn", {"channel_id": channel, "kind": "claude", **params})
     launched(result["id"], result["pid"])
@@ -203,8 +225,8 @@ try:
     a, b, legacy = spawn(ch, account_profile=personal), spawn(ch, account_profile=work), spawn(ch)
     check(launched(a["id"])["config_dir"] == str(BASE / "personal") and launched(b["id"])["config_dir"] == str(BASE / "work"),
           "concurrent Claude processes receive different profile directories")
-    check(launched(legacy["id"])["config_dir"] == str(BASE / "default") and legacy["account_profile_id"] is None,
-          "legacy/default launch preserves ordinary inherited environment")
+    check(launched(legacy["id"])["config_dir"] is None and legacy["account_profile_id"] is None,
+          "a Default launch runs on Claude Code's default folder (no CLAUDE_CONFIG_DIR)")
     cli("profile", "default", str(REPO), "Work")
     inherited = spawn(ch, parent_id=a["id"])
     default_child = spawn(ch, parent_id=legacy["id"])
@@ -236,6 +258,7 @@ try:
     for event in ("SessionStart", "Stop"):
         status, _ = http(f"/hook/{event}", {"session_id": "fixture-conversation"}, run_token)
         assert status == 200, event
+    save_conversation(named["id"], "fixture-conversation")
     resumed = rpc("session.restart", {"id": named["id"]})
     named_run = launched(named["id"], resumed["pid"])
     check(named_run["config_dir"] == str(BASE / "personal") and "fixture-conversation" in named_run["args"],
@@ -264,6 +287,7 @@ try:
                                ("Stop", {"session_id": conversation, **({"last_assistant_message": reply} if reply else {})})):
             status, _ = http(f"/hook/{event}", payload, run)
             assert status == 200, event
+        save_conversation(sid, conversation)
 
     def reviewer():
         return next(x for x in rpc("agent.list") if x["name"] == "reviewer")
@@ -545,6 +569,52 @@ try:
                         f"http://127.0.0.1:{PORT}/#token={token}", str(BASE), str(browser_port)],
                        env=ENV, check=True, timeout=90)
         check(True, "rendered profile management and new-session selection")
+
+    # ----- Default never follows whoever started the backend (27 Nov 2026) -----
+    # A reload typed in a tab on the second profile hands the new backend that tab's environment.
+    reload_env = {**ENV, "CLAUDE_CONFIG_DIR": str(BASE / "personal"), "MUSTER": "1", "MUSTER_SESSION_ID": str(a["id"]),
+                  "MUSTER_TOKEN": "fixture-tab-token", "MUSTER_PORT_BASE": "20040", "PORT": "20040"}
+    rpc("daemon.shutdown", {})
+    current.wait(timeout=15)
+    start(reload_env)
+    cli("agent", "new", "lead", "--profile", "default")
+    lead = rpc("agent.start", {"name": "lead"})["session"]
+    run = launched(lead["id"], lead["pid"])
+    check(run["config_dir"] is None and lead["account_profile_id"] is None,
+          "after a reload from a tab on another profile, a Default session still starts on the default folder")
+    hooks(lead["id"], "lead-conversation")
+    check((next(DEFAULT.glob("projects/*/lead-conversation.jsonl"), None) is not None
+           and next(BASE.glob("personal/projects/*/lead-conversation.jsonl"), None) is None),
+          "its conversation is saved in the default folder, not the reloading tab's")
+    # The owner's full restart from a plain terminal: the lead's next start reopens it.
+    rpc("daemon.shutdown", {})
+    current.wait(timeout=15)
+    start()
+    again = rpc("session.restart", {"id": lead["id"]})
+    run = launched(lead["id"], again["pid"])
+    time.sleep(1)
+    check(run["config_dir"] is None and "lead-conversation" in run["args"] and session(lead["id"])["state"] != "exited",
+          "after the restart the Default session resumes and finds its conversation")
+    # A conversation saved only under another profile (as before this fix): it starts there.
+    save_conversation(a["id"], "stray-conversation")  # session a ran on Personal (now named Home)
+    stray = rpc("session.spawn", {"channel_id": ch, "kind": "claude", "account_profile": "default",
+                                  "extra_args": ["--resume", "stray-conversation"]})
+    run = launched(stray["id"], stray["pid"])
+    told = [e for e in rpc("channel.timeline", {"id": ch, "limit": 100})
+            if e["kind"] == "system" and "account_followed_conversation" in e["data"]]
+    check(run["config_dir"] == str(BASE / "personal") and session(stray["id"])["account_profile_id"] == personal
+          and len(told) == 1, "a resume whose conversation is only in another profile's folder starts there, once told")
+    # Registering the default folder folds Default into that profile.
+    cli("profile", "add", "Main", str(DEFAULT))
+    main = next(p for p in json.loads(cli("profile", "ls", "--json")) if p["name"] == "Main")
+    check(main.get("is_default") and session(lead["id"])["account_profile_id"] == main["id"]
+          and next(x for x in rpc("agent.list") if x["name"] == "lead")["account_profile_id"] == main["id"],
+          "a profile at the default folder becomes Default: saved Default records take it")
+    folded = spawn(ch, account_profile="default")
+    check(folded["account_profile_id"] == main["id"] and launched(folded["id"])["config_dir"] is None
+          and all(r["name"] != "Default" for r in rpc("account_usage.get")["rows"]),
+          "choosing Default picks that profile, still without CLAUDE_CONFIG_DIR, and usage has no Default row")
+
     check(all((p.read_bytes(), p.stat().st_mtime_ns) == before for p, before in sentinels.items()),
           "all fixture authentication files remain byte-for-byte and timestamp unchanged")
     print(f"Passed {checks} profile integration checks.", flush=True)

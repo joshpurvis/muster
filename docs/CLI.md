@@ -453,15 +453,18 @@ muster agent edit reviewer --profile Personal --now
 
 `--profile` accepts an exact name (case-insensitive), numeric profile ID, or `default`.
 Without it, `muster new` inherits the calling Claude session's profile before the workspace
-default. Outside a Claude session it uses the workspace default, or the ordinary inherited
-Claude environment. `--profile default` explicitly selects that ordinary environment. The
-flag is only valid for Claude. Named agents default to the ordinary environment and keep
+default. Outside a Claude session it uses the workspace default, or Default.
+`--profile default` explicitly selects Default: Claude Code's default folder, `~/.claude`,
+whoever started or reloaded Muster (the backend drops an inherited `CLAUDE_CONFIG_DIR`). When
+`~/.claude` is itself registered as a profile, Default is that profile: `muster profile ls`
+marks it `default`, and sessions and agents saved as Default take it. The flag is only valid
+for Claude. Named agents default to Default and keep
 their profile for fresh conversations and replacement sessions until it is moved with
 `muster agent edit NAME --profile PROFILE` (a new conversation on the new profile).
 
 | Command | Meaning |
 |---|---|
-| `muster profile ls [--json]` | List references, including disabled profiles. Does not check login status. |
+| `muster profile ls [--json]` | List references, including disabled profiles; a last column `default` marks the one Default is (`is_default` in JSON). Does not check login status. |
 | `muster profile add NAME DIRECTORY` | Register an existing directory. Relative CLI paths are resolved locally; duplicate canonical paths are refused. |
 | `muster profile rename PROFILE NAME` | Change the display label. Directory and session bindings stay fixed. |
 | `muster profile disable PROFILE` | Prevent new launches and restarts; running sessions remain usable. |

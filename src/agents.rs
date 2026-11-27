@@ -1493,6 +1493,22 @@ impl Registry {
         Ok(Some(a.clone()))
     }
 
+    /// Claude agent `id` runs on profile `profile` from now on, with no move (its conversation
+    /// stays): Default recorded as the profile it folds into, or the account its conversation was
+    /// found in (`Hub::launch_account`). The record after, if it changed.
+    pub(crate) fn set_account_profile(&self, store: &Store, id: i64, profile: Option<i64>) -> anyhow::Result<Option<Agent>> {
+        let mut g = self.inner.lock();
+        let Some(b) = g.agents.get_mut(&id) else { return Ok(None) };
+        if b.kind != SessionKind::Claude || b.account_profile_id == profile {
+            return Ok(None);
+        }
+        let mut a = b.clone();
+        a.account_profile_id = profile;
+        store.update_agent_config(&a)?;
+        *b = a.clone();
+        Ok(Some(a))
+    }
+
     pub(crate) fn update(&self, store: &Store, id: i64, f: impl FnOnce(&mut Agent)) -> anyhow::Result<()> {
         let mut g = self.inner.lock();
         let b = g.agents.get_mut(&id).ok_or_else(|| anyhow::anyhow!("agent {id} was removed"))?;
@@ -2000,7 +2016,7 @@ pub fn create(hub: &Hub, req: NewAgent) -> anyhow::Result<Agent> {
     let kind = req.kind.unwrap_or(SessionKind::Claude);
     anyhow::ensure!(kind == SessionKind::Claude || req.account_profile.is_none(),
         "account_profile is only supported for Claude agents");
-    let account_profile_id = req.account_profile.and_then(|p| p.id());
+    let account_profile_id = (kind == SessionKind::Claude).then(|| hub.fold_default(req.account_profile.and_then(|p| p.id()))).flatten();
     hub.check_account_profile(account_profile_id)?;
     let (model, effort) = (clean_opt(req.model), clean_opt(req.effort));
     agent_args(kind, model.as_deref(), effort.as_deref(), None)?;
@@ -2327,8 +2343,9 @@ pub fn update_full(hub: &Hub, req: AgentUpdate, outside: bool) -> anyhow::Result
     // the old profile's folder, which Muster never opens).
     anyhow::ensure!(req.account_profile.is_none() || cur.kind == SessionKind::Claude,
         "account_profile is only supported for Claude agents");
-    let moving = match req.account_profile.map(|p| p.id()) {
-        Some(to) if to != cur.account_profile_id => {
+    // Default and the profile it folds into are one account: choosing one for the other moves nothing.
+    let moving = match req.account_profile.map(|p| hub.fold_default(p.id())) {
+        Some(to) if to != hub.fold_default(cur.account_profile_id) => {
             hub.check_account_profile(to)?;
             Some(to)
         }
@@ -2399,6 +2416,9 @@ pub fn update_full(hub: &Hub, req: AgentUpdate, outside: bool) -> anyhow::Result
     }
     if let Some(to) = switching {
         switch_kind(&mut next, to);
+        if to == SessionKind::Claude {
+            next.account_profile_id = hub.fold_default(next.account_profile_id);
+        }
     }
 
     if let Some(m) = req.model {
@@ -2839,6 +2859,10 @@ async fn run_agent(hub: &Arc<Hub>, mut agent: Agent, fresh: bool, window: Option
         })
         .await?;
     agent.session_id = Some(session.id);
+    // Its launch may have recorded another account on it (`Hub::launch_account`).
+    if let Some(now) = hub.agents().by_id(agent.id) {
+        agent.account_profile_id = now.account_profile_id;
+    }
     Ok(AgentSession { agent, session, started: true, woke, new_conversation: false })
 }
 
@@ -3047,7 +3071,7 @@ const HANDOFF_SCAN: usize = 200;
 
 /// A profile's name as the owner knows it: "Default" for none.
 fn profile_name(hub: &Hub, id: Option<crate::account_profiles::ProfileId>) -> String {
-    match id {
+    match hub.fold_default(id) {
         None => "Default".into(),
         Some(id) => hub.account_profile(id).map(|p| p.name).unwrap_or_else(|_| format!("profile #{id} (removed)")),
     }

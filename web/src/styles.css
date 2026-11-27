@@ -3764,6 +3764,7 @@ legend {
 }
 .pf-note { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; color: var(--text-muted); }
 .pf-path-plain { font-family: inherit; font-size: 12px; }
+.pf-default { font-size: 11px; color: var(--text-muted); border: 1px solid var(--border-strong); border-radius: 4px; padding: 0 5px; }
 .pf-chev { flex: none; color: var(--text-faint); transition: transform var(--t) var(--ease); }
 .pf-item.open .pf-chev { transform: rotate(90deg); }
 .pf-item.open > .pf-head { background: var(--accent-softer); }

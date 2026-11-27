@@ -208,6 +208,8 @@ export interface SessionInfo {
   state_since: number;
   title: string | null;
   parent_id: SessionId | null;
+  /** The named agent whose "May start sessions in" grant started it (docs/MCP.md). Absent from an older backend. */
+  delegated_by?: number | null;
   pid: number | null;
   exit_code: number | null;
   cols: number;
@@ -361,6 +363,10 @@ export interface Agent {
   tools_up_front?: boolean;
   /** A lead agent (Claude or Antigravity): what it sends from scheduled work goes as origin "lead", taken like the human's (docs/MCP.md "Lead agents"). Absent from an older backend. */
   lead?: boolean;
+  /** Workspaces besides its own it may start sessions in (Edit agent, "May start sessions in";
+   * docs/MCP.md "Starting sessions in another workspace"). Only the window adds one. Absent from
+   * an older backend. */
+  spawn_workspaces?: WorkspaceId[];
   /** The kinds Edit agent can switch it between (Claude and Antigravity; empty for Codex).
    * Absent from an older backend, which can't switch. */
   switch_kinds?: Agent["kind"][];

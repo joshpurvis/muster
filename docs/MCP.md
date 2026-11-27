@@ -86,17 +86,17 @@ and targets in them are refused.
 
 | Tool | Arguments | Result |
 |---|---|---|
-| `whoami` | — | Caller session, cwd, channel (id, name, branch, base branch, cwd, `permissions`), workspace (id, name, path), spawn budget, `policy: {shell_commands, other_workspaces}`. |
+| `whoami` | — | Caller session, cwd, channel (id, name, branch, base branch, cwd, `permissions`), workspace (id, name, path), spawn budget, `policy: {shell_commands, sharing_rules, may_start_sessions_in}`. `may_start_sessions_in`: the names of the workspaces besides its own that the caller's agent may start sessions in (empty for a session that isn't a named agent). |
 | `list_channels` | — | Non-archived channels: id, name, workspace, cwd, branch, base_branch, `permissions`, `state` (aggregate), `sessions`, `live_sessions`. |
 | `list_sessions` | `channel_id?` | All sessions (including exited): id, channel_id, kind, name, state, detail, state_since_ms, queued, quiet_waiting (quiet messages waiting for a later turn, see "Quiet messages" below), parent_id, title, exit_code, is_me, `link`, `mention` (see "Links" below). With `queued` above 0 also `queue_waits`: why those prompts are not typed yet, in plain words, or null when the next is about to be typed (docs/PROTOCOL.md `session.queue`, `waiting`). |
-| `spawn_session` (alias `spawn_agent`, its old name: still accepted, not listed) | `kind` (`claude`\|`codex`\|`antigravity`\|`shell`), `prompt?`, `name?`, `model?`, `effort?`, `args?: string[]`, `channel_id?` **or** `new_channel?: {name?, worktree? = true, base?}` | New session (`parent_id` = caller) plus its channel. Default: caller's channel. The new session is a tab in the caller's window. `new_channel` is created in the caller's workspace, in the caller's window (else its channel's), with the caller's channel's permission profile. Without a `name` it is auto-named like any unnamed channel (docs/PROTOCOL.md), usually from the agent's title or the `prompt`. Unlike `channel.create`, `worktree` defaults to `true` here, so parallel agents don't share a checkout. `kind: shell` with a `prompt` or any `args` is refused unless shell commands are allowed (arguments to a shell are a command too). `model`/`effort` become `--model`/`--effort` (claude) or `-m`/`-c model_reasoning_effort=` (codex); `args` are extra CLI arguments; all of them go through the agent-argument allowlist (docs/PROTOCOL.md, "Channel permissions"), so they can't widen the profile. |
+| `spawn_session` (alias `spawn_agent`, its old name: still accepted, not listed) | `kind` (`claude`\|`codex`\|`antigravity`\|`shell`), `prompt?`, `name?`, `model?`, `effort?`, `args?: string[]`, `channel_id?` **or** `new_channel?: {name?, workspace?, worktree? = true, base?}` | New session (`parent_id` = caller) plus its channel. Default: caller's channel. The new session is a tab in the caller's window. `new_channel` is created in the caller's workspace (or in the one `workspace` names, exactly, if the human lets the caller's agent start sessions there: see "Starting sessions in another workspace"), in the caller's window (else its channel's), with the caller's channel's permission profile. Without a `name` it is auto-named like any unnamed channel (docs/PROTOCOL.md), usually from the agent's title or the `prompt`. Unlike `channel.create`, `worktree` defaults to `true` here, so parallel agents don't share a checkout. `kind: shell` with a `prompt` or any `args` is refused unless shell commands are allowed (arguments to a shell are a command too). `model`/`effort` become `--model`/`--effort` (claude) or `-m`/`-c model_reasoning_effort=` (codex); `args` are extra CLI arguments; all of them go through the agent-argument allowlist (docs/PROTOCOL.md, "Channel permissions"), so they can't widen the profile. |
 | `send_message` | `session_id`, `text`, `interrupt? = false`, `wake? = true` | `{delivered, queued, sent_at_ms}`. Goes through the injection queue (`inject::send`, `from = "session:<caller>"`). With `wake: false` it is kept for the session's next turn that can take it instead (`{session_id, quiet_id, wake: false, status: "waiting", note, sent_at_ms}`; Claude sessions only, not with `interrupt`; see "Quiet messages" below). A named agent's session is refused: it takes messages through `ask_agent`, or `tell_agent` for a note that doesn't need an answer. Like any first prompt, it names an auto-named channel. Shell targets are refused unless shell commands are allowed; when allowed, the text is preceded by a line clear (Ctrl-E Ctrl-U) so it doesn't append to a half-typed command. |
 | `read_screen` | `session_id` | `[session N (kind) state=S]` header, then the visible screen. |
 | `get_recent_output` | `session_id`, `lines? = 100` (max 2000) | Last N lines, ANSI stripped. |
 | `wait_for_state` | `session_id`, `states?`, `timeout_seconds? = 300` (max 1800), `after_ms?` | `{state, detail, reached, timed_out, ended, waited_ms, queued, …}`. |
 | `post_to_channel` | `text`, `channel_id?` (default: caller's) | Logs an `agent_post` event (`{session_id, text}`) on the human-visible timeline. |
 | `get_diff` | `channel_id?` (default: caller's), `max_bytes? = 60000` (max 400000) | `worktree::diff(channel.cwd, channel.base_branch)`. Past `max_bytes` it is cut at a line boundary with a note listing the changed files (first 200). |
-| `list_agents` | — | `{agents: [{id, name, kind, model, effort, persona, permissions, accepts_origins, autostart, home_dir, channel_id, session_id, state, detail, resumable, created_at, sleep_after_min, asleep, asleep_at, self_handoff, self_handoff_at, tools_up_front, lead, is_me}], your_origin: {origin, hop}}`. `lead`: a lead agent (see "Lead agents" under Agents); a lead's `your_origin` is then `lead` in a scheduled turn. All agents, whatever the caller's workspace. `asleep`: its process was stopped while idle (state `exited`, detail `asleep`); asking it wakes it, which re-reads its whole conversation unless a pending account move starts it in a new one (docs/PROTOCOL.md "Sleep and wake"). Listing never wakes anyone. |
+| `list_agents` | — | `{agents: [{id, name, kind, model, effort, persona, permissions, accepts_origins, autostart, home_dir, channel_id, session_id, state, detail, resumable, created_at, sleep_after_min, asleep, asleep_at, self_handoff, self_handoff_at, tools_up_front, lead, spawn_workspaces, is_me}], your_origin: {origin, hop}}`. `spawn_workspaces`: ids of the workspaces besides its own the agent may start sessions in ("Starting sessions in another workspace"). `lead`: a lead agent (see "Lead agents" under Agents); a lead's `your_origin` is then `lead` in a scheduled turn. All agents, whatever the caller's workspace. `asleep`: its process was stopped while idle (state `exited`, detail `asleep`); asking it wakes it, which re-reads its whole conversation unless a pending account move starts it in a new one (docs/PROTOCOL.md "Sleep and wake"). Listing never wakes anyone. |
 | `ask_agent` | `agent` (name, case-insensitive), `text`, `timeout_seconds? = 600` (max 1800) | `{agent, msg_id, session_id, reply, state, detail, timed_out, ended, origin, hop, sent_at_ms, started, woke, woke_note?, waited_ms, note?, unattributed_output?}`. Starts the agent if it has no live session (`woke: true` when it was asleep: it restarted into its conversation first), sends `[muster msg <id> from <sender> origin=<o> hop=<n>]` plus the text through the injection queue (`from = "session:<caller>"`), then waits for **this message's** turn: until the agent reports a final message attributed to it (Stop hook, Codex notify), or, after the message was typed in, stops on a prompt, question or error (`reply: null` and a `note`), or exits. If the agent goes idle after it with no attributed final message (3 s grace), `reply` is null and `unattributed_output` holds its last 60 terminal lines, with a `note` that they may belong to another prompt. The agent's `reply` to this message while the ask waits ends it with that text as `reply`. On timeout a `note` says a later answer comes as a new message (or, sent with wake=false, at the start of the next turn). See "Agents" below. |
 | `tell_agent` | `agent`, `text`, `wake` (required) | A message nobody waits for an answer to. `wake: true`: delivered now as `ask_agent`'s message is (the agent starts or wakes if needed), without waiting for the turn: `{agent, msg_id, wake, status: "delivered"\|"queued", session_id, woke, started, origin, hop, sent_at_ms, note}`. `wake: false`: kept for the agent's next turn that can take it (`{agent, msg_id, wake, status: "waiting", waiting, origin, hop, sent_at_ms, note}`); see "Quiet messages" below. Same checks as `ask_agent` either way. |
 | `reply` | `msg_id`, `text`, `wake? = true` | `{msg_id, status, delivered, note, delivered_as, session_id, origin, hop}`. Answers a message delivered to the caller's agent after the turn that received it; see "Late replies" below. A waiting ask returns it only when it brings no origin the question's chain didn't have and is at most one hop past the question; otherwise it goes as a new message. A schedule's run whose turn left no final message takes it as its reply under the same rule (`status: "returned"`). With `wake: false`, unless a waiting ask takes it, the asker gets it at the start of its next turn that can take it instead of a new turn (refused, nothing stored, when the reply is rooted in two kinds of unattended work, or on `lead` work when an existing agent or a live session asked: send it with `wake: true`). Errors (nothing stored, no rate-limit slot used): the caller isn't a named agent, the message wasn't delivered to it (unknown, another agent's, refused, still queued), it already has a reply, empty or over 100 000 chars, starts with `!` (unless shell commands are allowed), or, with `wake: false`, over 6,000 characters (an emoji such as 😀 counts as two) or 150 lines. |
@@ -1392,7 +1392,8 @@ the channel starts with it, including ones spawned through MCP:
   `send_message` to an agent running in such a channel. Shells aren't governed by the profile.
   Spawning into or messaging an equal or narrower channel is fine.
 - A `new_channel` created through `spawn_session` gets the **caller's** channel profile, never
-  more (and never the defaults if the caller has less).
+  more (and never the defaults if the caller has less), also in another workspace
+  (`new_channel.workspace`): never that workspace's defaults, even if they are wider.
 - `whoami` and `list_channels` show each channel's `permissions` as
   `{codex_sandbox, claude_mode, antigravity_mode, codex_flags, claude_permission_mode, antigravity_flags, set_by}`, so an agent knows
   whether a child could, say, reach the network before it spawns one. If a task needs more, the
@@ -1466,7 +1467,45 @@ server refuses:
   `get_recent_output`, `wait_for_state` (by session), `post_to_channel`, `get_diff`,
   `spawn_session` (by `channel_id`). `list_channels` and `list_sessions` only show the caller's
   workspace plus explicitly shared targets. The human grants access in Muster's sidebar (Channels ⋯) under
-  Session communication, with separate messaging and output-reading permissions.
+  Session communication, with separate messaging and output-reading permissions. A sharing rule
+  lets sessions message or read each other; it never lets one start sessions in the other
+  workspace (that takes the grant below).
+
+### Starting sessions in another workspace
+
+A lead agent lives in its own folder, so the sessions it starts there don't load a repository's
+CLAUDE.md, AGENTS.md or `.claude` hooks. To start a builder inside the repository instead, the
+human lets that agent start sessions in the repository's workspace: Edit agent (the agent's menu
+in the sidebar) > More options > **May start sessions in**, one tick per workspace
+(`Agent::spawn_workspaces`, `agent.update` `spawn_workspaces`).
+
+- Only a click in Muster's window adds a workspace. The CLI (even from the owner's own terminal),
+  a script, a paired device, and any call made from inside a Muster session are refused; they can
+  only take workspaces off the list. No MCP tool changes it.
+- The agent then calls `spawn_session` with `new_channel: {workspace: "<name>"}` (the exact name
+  in the sidebar), or with a `channel_id` in that workspace. By default the new channel gets its
+  own git worktree and branch in that repository (`worktree` defaults to `true`; ignored for a
+  non-git workspace), and the child starts there, so the repository's instructions and hooks load.
+- A `channel_id` there is accepted only for a channel that holds a session the agent started
+  there (to retry in it); the human's own channels there are refused, grant or not.
+- A new channel gets the caller's channel permission profile (see "Permissions"), never the
+  target workspace's; a `channel_id` keeps that channel's, which can't exceed the caller's.
+- A session started this way records the agent (`SessionInfo.delegated_by`), and so do the
+  sessions it starts in turn. Such a session counts as one of the agent's own workspace for
+  reach, wherever it runs: it reaches what the agent's other children reach, never the human's
+  sessions in the workspace it runs in, and starts sessions there only while the grant holds.
+- The agent can wait for, read, message and diff the sessions started under its grant (from any
+  of its own sessions: a restart keeps that, since the record names the agent), and they show in
+  its `list_sessions` and `list_channels`. The human's own sessions in that workspace, and other
+  agents' sessions there, stay out of reach.
+- Refused, with the setting named: another workspace without the grant; any session that isn't a
+  named agent or started under one's grant; and a sharing rule alone. An unknown name is refused
+  with the names the caller may use, and a blank one too. When two workspaces share a name, the
+  one the caller may start sessions in is used; if that is still not one, it is refused.
+- Taking a workspace off the list ends the reach and further starts there at once (also for the
+  sessions started under the grant); the sessions already running keep running. `whoami` shows
+  the current list as `policy.may_start_sessions_in`.
+- The usual spawn limits apply (depth, live children, rate, agent-created channels).
 
 Text from agents (`send_message` text, `spawn_session` prompt) is typed into a terminal, so it
 is cleaned first: ESC and all other control characters except newline and tab are removed (CR

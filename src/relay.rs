@@ -217,8 +217,12 @@ pub fn check_reach(hub: &Hub, recorder: SessionId, t: &Target) -> Result<(), Str
             if s.state == AgentState::Exited || c.archived {
                 return Err(format!("session {} has ended", s.id));
             }
-            let shared = c.workspace_id == mine.workspace_id
-                || hub.mcp().is_some_and(|st| crate::mcp::communication::allowed(&st, recorder, &c, false));
+            // The MCP reach rule (a session started under an agent's grant reaches what the agent
+            // reaches, not the workspace it runs in); the plain workspace rule without MCP.
+            let shared = match hub.mcp() {
+                Some(st) => crate::mcp::communication::allowed_session(&st, recorder, s, &c, false),
+                None => c.workspace_id == mine.workspace_id,
+            };
             if !shared {
                 return Err(format!(
                     "session {} is in another workspace and messaging it isn't shared with yours, so an answer can't reach it. \

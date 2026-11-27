@@ -674,6 +674,15 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX ended_sessions_newest ON ended_sessions(ended_at, id);
     "#,
+    // v35: `spawn_workspaces`: the workspaces besides its own the human lets this agent start
+    // sessions in (`Agent::spawn_workspaces`), a JSON list of workspace ids. An older backend
+    // ignores it (its agents stay in their own workspace).
+    // `sessions.delegated_by`: the named agent that started this session (or an ancestor of it) in
+    // a workspace other than its own, under that grant (`SessionInfo::delegated_by`).
+    r#"
+    ALTER TABLE agents ADD COLUMN spawn_workspaces TEXT NOT NULL DEFAULT '[]';
+    ALTER TABLE sessions ADD COLUMN delegated_by INTEGER;
+    "#,
 ];
 
 /// The first non-blank line of `head`, trimmed, at most 120 characters (a note's preview).
@@ -1439,7 +1448,7 @@ impl Store {
             "SELECT id, name, kind, model, effort, persona, home_dir, permissions, accepts_origins, session_id,
                     resume_id, created_at, channel_id, autostart, account_profile_id, provider, sleep_after_min, asleep_at,
                     asleep_autostart, working_location, reset_on_next_start, handoff_from, self_handoff, self_handoff_at,
-                    tools_up_front, lead
+                    tools_up_front, lead, spawn_workspaces
              FROM agents ORDER BY id",
         )?;
         let rows = st.query_map([], |r| {
@@ -1478,6 +1487,8 @@ impl Store {
                 self_handoff_at: r.get(23)?,
                 tools_up_front: r.get::<_, i64>(24)? != 0,
                 lead: r.get::<_, i64>(25)? != 0,
+                // Unreadable (written by hand): none, so it stays in its own workspace.
+                spawn_workspaces: serde_json::from_str(&r.get::<_, String>(26)?).unwrap_or_default(),
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -1491,9 +1502,9 @@ impl Store {
             "INSERT INTO agents (name, kind, model, effort, persona, home_dir, permissions, accepts_origins,
                                session_id, resume_id, created_at, channel_id, autostart, account_profile_id, provider,
                                sleep_after_min, asleep_at, asleep_autostart, working_location, reset_on_next_start,
-                               handoff_from, self_handoff, self_handoff_at, tools_up_front, lead)
+                               handoff_from, self_handoff, self_handoff_at, tools_up_front, lead, spawn_workspaces)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21,
-                     ?22, ?23, ?24, ?25)",
+                     ?22, ?23, ?24, ?25, ?26)",
             params![
                 b.name,
                 b.kind.as_str(),
@@ -1519,7 +1530,8 @@ impl Store {
                 b.self_handoff as i64,
                 b.self_handoff_at,
                 b.tools_up_front as i64,
-                b.lead as i64
+                b.lead as i64,
+                serde_json::to_string(&b.spawn_workspaces)?
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -1563,7 +1575,7 @@ impl Store {
                     asleep_autostart = CASE WHEN asleep_at IS NULL THEN NULL ELSE ?7 END,
                     provider = ?8, sleep_after_min = ?9, working_location = ?10, reset_on_next_start = ?11,
                     account_profile_id = ?12, handoff_from = ?13, self_handoff = ?14, tools_up_front = ?15,
-                    lead = ?16, kind = ?17 WHERE id = ?1",
+                    lead = ?16, kind = ?17, spawn_workspaces = ?18 WHERE id = ?1",
             params![
                 b.id,
                 b.model,
@@ -1581,7 +1593,8 @@ impl Store {
                 b.self_handoff as i64,
                 b.tools_up_front as i64,
                 b.lead as i64,
-                b.kind.as_str()
+                b.kind.as_str(),
+                serde_json::to_string(&b.spawn_workspaces)?
             ],
         )?;
         Ok(())
@@ -3101,7 +3114,7 @@ impl Store {
         let mut st = conn.prepare(
             "SELECT id, channel_id, kind, name, cwd, state, state_detail, state_since, title, parent_id, pid,
                     exit_code, cols, rows, queued, extra_args, created_at, window_id, account_profile_id, hidden, provider,
-                    last_turn_at FROM sessions ORDER BY id",
+                    last_turn_at, delegated_by FROM sessions ORDER BY id",
         )?;
         let rows = st.query_map([], |r| {
             let kind: String = r.get(2)?;
@@ -3141,6 +3154,7 @@ impl Store {
                     hidden: r.get::<_, i64>(19)? != 0,
                     provider: crate::openrouter::Provider::parse(&r.get::<_, String>(20)?),
                     account_profile_id: r.get(18)?,
+                    delegated_by: r.get(22)?,
                 },
                 extra_args: serde_json::from_str(&extra).unwrap_or_default(),
             })
@@ -3155,8 +3169,8 @@ impl Store {
         conn.execute(
             "INSERT INTO sessions (channel_id, kind, name, cwd, state, state_detail, state_since, title,
                                    parent_id, pid, exit_code, cols, rows, queued, extra_args, created_at, window_id, account_profile_id, hidden, provider,
-                                   last_turn_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+                                   last_turn_at, delegated_by)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
             params![
                 i.channel_id,
                 i.kind.as_str(),
@@ -3178,7 +3192,8 @@ impl Store {
                 i.account_profile_id,
                 i.hidden,
                 i.provider.as_str(),
-                i.last_turn_at
+                i.last_turn_at,
+                i.delegated_by
             ],
         )?;
         let id = conn.last_insert_rowid();
@@ -3944,7 +3959,7 @@ mod tests {
             session_id: None,
             resume_id: None,
             created_at: 5,
-            autostart: false, sleep_after_min: None, asleep_at: None, self_handoff: false, self_handoff_at: None, tools_up_front: false, lead: false,
+            autostart: false, sleep_after_min: None, asleep_at: None, self_handoff: false, self_handoff_at: None, tools_up_front: false, lead: false, spawn_workspaces: Vec::new(),
         };
         b.id = s.insert_agent(&b).unwrap();
         // Names are unique case-insensitively.

@@ -1139,6 +1139,18 @@ sends only what changed (`schedule.settings.set`). The dialog scrolls in a short
   turns it on. The closed More options line says "Lead agent" when on, and
   the agent's row in the list shows a "lead" tag. Only the owner's click turns it on (as for Can
   start itself fresh); it applies at once.
+- **May start sessions in** (Edit only; after Sleep when idle): one chip per workspace other
+  than the one the agent's tab is in, sorted by name, none ticked by default; the workspace's
+  folder shows on hover. A tick lets the agent start sessions in that repository through MCP
+  `spawn_session` (`spawn_workspaces`, docs/MCP.md "Starting sessions in another workspace").
+  The hint: "Lets it start sessions in the ticked workspaces, so their CLAUDE.md, AGENTS.md and
+  hooks apply. A new tab there gets its own branch in a Git workspace. They get this agent's
+  permissions. It can follow and message the sessions it starts there, not your own. Only you can
+  turn this on, here." The closed More options line says "May start in <name>" (or "in N
+  workspaces"). Only the owner's click adds a workspace; the CLI and anything a session runs can
+  only remove one. Save sends only the ticks changed in this dialog, applied to the list as it is
+  then, so a workspace taken away from another window meanwhile stays off; a removed workspace
+  drops off the list on the next save.
 - Edit saves only changed fields (`agent.update`); provider, model, effort and permissions apply
   from the agent's next start, which the toast says when it runs. Edit's title shows the
   OpenRouter badge for an agent on it.

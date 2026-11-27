@@ -399,6 +399,7 @@ pub(crate) fn test_session(id: SessionId, parent: Option<SessionId>) -> SessionI
         state_since: 0,
         title: None,
         parent_id: parent,
+        delegated_by: None,
         pid: None,
         exit_code: None,
         cols: 80,

@@ -197,6 +197,9 @@ pub struct SpawnSession {
     /// The named agent this session is started for (agents.rs), linked before launch.
     #[serde(skip)]
     pub agent_id: Option<i64>,
+    /// `SessionInfo::delegated_by`: set only by MCP `spawn_session`, never from a request.
+    #[serde(skip)]
+    pub delegated_by: Option<i64>,
 }
 
 /// `spawn_session` failed with an unconfirmed launch outcome. The session and its prepared
@@ -2475,6 +2478,7 @@ impl Hub {
                 from_session: req.from_session,
                 prov: req.prov,
                 agent_id: None,
+                delegated_by: None,
             };
             if let Err(e) = self.spawn_session(spawn).await {
                 let text = format!("Could not start {}: {e:#}", kind.as_str());
@@ -3270,6 +3274,7 @@ impl Hub {
                 state_since: now,
                 title: None,
                 parent_id: req.parent_id,
+                delegated_by: req.delegated_by,
                 pid: None,
                 exit_code: None,
                 cols,
@@ -5595,7 +5600,7 @@ mod tests {
                     session_id: Some(2),
                     resume_id: None,
                     created_at: 0,
-                    autostart: false, sleep_after_min: None, asleep_at: None, self_handoff: false, self_handoff_at: None, tools_up_front: false, lead: false,
+                    autostart: false, sleep_after_min: None, asleep_at: None, self_handoff: false, self_handoff_at: None, tools_up_front: false, lead: false, spawn_workspaces: Vec::new(),
                 })
                 .unwrap();
         })
@@ -6187,7 +6192,7 @@ mod tests {
                 account_profile_id: None, provider: Provider::OpenRouter, id: 0, name: "ada".into(),
                 kind: SessionKind::Claude, model: None, effort: None, persona: String::new(), home_dir: "/x".into(), working_location: Default::default(), reset_on_next_start: false, handoff: None,
                 permissions: Permissions::default(), accepts_origins: crate::agents::default_accepts(SessionKind::Claude),
-                channel_id: Some(1), session_id: Some(2), resume_id: None, created_at: 0, autostart: false, sleep_after_min: None, asleep_at: None, self_handoff: false, self_handoff_at: None, tools_up_front: false, lead: false,
+                channel_id: Some(1), session_id: Some(2), resume_id: None, created_at: 0, autostart: false, sleep_after_min: None, asleep_at: None, self_handoff: false, self_handoff_at: None, tools_up_front: false, lead: false, spawn_workspaces: Vec::new(),
             }).unwrap();
             store.save_terminal(2, record).unwrap();
         };
@@ -7070,7 +7075,7 @@ mod tests {
                     kind: SessionKind::Codex, model: None, effort: None, persona: String::new(),
                     home_dir: "/x".into(), working_location: Default::default(), reset_on_next_start: false, handoff: None, permissions: Permissions::default(),
                     accepts_origins: crate::agents::default_accepts(SessionKind::Codex),
-                    channel_id: Some(1), session_id: Some(3), resume_id: None, created_at: 0, autostart: false, sleep_after_min: None, asleep_at: None, self_handoff: false, self_handoff_at: None, tools_up_front: false, lead: false,
+                    channel_id: Some(1), session_id: Some(3), resume_id: None, created_at: 0, autostart: false, sleep_after_min: None, asleep_at: None, self_handoff: false, self_handoff_at: None, tools_up_front: false, lead: false, spawn_workspaces: Vec::new(),
                 }).unwrap();
             }
         });
@@ -7362,7 +7367,7 @@ mod tests {
             kind: SessionKind::Codex, model: None, effort: None, persona: String::new(),
             home_dir: "/x".into(), working_location: Default::default(), reset_on_next_start: false, handoff: None, permissions: Permissions::default(),
             accepts_origins: crate::agents::default_accepts(SessionKind::Codex),
-            channel_id: None, session_id: None, resume_id: resume.map(Into::into), created_at: 0, autostart: false, sleep_after_min: None, asleep_at: None, self_handoff: false, self_handoff_at: None, tools_up_front: false, lead: false,
+            channel_id: None, session_id: None, resume_id: resume.map(Into::into), created_at: 0, autostart: false, sleep_after_min: None, asleep_at: None, self_handoff: false, self_handoff_at: None, tools_up_front: false, lead: false, spawn_workspaces: Vec::new(),
         };
         let legacy = store.insert_agent(&agent("old", Some("th-title"))).unwrap();
         let confirmed = store.insert_agent(&agent("new", Some("th-1"))).unwrap();

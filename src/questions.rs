@@ -1167,8 +1167,12 @@ pub fn may_read(hub: &Hub, viewer: SessionId, q: &Question) -> bool {
     let mine = hub.session(viewer).and_then(|s| hub.channel(s.channel_id));
     let theirs = hub.session(q.asker.session_id).and_then(|s| hub.channel(s.channel_id));
     match (mine, theirs) {
-        (Some(m), Some(t)) => m.workspace_id == t.workspace_id
-            || hub.mcp().is_some_and(|st| crate::mcp::communication::allowed(&st, viewer, &t, true)),
+        // The MCP reach rule: the same workspace (a session started under an agent's grant
+        // counts as that agent's workspace) or a sharing rule; the plain workspace rule without MCP.
+        (Some(m), Some(t)) => match hub.mcp() {
+            Some(st) => crate::mcp::communication::allowed(&st, viewer, &t, true),
+            None => m.workspace_id == t.workspace_id,
+        },
         _ => false,
     }
 }

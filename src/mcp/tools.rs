@@ -133,7 +133,7 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "spawn_session",
             "Spawn session",
-            "Start a new agent (claude, codex or antigravity) or shell session, recorded as your child. By default it starts in YOUR channel (same working directory). Pass channel_id to use another existing channel of your workspace, or new_channel to create a fresh channel (a new tab in your channel's window; by default with its own git worktree + branch, so parallel work doesn't collide; without a name it is named after the agent's task). A Claude child inherits the calling Claude session's account profile, including Default; otherwise the workspace default applies. The agent runs with the target channel's permission profile (Codex sandbox, Claude permission mode, Antigravity mode; see whoami/list_channels), which only the human can change; a new_channel gets your channel's profile. There is no way to request more: a channel_id whose profile would give this kind of agent more than your channel has is refused. The prompt, if given, is delivered once the agent is ready. A shell can't be given a prompt unless the human allowed it. A Claude session can't be started while you handle scheduled or triggered work (origin schedule or webhook), unless you are a lead agent handling scheduled work (not a trigger's). Returns immediately; use wait_for_state to wait for it. Limits: spawn depth 3, 32 live children per caller, 32 agent-spawned sessions in total, 10 spawns per 10 minutes per caller, 10 open agent-created channels.",
+            "Start a new agent (claude, codex or antigravity) or shell session, recorded as your child. By default it starts in YOUR channel (same working directory). Pass channel_id to use another existing channel of your workspace (or, in a workspace you may start sessions in, one holding a session you started there), or new_channel to create a fresh channel (a new tab in your channel's window; by default with its own git worktree + branch, so parallel work doesn't collide; without a name it is named after the agent's task). A new_channel is in your workspace unless you name another with new_channel.workspace: only a named agent the human allowed to start sessions there may (whoami shows them as may_start_sessions_in); the child then starts in that repository, so its CLAUDE.md, AGENTS.md and hooks load; you can wait for it, read it and message it as one of your own workspace, and it reaches what your other children reach, not the human's sessions there. A sharing rule doesn't let you start sessions in another workspace. A Claude child inherits the calling Claude session's account profile, including Default; otherwise the workspace default applies. The agent runs with the target channel's permission profile (Codex sandbox, Claude permission mode, Antigravity mode; see whoami/list_channels), which only the human can change; a new_channel gets your channel's profile. There is no way to request more: a channel_id whose profile would give this kind of agent more than your channel has is refused. The prompt, if given, is delivered once the agent is ready. A shell can't be given a prompt unless the human allowed it. A Claude session can't be started while you handle scheduled or triggered work (origin schedule or webhook), unless you are a lead agent handling scheduled work (not a trigger's). Returns immediately; use wait_for_state to wait for it. Limits: spawn depth 3, 32 live children per caller, 32 agent-spawned sessions in total, 10 spawns per 10 minutes per caller, 10 open agent-created channels.",
             json!({
                 "type": "object",
                 "properties": {
@@ -146,9 +146,10 @@ pub fn tool_definitions() -> Vec<Value> {
                     "channel_id": {"type": "integer", "description": "Existing channel to spawn in. Mutually exclusive with new_channel."},
                     "new_channel": {
                         "type": "object",
-                        "description": "Create a new channel in your workspace and spawn there.",
+                        "description": "Create a new channel and spawn there: in your workspace, or in the one named by workspace.",
                         "properties": {
                             "name": {"type": "string", "description": "Channel name, e.g. 'fix-login-bug'. Omit to let muster name it from the agent's task."},
+                            "workspace": {"type": "string", "description": "Name of a workspace registered in Muster to create the channel in (default: yours). Another workspace than yours needs the human's leave for your agent (whoami: may_start_sessions_in)."},
                             "worktree": {"type": "boolean", "default": true, "description": "Create a git worktree + branch muster/<channel id>, renamed after the channel name (ignored for non-git workspaces)."},
                             "base": {"type": "string", "description": "Branch or commit to base the worktree on. Default: workspace HEAD."}
                         },
@@ -163,7 +164,7 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "send_message",
             "Send message",
-            "Send a prompt to another agent session in your workspace (a named agent's session takes messages through ask_agent, or tell_agent for a note that needs no answer). It goes through the injection queue: if the agent is busy it is delivered when the agent becomes ready (set interrupt=true to interrupt its current turn first). Returns delivered/queued and sent_at_ms (pass it as after_ms to wait_for_state if you want to be explicit). With wake=false it is kept instead, unseen, for that session's next turn that can take it, and arrives as context at the start of that turn: nothing is typed in and the session isn't woken. It waits while the session runs with wider permissions than when you sent it, and is dropped if the session's process ends first, so choose wake=false only for what can wait (Claude sessions only; not with interrupt; at most 6,000 characters (an emoji such as 😀 counts as two) and 150 lines). Then it returns status \"waiting\", quiet_id and sent_at_ms. Cannot target yourself or (unless the human allowed it) shell sessions, and cannot answer permission prompts: only the human approves those. Rate limited to 20 per minute per caller.",
+            "Send a prompt to another agent session in your workspace, or one your agent started in a workspace the human lets it start sessions in (a named agent's session takes messages through ask_agent, or tell_agent for a note that needs no answer). It goes through the injection queue: if the agent is busy it is delivered when the agent becomes ready (set interrupt=true to interrupt its current turn first). Returns delivered/queued and sent_at_ms (pass it as after_ms to wait_for_state if you want to be explicit). With wake=false it is kept instead, unseen, for that session's next turn that can take it, and arrives as context at the start of that turn: nothing is typed in and the session isn't woken. It waits while the session runs with wider permissions than when you sent it, and is dropped if the session's process ends first, so choose wake=false only for what can wait (Claude sessions only; not with interrupt; at most 6,000 characters (an emoji such as 😀 counts as two) and 150 lines). Then it returns status \"waiting\", quiet_id and sent_at_ms. Cannot target yourself or (unless the human allowed it) shell sessions, and cannot answer permission prompts: only the human approves those. Rate limited to 20 per minute per caller.",
             json!({
                 "type": "object",
                 "properties": {
@@ -877,15 +878,112 @@ pub(super) fn caller_prov<B: Backend>(st: &McpState<B>, caller: SessionId) -> Op
     st.backend.send_prov(caller)
 }
 
-/// The caller's workspace (None if its channel is gone).
+/// The caller's workspace for reach (None if its channel is gone): its channel's. A session
+/// started under a named agent's "May start sessions in" grant (`SessionInfo::delegated_by`) counts
+/// as one of that agent's workspace instead, wherever it runs, so it reaches what the agent's own
+/// children reach and never the other sessions of the workspace it was started in.
 pub(super) fn caller_workspace<B: Backend>(st: &McpState<B>, caller: SessionId) -> Option<WorkspaceId> {
     let me = st.backend.session(caller)?;
-    st.backend.channel(me.channel_id).map(|c| c.workspace_id)
+    match me.delegated_by {
+        Some(id) => {
+            let a = st.backend.agents().into_iter().find(|a| a.id == id)?;
+            st.backend.channel(a.channel_id?).map(|c| c.workspace_id)
+        }
+        None => st.backend.channel(me.channel_id).map(|c| c.workspace_id),
+    }
 }
 
-/// Is channel `ch` reachable for `caller`?
+/// Is channel `ch` reachable for `caller`? Also a channel that holds a session its agent started
+/// in a workspace the human lets it start sessions in (`started_there`).
 fn in_reach<B: Backend>(st: &McpState<B>, caller: SessionId, ch: &Channel) -> bool {
-    super::communication::allowed(st, caller, ch, false) || super::communication::allowed(st, caller, ch, true)
+    super::communication::allowed(st, caller, ch, false)
+        || super::communication::allowed(st, caller, ch, true)
+        || channel_started_there(st, caller, ch)
+}
+
+/// The named agent whose current session `caller` is.
+fn caller_agent<B: Backend>(st: &McpState<B>, caller: SessionId) -> Option<crate::agents::Agent> {
+    st.backend.agents().into_iter().find(|a| a.session_id == Some(caller))
+}
+
+/// The named agent `caller` acts for: its own session's, or the one whose grant started it
+/// (`SessionInfo::delegated_by`, also for that session's own children).
+fn acting_agent<B: Backend>(st: &McpState<B>, caller: SessionId) -> Option<crate::agents::Agent> {
+    let agents = st.backend.agents();
+    if let Some(a) = agents.iter().find(|a| a.session_id == Some(caller)) {
+        return Some(a.clone());
+    }
+    let id = st.backend.session(caller)?.delegated_by?;
+    agents.into_iter().find(|a| a.id == id)
+}
+
+/// May `caller` start sessions in workspace `ws`? In its own workspace (`caller_workspace`),
+/// always (the other spawn rules apply); in another, only for a named agent the human let start
+/// sessions there (`Agent::spawn_workspaces`, set only in Muster's window): its own session, or
+/// one started under that grant while the grant holds. A sharing rule is not enough: it lets
+/// sessions message or read each other, not start new agents.
+fn check_start_in<B: Backend>(st: &McpState<B>, caller: SessionId, ws: WorkspaceId) -> Result<(), String> {
+    if caller_workspace(st, caller) == Some(ws) {
+        return Ok(());
+    }
+    let name = st.backend.workspace(ws).map_or_else(|| format!("{ws}"), |w| w.name);
+    match acting_agent(st, caller) {
+        Some(a) if a.spawn_workspaces.contains(&ws) => Ok(()),
+        Some(a) => Err(format!(
+            "{} may not start sessions in the workspace \"{name}\": agents start sessions in their own workspace. The human \
+             can allow it for this agent and workspace in {}",
+            a.name,
+            crate::agents::SPAWN_WORKSPACES_SETTING
+        )),
+        None => Err(format!(
+            "this session may not start sessions in the workspace \"{name}\": only a named agent can be allowed to start \
+             sessions outside its own workspace (by the human, in {}). Start it in your own workspace, or ask the agent that \
+             started you",
+            crate::agents::SPAWN_WORKSPACES_SETTING
+        )),
+    }
+}
+
+/// Was `s` started under the grant of the agent `caller` acts for (`SessionInfo::delegated_by`),
+/// in a workspace the human still lets that agent start sessions in? Then `caller` may reach `s`
+/// as if `s` were in its own workspace: wait for it, read its output, message it, look at its
+/// diff. Recorded on `s` at its start, so the agent's later sessions keep it. Taking the
+/// workspace off the agent's list ends that reach, not `s`.
+pub(super) fn started_there<B: Backend>(st: &McpState<B>, caller: SessionId, s: &SessionInfo) -> bool {
+    let Some(by) = s.delegated_by else { return false };
+    let Some(a) = acting_agent(st, caller) else { return false };
+    a.id == by && st.backend.channel(s.channel_id).is_some_and(|ch| a.spawn_workspaces.contains(&ch.workspace_id))
+}
+
+/// Does channel `ch` hold a session `started_there` for `caller`?
+fn channel_started_there<B: Backend>(st: &McpState<B>, caller: SessionId, ch: &Channel) -> bool {
+    acting_agent(st, caller).is_some_and(|a| a.spawn_workspaces.contains(&ch.workspace_id))
+        && st.backend.sessions().iter().any(|s| s.channel_id == ch.id && started_there(st, caller, s))
+}
+
+/// The workspace `new_channel.workspace` names (exact name). Unknown: refused, naming the
+/// workspaces this caller may start sessions in. Several with that name: the one of them this
+/// caller may start sessions in, if only one.
+fn workspace_named<B: Backend>(st: &McpState<B>, caller: SessionId, name: &str) -> Result<WorkspaceId, String> {
+    let all = st.backend.workspaces();
+    let own = caller_workspace(st, caller);
+    let granted = acting_agent(st, caller).map(|a| a.spawn_workspaces).unwrap_or_default();
+    let mine = |w: &Workspace| Some(w.id) == own || granted.contains(&w.id);
+    let found: Vec<&Workspace> = all.iter().filter(|w| w.name == name).collect();
+    let usable: Vec<&Workspace> = found.iter().copied().filter(|w| mine(w)).collect();
+    match (found.as_slice(), usable.as_slice()) {
+        ([w], _) | (_, [w]) => Ok(w.id),
+        ([], _) => {
+            let mut names: Vec<String> = all.iter().filter(|w| mine(w)).map(|w| format!("\"{}\"", w.name)).collect();
+            names.sort();
+            Err(format!("no workspace named \"{name}\". You may start sessions in: {}", names.join(", ")))
+        }
+        _ => Err(format!(
+            "{} workspaces are named \"{name}\", so the name doesn't say which one; ask the human (they can remove one \
+             and add it again under another name)",
+            found.len()
+        )),
+    }
 }
 
 fn check_channel_reach<B: Backend>(
@@ -908,7 +1006,9 @@ fn check_session_reach<B: Backend>(
     s: &SessionInfo,
 ) -> Result<(), String> {
     match st.backend.channel(s.channel_id) {
-        Some(ch) if in_reach(st, caller, &ch) => Ok(()),
+        Some(ch) if super::communication::allowed(st, caller, &ch, false)
+            || super::communication::allowed(st, caller, &ch, true)
+            || started_there(st, caller, s) => Ok(()),
         _ => Err(format!(
             "session {} is in another workspace; agents can only reach their own workspace. {HOW_CROSS}",
             s.id
@@ -954,6 +1054,9 @@ fn whoami<B: Backend>(st: &McpState<B>, caller: SessionId) -> TResult {
         "policy": {
             "shell_commands": st.limits.allow_shell,
             "sharing_rules": st.guard.lock().communication.grants.iter().filter(|g| Some(g.from_workspace) == caller_workspace(st, caller) && g.from_session.is_none_or(|s| s == caller)).collect::<Vec<_>>(),
+            // Workspaces besides its own this agent may start sessions in (`new_channel.workspace`).
+            "may_start_sessions_in": caller_agent(st, caller).map(|a| a.spawn_workspaces).unwrap_or_default().into_iter()
+                .filter_map(|w| st.backend.workspace(w).map(|w| w.name)).collect::<Vec<_>>(),
         },
     })))
 }
@@ -1083,8 +1186,33 @@ async fn spawn_session<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args
         Some(_) => None,
         None => Some(open_channel(st, channel_id.unwrap_or(me.channel_id))?),
     };
+    // Another workspace takes the human's leave for this agent (`check_start_in`), for an
+    // existing channel there as for a new one; a sharing rule alone is not enough. A new
+    // channel without a `workspace` goes in the caller's channel's workspace.
+    let new_ws = match new_channel {
+        Some(m) => match Args(m).str("workspace")? {
+            Some(name) if name.trim().is_empty() => {
+                return Err("new_channel.workspace is blank: name a workspace, or leave it out for your own".into());
+            }
+            Some(name) => Some(workspace_named(st, caller, name.trim())?),
+            None => Some(open_channel(st, me.channel_id)?.workspace_id),
+        },
+        None => None,
+    };
+    if let Some(ws) = new_ws {
+        check_start_in(st, caller, ws)?;
+    }
     if let Some(ch) = &target_channel {
-        check_channel_reach(st, caller, ch)?;
+        check_start_in(st, caller, ch.workspace_id)?;
+        // In another workspace, only a channel this agent's grant started sessions in: the
+        // human's own channels there (their checkout, their sessions) stay theirs.
+        if caller_workspace(st, caller) != Some(ch.workspace_id) && !channel_started_there(st, caller, ch) {
+            return Err(format!(
+                "channel {} is in another workspace and holds no session you started there; start one with \
+                 new_channel.workspace instead (its own worktree)",
+                ch.id
+            ));
+        }
         check_not_more_permissive(st, &me, ch, kind)?;
     }
 
@@ -1132,9 +1260,13 @@ async fn spawn_session<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args
                 .backend
                 .channel(me.channel_id)
                 .ok_or("your channel no longer exists")?;
+            // Checked above (`check_start_in`) and again here, in case the human took the
+            // workspace off this agent's list meanwhile.
+            let workspace_id = new_ws.unwrap_or(my_ch.workspace_id);
+            check_start_in(st, caller, workspace_id)?;
             Ok(CreateChannel {
                 account_profile: None,
-                workspace_id: my_ch.workspace_id,
+                workspace_id,
                 name: ch_name,
                 worktree: nc.bool("worktree")?.unwrap_or(true),
                 base: nc.str("base")?.map(str::to_string),
@@ -1166,6 +1298,13 @@ async fn spawn_session<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args
         )
     };
 
+    // Started under an agent's grant: outside the caller's workspace, or by a session that was
+    // itself (`SessionInfo::delegated_by`); its reach is then that agent's (`caller_workspace`).
+    let delegated_by = match me.delegated_by {
+        Some(id) => Some(id),
+        None if caller_workspace(st, caller) != Some(channel.workspace_id) => acting_agent(st, caller).map(|a| a.id),
+        None => None,
+    };
     let req = SpawnSession {
         account_profile: None,
         channel_id: channel.id,
@@ -1183,6 +1322,7 @@ async fn spawn_session<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args
         // The child starts with the caller's provenance and keeps it (agents.rs).
         prov: Some(route.prov(None)),
         agent_id: None,
+        delegated_by,
     };
     let info = match st.backend.spawn_session(req).await {
         Ok(info) => info,
@@ -1848,7 +1988,7 @@ async fn get_diff<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_>)
         .unwrap_or(st.limits.diff_default_bytes as i64)
         .clamp(1000, st.limits.diff_max_bytes as i64) as usize;
     let ch = open_channel(st, ch_id)?;
-    if !super::communication::allowed(st, caller, &ch, true) { return Err(format!("channel {} is in another workspace; output reading requires a sharing rule. {HOW_CROSS}", ch.id)); }
+    if !super::communication::allowed(st, caller, &ch, true) && !channel_started_there(st, caller, &ch) { return Err(format!("channel {} is in another workspace; output reading requires a sharing rule. {HOW_CROSS}", ch.id)); }
     let diff = st
         .backend
         .diff(ch.cwd.clone(), ch.base_branch.clone())

@@ -3856,6 +3856,40 @@ mod tests {
         assert_eq!(r["tools_up_front"], true);
     }
 
+    /// "May start sessions in" (`Agent::spawn_workspaces`): only a click in Muster's window adds a
+    /// workspace; not the CLI, not even from the owner's terminal, nor a session's call through the
+    /// window. A missing workspace is refused. The same list or a shorter one works from anywhere.
+    #[tokio::test]
+    async fn only_a_click_in_the_window_lets_an_agent_start_sessions_elsewhere() {
+        let (hub, _st) = fixture();
+        agent(&hub, "rpc-wanda");
+        let on = json!({"name": "rpc-wanda", "spawn_workspaces": [1]});
+        let e = call(&hub, "agent.update", on.clone()).await.unwrap_err();
+        assert!(e.contains("only the human") && e.contains("\"May start sessions in\""), "{e}");
+        let e = OWNER_TERMINAL.scope(true, call(&hub, "agent.update", on.clone())).await.unwrap_err();
+        assert!(e.contains("only the human"), "{e}");
+        let mut from = on.clone();
+        from["from_session"] = json!(2);
+        let e = dispatch_via(&hub, &Principal::Local, "agent.update", from, Via::Window).await.map_err(|e| e.0).unwrap_err();
+        assert!(e.contains("only the human"), "{e}");
+        let e = dispatch_via(&hub, &Principal::Device { id: 1 }, "agent.update", on.clone(), Via::Window).await.map_err(|e| e.0).unwrap_err();
+        assert!(!e.is_empty());
+        assert!(hub.agents().get("rpc-wanda").unwrap().spawn_workspaces.is_empty());
+        let e = dispatch_via(&hub, &Principal::Local, "agent.update", json!({"name": "rpc-wanda", "spawn_workspaces": [99]}), Via::Window)
+            .await.map_err(|e| e.0).unwrap_err();
+        assert!(e.contains("no workspace with id 99"), "{e}");
+        // The window: on and saved.
+        let r = dispatch_via(&hub, &Principal::Local, "agent.update", json!({"name": "rpc-wanda", "spawn_workspaces": [1, 1]}), Via::Window)
+            .await.map_err(|e| e.0).unwrap();
+        assert_eq!(r["spawn_workspaces"], json!([1]));
+        assert_eq!(hub.store().load_agents().unwrap()[0].spawn_workspaces, vec![1], "saved");
+        // From the CLI: the same list is no change, a shorter one is saved.
+        call(&hub, "agent.update", on).await.unwrap();
+        let r = call(&hub, "agent.update", json!({"name": "rpc-wanda", "spawn_workspaces": []})).await.unwrap();
+        assert_eq!(r["spawn_workspaces"], json!([]));
+        assert!(hub.store().load_agents().unwrap()[0].spawn_workspaces.is_empty(), "saved");
+    }
+
     /// The lead role: only the human turns it on (the window, or `muster agent edit NAME --lead on`
     /// from the owner's terminal); a session's CLI, a script or a paired device is refused, a Codex
     /// agent can't have it, and anyone may turn it off. The persona file says so.

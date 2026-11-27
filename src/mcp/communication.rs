@@ -59,6 +59,11 @@ pub fn allowed<B: Backend>(st: &McpState<B>, caller: SessionId, ch: &Channel, re
                 && if read { g.read_output } else { g.message }
         })
 }
+/// `allowed` for one session: also a session the caller's agent started in a workspace the human
+/// lets it start sessions in (`tools::started_there`), while that holds.
+pub fn allowed_session<B: Backend>(st: &McpState<B>, caller: SessionId, s: &SessionInfo, ch: &Channel, read: bool) -> bool {
+    allowed(st, caller, ch, read) || started_there(st, caller, s)
+}
 pub fn check<B: Backend>(
     st: &McpState<B>,
     caller: SessionId,
@@ -72,7 +77,7 @@ pub fn check<B: Backend>(
     if ch.archived {
         return Err("channel is archived".into());
     }
-    if !allowed(st, caller, &ch, read) {
+    if !allowed_session(st, caller, s, &ch, read) {
         return Err(if read {
             "output reading is not shared"
         } else {

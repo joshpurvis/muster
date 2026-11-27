@@ -621,6 +621,8 @@ interface MockAgent {
   /** Muster's message tools load up front in its sessions (src/mcp/tools.rs `UP_FRONT`). */
   tools_up_front: boolean;
   lead: boolean;
+  /** Workspaces besides its own it may start sessions in (src/agents.rs `Agent::spawn_workspaces`). */
+  spawn_workspaces: number[];
 }
 
 const DEFAULT_PERMS = { codex_sandbox: "workspace_write", claude_mode: "default", antigravity_mode: "auto" };
@@ -781,6 +783,7 @@ function newAgent(p: any): MockAgent {
     self_handoff_at: null,
     tools_up_front: false,
     lead: false,
+    spawn_workspaces: [],
   };
   agentList.push(a);
   memory.set(a.name, new Map());
@@ -1384,6 +1387,13 @@ async function agentMethod(method: string, p: any): Promise<unknown> {
           from, to: a.kind, now: !!p.now, running: live, kept_aside: [`${persona(from)}.before-${a.kind}`],
           outcome: p.now && live ? (s.state === "idle" && s.queued === 0 ? "restarted" : "busy") : "next_start",
         };
+      }
+      if ("spawn_workspaces" in p) {
+        // The window is the only caller here, so adding is allowed (src/agents.rs `check_spawn_workspaces`).
+        const list = [...new Set<number>(p.spawn_workspaces)].sort((x, y) => x - y);
+        const gone = list.find((w) => !a.spawn_workspaces.includes(w) && !workspaces.some((x) => x.id === w));
+        if (gone !== undefined) throw new Error(`no workspace with id ${gone}`);
+        a.spawn_workspaces = list;
       }
       if ("lead" in p) {
         if (p.lead && a.kind === "codex") throw new Error(`only Claude and Antigravity agents can be lead agents: ${a.name} uses ${a.kind}`);

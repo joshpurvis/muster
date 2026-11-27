@@ -233,6 +233,12 @@ pub struct Agent {
     /// like the human's by accept lists (`sending_prov`). Claude and Antigravity agents only (`can_lead`),
     /// off by default, turned on only by the human (`check_lead`); no agent can set it, on itself or another.
     pub lead: bool,
+    /// Workspaces besides its own that this agent may start sessions in (MCP `spawn_session` with
+    /// `new_channel.workspace`, or a `channel_id` there), and reach the sessions it started there
+    /// (`mcp::tools::started_there`). Empty by default; a workspace is added only by a click in
+    /// Muster's window (`check_spawn_workspaces`), never by an agent or the CLI. Taking one away
+    /// works from anywhere. Ids of removed workspaces stay harmless: ids are never reused.
+    pub spawn_workspaces: Vec<WorkspaceId>,
 }
 
 /// One message muster delivered to an agent (or refused to: `refused`).
@@ -1465,6 +1471,7 @@ impl Registry {
         a.self_handoff = next.self_handoff;
         a.tools_up_front = next.tools_up_front;
         a.lead = next.lead;
+        a.spawn_workspaces = next.spawn_workspaces.clone();
         a.kind = next.kind;
         store.update_agent_config(&a)?;
         *b = a.clone();
@@ -2062,7 +2069,7 @@ pub fn create(hub: &Hub, req: NewAgent) -> anyhow::Result<Agent> {
             asleep_at: None,
             self_handoff: false,
             self_handoff_at: None,
-            tools_up_front: false, lead: false,
+            tools_up_front: false, lead: false, spawn_workspaces: Vec::new(),
         },
     )?;
     publish(hub, &a);
@@ -2140,6 +2147,10 @@ pub struct AgentUpdate {
     /// turning it off works from anywhere.
     #[serde(default)]
     pub lead: Option<bool>,
+    /// The whole list of workspaces it may start sessions in (`Agent::spawn_workspaces`). Adding
+    /// one takes a click in Muster's window; a shorter list works from anywhere.
+    #[serde(default)]
+    pub spawn_workspaces: Option<Vec<WorkspaceId>>,
     /// The call is the human's own: a click in Muster's window, or the CLI from a terminal
     /// outside every Muster session (`rpc::owner_terminal`). Set by the RPC layer, never by
     /// the caller (not a request field).
@@ -2224,6 +2235,34 @@ fn check_lead(a: &Agent, by_owner: bool) -> anyhow::Result<()> {
         name = a.name
     );
     Ok(())
+}
+
+/// Where the human lets an agent start sessions in another workspace, in the words of the window:
+/// named in every refusal so the reader knows where to look.
+pub const SPAWN_WORKSPACES_SETTING: &str =
+    "Edit agent (the agent's menu in Muster's sidebar), More options, \"May start sessions in\"";
+
+/// The new `Agent::spawn_workspaces` from `list` (sorted, without repeats). Adding a workspace `a`
+/// doesn't have takes a click in Muster's window (`window`: `by_owner` and not `rpc::Via::Outside`),
+/// and it must exist. Taking one away, or keeping ids of removed workspaces, works from anywhere.
+fn check_spawn_workspaces(hub: &Hub, a: &Agent, mut list: Vec<WorkspaceId>, window: bool) -> anyhow::Result<Vec<WorkspaceId>> {
+    list.sort_unstable();
+    list.dedup();
+    let added: Vec<WorkspaceId> = list.iter().copied().filter(|w| !a.spawn_workspaces.contains(w)).collect();
+    if added.is_empty() {
+        return Ok(list);
+    }
+    anyhow::ensure!(
+        window,
+        "only the human can let {} start sessions in another workspace, with a click in Muster's window: {}. This call \
+         came from the CLI, a script, or a Muster session (an agent, or a shell tab), so it may be an agent's. From here \
+         the list can only shrink",
+        a.name, SPAWN_WORKSPACES_SETTING
+    );
+    for w in added {
+        anyhow::ensure!(hub.workspace(w).is_some(), "no workspace with id {w}");
+    }
+    Ok(list)
 }
 
 /// May this `agent.update` switch `a` to `to`? Only between Claude and Antigravity (a Codex agent
@@ -2465,6 +2504,9 @@ pub fn update_full(hub: &Hub, req: AgentUpdate, outside: bool) -> anyhow::Result
             check_lead(&cur, req.by_owner)?;
         }
         next.lead = on;
+    }
+    if let Some(list) = req.spawn_workspaces {
+        next.spawn_workspaces = check_spawn_workspaces(hub, &cur, list, req.by_owner && !outside)?;
     }
     // Checked against the kind it has after this edit: a switch to Antigravity can't keep or
     // grant what only Claude has.
@@ -2856,6 +2898,7 @@ async fn run_agent(hub: &Arc<Hub>, mut agent: Agent, fresh: bool, window: Option
             prov: None,
             // Linked before the process starts (see link_session).
             agent_id: Some(agent.id),
+            delegated_by: None,
         })
         .await?;
     agent.session_id = Some(session.id);
@@ -4165,6 +4208,8 @@ pub fn agent_json(b: &Agent, session: Option<&SessionInfo>) -> Value {
         "self_handoff_at": b.self_handoff_at,
         "tools_up_front": b.tools_up_front,
         "lead": b.lead,
+        // Workspaces besides its own it may start sessions in (Edit agent, "May start sessions in").
+        "spawn_workspaces": b.spawn_workspaces,
         // The kinds Edit agent can switch it to and from (`AgentUpdate::kind`); empty for Codex.
         "switch_kinds": if can_lead(b.kind) { json!(["claude", "antigravity"]) } else { json!([]) },
     })
@@ -4998,7 +5043,7 @@ mod tests {
             session_id: Some(9),
             resume_id: None,
             created_at: 0,
-            autostart: false, sleep_after_min: None, asleep_at: None, self_handoff: false, self_handoff_at: None, tools_up_front: false, lead: false,
+            autostart: false, sleep_after_min: None, asleep_at: None, self_handoff: false, self_handoff_at: None, tools_up_front: false, lead: false, spawn_workspaces: Vec::new(),
         }
     }
 

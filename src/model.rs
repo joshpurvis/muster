@@ -446,6 +446,12 @@ pub struct SessionInfo {
     pub title: Option<String>,
     /// Session that spawned this one through MCP, if any.
     pub parent_id: Option<SessionId>,
+    /// The named agent (its id) that started this session, or an ancestor of it, in a workspace
+    /// other than its own, under its "May start sessions in" grant (`Agent::spawn_workspaces`).
+    /// Such a session reaches what that agent reaches, not the workspace it runs in
+    /// (`mcp::tools::caller_workspace`). Set at spawn, never changed.
+    #[serde(default)]
+    pub delegated_by: Option<i64>,
     pub pid: Option<u32>,
     pub exit_code: Option<i32>,
     pub cols: u16,

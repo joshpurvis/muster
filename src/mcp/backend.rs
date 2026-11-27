@@ -41,6 +41,8 @@ pub trait Backend: Send + Sync + 'static {
     fn channel(&self, id: ChannelId) -> Option<Channel>;
     fn channels(&self) -> Vec<Channel>;
     fn workspace(&self, id: WorkspaceId) -> Option<Workspace>;
+    /// Every registered workspace (for `spawn_session`'s `new_channel.workspace`, by name).
+    fn workspaces(&self) -> Vec<Workspace>;
     /// Visible screen as text.
     fn screen_text(&self, id: SessionId) -> Option<String>;
     fn recent_output(&self, id: SessionId, lines: usize) -> Option<String>;
@@ -172,6 +174,9 @@ impl Backend for HubBackend {
     }
     fn workspace(&self, id: WorkspaceId) -> Option<Workspace> {
         self.0.workspace(id)
+    }
+    fn workspaces(&self) -> Vec<Workspace> {
+        self.0.workspaces()
     }
     fn screen_text(&self, id: SessionId) -> Option<String> {
         self.0.screen(id).map(|s| s.text())

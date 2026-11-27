@@ -164,6 +164,9 @@ impl Backend for Arc<Mock> {
     fn workspace(&self, id: WorkspaceId) -> Option<Workspace> {
         self.d.lock().workspaces.get(&id).cloned()
     }
+    fn workspaces(&self) -> Vec<Workspace> {
+        self.d.lock().workspaces.values().cloned().collect()
+    }
     fn screen_text(&self, id: SessionId) -> Option<String> {
         self.d
             .lock()
@@ -206,6 +209,7 @@ impl Backend for Arc<Mock> {
         d.next_session += 1;
         d.last_args = req.extra_args.clone();
         let mut s = session(d.next_session, req.channel_id, req.kind, req.parent_id);
+        s.delegated_by = req.delegated_by;
         if let Some(p) = req.prov {
             d.prov.insert(s.id, p);
         }
@@ -1531,7 +1535,6 @@ async fn other_workspaces_out_of_reach_by_default() {
         ),
         ("post_to_channel", json!({"channel_id": 20, "text": "hi"})),
         ("get_diff", json!({"channel_id": 20})),
-        ("spawn_session", json!({"kind": "codex", "channel_id": 20})),
     ] {
         let (t, err) = call(&st, tool, args).await;
         assert!(
@@ -1539,6 +1542,9 @@ async fn other_workspaces_out_of_reach_by_default() {
             "{tool}: {t}"
         );
     }
+    // Starting a session there takes the human's leave for a named agent, not a sharing rule.
+    let (t, err) = call(&st, "spawn_session", json!({"kind": "codex", "channel_id": 20})).await;
+    assert!(err && t.contains("may not start sessions in the workspace \"other\"") && t.contains("May start sessions in"), "{t}");
     // Lists only show the caller's workspace.
     let v = parse(&call(&st, "list_sessions", json!({})).await.0);
     assert!(v.as_array().unwrap().iter().all(|s| s["id"] != 5), "{v}");
@@ -1557,13 +1563,14 @@ async fn other_workspaces_reachable_when_enabled() {
     add_shell_and_other_workspace(&m);
     let (t, err) = call(&st, "send_message", json!({"session_id": 5, "text": "hi"})).await;
     assert!(!err, "{t}");
-    let (t, err) = call(
-        &st,
-        "spawn_session",
-        json!({"kind": "codex", "channel_id": 20}),
-    )
-    .await;
-    assert!(!err, "{t}");
+    // A sharing rule lets sessions message and read each other; it doesn't let them start agents
+    // in the other workspace (it did before `Agent::spawn_workspaces`): not in a channel there,
+    // nor in a new one.
+    let (t, err) = call(&st, "spawn_session", json!({"kind": "codex", "channel_id": 20})).await;
+    assert!(err && t.contains("only a named agent") && t.contains("May start sessions in"), "{t}");
+    let (t, err) = call(&st, "spawn_session", json!({"kind": "codex", "new_channel": {"workspace": "other"}})).await;
+    assert!(err && t.contains("only a named agent"), "{t}");
+    assert!(m.d.lock().sessions.values().all(|s| s.channel_id != 20 || s.id == 5), "nothing started there");
     let v = parse(&call(&st, "list_channels", json!({})).await.0);
     assert!(v.as_array().unwrap().iter().any(|c| c["id"] == 20), "{v}");
 }
@@ -1714,7 +1721,7 @@ fn with_agents(m: &Mock) {
             session_id: Some(id),
             resume_id: None,
             created_at: 0,
-            autostart: false, sleep_after_min: None, asleep_at: None, self_handoff: false, self_handoff_at: None, tools_up_front: false, lead: false,
+            autostart: false, sleep_after_min: None, asleep_at: None, self_handoff: false, self_handoff_at: None, tools_up_front: false, lead: false, spawn_workspaces: Vec::new(),
         });
         d.replies.insert(id, format!("{name} says hi"));
     }
@@ -2233,4 +2240,182 @@ async fn session_request_timeout_keeps_late_reply_and_survives_reload() {
     let st = McpState::new(m);
     let (out,err) = call_as(&st,"tok2","reply_session",json!({"request_id":out["id"],"text":"late answer"})).await;
     assert!(!err,"{out}"); assert_eq!(parse(&out)["status"],"answered");
+}
+
+// ----- starting sessions in another workspace (`Agent::spawn_workspaces`) -----
+
+/// ada's agent id (`with_agents`).
+fn ada_id(m: &Mock) -> i64 {
+    m.d.lock().agents.iter().find(|a| a.name == "ada").unwrap().id
+}
+
+/// `with_agents`, plus ada (session 3, workspace "agents") allowed to start sessions in `allowed`.
+fn ada_may_start_in(m: &Mock, allowed: &[WorkspaceId]) {
+    let mut d = m.d.lock();
+    d.agents.iter_mut().find(|a| a.name == "ada").unwrap().spawn_workspaces = allowed.to_vec();
+}
+
+#[tokio::test]
+async fn agent_starts_sessions_in_a_workspace_the_human_allowed() {
+    let (m, st) = state();
+    with_agents(&m);
+    ada_may_start_in(&m, &[1]);
+    // ada's own tab runs with a narrower profile than the target repository's channels.
+    m.d.lock().channels.get_mut(&10).unwrap().permissions.claude_mode = ClaudeMode::Bypass;
+    let v = parse(&call_as(&st, "tok3", "whoami", json!({})).await.0);
+    assert_eq!(v["policy"]["may_start_sessions_in"], json!(["repo"]), "{v}");
+    let (t, err) = call_as(&st, "tok3", "spawn_session",
+        json!({"kind": "claude", "prompt": "build it", "new_channel": {"workspace": "repo", "name": "build"}})).await;
+    assert!(!err, "{t}");
+    let v = parse(&t);
+    let (child, ch) = (v["session"]["id"].as_u64().unwrap() as SessionId, v["channel"]["id"].as_u64().unwrap() as ChannelId);
+    {
+        let d = m.d.lock();
+        let c = &d.channels[&ch];
+        assert_eq!(c.workspace_id, 1, "created in the named workspace");
+        assert_eq!(c.cwd, "/repo/.wt/build", "with its own worktree by default");
+        assert_eq!(c.permissions, d.channels[&20].permissions, "the caller's profile, never the target's");
+        assert_eq!(d.sessions[&child].parent_id, Some(3));
+        assert_eq!(d.sessions[&child].channel_id, ch);
+    }
+    // ada reaches its own child there: wait, read, message, diff, lists.
+    for (tool, args) in [
+        ("wait_for_state", json!({"session_id": child, "timeout_seconds": 0})),
+        ("read_screen", json!({"session_id": child})),
+        ("get_recent_output", json!({"session_id": child})),
+        ("send_message", json!({"session_id": child, "text": "status?"})),
+        ("get_diff", json!({"channel_id": ch})),
+    ] {
+        let (t, err) = call_as(&st, "tok3", tool, args).await;
+        assert!(!err, "{tool}: {t}");
+    }
+    let v = parse(&call_as(&st, "tok3", "list_sessions", json!({})).await.0);
+    assert!(v.as_array().unwrap().iter().any(|s| s["id"] == child), "{v}");
+    let v = parse(&call_as(&st, "tok3", "list_channels", json!({})).await.0);
+    assert!(v.as_array().unwrap().iter().any(|c| c["id"] == ch), "{v}");
+    // ...but not the human's own sessions in that workspace.
+    let (t, err) = call_as(&st, "tok3", "read_screen", json!({"session_id": 1})).await;
+    assert!(err && t.contains("another workspace"), "{t}");
+    // An existing channel there works too (after a failed spawn, "retry in it").
+    let (t, err) = call_as(&st, "tok3", "spawn_session", json!({"kind": "codex", "channel_id": ch})).await;
+    assert!(!err, "{t}");
+    // Its own workspace by name needs nothing.
+    let (t, err) = call_as(&st, "tok3", "spawn_session", json!({"kind": "codex", "new_channel": {"workspace": "agents"}})).await;
+    assert!(!err, "{t}");
+    // The human's own channel there is not ada's to start sessions in, grant or not.
+    let (t, err) = call_as(&st, "tok3", "spawn_session", json!({"kind": "codex", "channel_id": 10})).await;
+    assert!(err && t.contains("holds no session you started there"), "{t}");
+    // The child is recorded as started under ada's grant...
+    let ada = ada_id(&m);
+    assert_eq!(m.d.lock().sessions[&child].delegated_by, Some(ada));
+    // ...so it reaches what ada's own children reach, not the workspace it runs in: not the
+    // human's sessions there, nor their channel.
+    let tok = format!("tok{child}");
+    m.d.lock().tokens.insert(tok.clone(), child);
+    for (tool, args) in [
+        ("read_screen", json!({"session_id": 1})),
+        ("get_recent_output", json!({"session_id": 1})),
+        ("send_message", json!({"session_id": 1, "text": "hi"})),
+        ("wait_for_state", json!({"session_id": 1, "timeout_seconds": 0})),
+        ("get_diff", json!({"channel_id": 10})),
+    ] {
+        let (t, err) = call_as(&st, &tok, tool, args).await;
+        assert!(err, "{tool}: {t}");
+    }
+    let v = parse(&call_as(&st, &tok, "list_sessions", json!({})).await.0);
+    assert!(v.as_array().unwrap().iter().all(|s| s["id"] != 1), "{v}");
+    let (t, err) = call_as(&st, &tok, "spawn_session", json!({"kind": "codex", "channel_id": 10})).await;
+    assert!(err && t.contains("holds no session you started there"), "{t}");
+    // It reaches ada's workspace like ada's own children (ada herself, session 3).
+    let (t, err) = call_as(&st, &tok, "read_screen", json!({"session_id": 3})).await;
+    assert!(!err, "{t}");
+    // Its own children there are started under ada's grant too, and ada reaches them.
+    let (t, err) = call_as(&st, &tok, "spawn_session", json!({"kind": "codex"})).await;
+    assert!(!err, "{t}");
+    let grandchild = parse(&t)["session"]["id"].as_u64().unwrap() as SessionId;
+    assert_eq!(m.d.lock().sessions[&grandchild].delegated_by, Some(ada));
+    let (t, err) = call_as(&st, "tok3", "read_screen", json!({"session_id": grandchild})).await;
+    assert!(!err, "{t}");
+    // A blank workspace name is refused, not taken as "yours".
+    let (t, err) = call_as(&st, "tok3", "spawn_session", json!({"kind": "codex", "new_channel": {"workspace": "  "}})).await;
+    assert!(err && t.contains("blank"), "{t}");
+    // After a restart of ada (a new session in its own tab, the old one gone), it still reaches
+    // the child: the record names ada, not the session that started it.
+    {
+        let mut d = m.d.lock();
+        d.sessions.insert(30, session(30, 20, SessionKind::Claude, None));
+        d.live.insert(30);
+        d.tokens.insert("tok30".into(), 30);
+        d.agents.iter_mut().find(|a| a.name == "ada").unwrap().session_id = Some(30);
+        d.sessions.remove(&3);
+        d.live.remove(&3);
+    }
+    let (t, err) = call_as(&st, "tok30", "read_screen", json!({"session_id": child})).await;
+    assert!(!err, "{t}");
+    // Another agent (cody) can't reach ada's child, nor start sessions there.
+    let (t, err) = call_as(&st, "tok4", "read_screen", json!({"session_id": child})).await;
+    assert!(err && t.contains("another workspace"), "{t}");
+    let (t, err) = call_as(&st, "tok4", "spawn_session", json!({"kind": "codex", "new_channel": {"workspace": "repo"}})).await;
+    assert!(err && t.contains("cody may not start sessions") && t.contains("May start sessions in"), "{t}");
+    // The human takes the workspace off ada's list: no more reach, no more starts (also from
+    // the child, in its own channel or a new one there); the child runs on.
+    ada_may_start_in(&m, &[]);
+    let (t, err) = call_as(&st, "tok30", "read_screen", json!({"session_id": child})).await;
+    assert!(err && t.contains("another workspace"), "{t}");
+    for args in [json!({"kind": "codex"}), json!({"kind": "codex", "new_channel": {}})] {
+        let (t, err) = call_as(&st, &tok, "spawn_session", args).await;
+        assert!(err && t.contains("ada may not start sessions in the workspace \"repo\""), "{t}");
+    }
+    let (t, err) = call_as(&st, "tok30", "spawn_session", json!({"kind": "codex", "channel_id": ch})).await;
+    assert!(err && t.contains("ada may not start sessions in the workspace \"repo\""), "{t}");
+    assert!(m.d.lock().live.contains(&child));
+}
+
+#[tokio::test]
+async fn starting_sessions_in_another_workspace_is_refused_without_leave() {
+    let (m, st) = state();
+    with_agents(&m);
+    let spawned = || m.d.lock().sessions.len();
+    let before = spawned();
+    // No leave: refused, naming the setting and where it is.
+    let (t, err) = call_as(&st, "tok3", "spawn_session", json!({"kind": "claude", "new_channel": {"workspace": "repo"}})).await;
+    assert!(err, "{t}");
+    assert!(t.contains("ada may not start sessions in the workspace \"repo\"") && t.contains("Edit agent")
+        && t.contains("More options") && t.contains("\"May start sessions in\""), "{t}");
+    let (t, err) = call_as(&st, "tok3", "spawn_session", json!({"kind": "codex", "channel_id": 10})).await;
+    assert!(err && t.contains("May start sessions in"), "{t}");
+    // An unknown name: refused, listing where it may start sessions (no other names).
+    let (t, err) = call_as(&st, "tok3", "spawn_session", json!({"kind": "codex", "new_channel": {"workspace": "nope"}})).await;
+    assert!(err && t.contains("no workspace named \"nope\"") && t.contains("\"agents\"") && !t.contains("\"repo\""), "{t}");
+    // Leave for another workspace doesn't cover this one.
+    m.d.lock().workspaces.insert(3, Workspace { account_profile_id: None, id: 3, name: "third".into(), path: "/third".into(), is_git: false, created_at: 0 });
+    ada_may_start_in(&m, &[3]);
+    let (t, err) = call_as(&st, "tok3", "spawn_session", json!({"kind": "codex", "new_channel": {"workspace": "repo"}})).await;
+    assert!(err && t.contains("may not start sessions"), "{t}");
+    // A non-git workspace: a plain channel in its folder (`worktree` is ignored there).
+    let (t, err) = call_as(&st, "tok3", "spawn_session", json!({"kind": "codex", "new_channel": {"workspace": "third", "worktree": false}})).await;
+    assert!(!err, "{t}");
+    assert_eq!(m.d.lock().channels[&(parse(&t)["channel"]["id"].as_u64().unwrap() as ChannelId)].workspace_id, 3);
+    // An ordinary session (not a named agent) in workspace 1 can't start one in "agents".
+    let (t, err) = call(&st, "spawn_session", json!({"kind": "codex", "new_channel": {"workspace": "agents"}})).await;
+    assert!(err && t.contains("only a named agent"), "{t}");
+    // Its own workspace by name is fine.
+    let (t, err) = call(&st, "spawn_session", json!({"kind": "codex", "new_channel": {"workspace": "repo"}})).await;
+    assert!(!err, "{t}");
+    assert_eq!(spawned(), before + 2, "only the two allowed spawns started");
+}
+
+/// Two workspaces with one name: the one the caller may start sessions in, if only one;
+/// otherwise refused as ambiguous.
+#[tokio::test]
+async fn a_shared_workspace_name_resolves_to_the_one_granted() {
+    let (m, st) = state();
+    with_agents(&m);
+    m.d.lock().workspaces.insert(4, Workspace { account_profile_id: None, id: 4, name: "repo".into(), path: "/elsewhere/repo".into(), is_git: false, created_at: 0 });
+    ada_may_start_in(&m, &[4]);
+    let (t, err) = call_as(&st, "tok3", "spawn_session", json!({"kind": "codex", "new_channel": {"workspace": "repo"}})).await;
+    assert!(!err, "{t}");
+    assert_eq!(m.d.lock().channels[&(parse(&t)["channel"]["id"].as_u64().unwrap() as ChannelId)].workspace_id, 4);
+    let (t, err) = call_as(&st, "tok4", "spawn_session", json!({"kind": "codex", "new_channel": {"workspace": "repo"}})).await;
+    assert!(err && t.contains("2 workspaces are named \"repo\""), "{t}");
 }

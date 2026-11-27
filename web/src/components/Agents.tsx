@@ -6,6 +6,7 @@ import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "pr
 import { rpc } from "../rpc.ts";
 import {
   workspaces,
+  channels,
   accountProfiles,
   accountUsage,
   agentFilter,
@@ -557,6 +558,8 @@ interface Draft {
   toolsUpFront: boolean;
   /** A lead agent: what it sends from scheduled work is taken like the human's (Edit, Claude and Antigravity; the human's to set). */
   lead: boolean;
+  /** Other workspaces it may start sessions in (Edit; the human's to grant, in this window only). */
+  spawnWorkspaces: number[];
 }
 
 function fromTemplate(t: AgentTemplate): Draft {
@@ -577,6 +580,7 @@ function fromTemplate(t: AgentTemplate): Draft {
     selfHandoff: false,
     toolsUpFront: false,
     lead: false,
+    spawnWorkspaces: [],
   };
 }
 
@@ -598,6 +602,7 @@ function fromAgent(a: Agent): Draft {
     selfHandoff: !!a.self_handoff,
     toolsUpFront: !!a.tools_up_front,
     lead: !!a.lead,
+    spawnWorkspaces: [...(a.spawn_workspaces ?? [])].sort((x, y) => x - y),
   };
 }
 
@@ -618,6 +623,7 @@ const BLANK: Draft = {
   selfHandoff: false,
   toolsUpFront: false,
   lead: false,
+  spawnWorkspaces: [],
 };
 
 let templateCache: AgentTemplate[] | null = null;
@@ -645,6 +651,9 @@ export function AgentDialog(
   const [orLoading, setOrLoading] = useState(false);
   const [tpl, setTpl] = useState(startTpl?.id ?? "blank");
   const [d, setD] = useState<Draft>(agent ? fromAgent(agent) : startTpl ? fromTemplate(startTpl) : BLANK);
+  /** "May start sessions in" as the dialog opened: Save sends only the ticks changed here, applied to
+   * the list as it is then, so a workspace taken away meanwhile (another window) doesn't come back. */
+  const openedStartIn = useRef(d.spawnWorkspaces);
   /** Model / Effort show Custom… until another entry is picked (`choiceOf`). */
   const [custom, setCustom] = useState({ model: false, effort: false });
   const [nameTouched, setNameTouched] = useState(false);
@@ -801,6 +810,14 @@ export function AgentDialog(
   const canToolsUpFront = !!agent && agent.kind === "claude" && d.kind === "claude" && agent.tools_up_front !== undefined;
   /** Lead agent: an existing Claude or Antigravity agent on a backend that knows it. */
   const canLead = !!agent && (agent.kind === "claude" || agent.kind === "antigravity") && agent.lead !== undefined;
+  /** May start sessions in: an existing agent on a backend that knows it, offered every workspace
+   * but the one its own tab is in (there it needs no leave). */
+  const ownWorkspace = agent?.channel_id != null ? channels.value.find((c) => c.id === agent.channel_id)?.workspace_id : undefined;
+  const startIn = agent && agent.spawn_workspaces !== undefined
+    ? workspaces.value.filter((w) => w.id !== ownWorkspace).sort((x, y) => x.name.localeCompare(y.name))
+    : [];
+  /** The ticked ones that still exist (a removed workspace's id is dropped on save). */
+  const startInPicked = d.spawnWorkspaces.filter((w) => startIn.some((x) => x.id === w));
   const moreSummary = [
     or && (d.provider === "openrouter" ? "OpenRouter" : "Subscription"),
     d.autostart ? "Autostart on" : "No autostart",
@@ -808,6 +825,7 @@ export function AgentDialog(
     canSelfHandoff && d.selfHandoff && "Can start itself fresh",
     canToolsUpFront && d.toolsUpFront && "Message tools up front",
     canLead && d.lead && "Lead agent",
+    startInPicked.length > 0 && `May start in ${startInPicked.length === 1 ? startIn.find((w) => w.id === startInPicked[0])?.name : `${startInPicked.length} workspaces`}`,
   ].filter(Boolean).join(" · ");
   const keyHint = or && !or.key_present && (
     <span class="field-hint or-key-hint" id="agent-provider-hint">
@@ -867,6 +885,16 @@ export function AgentDialog(
       if (canSelfHandoff && d.selfHandoff !== before.selfHandoff) patch.self_handoff = d.selfHandoff;
       if (canToolsUpFront && d.toolsUpFront !== before.toolsUpFront) patch.tools_up_front = d.toolsUpFront;
       if (canLead && d.lead !== before.lead) patch.lead = d.lead;
+      if (agent.spawn_workspaces !== undefined) {
+        const opened = openedStartIn.current;
+        const added = startInPicked.filter((w) => !opened.includes(w));
+        const removed = opened.filter((w) => !d.spawnWorkspaces.includes(w));
+        // Ids of removed workspaces drop off too.
+        const next = [...new Set([...before.spawnWorkspaces.filter((w) => !removed.includes(w)), ...added])]
+          .filter((w) => workspaces.value.some((x) => x.id === w))
+          .sort((x, y) => x - y);
+        if (next.join() !== before.spawnWorkspaces.join()) patch.spawn_workspaces = next;
+      }
       if (switching) {
         patch.kind = d.kind;
         patch.now = kindNow;
@@ -1555,6 +1583,44 @@ export function AgentDialog(
                   agents, which take its messages as if you sent them. Each message still counts one step,
                   and a chain stops after 8. Work a trigger started keeps the usual rules, and nothing scheduled
                   work reaches can set reminders or schedules. Only you can turn this on.
+                </span>
+              </div>
+            )}
+            {startIn.length > 0 && (
+              <div class="sleep-field start-in-field">
+                <span class="field-label" id={`${id}-start-in`}>May start sessions in</span>
+                <div
+                  class="check-row chips"
+                  role="group"
+                  aria-labelledby={`${id}-start-in`}
+                  aria-describedby={`${id}-start-in-hint`}
+                >
+                  {startIn.map((w) => {
+                    const on = d.spawnWorkspaces.includes(w.id);
+                    return (
+                      <label key={w.id} class={cx("check chip", on && "on")} data-tip={w.path}>
+                        <input
+                          type="checkbox"
+                          data-field="spawn-workspace"
+                          checked={on}
+                          onChange={(e) => {
+                            const checked = (e.target as HTMLInputElement).checked;
+                            set({
+                              spawnWorkspaces: checked
+                                ? [...d.spawnWorkspaces, w.id].sort((x, y) => x - y)
+                                : d.spawnWorkspaces.filter((x) => x !== w.id),
+                            });
+                          }}
+                        />
+                        {w.name}
+                      </label>
+                    );
+                  })}
+                </div>
+                <span id={`${id}-start-in-hint`} class="field-hint">
+                  Lets it start sessions in the ticked workspaces, so their CLAUDE.md, AGENTS.md and hooks apply. A
+                  new tab there gets its own branch in a Git workspace. They get this agent's permissions. It can
+                  follow and message the sessions it starts there, not your own. Only you can turn this on, here.
                 </span>
               </div>
             )}

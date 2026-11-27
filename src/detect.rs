@@ -349,6 +349,7 @@ mod tests {
             state_since: since,
             title: None,
             parent_id: None,
+            delegated_by: None,
             pid: None,
             exit_code: None,
             cols: 120,

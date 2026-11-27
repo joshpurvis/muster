@@ -1712,6 +1712,16 @@ pub async fn from_window(hub: &Arc<Hub>, who: &Principal, conn: u64, link: &WsLi
         return Err("it was made on a session's behalf (the command line or an agent)".into());
     }
     if !link.ui_origin || !hub.holds_window(conn) {
+        // The owner's message stays one; the log says which half failed.
+        if !link.ui_origin {
+            tracing::warn!(conn, "a window call refused: its WebSocket sent no Origin of Muster's UI");
+        } else {
+            match hub.last_claim(conn) {
+                Some((window, holder)) => tracing::warn!(conn, window, holder = ?holder,
+                    "a window call refused: this connection holds no window (it last claimed this window, now held by the connection named)"),
+                None => tracing::warn!(conn, "a window call refused: this connection holds no window (it never claimed one)"),
+            }
+        }
         return Err("it doesn't come from a window of Muster's (a script, or a page that holds no window)".into());
     }
     let (Some(peer), Some(server)) = (link.peer, link.server) else {
@@ -2615,9 +2625,16 @@ async fn handle_request(
             struct P {
                 #[serde(default)]
                 id: Option<WindowId>,
+                /// The page's own id (random per page load): only the same page takes a window
+                /// another connection holds (`Hub::claim_window_for`).
+                #[serde(default)]
+                page: Option<String>,
             }
             // Through the response queue, after the events it emits.
-            let r = parse::<P>(req.params).and_then(|p| to_value(hub.claim_window(conn, p.id)?));
+            let r = parse::<P>(req.params).and_then(|p| {
+                let page = p.page.filter(|s| !s.is_empty() && s.len() <= 128);
+                to_value(hub.claim_window_for(conn, p.id, page.as_deref())?)
+            });
             let _ = resp.send(Message::Text(response(&req.id, r).to_string().into())).await;
         }
         // Making or widening unattended work: as asked only from a click in the owner's

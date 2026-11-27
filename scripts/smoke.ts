@@ -1116,6 +1116,16 @@ done
 
   // --- clean backend shutdown also preserves terminals
   const beforeCleanStop = (await c.call("hello")).sessions.find((x: Json) => x.id === sid);
+  // An open window across the restart (`muster stop`, then `muster`): the old window keeps
+  // retrying and reconnects beside the new one. A click in the new one must still count.
+  const uiOrigin = `http://127.0.0.1:${PORT}`;
+  // `question.answer` for a question that doesn't exist: "no question" means the call passed the
+  // window check (`rpc::from_window`) and failed only on the id.
+  const clickIn = (w: Client) => w.call("question.answer", { id: 999999, pick: ["a"] }).then(() => "ok", (e: Error) => String(e.message));
+  const oldWin = new Client(d.token, uiOrigin);
+  await oldWin.open();
+  const heldWin = (await oldWin.call("window.claim", { page: "smoke-old" })).id;
+  ok((await clickIn(oldWin)).includes("no question"), "a click in a window that claimed one passes the window check");
   c.close();
   console.log("SIGTERM daemon, restart");
   const status = await stopDaemon(d, "SIGTERM");
@@ -1124,6 +1134,47 @@ done
   d = await startDaemon();
   c = new Client(d.token);
   await c.open();
+  {
+    const waitFor = async (what: string, cond: () => Promise<boolean>) => {
+      for (let n = 0; n < 200; n++) {
+        if (await cond()) return;
+        await sleep(50);
+      }
+      throw new Error(`timeout waiting for ${what}`);
+    };
+    const newWin = new Client(d.token, uiOrigin);
+    await newWin.open();
+    ok((await newWin.call("window.claim", { id: heldWin, page: "smoke-new" })).id === heldWin, "after a restart the new window claims the window");
+    ok((await clickIn(newWin)).includes("no question"), "after a restart a click in the new window passes the window check");
+    // The old window's page reconnects and asks for the window it showed: it gets another one.
+    const back = new Client(d.token, uiOrigin);
+    await back.open();
+    const other = (await back.call("window.claim", { id: heldWin, page: "smoke-old" })).id;
+    ok(other !== heldWin, "an old window reconnecting beside the new one gets a window of its own");
+    // The same with no page id (an older UI, or a script): it can't take the window either.
+    const script = new Client(d.token, uiOrigin);
+    await script.open();
+    ok((await script.call("window.claim", { id: heldWin })).id !== heldWin, "a claim without a page id can't take a held window");
+    ok((await clickIn(newWin)).includes("no question"), "with the old window beside it, the new window's click still counts");
+    back.close();
+    script.close();
+    await waitFor("the old window's release", async () => !(await c.call("hello")).windows.some((w: Json) => w.id === other && w.open));
+    ok((await clickIn(newWin)).includes("no question"), "with the old window closed, the new window's click still counts");
+    // The same page on a new connection (it reconnected; its old connection lingers) takes its
+    // window back, and the lingering connection's clicks no longer count.
+    const again = new Client(d.token, uiOrigin);
+    await again.open();
+    ok((await again.call("window.claim", { id: heldWin, page: "smoke-new" })).id === heldWin, "the same page reconnecting takes its window back");
+    ok((await clickIn(again)).includes("no question"), "and its clicks count");
+    const stale = await clickIn(newWin);
+    ok(stale.includes("holds no window"), `the lingering connection's click is refused (${stale.slice(0, 80)})`);
+    await waitFor("the refusal in the log", async () => d.log.join("").includes("this connection holds no window (it last claimed"));
+    ok(true, "the log says the connection holds no window and which it last claimed");
+    newWin.close();
+    await sleep(300);
+    ok((await clickIn(again)).includes("no question"), "the lingering connection closing leaves the window held");
+    again.close();
+  }
   h = await c.call("hello");
   s = h.sessions.find((x: Json) => x.id === sid);
   ok(s.state !== "exited" && s.pid === beforeCleanStop.pid, "after clean backend stop: original terminal process survives");

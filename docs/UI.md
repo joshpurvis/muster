@@ -1227,9 +1227,14 @@ Enable **Terminal gets Alt keys** to use Antigravity’s Alt+J shortcut in its f
   it again re-attaches and the replay resets it), and a tab moved here appears.
 - Only attach sessions shown in this window (a terminal attaches when its pane is first shown).
   Detach terminals of tabs that left.
-- Every hello (first connect and reconnects) re-claims the window, then re-attaches. If
-  `window_removed` names this client's window, it claims the same id again (created if
-  missing).
+- Every hello (first connect and reconnects) re-claims the window, then re-attaches. Each claim
+  carries this page load's own random id (`page`), so a reconnect gets the window back even while
+  its old connection lingers. If `window_removed` names this client's window, or a
+  `window_upserted` for it says nobody holds it (`open: false`), it claims the same id again
+  (created if missing). A claim answered with another window than the one asked for (another page
+  shows it, as an old window that reconnects after `muster stop` and `muster`) switches to that
+  window with a toast: "Window 1 is open in another Muster window, so this one shows Window 2
+  now."
 - Daemons without windows (hello has no `windows`): every session is a tab of this window, in
   task `sort_order`; the layout is kept in memory only; window UI (window chip, Move to window,
   Jump focuses the other window, Rename window) is hidden; new tabs send the folder name as

@@ -226,7 +226,11 @@ interface Sched {
   created_at: number;
   updated_at: number;
   /** An agent's proposal (src/schedules/agent.rs, loosely): waits for Approve, never runs before. */
-  made_by?: { agent_id: number; agent: string; kind: "proposal"; reason: string; at: number; approved_at: number | null } | null;
+  made_by?: {
+    agent_id: number; agent: string; kind: "proposal"; reason: string; at: number; approved_at: number | null;
+    /** The schedule approving this one pauses (`propose_schedule`'s `replaces`). */
+    replaces?: { id: number; name: string } | null;
+  } | null;
 }
 
 // The mock's own time zone is pinned to UTC, so its data and screenshots never carry the zone of
@@ -371,13 +375,19 @@ export function scheduleMock(deps: ScheduleDeps) {
         ? { id: s.when.note_id, title: deps.noteTitle(s.when.note_id) ?? "", triggers: !!deps.noteTriggers(s.when.note_id) }
         : null,
       url: s.when.kind === "url" ? `http://127.0.0.1:7433/api/trigger/${s.when.name}` : null,
-      made_by: s.made_by ?? null,
+      made_by: s.made_by ? { ...s.made_by, replaces: replacesJson(s.made_by.replaces) } : null,
       estimate: waiting(s)
         ? { runs_per_week: 1, max_per_day: 1, billing: "codex", text: "1 run in the coming week, at most 1 a day.", lines: null }
         : null,
     };
   }
   const waiting = (s: Sched) => !!s.made_by && s.made_by.approved_at === null;
+  /** As src/schedules/mod.rs `schedule_json`: the replaced schedule, its name now, removed or paused. */
+  function replacesJson(r: { id: number; name: string } | null | undefined) {
+    if (!r) return null;
+    const cur = list.find((x) => x.id === r.id);
+    return { id: r.id, name: cur?.name ?? r.name, gone: !cur, paused: !!cur?.paused };
+  }
 
   /** As src/schedules/mod.rs `failing_of`: two or more of the newest own runs failed in a row
    * (skipped and running ones neither count nor break it; a late reply does). */
@@ -703,6 +713,14 @@ export function scheduleMock(deps: ScheduleDeps) {
         s.made_by!.approved_at = now();
         s.next_run = next;
         s.updated_at = now();
+        // The schedule it replaces is paused in the same click (src/schedules/mod.rs `approve`).
+        const r = s.made_by!.replaces;
+        const old = r ? list.find((x) => x.id === r.id) : undefined;
+        if (old && old.id !== s.id && !old.paused) {
+          old.paused = true;
+          old.updated_at = now();
+          publish(old);
+        }
         return publish(s);
       }
       case "schedule.update":
@@ -932,9 +950,12 @@ export function scheduleMock(deps: ScheduleDeps) {
   }
 
   /** Seed: an agent's proposal waiting for approval, made `ageMs` ago. */
-  function propose(p: any, by: string, reason: string, ageMs: number) {
+  function propose(p: any, by: string, reason: string, ageMs: number, replaces?: number) {
     const a = agentNamed(by);
-    const j = create(p, { agent_id: a.id, agent: a.name, kind: "proposal", reason, at: now() - ageMs, approved_at: null }, now() - ageMs) as { id: number };
+    const old = replaces === undefined ? undefined : get(replaces);
+    const madeBy = { agent_id: a.id, agent: a.name, kind: "proposal" as const, reason, at: now() - ageMs, approved_at: null,
+      replaces: old ? { id: old.id, name: old.name } : null };
+    const j = create(p, madeBy, now() - ageMs) as { id: number };
     return j;
   }
 

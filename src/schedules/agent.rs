@@ -11,7 +11,9 @@
 //! - A proposal is stored with `made_by` and no time to run: the scheduler never sees it as due,
 //!   and approving it (`schedules::approve`, the human's RPC only) checks it again as if made now.
 //!   No tool approves, resumes or edits a schedule: an agent can pause or delete its own, never
-//!   widen one (to change it, it proposes a new one).
+//!   widen one (to change it, it proposes a new one, which may name the one it `replaces`: the
+//!   human's click on Approve pauses that one too). A lead agent, or any session working for the
+//!   human, may pause any schedule, with a notice naming who (owner, 27 Nov 2026; `pause`).
 //! - Only a named agent proposes, and only while it is working for the human: a session handling
 //!   scheduled or triggered work (any chain a schedule or trigger started) is refused, so a
 //!   reminder can't set the next reminder and a schedule can't breed more schedules.
@@ -205,6 +207,16 @@ fn brief(hub: &Hub, s: &Schedule) -> Value {
 
 /// The MCP schedule tools, run as session `caller` (src/mcp/tools.rs checks the rate limit).
 pub fn tool(hub: &Hub, caller: SessionId, name: &str, args: Value) -> anyhow::Result<Value> {
+    // Pausing is any session's, under its own rule (`pause`); the rest is a named agent's.
+    if name == "pause_schedule" {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct P {
+            schedule_id: i64,
+        }
+        let p: P = serde_json::from_value(args)?;
+        return pause(hub, caller, p.schedule_id);
+    }
     let me = me(hub, caller)?;
     let now = hub.schedules.now();
     match name {
@@ -294,7 +306,7 @@ pub fn tool(hub: &Hub, caller: SessionId, name: &str, args: Value) -> anyhow::Re
                 conversation: Some(Conversation::Continue),
                 ..Default::default()
             };
-            let made = MadeBy { agent_id: me.id, agent: me.name.clone(), session_id: Some(caller), kind: MadeKind::Reminder, reason: String::new(), at: now, approved_at: None };
+            let made = MadeBy { agent_id: me.id, agent: me.name.clone(), session_id: Some(caller), kind: MadeKind::Reminder, reason: String::new(), at: now, approved_at: None, replaces: None };
             let s = super::create_as(hub, req, Some(made), None).map_err(reword)?;
             hub.schedules.made.add(me.id, MadeKind::Reminder, now);
             Ok(json!({
@@ -331,10 +343,22 @@ pub fn tool(hub: &Hub, caller: SessionId, name: &str, args: Value) -> anyhow::Re
                 daily_cap: Option<u32>,
                 #[serde(default)]
                 note_id: Option<NoteId>,
+                /// A schedule this one replaces: the human's click on Approve pauses it too.
+                #[serde(default)]
+                replaces: Option<i64>,
             }
             let p: P = serde_json::from_value(args)?;
             attended(hub, caller)?;
             let reason = clean_reason(&p.reason)?;
+            // Any schedule that is there now: the human's click is what pauses it (owner, 27 Nov
+            // 2026), so it needn't be one the caller could pause itself.
+            let replaces = match p.replaces {
+                Some(id) => {
+                    let old = hub.schedules.get(id).with_context(|| format!("no schedule {id} to replace (see list_schedules)"))?;
+                    Some(super::Replaces { id: old.id, name: old.name, created_at: old.created_at })
+                }
+                None => None,
+            };
             let when = when_of(p.cron, p.at, p.in_minutes, now)?;
             let target = match p.agent.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
                 Some(n) => hub.agents().get(n).ok_or_else(|| crate::agents::no_agent(hub, n))?,
@@ -362,7 +386,8 @@ pub fn tool(hub: &Hub, caller: SessionId, name: &str, args: Value) -> anyhow::Re
                 note: p.note_id.map(|id| Some(NoteChoice::Id { id })),
                 ..Default::default()
             };
-            let made = MadeBy { agent_id: me.id, agent: me.name.clone(), session_id: Some(caller), kind: MadeKind::Proposal, reason, at: now, approved_at: None };
+            let replaced = replaces.as_ref().map(|r| format!(" Approving it pauses schedule {} ({}).", r.id, r.name)).unwrap_or_default();
+            let made = MadeBy { agent_id: me.id, agent: me.name.clone(), session_id: Some(caller), kind: MadeKind::Proposal, reason, at: now, approved_at: None, replaces };
             let s = super::create_as(hub, req, Some(made), None).map_err(reword)?;
             hub.schedules.made.add(me.id, MadeKind::Proposal, now);
             drop(_making);
@@ -373,7 +398,7 @@ pub fn tool(hub: &Hub, caller: SessionId, name: &str, args: Value) -> anyhow::Re
                 hub,
                 "info",
                 &format!("{} proposes a schedule: \"{}\"", me.name, s.name),
-                &format!("{reading}{on}. Approve or dismiss it in Needs you at the top of Muster's sidebar."),
+                &format!("{reading}{on}.{replaced} Approve or dismiss it in Needs you at the top of Muster's sidebar."),
             );
             Ok(json!({
                 "schedule_id": s.id,
@@ -384,22 +409,6 @@ pub fn tool(hub: &Hub, caller: SessionId, name: &str, args: Value) -> anyhow::Re
                 "note": "It doesn't run until the human approves it in Muster's sidebar (they may edit it first). \
                          list_schedules shows whether it was approved; dismissed proposals disappear.",
             }))
-        }
-        "pause_schedule" => {
-            #[derive(Deserialize)]
-            #[serde(deny_unknown_fields)]
-            struct P {
-                schedule_id: i64,
-            }
-            let p: P = serde_json::from_value(args)?;
-            let s = hub.schedules.get(p.schedule_id).with_context(|| format!("no schedule {} (see list_schedules)", p.schedule_id))?;
-            ensure!(
-                s.agent_id == me.id || s.made_by.as_ref().is_some_and(|m| m.agent_id == me.id),
-                "schedule {} neither runs on you nor was made by you: only the human can pause it",
-                s.id
-            );
-            let j = super::set_paused(hub, s.id, true, None)?;
-            Ok(json!({"schedule_id": s.id, "status": j["status"], "note": "Only the human can resume it."}))
         }
         "delete_schedule" => {
             #[derive(Deserialize)]
@@ -419,6 +428,40 @@ pub fn tool(hub: &Hub, caller: SessionId, name: &str, args: Value) -> anyhow::Re
         }
         _ => anyhow::bail!("unknown schedule tool"),
     }
+}
+
+/// Is the caller's current work the human's, for pausing any schedule (owner, 27 Nov 2026)? Read
+/// from its route (`agents::send_prov`), never from anything it passes: the human typed its turn
+/// (no provenance), or it came along a chain the human started (origin human), or a lead agent's
+/// (origin lead: a lead's scheduled work, `agents::sending_prov`, and what it sent on). A trigger's
+/// or an add-on's work, and a non-lead's scheduled work, isn't.
+fn for_the_human(hub: &Hub, caller: SessionId) -> bool {
+    hub.agents().send_prov(caller).is_none_or(|p| matches!(p.origin, Origin::Human | Origin::Lead))
+}
+
+/// `pause_schedule` (and `muster schedule pause` in a session): a schedule that runs on the
+/// calling agent or that it made, always; any schedule for a lead agent (in any turn) and when
+/// the caller works for the human (`for_the_human`). Muster says who paused what, so a pause
+/// never goes unseen. Pausing only narrows: resuming, making and changing stay the human's.
+fn pause(hub: &Hub, caller: SessionId, id: i64) -> anyhow::Result<Value> {
+    let s = hub.schedules.get(id).with_context(|| format!("no schedule {id} (see list_schedules)"))?;
+    let agent = hub.agents().by_session(caller);
+    let own = agent.as_ref().is_some_and(|a| s.agent_id == a.id || s.made_by.as_ref().is_some_and(|m| m.agent_id == a.id));
+    // A lead agent pauses any schedule in any turn (owner, 27 Nov 2026: "lead agents ... may
+    // pause ANY schedule"); pausing only narrows, and the notice says who did it.
+    let lead = agent.as_ref().is_some_and(crate::agents::is_lead);
+    ensure!(
+        own || lead || for_the_human(hub, caller),
+        "schedule {id} neither runs on you nor was made by you, and you're handling scheduled or triggered work: \
+         only the human (or a lead agent, or a session working for the human) can pause it"
+    );
+    let was_paused = s.paused;
+    let j = super::set_paused(hub, s.id, true, None)?;
+    if !was_paused {
+        let who = crate::agents::sender_label(agent.as_ref(), caller);
+        super::run::alert_schedule(hub, "info", &format!("{who} paused schedule {} ({})", s.id, s.name), "", s.id);
+    }
+    Ok(json!({"schedule_id": s.id, "status": j["status"], "note": "Only the human can resume it."}))
 }
 
 /// The human-facing errors of `create`, said to an agent.

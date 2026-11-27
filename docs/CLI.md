@@ -252,12 +252,15 @@ limits"). Schedules you make or widen from the command line wait the same way (a
 
 | Command | What it does |
 |---|---|
-| `muster schedule propose TIMING --reason "…" [--agent NAME] [options] [PROMPT...]` | **Inside an agent's session only**: propose a schedule as that agent (its MCP `propose_schedule`). TIMING as for `add`; options `--name`, `--tz`, `--fresh`, `--quiet-hours on\|off`, `--max-per-day N`, `--note <id>`. Prints `schedule ID: proposed (…)` and its estimated use. |
+| `muster schedule propose TIMING --reason "…" [--agent NAME] [options] [PROMPT...]` | **Inside an agent's session only**: propose a schedule as that agent (its MCP `propose_schedule`). TIMING as for `add`; options `--name`, `--tz`, `--fresh`, `--quiet-hours on\|off`, `--max-per-day N`, `--note <id>`, `--replaces <id>` (a schedule this one replaces: your click on Approve pauses it). Prints `schedule ID: proposed (…)` and its estimated use. |
 | `muster schedule remind --at WHEN [PROMPT...]` | **Inside an agent's session only**: a one-off reminder for itself, 5 minutes to 24 hours ahead (`+20m`, `15:30`, `"YYYY-MM-DD HH:MM"`), no approval (its MCP `set_reminder`). A relative time is sent as minutes (`in_minutes`), counted by the daemon, so `--at +5m` is exactly 5 minutes ahead. |
 
-Inside an agent's session, `muster schedule pause <id>` and `muster schedule rm <id>` run its
-`pause_schedule` and `delete_schedule`: it may pause a schedule that runs on it or that it made,
-and delete one it made; resuming, editing and approving stay yours.
+Inside a session, `muster schedule pause <id>` runs its `pause_schedule` (docs/MCP.md
+"Scheduling"): a lead agent, or any session working for you (you typed its turn, or it came from
+an agent you or a lead set going), may pause any schedule, and Muster shows who paused what; in
+scheduled or triggered work a non-lead agent pauses only a schedule that runs on it or that it made. The
+same holds in a shell an agent typed into. `muster schedule rm <id>` in an agent's session runs its
+`delete_schedule` (one it made). Resuming, editing and approving stay yours.
 
 ```sh
 # run by an agent, in its session:

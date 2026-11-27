@@ -43,6 +43,7 @@ import {
   isProposal,
   isHeld,
   heldHeadline,
+  replacesLine,
   madeByLabel,
   proposalFacts,
   promptIsLong,
@@ -537,6 +538,22 @@ Deno.test("a schedule made or changed outside the window waits like a proposal, 
   const p = sched({ id: 7, status: "proposed", next_run: null, made_by: { agent_id: 2, agent: "reviewer", kind: "proposal", reason: "r", at: NOW - 60_000, approved_at: null } });
   eq(waitingProposals([changed, sched({ id: 1 }), made, p]).map((s) => s.id), [7, 9, 10], "oldest first");
   eq(isHeld(sched({})), false);
+});
+
+Deno.test("a proposal that replaces a schedule says approving pauses it", () => {
+  const by = { agent_id: 2, agent: "alpha", kind: "proposal" as const, reason: "r", at: NOW - 60_000, approved_at: null };
+  const p = (replaces: { id: number; name: string; gone: boolean; paused: boolean } | null, approved_at: number | null = null) =>
+    sched({ id: 7, status: approved_at ? "active" : "proposed", made_by: { ...by, approved_at, replaces } });
+  eq(replacesLine(p(null)), null);
+  eq(replacesLine(p({ id: 12, name: "Nightly scout", gone: false, paused: false })), "Approving pauses schedule 12 (Nightly scout).");
+  eq(replacesLine(p({ id: 12, name: "Nightly scout", gone: false, paused: true })), "It replaces schedule 12 (Nightly scout), which is already paused.");
+  eq(replacesLine(p({ id: 12, name: "Nightly scout", gone: true, paused: false })),
+    "It replaces schedule 12 (Nightly scout), which was removed since: approving pauses nothing else.");
+  eq(replacesLine(p({ id: 12, name: "Nightly scout", gone: false, paused: true }, NOW)), null, "approved: nothing left to say");
+  // The schedules as they are now win over the proposal's own copy: resumed, renamed, removed since.
+  const stale = p({ id: 12, name: "Nightly scout", gone: false, paused: true });
+  eq(replacesLine(stale, [sched({ id: 12, name: "Night scout", paused: false })]), "Approving pauses schedule 12 (Night scout).");
+  eq(replacesLine(stale, [sched({ id: 3 })]), "It replaces schedule 12 (Nightly scout), which was removed since: approving pauses nothing else.");
 });
 
 Deno.test("the approval card lists every \"Then…\" step, nested ones included", () => {

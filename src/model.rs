@@ -416,6 +416,47 @@ impl Permissions {
         }
     }
 
+    /// Where an agent of `kind` stands with this profile on one scale every kind shares (owner,
+    /// 27 Nov 2026), for comparing agents of different kinds: 0 changes nothing (plan,
+    /// read-only), 1 asks before edits (Claude's default), 2 edits without asking but asks
+    /// before commands or keeps them in a sandbox without network (accept-edits, Codex's
+    /// workspace write, Antigravity's accept-edits and auto), 3 runs commands with network
+    /// without asking (Codex's workspace write with network), 4 no limits (bypass, full access).
+    /// Shells: 0 (the profile doesn't govern them).
+    pub fn level(&self, kind: SessionKind) -> u8 {
+        match kind {
+            SessionKind::Claude => match self.claude_mode {
+                ClaudeMode::Plan => 0,
+                ClaudeMode::Default => 1,
+                ClaudeMode::AcceptEdits => 2,
+                ClaudeMode::Bypass => 4,
+            },
+            SessionKind::Codex => match self.codex_sandbox {
+                CodexSandbox::ReadOnly => 0,
+                CodexSandbox::WorkspaceWrite => 2,
+                CodexSandbox::WorkspaceWriteNetwork => 3,
+                CodexSandbox::FullAccess => 4,
+            },
+            SessionKind::Antigravity => match self.antigravity_mode {
+                AntigravityMode::Plan => 0,
+                AntigravityMode::AcceptEdits | AntigravityMode::Auto => 2,
+                AntigravityMode::FullAccess => 4,
+            },
+            SessionKind::Shell => 0,
+        }
+    }
+
+    /// Would an agent of `kind` with `self` do more than a sender of kind `from` in a channel
+    /// with `mine` may drive? Only when `self` exceeds `mine` for `kind` (`exceeds_for`: the
+    /// sender could start such an agent in its own channel otherwise) and, for a sender of
+    /// another kind, its own mode (`mine` for `from`) also sits lower on the shared scale
+    /// (`level`): a Codex sender's Claude field, which its form doesn't show, decides nothing
+    /// on its own. The same kind (or a shell sender) is compared field by field, as before.
+    pub fn exceeds_from(&self, mine: &Permissions, kind: SessionKind, from: SessionKind) -> bool {
+        self.exceeds_for(mine, kind)
+            && (from == kind || from == SessionKind::Shell || self.level(kind) > mine.level(from))
+    }
+
     /// More permissive than the defaults in any respect.
     #[allow(dead_code)] // used by tests and documented for clients
     pub fn is_elevated(&self) -> bool {

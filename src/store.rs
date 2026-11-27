@@ -2507,6 +2507,18 @@ impl Store {
         Self::save_schedule_on(&self.conn.lock(), s)
     }
 
+    /// Several schedules in one transaction: all saved, or none (approving a proposal and pausing
+    /// the schedule it replaces).
+    pub fn save_schedules(&self, list: &[crate::schedules::Schedule]) -> anyhow::Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        for s in list {
+            Self::save_schedule_on(&tx, s)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// The schedule and its runs.
     pub fn delete_schedule(&self, id: i64) -> anyhow::Result<()> {
         let mut conn = self.conn.lock();

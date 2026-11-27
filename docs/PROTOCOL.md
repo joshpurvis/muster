@@ -940,7 +940,8 @@ Code: `src/schedules/agent.rs` (the agent tools and the estimate), `src/schedule
 
 ```ts
 // Added to Schedule:
-//   made_by: { agent_id, agent, kind: "proposal" | "reminder", reason, at, approved_at: number | null } | null
+//   made_by: { agent_id, agent, kind: "proposal" | "reminder", reason, at, approved_at: number | null,
+//              replaces?: { id, name, gone, paused } | null } | null
 //            // null: the human made it. A proposal with approved_at null waits for approval.
 //   estimate: { runs_per_week: number | null, max_per_day: number | null,
 //               billing: "claude_subscription" | "openrouter" | "codex" | "other",
@@ -959,10 +960,10 @@ type FilesWhen = { kind: "files"; folder: string /* absolute, links resolved */;
 
 | Method | Params | Result |
 |---|---|---|
-| `schedule.approve` | `{id, seen?}` | `Schedule`. The owner approves an agent's proposal or a held schedule: checked again as if made now (its agent, and every step's, still takes the work; a one-off's time hasn't passed: otherwise refused, to edit or dismiss), then it runs like any schedule from its next time. A Claude subscription agent's 7 days start now for a proposal, a held new schedule or a held renewal, and stay as they were for a held change. `seen`: the `updated_at` the owner looked at (the UI sends it); a schedule changed since is refused. **Only a click in Muster's window** (below). Refused everywhere else: `/api/rpc` and so the CLI, a WebSocket without a window or the UI's origin, a paired device, an agent's session or an agent-driven shell (`from_session`), a client run inside a session, a connection whose program can't be told. See docs/SCHEDULING_PLAN.md "Approval and its limits" for what that does and doesn't stop. Dismissing is `schedule.remove` with `waiting`. |
+| `schedule.approve` | `{id, seen?}` | `Schedule`. The owner approves an agent's proposal or a held schedule: checked again as if made now (its agent, and every step's, still takes the work; a one-off's time hasn't passed: otherwise refused, to edit or dismiss), then it runs like any schedule from its next time. A proposal that names a schedule it replaces (`made_by.replaces`) pauses that one in the same step, saved together with the approval; the result then has `replaced: {id, name, paused, gone?}` (`paused: false, gone: true` when it was removed before the click, which doesn't stop the approval), and a notice names it. A Claude subscription agent's 7 days start now for a proposal, a held new schedule or a held renewal, and stay as they were for a held change. `seen`: the `updated_at` the owner looked at (the UI sends it); a schedule changed since is refused. **Only a click in Muster's window** (below). Refused everywhere else: `/api/rpc` and so the CLI, a WebSocket without a window or the UI's origin, a paired device, an agent's session or an agent-driven shell (`from_session`), a client run inside a session, a connection whose program can't be told. See docs/SCHEDULING_PLAN.md "Approval and its limits" for what that does and doesn't stop. Dismissing is `schedule.remove` with `waiting`. |
 | `schedule.propose` | `{from_session, prompt, reason, cron? \| at? \| in_minutes?, agent?, name?, tz?, conversation?, quiet_hours?, daily_cap?, note_id?}` | MCP `propose_schedule`'s result. Only from an agent's own session (`muster schedule propose`): it runs that tool as the agent (its rules, rate limit and audit). Anyone else is refused. |
 | `schedule.remind` | `{from_session, prompt, in_minutes? \| at?, name?, tz?}` | MCP `set_reminder`'s result, likewise. |
-| `schedule.pause` / `schedule.remove` | from an agent's session | Run as its MCP `pause_schedule` / `delete_schedule` (pausing only: `on: false` stays the human's). |
+| `schedule.pause` / `schedule.remove` | from an agent's session (any session that isn't a shell; for `schedule.pause`, also a shell an agent typed into) | Run as its MCP `pause_schedule` / `delete_schedule`, with that tool's rules (pausing only: `on: false` stays the human's). |
 | `schedule.settings.set` | also `watch_folders: string[]` (the whole list; existing folders, `~/` allowed, made absolute with links resolved; not `/`; at most 20) | `ScheduleSettings`. Removing a folder stops the file triggers inside it: their waiting events go, their prompts still in an agent's queue are taken back, and a run due is `skipped`. |
 
 **Held** (fix round 2). A click in Muster's window is a call over a WebSocket that came in with the

@@ -193,6 +193,17 @@ export function rememberWindow(id: number) {
  */
 let claiming: Promise<void> | null = null;
 
+/** This page load's own id, sent with every claim: after a reconnect the daemon gives this page
+ * its window back even while its old connection lingers, but never hands a window another page
+ * shows to this one (an old window reconnecting after a restart gets a window of its own). */
+const PAGE_ID = (() => {
+  try {
+    return crypto.randomUUID();
+  } catch {
+    return Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) => b.toString(16).padStart(2, "0")).join("");
+  }
+})();
+
 export function claimWindow(): Promise<void> {
   // One claim at a time (a lost-window event during a claim must not start a second one).
   claiming ??= doClaim().finally(() => (claiming = null));
@@ -206,8 +217,14 @@ async function doClaim(): Promise<void> {
   }
   const want = windowId.value ?? storedWindow();
   try {
-    const w = await rpc.call<Win>("window.claim", want !== null ? { id: want } : {});
+    const w = await rpc.call<Win>("window.claim", want !== null ? { id: want, page: PAGE_ID } : { page: PAGE_ID });
     knowWindow(w);
+    // Asked for a window another page shows (this one reconnected after a restart beside a newer
+    // window): the daemon gave this page one of its own instead.
+    if (want !== null && w.id !== want) {
+      const asked = windows.value.find((x) => x.id === want) ?? { id: want, name: String(want) };
+      toast("info", `${windowLabel(asked)} is open in another Muster window, so this one shows ${windowLabel(w)} now.`, 8000);
+    }
     windowId.value = w.id;
     rememberWindow(w.id);
     native.tellNativeWindow(w.id);

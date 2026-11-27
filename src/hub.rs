@@ -344,6 +344,9 @@ struct WinEntry {
     created_at: i64,
     /// Client connection showing this window (`window.claim`).
     holder: Option<u64>,
+    /// The page that holder said it is (`window.claim`'s `page`): the same page reconnecting on a
+    /// new connection may take the window back from its own stale one; any other page may not.
+    holder_page: Option<String>,
     /// The frontend's split layout (`window.set_layout`), stored verbatim.
     layout: Option<serde_json::Value>,
 }
@@ -360,6 +363,9 @@ struct Inner {
     workspaces: BTreeMap<WorkspaceId, Workspace>,
     channels: BTreeMap<ChannelId, Channel>,
     windows: BTreeMap<WindowId, WinEntry>,
+    /// The window each open client connection last claimed (`window.claim`), kept after it was
+    /// taken or released, for the log when a window call is refused (`rpc::from_window`).
+    last_claims: HashMap<u64, WindowId>,
     titles: HashMap<ChannelId, Titles>,
     /// Per channel, the source of the derived name its branch was last renamed after this run.
     /// A better source (agent title > first prompt > shell title) renames it again.
@@ -966,6 +972,7 @@ impl Hub {
                     last_focused_at: w.last_focused_at,
                     created_at: w.created_at,
                     holder: None,
+                    holder_page: None,
                     layout: w.layout,
                 },
             );
@@ -2724,6 +2731,7 @@ impl Hub {
                 last_focused_at: 0,
                 created_at: now,
                 holder: None,
+                holder_page: None,
                 layout: None,
             },
         );
@@ -2777,16 +2785,48 @@ impl Hub {
         Ok(w)
     }
 
-    /// `window.claim` for connection `conn`: with `id`, that window (created if missing);
-    /// else the lowest-id window with tabs or durable channels that nobody holds, else a new one.
-    /// Releases the connection's previous window and adopts channels and sessions without a
-    /// (live) window.
+    /// `window.claim` for connection `conn`, from a page that calls itself `page` (a random id
+    /// per page load, given only for a connection with the UI's Origin): with `id`, that window
+    /// (created if missing); else the lowest-id window with tabs or durable channels that nobody
+    /// holds, else a new one. A window a page holds (its claim had a page id) is taken over only
+    /// by the same page (it reconnected while its old connection lingers); any other claim for it
+    /// gets a window as if it named none, so a second page (an old window reconnecting after a
+    /// restart, a copied browser tab) can't take the window out from under the one showing it. A
+    /// hold without a page id (a script, an older UI) is taken by the next claim. Releases the connection's previous window
+    /// and adopts channels and sessions without a (live) window.
+    #[cfg(test)]
     pub fn claim_window(&self, conn: u64, id: Option<WindowId>) -> anyhow::Result<Window> {
+        self.claim_window_for(conn, id, None)
+    }
+
+    /// `claim_window` with the claiming page's id (`window.claim`'s `page`).
+    pub fn claim_window_for(&self, conn: u64, id: Option<WindowId>, page: Option<&str>) -> anyhow::Result<Window> {
         let mut events = Vec::new();
         let w = {
             let mut g = self.inner.lock();
-            let target = match id {
+            // Only a hold that came with a page id (a page of Muster's UI: `rpc` passes `page` only
+            // from a connection with the UI's Origin) is kept from other claims; a hold without one
+            // (a script, an older UI) goes to whoever claims next, as before.
+            let taken = |g: &Inner, id: WindowId| {
+                g.windows.get(&id).and_then(|w| {
+                    let other = w.holder.filter(|h| *h != conn)?;
+                    let held_by_page = w.holder_page.is_some() && w.holder_page.as_deref() != page;
+                    held_by_page.then_some(other)
+                })
+            };
+            let id = match id {
                 Some(id) if id < 1 => anyhow::bail!("invalid window id: {id}"),
+                Some(id) => match taken(&g, id) {
+                    Some(other) => {
+                        tracing::info!(conn, window = id, holder = other,
+                            "window.claim: another page shows this window; giving this one another window");
+                        None
+                    }
+                    None => Some(id),
+                },
+                None => None,
+            };
+            let target = match id {
                 Some(id) => {
                     if !g.windows.contains_key(&id) {
                         self.add_window_locked(&mut g, id, None)?;
@@ -2818,8 +2858,13 @@ impl Hub {
                 .map(|(wid, _)| *wid)
                 .collect();
             if let Some(w) = g.windows.get_mut(&target) {
+                if let Some(prev) = w.holder.filter(|h| *h != conn) {
+                    tracing::info!(conn, window = target, from = prev, "window.claim: the same page took its window back from its old connection");
+                }
                 w.holder = Some(conn);
+                w.holder_page = page.map(str::to_owned);
             }
+            g.last_claims.insert(conn, target);
             g.launching.remove(&target);
             // Adopt orphans: live channels whose window is unset or gone, except a hidden agent's
             // task (every one of its tabs hidden: `hide_session`).
@@ -2885,11 +2930,20 @@ impl Hub {
         self.inner.lock().windows.values().any(|w| w.holder == Some(conn))
     }
 
+    /// The window connection `conn` last claimed, and the connection holding it now (for the
+    /// log when a window call is refused).
+    pub fn last_claim(&self, conn: u64) -> Option<(WindowId, Option<u64>)> {
+        let g = self.inner.lock();
+        let id = *g.last_claims.get(&conn)?;
+        Some((id, g.windows.get(&id).and_then(|w| w.holder)))
+    }
+
     /// A connection closed: release its window (deleted when it has no tabs).
     pub fn release_windows(&self, conn: u64) {
         let mut events = Vec::new();
         {
             let mut g = self.inner.lock();
+            g.last_claims.remove(&conn);
             let held: Vec<WindowId> = g
                 .windows
                 .iter()
@@ -2908,6 +2962,7 @@ impl Hub {
     fn release_locked(&self, g: &mut Inner, id: WindowId, events: &mut Vec<ServerEvent>) {
         if let Some(w) = g.windows.get_mut(&id) {
             w.holder = None;
+            w.holder_page = None;
         }
         self.gc_window_locked(g, id, events);
     }
@@ -7015,6 +7070,39 @@ mod tests {
     }
 
     #[test]
+    fn another_page_cant_take_a_window_a_live_page_holds() {
+        // The owner's restart (27 Nov 2026): the new window shows window 1, then the old window's
+        // page reconnects and asks for window 1 too.
+        let hub = move_fixture();
+        assert_eq!(hub.claim_window_for(1, None, Some("new")).unwrap().id, 1);
+        let old = hub.claim_window_for(2, Some(1), Some("old")).unwrap();
+        assert_ne!(old.id, 1, "the old window gets one of its own");
+        // A claim with no page id (an older UI, a script) can't take it either.
+        assert_ne!(hub.claim_window_for(3, Some(1), None).unwrap().id, 1);
+        assert_ne!(hub.claim_window(3, Some(1)).unwrap().id, 1);
+        // But a hold without a page id never keeps a page out: conn 3's window goes to page "new2".
+        let scripts = hub.claim_window(3, None).unwrap().id;
+        assert_eq!(hub.claim_window_for(6, Some(scripts), Some("new2")).unwrap().id, scripts);
+        assert!(hub.holds_window(6) && !hub.holds_window(3));
+        hub.release_windows(6);
+        assert!(hub.holds_window(1) && hub.holds_window(2));
+        // The old window closes: the new one still holds window 1.
+        hub.release_windows(2);
+        hub.release_windows(3);
+        assert!(hub.holds_window(1) && hub.window(1).unwrap().open);
+        // The new page reconnects while its old connection lingers: it takes window 1 back.
+        assert_eq!(hub.claim_window_for(4, Some(1), Some("new")).unwrap().id, 1);
+        assert!(hub.holds_window(4) && !hub.holds_window(1));
+        assert_eq!(hub.last_claim(1), Some((1, Some(4))), "the log can name the window and its holder");
+        hub.release_windows(1);
+        assert!(hub.holds_window(4), "the lingering connection closing leaves the window held");
+        assert_eq!(hub.last_claim(1), None);
+        // Released, a window is free for any page again.
+        hub.release_windows(4);
+        assert_eq!(hub.claim_window_for(5, Some(1), Some("other")).unwrap().id, 1);
+    }
+
+    #[test]
     fn a_closed_agent_tab_is_hidden_not_stopped() {
         let hub = agent_fixture();
         // Only a named agent's tab can be hidden: any other closes for real.
@@ -7227,6 +7315,7 @@ mod tests {
                     last_focused_at: 0,
                     created_at: 0,
                     holder: None,
+                    holder_page: None,
                     layout: None,
                 },
             );

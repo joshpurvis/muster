@@ -106,6 +106,16 @@ export function windowLabel(w: Pick<Win, "id" | "name">): string {
   return /^\d+$/.test(n) ? `Window ${n}` : n;
 }
 
+/**
+ * Did this page lose the window it shows (`mine`) by this event, so it must claim one again?
+ * Yes when that window was removed, or is reported held by nobody (another page took it and then
+ * closed): until it claims again every click that must come from a window would be refused.
+ */
+export function lostWindow(ev: { event: string; data: { id: WindowId; open?: boolean } }, mine: WindowId | null): boolean {
+  if (mine === null || ev.data.id !== mine) return false;
+  return ev.event === "window_removed" || (ev.event === "window_upserted" && ev.data.open === false);
+}
+
 /** `window=<id>` from a location hash, if it is a positive integer. */
 export function windowParam(hash: string): number | null {
   const v = new URLSearchParams(hash.replace(/^#/, "")).get("window");

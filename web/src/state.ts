@@ -62,6 +62,7 @@ import {
   confirmAfterFocus,
   confirmAfterUpsert,
   documentTitle,
+  lostWindow,
   needsYouOrder,
   newerPrefs,
   pushFront,
@@ -1070,11 +1071,12 @@ export function applyEvent(ev: ServerEvent) {
     case "window_upserted": {
       // Our own layout is ours: the daemon stores what we send and never echoes it.
       withHolds(() => (windows.value = upsertWindow(windows.value, ev.data)));
+      if (lostWindow(ev, windowId.value)) { for (const f of windowLostListeners) f(); }
       break;
     }
     case "window_removed":
       windows.value = windows.value.filter((w) => w.id !== ev.data.id);
-      if (ev.data.id === windowId.value) { for (const f of windowLostListeners) f(); }
+      if (lostWindow(ev, windowId.value)) { for (const f of windowLostListeners) f(); }
       break;
     case "session_upserted": {
       versions.bump(ev.data.id);

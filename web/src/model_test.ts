@@ -6,6 +6,7 @@ import {
   documentTitle,
   type JumpCandidate,
   jumpOrder,
+  lostWindow,
   midTurn,
   moveChannelLocally,
   needsYouOrder,
@@ -460,4 +461,15 @@ Deno.test("midTurn: an agent working, stuck or waiting on the user asks first; s
     assertEquals(midTurn(sess(1, 1, state)), false, `claude ${state}`);
     assertEquals(midTurn(sess(1, 1, state, 0, { kind: "codex" })), false, `codex ${state}`);
   }
+});
+
+Deno.test("lostWindow: removed, or held by nobody, re-claims; other windows and held ones don't", () => {
+  const up = (id: number, open: boolean) => ({ event: "window_upserted", data: { id, open } });
+  // The owner's restart (27 Nov 2026): an old window took window 1 and closed; it stays (it has
+  // tabs) with nobody holding it.
+  assertEquals(lostWindow(up(1, false), 1), true);
+  assertEquals(lostWindow({ event: "window_removed", data: { id: 1 } }, 1), true);
+  assertEquals(lostWindow(up(1, true), 1), false);
+  assertEquals(lostWindow(up(2, false), 1), false);
+  assertEquals(lostWindow(up(1, false), null), false);
 });

@@ -2632,7 +2632,8 @@ async fn handle_request(
             }
             // Through the response queue, after the events it emits.
             let r = parse::<P>(req.params).and_then(|p| {
-                let page = p.page.filter(|s| !s.is_empty() && s.len() <= 128);
+                // Only a page of Muster's UI keeps others out of its window (`claim_window_for`).
+                let page = p.page.filter(|s| link.ui_origin && !s.is_empty() && s.len() <= 128);
                 to_value(hub.claim_window_for(conn, p.id, page.as_deref())?)
             });
             let _ = resp.send(Message::Text(response(&req.id, r).to_string().into())).await;

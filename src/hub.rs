@@ -2711,12 +2711,13 @@ impl Hub {
     }
 
     /// `window.claim` for connection `conn`, from a page that calls itself `page` (a random id
-    /// per page load): with `id`, that window (created if missing); else the lowest-id window
-    /// with tabs or durable channels that nobody holds, else a new one. A window another
-    /// connection holds is taken over only by the same page (it reconnected while its old
-    /// connection lingers); any other page asking for it gets a window as if it named none, so a
-    /// second page (an old window reconnecting after a restart, a copied browser tab) can't take
-    /// the window out from under the one showing it. Releases the connection's previous window
+    /// per page load, given only for a connection with the UI's Origin): with `id`, that window
+    /// (created if missing); else the lowest-id window with tabs or durable channels that nobody
+    /// holds, else a new one. A window a page holds (its claim had a page id) is taken over only
+    /// by the same page (it reconnected while its old connection lingers); any other claim for it
+    /// gets a window as if it named none, so a second page (an old window reconnecting after a
+    /// restart, a copied browser tab) can't take the window out from under the one showing it. A
+    /// hold without a page id (a script, an older UI) is taken by the next claim. Releases the connection's previous window
     /// and adopts channels and sessions without a (live) window.
     #[cfg(test)]
     pub fn claim_window(&self, conn: u64, id: Option<WindowId>) -> anyhow::Result<Window> {
@@ -2728,11 +2729,14 @@ impl Hub {
         let mut events = Vec::new();
         let w = {
             let mut g = self.inner.lock();
+            // Only a hold that came with a page id (a page of Muster's UI: `rpc` passes `page` only
+            // from a connection with the UI's Origin) is kept from other claims; a hold without one
+            // (a script, an older UI) goes to whoever claims next, as before.
             let taken = |g: &Inner, id: WindowId| {
                 g.windows.get(&id).and_then(|w| {
                     let other = w.holder.filter(|h| *h != conn)?;
-                    let same_page = page.is_some() && w.holder_page.as_deref() == page;
-                    (!same_page).then_some(other)
+                    let held_by_page = w.holder_page.is_some() && w.holder_page.as_deref() != page;
+                    held_by_page.then_some(other)
                 })
             };
             let id = match id {
@@ -6783,7 +6787,12 @@ mod tests {
         // A claim with no page id (an older UI, a script) can't take it either.
         assert_ne!(hub.claim_window_for(3, Some(1), None).unwrap().id, 1);
         assert_ne!(hub.claim_window(3, Some(1)).unwrap().id, 1);
-        assert!(hub.holds_window(1) && hub.holds_window(2) && hub.holds_window(3));
+        // But a hold without a page id never keeps a page out: conn 3's window goes to page "new2".
+        let scripts = hub.claim_window(3, None).unwrap().id;
+        assert_eq!(hub.claim_window_for(6, Some(scripts), Some("new2")).unwrap().id, scripts);
+        assert!(hub.holds_window(6) && !hub.holds_window(3));
+        hub.release_windows(6);
+        assert!(hub.holds_window(1) && hub.holds_window(2));
         // The old window closes: the new one still holds window 1.
         hub.release_windows(2);
         hub.release_windows(3);

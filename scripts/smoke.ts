@@ -1173,6 +1173,17 @@ done
     newWin.close();
     await sleep(300);
     ok((await clickIn(again)).includes("no question"), "the lingering connection closing leaves the window held");
+    // A connection without the UI's Origin (a script) holds a window only until a page claims it,
+    // whatever page id it sends.
+    const noOrigin = new Client(d.token);
+    await noOrigin.open();
+    const scriptWin = (await noOrigin.call("window.claim", { page: "smoke-script" })).id;
+    const page = new Client(d.token, uiOrigin);
+    await page.open();
+    ok((await page.call("window.claim", { id: scriptWin, page: "smoke-page" })).id === scriptWin,
+      "a script's window claim can't keep a page of Muster's UI out of that window");
+    noOrigin.close();
+    page.close();
     again.close();
   }
   h = await c.call("hello");

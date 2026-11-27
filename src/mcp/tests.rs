@@ -2482,6 +2482,15 @@ async fn a_sender_of_another_kind_is_compared_by_its_own_mode() {
     assert!(!wider(&r), "{}", r.0);
     let r = call_as(&st, "tok12", "ask_agent", json!({"agent": "cody", "text": "x"})).await;
     assert!(wider(&r), "{}", r.0);
+    // Claude in accept-edits (still asks before commands) can't drive Codex with network access,
+    // which runs them without asking.
+    {
+        let mut d = m.d.lock();
+        d.channels.get_mut(&20).unwrap().permissions.codex_sandbox = CodexSandbox::WorkspaceWriteNetwork;
+        d.channels.get_mut(&25).unwrap().permissions.claude_mode = ClaudeMode::AcceptEdits;
+    }
+    let r = call_as(&st, "tok12", "ask_agent", json!({"agent": "cody", "text": "x"})).await;
+    assert!(wider(&r), "{}", r.0);
     // Same kind: the field itself, as before (a Codex workspace-write sender can't drive a
     // Codex agent with network access, though both sit on the same step of the shared scale).
     {

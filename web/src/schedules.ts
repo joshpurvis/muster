@@ -689,14 +689,18 @@ export function heldHeadline(s: Schedule): string {
 }
 
 /** What approving a proposal also does to the schedule it replaces (`made_by.replaces`): "Approving
- * pauses schedule 12 (Nightly scout)."; null when it replaces none. */
-export function replacesLine(s: Schedule): string | null {
+ * pauses schedule 12 (Nightly scout)."; null when it replaces none. `list`: the schedules as they
+ * are now, so a resume, rename or removal of that one shows at once (the proposal's own copy is
+ * only as fresh as the proposal's last update); without it, that copy. */
+export function replacesLine(s: Schedule, list?: Schedule[]): string | null {
   const m = s.made_by;
   const r = m && m.approved_at === null ? m.replaces : null;
   if (!r) return null;
-  const which = `schedule ${r.id} (${r.name})`;
-  if (r.gone) return `It replaces ${which}, which was removed since: approving pauses nothing else.`;
-  if (r.paused) return `It replaces ${which}, which is already paused.`;
+  const cur = list?.find((x) => x.id === r.id);
+  const now = list ? { name: cur?.name ?? r.name, gone: !cur, paused: !!cur?.paused } : r;
+  const which = `schedule ${r.id} (${now.name})`;
+  if (now.gone) return `It replaces ${which}, which was removed since: approving pauses nothing else.`;
+  if (now.paused) return `It replaces ${which}, which is already paused.`;
   return `Approving pauses ${which}.`;
 }
 

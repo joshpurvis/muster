@@ -418,26 +418,29 @@ impl Permissions {
 
     /// Where an agent of `kind` stands with this profile on one scale every kind shares (owner,
     /// 27 Nov 2026), for comparing agents of different kinds: 0 changes nothing (plan,
-    /// read-only), 1 asks before edits (Claude's default), 2 edits without asking (accept-edits,
-    /// Codex's workspace write with or without network, Antigravity's accept-edits and auto),
-    /// 3 no limits (bypass, full access). Shells: 0 (the profile doesn't govern them).
+    /// read-only), 1 asks before edits (Claude's default), 2 edits without asking but asks
+    /// before commands or keeps them in a sandbox without network (accept-edits, Codex's
+    /// workspace write, Antigravity's accept-edits and auto), 3 runs commands with network
+    /// without asking (Codex's workspace write with network), 4 no limits (bypass, full access).
+    /// Shells: 0 (the profile doesn't govern them).
     pub fn level(&self, kind: SessionKind) -> u8 {
         match kind {
             SessionKind::Claude => match self.claude_mode {
                 ClaudeMode::Plan => 0,
                 ClaudeMode::Default => 1,
                 ClaudeMode::AcceptEdits => 2,
-                ClaudeMode::Bypass => 3,
+                ClaudeMode::Bypass => 4,
             },
             SessionKind::Codex => match self.codex_sandbox {
                 CodexSandbox::ReadOnly => 0,
-                CodexSandbox::WorkspaceWrite | CodexSandbox::WorkspaceWriteNetwork => 2,
-                CodexSandbox::FullAccess => 3,
+                CodexSandbox::WorkspaceWrite => 2,
+                CodexSandbox::WorkspaceWriteNetwork => 3,
+                CodexSandbox::FullAccess => 4,
             },
             SessionKind::Antigravity => match self.antigravity_mode {
                 AntigravityMode::Plan => 0,
                 AntigravityMode::AcceptEdits | AntigravityMode::Auto => 2,
-                AntigravityMode::FullAccess => 3,
+                AntigravityMode::FullAccess => 4,
             },
             SessionKind::Shell => 0,
         }

@@ -550,6 +550,10 @@ Deno.test("a proposal that replaces a schedule says approving pauses it", () => 
   eq(replacesLine(p({ id: 12, name: "Nightly scout", gone: true, paused: false })),
     "It replaces schedule 12 (Nightly scout), which was removed since: approving pauses nothing else.");
   eq(replacesLine(p({ id: 12, name: "Nightly scout", gone: false, paused: true }, NOW)), null, "approved: nothing left to say");
+  // The schedules as they are now win over the proposal's own copy: resumed, renamed, removed since.
+  const stale = p({ id: 12, name: "Nightly scout", gone: false, paused: true });
+  eq(replacesLine(stale, [sched({ id: 12, name: "Night scout", paused: false })]), "Approving pauses schedule 12 (Night scout).");
+  eq(replacesLine(stale, [sched({ id: 3 })]), "It replaces schedule 12 (Nightly scout), which was removed since: approving pauses nothing else.");
 });
 
 Deno.test("the approval card lists every \"Then…\" step, nested ones included", () => {

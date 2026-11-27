@@ -258,7 +258,7 @@ limits"). Schedules you make or widen from the command line wait the same way (a
 Inside a session, `muster schedule pause <id>` runs its `pause_schedule` (docs/MCP.md
 "Scheduling"): a lead agent, or any session working for you (you typed its turn, or it came from
 an agent you or a lead set going), may pause any schedule, and Muster shows who paused what; in
-scheduled or triggered work an agent pauses only a schedule that runs on it or that it made. The
+scheduled or triggered work a non-lead agent pauses only a schedule that runs on it or that it made. The
 same holds in a shell an agent typed into. `muster schedule rm <id>` in an agent's session runs its
 `delete_schedule` (one it made). Resuming, editing and approving stay yours.
 

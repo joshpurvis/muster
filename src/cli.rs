@@ -865,8 +865,8 @@ pub enum ScheduleCmd {
     },
     /// Remove a schedule (and its history).
     Rm { id: i64 },
-    /// Pause a schedule; `--all` pauses every schedule. In a session: any schedule while you work
-    /// for the human or a lead, only your own in scheduled or triggered work (Muster says who
+    /// Pause a schedule; `--all` pauses every schedule. In a session: any schedule for a lead
+    /// agent or while you work for the human or a lead, else only your own (Muster says who
     /// paused it).
     Pause {
         #[arg(required_unless_present = "all")] id: Option<i64>,

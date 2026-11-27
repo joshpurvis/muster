@@ -1132,7 +1132,7 @@ an agent **proposes** and the human **approves** each proposal with a click in N
 | `list_schedules` | — | `{schedules: [{schedule_id, agent, name, prompt, when, status, next_run, made_by, last_run}], takes_scheduled_work, limits}`: the schedules that run on the caller or that it made. `status` is `proposed` (waiting for the human), `active`, `paused`, `expired` or `done`; `next_run` is a local time. |
 | `propose_schedule` | `prompt`, `reason`, exactly one of `cron` / `at` (`"YYYY-MM-DDTHH:MM"` or unix ms) / `in_minutes`; `agent?` (default: the caller), `name?`, `tz?`, `conversation?` (`continue`\|`fresh`), `quiet_hours?`, `daily_cap?`, `note_id?`, `replaces?` | `{schedule_id, status: "proposed", agent, when, estimate, note}`. A schedule that **doesn't run** until the human approves it. The human sees its prompt, timing, agent, the caller's `reason` and an estimate of its use (runs in the coming week after quiet hours and caps, what pays for them, the caps that bound them), and may edit or dismiss it. The agent it runs on must take scheduled work. Times only: no triggers, no "Then…" steps (those are the human's). A notice and desktop notification tell the human it waits. `replaces`: the id of a schedule this one replaces (it must exist; any schedule, not only the caller's): the card says "Approving pauses schedule <id> (<name>)", and the human's click on Approve pauses it in the same step, so the two never both run. Nothing is paused before that click; a dismissed proposal pauses nothing; if the replaced schedule was removed meanwhile, the approval goes ahead alone. |
 | `set_reminder` | `prompt`, `in_minutes` (5 to 1440) **or** `at`; `name?`, `tz?` | `{schedule_id, status: "active", runs_at, note}`. A one-off schedule for the caller only, no approval: Muster sends `prompt` then, into its current conversation, as scheduled work (origin `schedule`). The caller must take scheduled work. For a Claude subscription agent, quiet hours stay on and a time inside them is refused. |
-| `pause_schedule` | `schedule_id` | `{schedule_id, status, note}`. Pauses a schedule. A lead agent, or any session (a named agent or not) whose current work is the human's (the human typed it, or it came along a chain the human or a lead started: origin `human` or `lead`), may pause any schedule; a lead's trigger work and anyone's scheduled or triggered work pause only a schedule that runs on the caller or that it made. Each pause shows a notice, "<who> paused schedule <id> (<name>)" (none when it was already paused). Only the human resumes. |
+| `pause_schedule` | `schedule_id` | `{schedule_id, status, note}`. Pauses a schedule. A lead agent (in any turn), or any session (a named agent or not) whose current work is the human's (the human typed it, or it came along a chain the human or a lead started: origin `human` or `lead`), may pause any schedule; a non-lead's scheduled or triggered work pauses only a schedule that runs on the caller or that it made. Each pause shows a notice, "<who> paused schedule <id> (<name>)" (none when it was already paused). Only the human resumes. |
 | `delete_schedule` | `schedule_id` | `{deleted}`. Deletes a schedule the caller made (a proposal, a reminder, an approved proposal) and its history. A schedule the human made can only be paused. |
 
 Rules (every one is checked in the tool, whatever the client):
@@ -1398,9 +1398,11 @@ the channel starts with it, including ones spawned through MCP:
   form: reaching it is fine when either its channel's field for the target's kind is no narrower
   (as above: it could start such an agent in its own channel), or its own mode sits at least as
   high on one scale every kind shares: 0 changes nothing (Claude `plan`, Codex `read_only`,
-  Antigravity `plan`); 1 asks before edits (Claude `default`); 2 edits without asking (Claude
-  `accept_edits`, Codex `workspace_write` and `workspace_write_network`, Antigravity `accept_edits`
-  and `auto`); 3 no limits (Claude `bypass`, Codex `full_access`, Antigravity `full_access`). So a
+  Antigravity `plan`); 1 asks before edits (Claude `default`); 2 edits without asking but asks
+  before commands or keeps them in a sandbox without network (Claude `accept_edits`, Codex
+  `workspace_write`, Antigravity `accept_edits` and `auto`); 3 runs commands with network without
+  asking (Codex `workspace_write_network`); 4 no limits (Claude `bypass`, Codex `full_access`,
+  Antigravity `full_access`). So a
   Codex agent with full access may ask a Claude agent in bypass, and a read-only one may not. The
   same kind is still compared field by field. Recording an answer (`record_answer`) follows the
   same rule.

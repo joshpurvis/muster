@@ -214,7 +214,7 @@ function NeedsProposal({ s, now, openAgent }: { s: Schedule; now: number; openAg
   const since = m?.at ?? held?.at ?? s.updated_at;
   const by = m ? `Proposed by ${m.agent}` : heldHeadline(s);
   const on = s.agent && s.agent !== m?.agent ? ` for ${s.agent}` : "";
-  const replaces = replacesLine(s);
+  const replaces = replacesLine(s, schedules.value);
   return (
     <div
       role="listitem"
@@ -513,7 +513,7 @@ function ProposalCard({ s, now }: { s: Schedule; now: number }) {
   const [whole, setWhole] = useState(false);
   const promptId = useId();
   const by = m ? `Proposed by ${m.agent}` : heldHeadline(s);
-  const replaces = replacesLine(s);
+  const replaces = replacesLine(s, schedules.value);
   const more = steps.length ? ` Then ${steps.length} more ${steps.length === 1 ? "step" : "steps"}.` : "";
   const label = `${by}: ${s.name}, ${when}, on ${s.agent ?? "a removed agent"}.${more}${replaces ? ` ${replaces}` : ""} Waiting for your approval.`;
   return (

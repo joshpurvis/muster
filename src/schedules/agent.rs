@@ -440,15 +440,18 @@ fn for_the_human(hub: &Hub, caller: SessionId) -> bool {
 }
 
 /// `pause_schedule` (and `muster schedule pause` in a session): a schedule that runs on the
-/// calling agent or that it made, always; any schedule when the caller works for the human
-/// (`for_the_human`), a lead agent's session included. Muster says who paused what, so a pause
+/// calling agent or that it made, always; any schedule for a lead agent (in any turn) and when
+/// the caller works for the human (`for_the_human`). Muster says who paused what, so a pause
 /// never goes unseen. Pausing only narrows: resuming, making and changing stay the human's.
 fn pause(hub: &Hub, caller: SessionId, id: i64) -> anyhow::Result<Value> {
     let s = hub.schedules.get(id).with_context(|| format!("no schedule {id} (see list_schedules)"))?;
     let agent = hub.agents().by_session(caller);
     let own = agent.as_ref().is_some_and(|a| s.agent_id == a.id || s.made_by.as_ref().is_some_and(|m| m.agent_id == a.id));
+    // A lead agent pauses any schedule in any turn (owner, 27 Nov 2026: "lead agents ... may
+    // pause ANY schedule"); pausing only narrows, and the notice says who did it.
+    let lead = agent.as_ref().is_some_and(crate::agents::is_lead);
     ensure!(
-        own || for_the_human(hub, caller),
+        own || lead || for_the_human(hub, caller),
         "schedule {id} neither runs on you nor was made by you, and you're handling scheduled or triggered work: \
          only the human (or a lead agent, or a session working for the human) can pause it"
     );

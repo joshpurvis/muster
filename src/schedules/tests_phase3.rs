@@ -299,8 +299,8 @@ fn unpause(f: &Fixture, id: i64) {
     set_paused(&f.hub, id, false, None).unwrap();
 }
 
-/// Owner, 27 Nov 2026: a lead agent, and any session working for the human (its turn the human's,
-/// or a lead's), pauses any schedule, and Muster says who paused what. A non-lead's scheduled or
+/// Owner, 27 Nov 2026: a lead agent (in any turn), and any session working for the human (its turn
+/// the human's, or a lead's), pauses any schedule, and Muster says who paused what. A non-lead's scheduled or
 /// triggered turn still pauses only its own; resuming stays the human's.
 #[test]
 fn who_may_pause_any_schedule() {
@@ -316,16 +316,13 @@ fn who_may_pause_any_schedule() {
         f.hub.agents().set_prov(sid, origin.map(|origin| Prov { origin, hop: 1, msg_id: Some(1) })).unwrap();
     };
     let pause = |sid: SessionId| tool(&f, sid, "pause_schedule", json!({"schedule_id": orla.id}));
-    // The lead: in the human's turn, in its scheduled work (passed on as lead), not in a trigger's.
-    for origin in [None, Some(Origin::Schedule), Some(Origin::Lead)] {
+    // The lead: in any turn, a trigger's included ("lead agents may pause any schedule").
+    for origin in [None, Some(Origin::Schedule), Some(Origin::Lead), Some(Origin::Webhook)] {
         prov(45, origin);
         assert_eq!(pause(45).unwrap()["status"], "paused", "{origin:?}");
         assert_eq!(notices(&mut rx), vec![(format!("cleo paused schedule {} (Nightly scout)", orla.id), Some(orla.id))]);
         unpause(&f, orla.id);
     }
-    prov(45, Some(Origin::Webhook));
-    assert!(err(pause(45)).contains("only the human"));
-    assert!(!paused(&f, orla.id));
     // A non-lead agent: in the human's turn (typed, or asked by an agent the human started), yes.
     for origin in [None, Some(Origin::Human), Some(Origin::Lead)] {
         prov(41, origin);

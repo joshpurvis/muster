@@ -74,6 +74,7 @@ import {
   isProposal,
   isHeld,
   heldHeadline,
+  replacesLine,
   madeByLabel,
   proposalFacts,
   promptIsLong,
@@ -213,6 +214,7 @@ function NeedsProposal({ s, now, openAgent }: { s: Schedule; now: number; openAg
   const since = m?.at ?? held?.at ?? s.updated_at;
   const by = m ? `Proposed by ${m.agent}` : heldHeadline(s);
   const on = s.agent && s.agent !== m?.agent ? ` for ${s.agent}` : "";
+  const replaces = replacesLine(s);
   return (
     <div
       role="listitem"
@@ -226,7 +228,7 @@ function NeedsProposal({ s, now, openAgent }: { s: Schedule; now: number; openAg
           proposalMenu(s, r.left + 24, r.bottom - 4, true);
         }
       }}
-      aria-label={`${s.name}. ${by}${on}, ${nextWhenPast(since, now)}. Waits for your approval.`}
+      aria-label={`${s.name}. ${by}${on}, ${nextWhenPast(since, now)}.${replaces ? ` ${replaces}` : ""} Waits for your approval.`}
       onContextMenu={(e) => {
         e.preventDefault();
         e.stopPropagation();
@@ -247,6 +249,7 @@ function NeedsProposal({ s, now, openAgent }: { s: Schedule; now: number; openAg
         <span class="ny-sub">
           {by}{on} <span class="ny-when" data-tip={new Date(since).toLocaleString()}>· {nextWhenPast(since, now)}</span>
         </span>
+        {replaces && <span class="ny-sub ny-replaces">{replaces}</span>}
         <span class="ny-actions">
           <button type="button" class="btn btn-sm btn-primary sch-approve"
             onClick={() => A.approveSchedule(s)}>Approve</button>
@@ -510,8 +513,9 @@ function ProposalCard({ s, now }: { s: Schedule; now: number }) {
   const [whole, setWhole] = useState(false);
   const promptId = useId();
   const by = m ? `Proposed by ${m.agent}` : heldHeadline(s);
+  const replaces = replacesLine(s);
   const more = steps.length ? ` Then ${steps.length} more ${steps.length === 1 ? "step" : "steps"}.` : "";
-  const label = `${by}: ${s.name}, ${when}, on ${s.agent ?? "a removed agent"}.${more} Waiting for your approval.`;
+  const label = `${by}: ${s.name}, ${when}, on ${s.agent ?? "a removed agent"}.${more}${replaces ? ` ${replaces}` : ""} Waiting for your approval.`;
   return (
     <div
       role="listitem"
@@ -609,6 +613,11 @@ function ProposalCard({ s, now }: { s: Schedule; now: number }) {
         {m?.reason && (
           <div class="sch-prop-fact">
             <dt>Why</dt> <dd class="sch-prop-reason" data-tip={`${m.agent}'s own words`}>{m.reason}</dd>
+          </div>
+        )}
+        {replaces && (
+          <div class="sch-prop-fact sch-prop-replaces">
+            <dt>Replaces</dt> <dd>{replaces}</dd>
           </div>
         )}
         {held && (

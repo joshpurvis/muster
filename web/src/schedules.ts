@@ -688,6 +688,18 @@ export function heldHeadline(s: Schedule): string {
   return `${list[0].toUpperCase()}${list.slice(1)} from the command line or a script`;
 }
 
+/** What approving a proposal also does to the schedule it replaces (`made_by.replaces`): "Approving
+ * pauses schedule 12 (Nightly scout)."; null when it replaces none. */
+export function replacesLine(s: Schedule): string | null {
+  const m = s.made_by;
+  const r = m && m.approved_at === null ? m.replaces : null;
+  if (!r) return null;
+  const which = `schedule ${r.id} (${r.name})`;
+  if (r.gone) return `It replaces ${which}, which was removed since: approving pauses nothing else.`;
+  if (r.paused) return `It replaces ${which}, which is already paused.`;
+  return `Approving pauses ${which}.`;
+}
+
 /** The chip on a row an agent made: "reminder" (it set it for itself) or "from reviewer" (its
  * approved proposal); null for yours and for proposals still waiting (their card says it). */
 export function madeByLabel(s: Schedule): { text: string; tip: string } | null {

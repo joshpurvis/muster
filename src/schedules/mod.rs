@@ -261,6 +261,20 @@ pub struct MadeBy {
     /// When the human approved it (a proposal); None: waiting for approval.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approved_at: Option<i64>,
+    /// A proposal's `replaces` (owner, 27 Nov 2026): the schedule the human's click on Approve
+    /// pauses, in the same step (`approve`). Kept in the schedule's JSON record: no migration, and
+    /// a backend from before it reads the proposal without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaces: Option<Replaces>,
+}
+
+/// The schedule a proposal replaces, as it was when proposed: its id, its name then (said once it
+/// is gone), and when it was made, so an id that ever came back for another schedule is never paused.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Replaces {
+    pub id: i64,
+    pub name: String,
+    pub created_at: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -782,6 +796,48 @@ impl Schedules {
         self.wake.notify_one();
         Ok(s)
     }
+
+    /// `edit` of schedule `id` that also pauses the schedule `r` names, under the same lock and
+    /// in the same store transaction: both are saved, or neither (approving a proposal that
+    /// replaces it, `approve`). The other is left alone when it is gone, or when the id now
+    /// belongs to another schedule (`Replaces::created_at`): `Replaced::Gone`.
+    fn edit_and_pause(&self, id: i64, f: impl FnOnce(&mut Schedule) -> anyhow::Result<()>, r: &Replaces) -> anyhow::Result<(Schedule, Replaced)> {
+        let mut g = self.inner.lock();
+        let mut s = g.list.get(&id).cloned().with_context(|| format!("no schedule {id} (see `muster schedule ls`)"))?;
+        f(&mut s)?;
+        if s.waiting_approval() {
+            s.next_run = None;
+            s.skip_slot = None;
+            s.event = None;
+        }
+        let now = self.now();
+        s.updated_at = now;
+        let other = g.list.get(&r.id).filter(|o| o.id != id && o.created_at == r.created_at).cloned();
+        let (saved, replaced) = match other {
+            None => (vec![s.clone()], Replaced::Gone),
+            Some(o) if o.paused => (vec![s.clone()], Replaced::AlreadyPaused),
+            Some(mut o) => {
+                o.paused = true;
+                o.updated_at = now;
+                (vec![s.clone(), o.clone()], Replaced::Paused(o))
+            }
+        };
+        self.store.save_schedules(&saved)?;
+        for x in saved {
+            g.list.insert(x.id, x);
+        }
+        drop(g);
+        self.wake.notify_one();
+        Ok((s, replaced))
+    }
+}
+
+/// What approving a proposal did to the schedule it replaces (`Schedules::edit_and_pause`).
+#[derive(Debug)]
+enum Replaced {
+    Paused(Schedule),
+    AlreadyPaused,
+    Gone,
 }
 
 /// Facts about a schedule's agent that the rules read. An agent counts as a Claude agent on its
@@ -924,6 +980,16 @@ pub fn schedule_json(hub: &Hub, s: &Schedule) -> Value {
             "reason": m.reason,
             "at": m.at,
             "approved_at": m.approved_at,
+            // What approving it pauses too: its name now (or then, once gone), gone, paused.
+            "replaces": m.replaces.as_ref().map(|r| {
+                let cur = hub.schedules.get(r.id).filter(|o| o.created_at == r.created_at);
+                json!({
+                    "id": r.id,
+                    "name": cur.as_ref().map_or_else(|| r.name.clone(), |o| o.name.clone()),
+                    "gone": cur.is_none(),
+                    "paused": cur.is_some_and(|o| o.paused),
+                })
+            }),
         })),
         // Made or changed outside Muster's window: what, when and why it waits for approval.
         "held": s.held.as_ref().map(|h| json!({"what": h.what, "at": h.at, "why": h.why})),
@@ -1797,7 +1863,7 @@ pub fn approve(hub: &Hub, id: i64, seen: Option<i64>) -> anyhow::Result<Value> {
     // A new schedule's or a renewal's 7 days start now; a change keeps them.
     let fresh = before.made_by.as_ref().is_some_and(MadeBy::waiting)
         || before.held.as_ref().is_some_and(|h| h.what.iter().any(|w| matches!(w, HeldWhat::Made | HeldWhat::Renewed)));
-    let s = hub.schedules.edit(id, |s| {
+    let apply = |s: &mut Schedule| {
         ensure!(s.waiting_approval(), "schedule {id} isn't waiting for approval");
         ensure!(s.updated_at == before.updated_at, "it was changed meanwhile: look at it again");
         if let Some(m) = s.made_by.as_mut().filter(|m| m.waiting()) {
@@ -1811,13 +1877,46 @@ pub fn approve(hub: &Hub, id: i64, seen: Option<i64>) -> anyhow::Result<Value> {
             s.expired_told = false;
         }
         Ok(())
-    })?;
+    };
+    // A proposal that replaces a schedule pauses it in the same step (owner, 27 Nov 2026): saved
+    // together, so the two never both run. Only while it waits as a proposal: a held change of
+    // one approved before pauses nothing again.
+    let replaces = before.made_by.as_ref().filter(|m| m.waiting()).and_then(|m| m.replaces.clone());
+    let (s, replaced) = match &replaces {
+        Some(r) => {
+            let (s, done) = hub.schedules.edit_and_pause(id, apply, r)?;
+            (s, Some((r, done)))
+        }
+        None => (hub.schedules.edit(id, apply)?, None),
+    };
     hub.schedules.expired_seen.lock().remove(&id);
     if s.when.is_trigger() {
         triggers::changed(hub, s.id);
     }
     publish(hub, &s);
-    Ok(schedule_json(hub, &s))
+    let mut j = schedule_json(hub, &s);
+    if let Some((r, done)) = replaced {
+        j["replaced"] = match done {
+            Replaced::Paused(old) => {
+                run::cancel_unsent(hub, Some(old.id), plan::PAUSED, false);
+                publish(hub, &old);
+                run::alert_schedule(
+                    hub,
+                    "info",
+                    &format!("Approving \"{}\" paused schedule {} ({})", s.name, old.id, old.name),
+                    "",
+                    old.id,
+                );
+                json!({"id": old.id, "name": old.name, "paused": true})
+            }
+            Replaced::AlreadyPaused => {
+                let name = hub.schedules.get(r.id).map_or_else(|| r.name.clone(), |o| o.name);
+                json!({"id": r.id, "name": name, "paused": true})
+            }
+            Replaced::Gone => json!({"id": r.id, "name": r.name, "paused": false, "gone": true}),
+        };
+    }
+    Ok(j)
 }
 
 /// Renew a Claude subscription agent's recurring schedule for 7 days from now. An expired one

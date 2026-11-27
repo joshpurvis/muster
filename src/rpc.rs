@@ -1417,7 +1417,8 @@ async fn dispatch_inner(hub: &Arc<Hub>, who: &Principal, method: &str, params: V
         // Schedules (docs/PROTOCOL.md "Schedules"). Only the human makes, approves or changes them:
         // a call on an agent session's behalf is refused, except what an agent may do through its
         // MCP schedule tools (propose, set a reminder, pause, delete its own), which `muster
-        // schedule propose/remind/pause/rm` inside an agent's session run as that agent.
+        // schedule propose/remind/pause/rm` inside an agent's session run as that agent (`pause`
+        // also in a shell an agent typed into, under `pause_schedule`'s rule).
         m if m.starts_with("schedule.") || m.starts_with("trigger.") || m == "note.set_triggers" => {
             require_local(who, method)?;
             let from = params.get("from_session").and_then(|v| v.as_u64()).map(|v| v as SessionId);
@@ -1630,11 +1631,15 @@ fn cap_or_quiet_only(method: &str, params: &Value) -> bool {
 
 /// `muster schedule propose/remind` (`schedule.propose`, `schedule.remind`: an agent's only), and
 /// `pause` and `rm` inside an agent's session: run as that agent's MCP schedule tool, so the
-/// CLI and MCP share one set of rules. None: an ordinary schedule call (the human's, or refused).
+/// CLI and MCP share one set of rules. `pause` in a shell an agent typed into runs as that
+/// shell's `pause_schedule` too (its rule reads the shell's provenance); a shell the human drives
+/// pauses as the human. None: an ordinary schedule call (the human's, or refused).
 async fn agent_schedule_call(hub: &Arc<Hub>, method: &str, params: &Value, from: Option<SessionId>) -> Option<RpcResult> {
     let agent_only = matches!(method, "schedule.propose" | "schedule.remind");
+    let pausing = method == "schedule.pause" && params.get("on").is_none_or(|v| v.as_bool() == Some(true));
     let session = match caller(hub, from) {
         Ok(Caller::Agent(s)) => s,
+        Ok(Caller::Shell(s)) if pausing && hub.agents().prov(s).is_some() => s,
         Err(e) => return agent_only.then_some(Err(e)),
         Ok(_) if agent_only => {
             return Some(Err(RpcError(format!(
@@ -1649,8 +1654,8 @@ async fn agent_schedule_call(hub: &Arc<Hub>, method: &str, params: &Value, from:
     let tool = match method {
         "schedule.propose" => "propose_schedule",
         "schedule.remind" => "set_reminder",
-        // Pausing is the agent's (its own or one that runs on it); resuming stays the human's.
-        "schedule.pause" if o.get("on").is_none_or(|v| v.as_bool() == Some(true)) => {
+        // Pausing is the session's, under `pause_schedule`'s rule; resuming stays the human's.
+        "schedule.pause" if pausing => {
             let id = o.get("id").cloned().unwrap_or(Value::Null);
             args = json!({"schedule_id": id});
             "pause_schedule"
@@ -3646,11 +3651,13 @@ mod tests {
         }
         let wk = hub.agents().get("rpc-wk").unwrap();
         hub.agents().link_session(hub.store(), wk.id, Some(3)).unwrap();
-        let s = call(&hub, "schedule.create", json!({"agent": "rpc-other", "name": "Scout", "prompt": "p", "when": {"kind": "cron", "cron": "0 9 * * *"}})).await.unwrap();
+        // Made as from the window (the CLI's would wait for approval).
+        let s = crate::schedules::create(&hub, serde_json::from_value(json!({"agent": "rpc-other", "name": "Scout", "prompt": "p", "when": {"kind": "cron", "cron": "0 9 * * *"}})).unwrap()).unwrap();
         let id = s["id"].as_i64().unwrap();
         let mut rx = hub.subscribe();
         let pause = |from: SessionId| call(&hub, "schedule.pause", json!({"id": id, "from_session": from}));
-        let resume = || call(&hub, "schedule.pause", json!({"id": id, "on": false}));
+        // The human's own resume, as a click in the window would (the CLI's would be held).
+        let resume = || async { crate::schedules::set_paused(&hub, id, false, None).map_err(|e| e.to_string()) };
         // A plain Claude session (2), an agent (3) and a shell an agent typed into for the human
         // (1): each pauses it, and Muster says who.
         hub.agents().set_prov(1, Some(Prov { origin: Origin::Human, hop: 1, msg_id: None })).unwrap();

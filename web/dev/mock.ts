@@ -1600,13 +1600,15 @@ async function agentMethod(method: string, p: any): Promise<unknown> {
       return { count: ended.length };
     }
     // Dev only: an agent proposes a schedule that waits for the human's Approve (the sidebar's
-    // Needs you box; src/schedules/agent.rs `propose_schedule`).
+    // Needs you box; src/schedules/agent.rs `propose_schedule`), optionally replacing schedule
+    // `replaces` (approving pauses it).
     case "mock.propose":
       return sched.propose(
         { agent: p.agent, name: p.name, prompt: p.prompt ?? "Check the open pull requests.", when: p.when ?? { kind: "cron", cron: "0 9 * * 1" } },
         p.by ?? p.agent,
         p.reason ?? "",
         p.age_ms ?? 40 * 60_000,
+        p.replaces,
       );
     // Dev only: an agent's queued messages are held (src/held.rs), or no longer (`clear`): the
     // sidebar's Needs you box lists it.

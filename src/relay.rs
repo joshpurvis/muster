@@ -199,7 +199,8 @@ pub fn target(hub: &Hub, poster: &Who, recorder: Option<&Who>, live: &HashSet<Se
 /// an agent or session that runs with more than the recorder's own channel allows (its words
 /// would steer an agent with wider permissions).
 pub fn check_reach(hub: &Hub, recorder: SessionId, t: &Target) -> Result<(), String> {
-    let mine = hub.session(recorder).and_then(|s| hub.channel(s.channel_id)).ok_or("the recorder's channel no longer exists")?;
+    let me = hub.session(recorder).ok_or("the recorder's channel no longer exists")?;
+    let mine = hub.channel(me.channel_id).ok_or("the recorder's channel no longer exists")?;
     let (ch, perms, kinds, what) = match t {
         Target::Agent(a, _) => {
             let session = a.session_id.and_then(|s| hub.session(s));
@@ -232,7 +233,8 @@ pub fn check_reach(hub: &Hub, recorder: SessionId, t: &Target) -> Result<(), Str
         }
         Target::NotNeeded(_) | Target::Gone(_) => return Ok(()),
     };
-    if ch != Some(mine.id) && let Some(kind) = kinds.into_iter().find(|k| perms.exceeds_for(&mine.permissions, *k)) {
+    // A recorder of another kind is compared by its own mode too (`Permissions::exceeds_from`).
+    if ch != Some(mine.id) && let Some(kind) = kinds.into_iter().find(|k| perms.exceeds_from(&mine.permissions, *k, me.kind)) {
         return Err(format!(
             "{what} lets {} do more than your channel does, so an answer can't carry your words into it. \
              Ask the human to answer it there (or the asker's own lead to record it)", kind.as_str()));

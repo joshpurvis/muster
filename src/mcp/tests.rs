@@ -2462,7 +2462,7 @@ async fn a_sender_of_another_kind_is_compared_by_its_own_mode() {
     // Codex full access -> Claude bypass: asked, told, messaged, spawned into.
     for (tool, args) in [
         ("ask_agent", json!({"agent": "ada", "text": "x"})),
-        ("tell_agent", json!({"agent": "ada", "text": "x"})),
+        ("tell_agent", json!({"agent": "ada", "text": "x", "wake": true})),
         ("send_message", json!({"session_id": 11, "text": "x"})),
         ("spawn_session", json!({"kind": "claude", "channel_id": 20})),
     ] {

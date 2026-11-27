@@ -865,7 +865,9 @@ pub enum ScheduleCmd {
     },
     /// Remove a schedule (and its history).
     Rm { id: i64 },
-    /// Pause a schedule; `--all` pauses every schedule.
+    /// Pause a schedule; `--all` pauses every schedule. In a session: any schedule while you work
+    /// for the human or a lead, only your own in scheduled or triggered work (Muster says who
+    /// paused it).
     Pause {
         #[arg(required_unless_present = "all")] id: Option<i64>,
         #[arg(long)] all: bool,
@@ -911,6 +913,8 @@ pub enum ScheduleCmd {
         #[arg(long)] max_per_day: Option<u32>,
         /// Also add each reply to this note (its id).
         #[arg(long)] note: Option<i64>,
+        /// A schedule this one replaces (its id): the human's click on Approve pauses it too.
+        #[arg(long, value_name = "ID")] replaces: Option<i64>,
     },
     /// Inside an agent's session: have Muster send you PROMPT once, 5 minutes to 24 hours from
     /// now, without approval. `--at +20m`, `--at 15:30` or `--at "YYYY-MM-DD HH:MM"`.
@@ -1267,14 +1271,14 @@ pub fn schedule(d: &Discovery, cmd: ScheduleCmd) -> anyhow::Result<()> {
             ),
         )),
         ScheduleCmd::Propose { prompt, reason, agent, every, hourly, daily, weekdays, weekly, cron, at, name, tz, fresh,
-            quiet_hours, max_per_day, note } => {
+            quiet_hours, max_per_day, note, replaces } => {
             let when = schedule_when(every, hourly, daily, weekdays, weekly, cron, at, tz.as_deref())?;
             let text = send_text(&prompt, || note_text(&[]).map_err(std::io::Error::other))?;
             let mut p = json!({
                 "prompt": text, "reason": reason, "agent": agent, "name": name, "tz": tz,
                 "cron": when.get("cron"), "at": when.get("at"),
                 "conversation": fresh.then_some("fresh"), "quiet_hours": quiet_hours.map(|q| q == "on"),
-                "daily_cap": max_per_day, "note_id": note,
+                "daily_cap": max_per_day, "note_id": note, "replaces": replaces,
             });
             p.as_object_mut().unwrap().retain(|_, v| !v.is_null());
             let r = one("schedule.propose", p)?;

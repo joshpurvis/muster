@@ -1130,9 +1130,9 @@ an agent **proposes** and the human **approves** each proposal with a click in N
 | Tool | Arguments | Result |
 |---|---|---|
 | `list_schedules` | — | `{schedules: [{schedule_id, agent, name, prompt, when, status, next_run, made_by, last_run}], takes_scheduled_work, limits}`: the schedules that run on the caller or that it made. `status` is `proposed` (waiting for the human), `active`, `paused`, `expired` or `done`; `next_run` is a local time. |
-| `propose_schedule` | `prompt`, `reason`, exactly one of `cron` / `at` (`"YYYY-MM-DDTHH:MM"` or unix ms) / `in_minutes`; `agent?` (default: the caller), `name?`, `tz?`, `conversation?` (`continue`\|`fresh`), `quiet_hours?`, `daily_cap?`, `note_id?` | `{schedule_id, status: "proposed", agent, when, estimate, note}`. A schedule that **doesn't run** until the human approves it. The human sees its prompt, timing, agent, the caller's `reason` and an estimate of its use (runs in the coming week after quiet hours and caps, what pays for them, the caps that bound them), and may edit or dismiss it. The agent it runs on must take scheduled work. Times only: no triggers, no "Then…" steps (those are the human's). A notice and desktop notification tell the human it waits. |
+| `propose_schedule` | `prompt`, `reason`, exactly one of `cron` / `at` (`"YYYY-MM-DDTHH:MM"` or unix ms) / `in_minutes`; `agent?` (default: the caller), `name?`, `tz?`, `conversation?` (`continue`\|`fresh`), `quiet_hours?`, `daily_cap?`, `note_id?`, `replaces?` | `{schedule_id, status: "proposed", agent, when, estimate, note}`. A schedule that **doesn't run** until the human approves it. The human sees its prompt, timing, agent, the caller's `reason` and an estimate of its use (runs in the coming week after quiet hours and caps, what pays for them, the caps that bound them), and may edit or dismiss it. The agent it runs on must take scheduled work. Times only: no triggers, no "Then…" steps (those are the human's). A notice and desktop notification tell the human it waits. `replaces`: the id of a schedule this one replaces (it must exist; any schedule, not only the caller's): the card says "Approving pauses schedule <id> (<name>)", and the human's click on Approve pauses it in the same step, so the two never both run. Nothing is paused before that click; a dismissed proposal pauses nothing; if the replaced schedule was removed meanwhile, the approval goes ahead alone. |
 | `set_reminder` | `prompt`, `in_minutes` (5 to 1440) **or** `at`; `name?`, `tz?` | `{schedule_id, status: "active", runs_at, note}`. A one-off schedule for the caller only, no approval: Muster sends `prompt` then, into its current conversation, as scheduled work (origin `schedule`). The caller must take scheduled work. For a Claude subscription agent, quiet hours stay on and a time inside them is refused. |
-| `pause_schedule` | `schedule_id` | `{schedule_id, status}`. Pauses a schedule that runs on the caller or that it made. Only the human resumes. |
+| `pause_schedule` | `schedule_id` | `{schedule_id, status, note}`. Pauses a schedule. A lead agent, or any session (a named agent or not) whose current work is the human's (the human typed it, or it came along a chain the human or a lead started: origin `human` or `lead`), may pause any schedule; a lead's trigger work and anyone's scheduled or triggered work pause only a schedule that runs on the caller or that it made. Each pause shows a notice, "<who> paused schedule <id> (<name>)" (none when it was already paused). Only the human resumes. |
 | `delete_schedule` | `schedule_id` | `{deleted}`. Deletes a schedule the caller made (a proposal, a reminder, an approved proposal) and its history. A schedule the human made can only be paused. |
 
 Rules (every one is checked in the tool, whatever the client):
@@ -1155,7 +1155,9 @@ Rules (every one is checked in the tool, whatever the client):
   agent can again once the human writes to it. An ask from another agent on a human-rooted chain
   is the human's work.
 - **Only named agents**, and a reminder only for the caller itself; a proposal may be for another
-  agent that takes scheduled work.
+  agent that takes scheduled work. The one exception is `pause_schedule`, which any session may
+  call under its rule above (owner, 27 Nov 2026: pausing only narrows, and the notice keeps it
+  seen).
 - **Limits per agent:** reminders at most 3 waiting, at least 15 minutes apart, 10 set per rolling
   24 hours (deleted ones count); proposals at most 3 waiting, 10 per rolling 24 hours (deleted or
   dismissed ones count); at most 5 live schedules it made (waiting, active, paused, or a one-off
@@ -1391,6 +1393,17 @@ the channel starts with it, including ones spawned through MCP:
   full_access` and `plan < default < accept_edits < bypass`) is refused, and so is
   `send_message` to an agent running in such a channel. Shells aren't governed by the profile.
   Spawning into or messaging an equal or narrower channel is fine.
+- A caller of another kind than the target is compared by its **own** mode too
+  (`Permissions::exceeds_from`), since the other kinds' fields of its channel aren't shown on its
+  form: reaching it is fine when either its channel's field for the target's kind is no narrower
+  (as above: it could start such an agent in its own channel), or its own mode sits at least as
+  high on one scale every kind shares: 0 changes nothing (Claude `plan`, Codex `read_only`,
+  Antigravity `plan`); 1 asks before edits (Claude `default`); 2 edits without asking (Claude
+  `accept_edits`, Codex `workspace_write` and `workspace_write_network`, Antigravity `accept_edits`
+  and `auto`); 3 no limits (Claude `bypass`, Codex `full_access`, Antigravity `full_access`). So a
+  Codex agent with full access may ask a Claude agent in bypass, and a read-only one may not. The
+  same kind is still compared field by field. Recording an answer (`record_answer`) follows the
+  same rule.
 - A `new_channel` created through `spawn_session` gets the **caller's** channel profile, never
   more (and never the defaults if the caller has less), also in another workspace
   (`new_channel.workspace`): never that workspace's defaults, even if they are wider.

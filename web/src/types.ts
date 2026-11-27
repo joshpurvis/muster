@@ -694,6 +694,9 @@ export interface MadeBy {
   at: number;
   /** When you approved it (a proposal); null: waiting. */
   approved_at: number | null;
+  /** The schedule it replaces: approving it pauses that one in the same click. `name` is its
+   * name now (or when proposed, once `gone`: removed since); `paused`: already paused. */
+  replaces?: { id: number; name: string; gone: boolean; paused: boolean } | null;
 }
 
 /** A proposal's estimated use. */

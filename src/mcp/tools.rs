@@ -373,6 +373,7 @@ pub fn tool_definitions() -> Vec<Value> {
     propose.insert("quiet_hours".into(), json!({"type":"boolean","description":"Skip runs in the human's quiet hours (default: on for Claude subscription agents)."}));
     propose.insert("daily_cap".into(), json!({"type":"integer","minimum":1,"maximum":200,"description":"At most this many runs a day."}));
     propose.insert("note_id".into(), json!({"type":"integer","minimum":1,"description":"Also add each reply to this existing note."}));
+    propose.insert("replaces".into(), json!({"type":"integer","minimum":1,"description":"The id of a schedule this one replaces (any schedule; see list_schedules). The human's click on Approve pauses it too, so the two never both run; nothing is paused before that."}));
     let mut remind = Map::new();
     remind.insert("prompt".into(), json!({"type":"string","description":"What Muster sends you then, e.g. \"Check whether CI on master passed and report to the human.\""}));
     remind.insert("in_minutes".into(), json!({"type":"integer","minimum":5,"maximum":1440,"description":"Minutes from now (5 to 1440)."}));
@@ -382,11 +383,11 @@ pub fn tool_definitions() -> Vec<Value> {
     tools.extend([
         tool("list_schedules", "List schedules", "List the schedules that run on you or that you made (proposals, reminders): id, agent, name, prompt, when, status (proposed: waiting for the human's approval; active, paused, expired, done), next run, who made it, and the last run's outcome. Also whether you take scheduled work at all (the human sets that).",
             empty_schema(), true),
-        tool("propose_schedule", "Propose schedule", "Propose a schedule (recurring with cron, or a one-off with at or in_minutes) for you or another agent that takes scheduled work. It does NOT run until the human approves it with a click in Muster's sidebar, where they see the prompt, the timing, the agent, your reason and the estimated use; they may edit or dismiss it. Each run is a message marked as scheduled, under every limit the human set (per-agent daily caps, spend caps, quiet hours, a Claude subscription agent's 7-day expiry). Refused while you handle scheduled or triggered work. Limits: 3 proposals waiting, 10 a day, 5 live schedules you made. Triggers and \"Then\" steps are the human's to set up.",
+        tool("propose_schedule", "Propose schedule", "Propose a schedule (recurring with cron, or a one-off with at or in_minutes) for you or another agent that takes scheduled work. It does NOT run until the human approves it with a click in Muster's sidebar, where they see the prompt, the timing, the agent, your reason and the estimated use; they may edit or dismiss it. Each run is a message marked as scheduled, under every limit the human set (per-agent daily caps, spend caps, quiet hours, a Claude subscription agent's 7-day expiry). Refused while you handle scheduled or triggered work. Limits: 3 proposals waiting, 10 a day, 5 live schedules you made. Triggers and \"Then\" steps are the human's to set up. Replacing a schedule? Pass replaces: approving pauses the old one in the same click.",
             json!({"type":"object","properties":Value::Object(propose),"required":["prompt","reason"],"additionalProperties":false}), false),
         tool("set_reminder", "Set reminder", "Have Muster send you a prompt once, 5 minutes to 24 hours from now (\"check CI again in 20 minutes\"), without asking the human: a one-off for yourself only, delivered as scheduled work into your current conversation. You must take scheduled work (the human sets that). Refused while you handle scheduled or triggered work, so a reminder can't set the next one. At most 3 waiting, 15 minutes apart, 10 a day. For anything recurring, later or for another agent, use propose_schedule.",
             json!({"type":"object","properties":Value::Object(remind),"required":["prompt"],"additionalProperties":false}), false),
-        tool("pause_schedule", "Pause schedule", "Pause a schedule that runs on you or that you made, so it skips its runs. Only the human can resume it.",
+        tool("pause_schedule", "Pause schedule", "Pause a schedule so it skips its runs. A lead agent, or any session whose current work is the human's (the human typed it, or it came from an agent the human or a lead set going), may pause any schedule; in scheduled or triggered work, only one that runs on you or that you made. Muster tells the human who paused what. Only the human can resume it.",
             json!({"type":"object","properties":{"schedule_id":schedule_id},"required":["schedule_id"],"additionalProperties":false}), false),
         tool("delete_schedule", "Delete schedule", "Delete a schedule you made (a proposal, a reminder, or a proposal the human approved) and its history. Schedules the human made can only be paused (pause_schedule).",
             json!({"type":"object","properties":{"schedule_id":schedule_id},"required":["schedule_id"],"additionalProperties":false}), false),
@@ -846,15 +847,24 @@ fn check_perms_not_wider<B: Backend>(
         .channel(me.channel_id)
         .map(|c| c.permissions)
         .ok_or("your channel no longer exists")?;
-    if target.exceeds_for(&mine, kind) {
+    // A sender of another kind is compared by its own mode too (`Permissions::exceeds_from`).
+    if target.exceeds_from(&mine, kind, me.kind) {
+        let mode = |p: &Permissions, k: SessionKind| match k {
+            SessionKind::Antigravity => format!("{:?}", p.antigravity_mode),
+            SessionKind::Codex => format!("{:?}", p.codex_sandbox),
+            _ => format!("{:?}", p.claude_mode),
+        };
+        let own = if me.kind != kind && me.kind != SessionKind::Shell {
+            format!(", and your own {} mode {} is narrower", me.kind.as_str(), mode(&mine, me.kind))
+        } else {
+            String::new()
+        };
         return Err(format!(
-            "{what} lets {} do more than your channel does ({}); agents can't use another channel's permissions. {HOW_PERMS}",
+            "{what} lets {} do more than your channel does ({} {} vs {}{own}); agents can't use another channel's permissions. {HOW_PERMS}",
             kind.as_str(),
-            match kind {
-                SessionKind::Antigravity => format!("mode {:?} vs {:?}", target.antigravity_mode, mine.antigravity_mode),
-                SessionKind::Codex => format!("sandbox {:?} vs {:?}", target.codex_sandbox, mine.codex_sandbox),
-                _ => format!("mode {:?} vs {:?}", target.claude_mode, mine.claude_mode),
-            }
+            if kind == SessionKind::Codex { "sandbox" } else { "mode" },
+            mode(target, kind),
+            mode(&mine, kind),
         ));
     }
     Ok(())

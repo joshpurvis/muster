@@ -5675,6 +5675,7 @@ pub fn derive_name(
 
 #[cfg(test)]
 mod tests {
+    mod quiet_depth;
     use super::*;
 
     #[test]

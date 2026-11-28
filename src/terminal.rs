@@ -876,6 +876,9 @@ pub(crate) mod testing {
                     let Ok(request) = frame.decode::<Request>() else { return };
                     match request.command {
                         Command::Inventory => { let _ = wire::write(&mut stream, &Frame::json(&Response::Inventory(runs.clone())).unwrap()); }
+                        Command::Screen { .. } => {
+                            let _ = wire::write(&mut stream, &Frame::json(&Response::Screen(ScreenSnapshot::default())).unwrap());
+                        }
                         Command::Events => {
                             let _ = wire::write(&mut stream, &Frame::json(&Response::Attached).unwrap());
                             while wire::write(&mut stream, &Frame::Ping).is_ok() { std::thread::sleep(Duration::from_secs(1)) }

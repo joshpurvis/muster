@@ -385,7 +385,7 @@ done
 
   // Per-channel agent permissions: defaults, create with a profile, set_permissions round trip.
   ok(
-    ch.permissions?.codex_sandbox === "workspace_write" && ch.permissions?.claude_mode === "default",
+    ch.permissions?.codex_sandbox === "workspace_write" && ch.permissions?.claude_mode === "auto",
     "new channel gets the default permission profile",
   );
   const netPerms = { codex_sandbox: "workspace_write_network", claude_mode: "accept_edits" };

@@ -2007,7 +2007,7 @@ pub struct NewAgent {
     /// Default: `default_accepts(kind)`.
     #[serde(default)]
     pub accepts: Option<Vec<Origin>>,
-    /// The profile of the agent's tab. Default: the CLIs' own defaults.
+    /// The profile of the agent's tab. Defaults to `Permissions::default()`.
     #[serde(default)]
     pub permissions: Option<PermissionsInput>,
     #[serde(default)]
@@ -2076,6 +2076,25 @@ pub fn create(hub: &Hub, req: NewAgent) -> anyhow::Result<Agent> {
     Ok(a)
 }
 
+/// Permission fields supplied to `agent.update`, applied after any kind switch maps the profile.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentPermissionsPatch {
+    pub codex_sandbox: Option<CodexSandbox>,
+    pub claude_mode: Option<ClaudeMode>,
+    pub antigravity_mode: Option<AntigravityMode>,
+}
+
+impl AgentPermissionsPatch {
+    fn onto(self, current: Permissions) -> Permissions {
+        Permissions {
+            codex_sandbox: self.codex_sandbox.unwrap_or(current.codex_sandbox),
+            claude_mode: self.claude_mode.unwrap_or(current.claude_mode),
+            antigravity_mode: self.antigravity_mode.unwrap_or(current.antigravity_mode),
+        }
+    }
+}
+
 /// `agent.update` / `muster agent edit`: an absent field stays as it is; an empty model or
 /// effort clears it. The name doesn't change (it names the home dir). The kind changes only
 /// between Claude and Antigravity, and only by the human (`kind`).
@@ -2108,7 +2127,7 @@ pub struct AgentUpdate {
     #[serde(default)]
     pub autostart: Option<bool>,
     #[serde(default)]
-    pub permissions: Option<PermissionsInput>,
+    pub permissions: Option<AgentPermissionsPatch>,
     /// Sleep after this many idle minutes; 0 turns sleeping off (src/sleep.rs).
     #[serde(default)]
     pub sleep_after_min: Option<u32>,
@@ -2285,20 +2304,16 @@ fn check_kind_switch(a: &Agent, to: SessionKind, by_owner: bool) -> anyhow::Resu
     Ok(())
 }
 
-/// The permission mode an agent switching from `from` to `to` gets in the new CLI: the nearest
-/// match, no wider than the one it had with one exception. Plan stays plan; Claude's bypass and
-/// Antigravity's full access are the same (no prompts at all) and map to each other; Antigravity's
-/// auto becomes Claude's accept-edits. The exception: Claude's default (asks before edits) has no
-/// Antigravity match, and becomes accept-edits (edits without asking; commands still ask), as the
-/// stored-mode upgrade maps it (`model::StoredPermissions`), rather than plan, where it could
-/// change nothing. The other kinds' fields are kept.
+/// Auto maps to auto in both directions. Claude's account default also maps to Antigravity auto.
+/// A switch translates only the destination mode.
 pub fn switch_permissions(p: Permissions, from: SessionKind, to: SessionKind) -> Permissions {
     use crate::model::{AntigravityMode as A, ClaudeMode as C};
     match (from, to) {
         (SessionKind::Claude, SessionKind::Antigravity) => Permissions {
             antigravity_mode: match p.claude_mode {
                 C::Plan => A::Plan,
-                C::Default | C::AcceptEdits => A::AcceptEdits,
+                C::Default | C::Auto => A::Auto,
+                C::AcceptEdits => A::AcceptEdits,
                 C::Bypass => A::FullAccess,
             },
             ..p
@@ -2306,7 +2321,8 @@ pub fn switch_permissions(p: Permissions, from: SessionKind, to: SessionKind) ->
         (SessionKind::Antigravity, SessionKind::Claude) => Permissions {
             claude_mode: match p.antigravity_mode {
                 A::Plan => C::Plan,
-                A::AcceptEdits | A::Auto => C::AcceptEdits,
+                A::AcceptEdits => C::AcceptEdits,
+                A::Auto => C::Auto,
                 A::FullAccess => C::Bypass,
             },
             ..p
@@ -3412,14 +3428,24 @@ async fn restart_switched(hub: &Arc<Hub>, ks: &KindSwitch) -> anyhow::Result<(&'
     Ok(("restarted", None))
 }
 
+/// Minimum stored Claude permission width for delivering a waiting message to Antigravity.
+/// Both auto and accept-edits can edit without asking (see `Permissions::level`).
+fn quiet_width_for_antigravity(mode: AntigravityMode) -> i64 {
+    crate::quiet::width(match mode {
+        AntigravityMode::Plan => ClaudeMode::Plan,
+        AntigravityMode::AcceptEdits | AntigravityMode::Auto => ClaudeMode::AcceptEdits,
+        AntigravityMode::FullAccess => ClaudeMode::Bypass,
+    })
+}
+
 /// Messages that waited for a Claude agent's next turn (wake=false, src/quiet.rs) can't reach it
 /// once it runs Antigravity, which has no hook to take them. At each start of an Antigravity
 /// agent, any still waiting are sent again as ordinary messages (typed in, starting a turn),
 /// from the same sender on the same route, through every check a message gets (`deliver`); the
 /// waiting one is marked expired first, so none is sent twice, and waits again when the send
 /// fails. Only what its sender could still send it now: a message checked against a narrower
-/// mode than its Antigravity tab now gives (in Claude's terms, `switch_permissions`), or from an
-/// origin it no longer accepts, keeps waiting. In the background: the start lock is held by the
+/// mode than its Antigravity tab now gives, or from an origin it no longer accepts, keeps
+/// waiting. In the background: the start lock is held by the
 /// start that calls it.
 fn hand_over_quiet(hub: &Arc<Hub>, agent: &Agent) {
     if agent.kind != SessionKind::Antigravity {
@@ -3430,7 +3456,7 @@ fn hand_over_quiet(hub: &Arc<Hub>, agent: &Agent) {
     tokio::spawn(async move {
         let Some(agent) = hub.agents().by_id(id) else { return };
         let tab = agent.channel_id.and_then(|c| hub.channel(c)).map_or(agent.permissions, |c| c.permissions);
-        let width = crate::quiet::width(switch_permissions(tab, SessionKind::Antigravity, SessionKind::Claude).claude_mode);
+        let width = quiet_width_for_antigravity(tab.antigravity_mode);
         let waiting = match hub.store().waiting_quiet_for_agent(id, width) {
             Ok(w) => w,
             Err(e) => return tracing::warn!(agent = name, "reading its waiting messages: {e:#}"),
@@ -4931,23 +4957,35 @@ mod tests {
     use super::*;
     use crate::mcp::guard::test_session;
 
-    /// A start reads as a new conversation from what it launches: Claude without `--resume`,
-    /// Codex without a saved thread.
-
-    /// A switch never widens what the agent may do unasked: each mode maps to the nearest one no
-    /// wider, except bypass and full access, which are the same.
     #[test]
-    fn a_kind_switch_maps_permission_modes_no_wider() {
+    fn a_kind_switch_maps_defaults_and_explicit_modes_in_both_directions() {
         use crate::model::{AntigravityMode as A, ClaudeMode as C};
         let p = |c, a| Permissions { claude_mode: c, antigravity_mode: a, ..Permissions::default() };
-        for (c, want) in [(C::Plan, A::Plan), (C::Default, A::AcceptEdits), (C::AcceptEdits, A::AcceptEdits), (C::Bypass, A::FullAccess)] {
-            assert_eq!(switch_permissions(p(c, A::Auto), SessionKind::Claude, SessionKind::Antigravity).antigravity_mode, want);
+        for (c, a) in [(C::Plan, A::Plan), (C::Auto, A::Auto), (C::AcceptEdits, A::AcceptEdits), (C::Bypass, A::FullAccess)] {
+            assert_eq!(switch_permissions(p(c, A::Plan), SessionKind::Claude, SessionKind::Antigravity), p(c, a));
+            assert_eq!(switch_permissions(p(C::Plan, a), SessionKind::Antigravity, SessionKind::Claude), p(c, a));
         }
-        for (a, want) in [(A::Plan, C::Plan), (A::AcceptEdits, C::AcceptEdits), (A::Auto, C::AcceptEdits), (A::FullAccess, C::Bypass)] {
-            assert_eq!(switch_permissions(p(C::Default, a), SessionKind::Antigravity, SessionKind::Claude).claude_mode, want);
-        }
+        assert_eq!(switch_permissions(p(C::Default, A::Plan), SessionKind::Claude, SessionKind::Antigravity), p(C::Default, A::Auto));
         let same = p(C::Plan, A::FullAccess);
         assert_eq!(switch_permissions(same, SessionKind::Claude, SessionKind::Claude), same);
+    }
+
+    #[test]
+    fn claude_auto_is_the_default_for_new_and_incomplete_profiles() {
+        let new = Permissions::default();
+        assert_eq!(new.claude_mode, ClaudeMode::Auto);
+        assert_eq!(new.level(SessionKind::Claude), 2);
+        assert!(new.is_elevated());
+        for saved in [json!({}), json!({"codex_sandbox": "read_only"})] {
+            assert_eq!(serde_json::from_value::<Permissions>(saved).unwrap().claude_mode, ClaudeMode::Auto);
+        }
+        let legacy: Permissions = serde_json::from_value(json!({"claude_mode": "default"})).unwrap();
+        assert_eq!(legacy.claude_mode, ClaudeMode::Default);
+    }
+
+    #[test]
+    fn quiet_handover_to_auto_requires_edit_permission() {
+        assert_eq!(quiet_width_for_antigravity(AntigravityMode::Auto), crate::quiet::width(ClaudeMode::AcceptEdits));
     }
 
     /// A message to an agent whose switch waits for its next start is checked for both kinds: the
@@ -4991,7 +5029,9 @@ mod tests {
         for (legacy, mode) in [
             (json!({"claude_mode":"plan"}), AntigravityMode::Plan),
             (json!({"codex_sandbox":"read_only"}), AntigravityMode::Plan),
-            (json!({}), AntigravityMode::AcceptEdits),
+            (json!({}), AntigravityMode::Auto),
+            (json!({"claude_mode":"accept_edits"}), AntigravityMode::Auto),
+            (json!({"antigravity_mode":"accept_edits"}), AntigravityMode::AcceptEdits),
             (json!({"claude_mode":"plan","antigravity_mode":"auto"}), AntigravityMode::Auto),
         ] {
             assert_eq!(serde_json::from_value::<Permissions>(legacy).unwrap().antigravity_mode, mode);
@@ -5003,6 +5043,8 @@ mod tests {
         assert!(!wide.exceeds_for(&stored, SessionKind::Codex));
     }
 
+    /// A start reads as a new conversation from what it launches: Claude without `--resume`,
+    /// Codex without a saved thread.
     #[test]
     fn a_start_is_a_new_conversation_only_without_a_resume() {
         let claude = Agent { resume_id: Some("0f7e3c1a-58b2-4d0e-9a6c-2b1d4e5f6a7b".into()), ..agent(SessionKind::Claude) };
@@ -6433,7 +6475,7 @@ mod tests {
         let skill = crate::skills::get("muster-pr-review").text;
         assert_eq!(pr, format!("{PR_REVIEWER_HEADER}{}", crate::skills::body(skill)));
         assert!(skill.ends_with(crate::skills::body(skill)) && !pr.contains("description:"));
-        assert_eq!(by("pr_reviewer").permissions, Permissions::default(), "gh still asks under the default profile");
+        assert_eq!(by("pr_reviewer").permissions, Permissions::default());
         let w = by("worker");
         assert_eq!(w.accepts, vec![Origin::Human, Origin::Schedule, Origin::Webhook]);
         assert_eq!(w.permissions.codex_sandbox, CodexSandbox::WorkspaceWrite);

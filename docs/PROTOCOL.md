@@ -23,7 +23,7 @@ mode 0600: `{"pid": 123, "port": 7433, "panel_port": 51234, "token": "<client to
 | `POST /api/device/logout` | device cookie | Revokes the calling device, clears the cookie. |
 | `GET /m/…` | none | The phone UI (`web/dist/m`), with a strict CSP. `/m` redirects to `/m/`. |
 | `POST /hook/<event>` | `Authorization: Bearer <session token>` | Agent hook callbacks (body: JSON payload). |
-| `POST /quiet/take` | `Authorization: Bearer <session token>` | Body `{"msg": <id> \| null, "permission_mode": <string> \| null}`: the message id of the envelope the prompt starts with (null: a prompt Muster didn't type in, the human's turn), and the `permission_mode` of Claude Code's `UserPromptSubmit` payload, the mode the process runs in now (`plan`, `default`, `acceptEdits`, `bypassPermissions`; any other, such as the user's own default `auto`, or null counts as the mode the session's tab sets). The quiet messages waiting for the turn this session's `UserPromptSubmit` hook is starting (docs/MCP.md "Quiet messages"), marked offered: `{context: string \| null, quiet: {agent: number[], session: number[]}, left: number}`. Only that session's own, and only while the token's run is its current one; `context` is null when none wait for this turn or the session isn't Claude. Not reachable through a funnel or proxy. |
+| `POST /quiet/take` | `Authorization: Bearer <session token>` | Body `{"msg": <id> \| null, "permission_mode": <string> \| null}`: the message id of the envelope the prompt starts with (null: a prompt Muster didn't type in, the human's turn), and the `permission_mode` of Claude Code's `UserPromptSubmit` payload, the mode the process runs in now (`plan`, `default`, `acceptEdits`, `auto`, or `bypassPermissions`). An unknown mode or null uses the tab's configured width. The quiet messages waiting for the turn this session's `UserPromptSubmit` hook is starting (docs/MCP.md "Quiet messages"), marked offered: `{context: string \| null, quiet: {agent: number[], session: number[]}, left: number}`. Only that session's own, and only while the token's run is its current one; `context` is null when none wait for this turn or the session isn't Claude. Not reachable through a funnel or proxy. |
 | `POST /usage/claude` | `Authorization: Bearer <session token>` | A Claude session's status-line usage report (`muster statusline`): `{rate_limits: {five_hour?, seven_day?: {used_percentage, resets_at}}, api_duration_ms?, context?: {conversation, tokens}}` (`api_duration_ms`: the run's `cost.total_api_duration_ms`; more than the run's previous report is the evidence that the numbers are newly fetched; a report may carry it alone, as the baseline before the run's first response; `context`: the conversation's id, Claude Code's `session_id`, and its size, `context_window.current_usage`'s input, cache-write and cache-read tokens, kept per named agent with that conversation for the cold-answer rule (only from a report that carries `api_duration_ms`, which orders them), docs/MCP.md "Questions for the human"; other fields are ignored), at most 16 KiB. Attributed by the token to its session and run, and filed under the configuration folder recorded at that run's launch; a run without one is ignored. See "Claude account profiles". |
 | `POST /usage/antigravity` | `Authorization: Bearer <session token>` | An Antigravity tab's plan quota, sent by its title callback (`muster hook antigravity state`) beside the state: `{quota: {<bucket>: {used_percentage, resets_at}}}` for the buckets `gemini-5h`, `gemini-weekly` (the Gemini models' pool), `3p-5h` and `3p-weekly` (the Claude and GPT models' pool), from agy's `quota` (`used_percentage` is 100 × (1 − `remaining_fraction`), one decimal; `resets_at` Unix s from `reset_time`, null while no window is running; a bucket whose `reset_time` can't be read is not sent, so the last good reading stays). Other buckets and fields are ignored; the callback sends the same figures again only after a minute. The token must be an Antigravity session's. Every tab shares the machine's agy login, so the newest reading of each bucket is kept (`runtime_state`, kept across restarts). See `antigravity_usage.get`. |
 | `POST /mcp` | `Authorization: Bearer <session token>` | MCP (streamable HTTP, JSON responses). |
@@ -130,7 +130,7 @@ All ids are numbers. Types (`Workspace`, `Channel`, `SessionInfo`, `Event`) are 
 | `hello` | `{}` | `{version, workspaces[], channels[], sessions[], agent_sessions[], agent_names, panels[], panel_origin, notes[] (summaries, see "Notes"), ended_sessions, windows[], account_profiles[], account_usage, home, default_shell, login_shell, updates, prefs, pid, build, openrouter: {key_present}}` (`agent_sessions`: the ids of named agents' sessions, and `agent_names`: `{"<session id>": "<agent name>"}` for the same sessions, which `session.remove` hides instead of stopping, so a paired phone, which has no `agent.list`, can say so before closing one; `updates`, `prefs`: see "Updates and window preferences"; `build`: the running backend build's content id, the first 12 hex digits of its SHA-256 as `updates.backend` names a waiting one, so a restart can tell which build answers; `ended_sessions`: how many closed tabs `session.ended_list` has (absent from older backends and from paired devices' hello); `pid`: the backend's own, so a CLI that can't see its process (a sandboxed command in its own PID namespace) can still tell that the discovery file names this backend; `openrouter`: see "OpenRouter", never the key itself) |
 | `workspace.add` | `{path, name?}` | `Workspace` (path may start with `~`). Idempotent: an existing, non-removed workspace with the same canonical path is returned as is. |
 | `workspace.remove` | `{id}` | `{}` (archives its channels, kills their sessions, keeps worktrees) |
-| `channel.create` | `CreateChannel` (src/hub.rs): `{workspace_id, name? , worktree? = false, base?, agent?, prompt?, extra_args?: string[], permissions?: Permissions, window_id?, cols? = 120, rows? = 32, from_session?, account_profile?}` | `Channel` (plus sessions arrive via `session_upserted`). No `name` (or blank) = auto-named (see Windows, tabs and naming). `extra_args` (alias `args`) go to the first agent's CLI after the permission flags, as `session.spawn`'s `extra_args` do, and are kept for that session's restarts; they need `agent` (else an error). `window_id` must name an existing window (else an error); without it, see "Where new channels go". `cols`/`rows` size the first agent's terminal. `from_session` (`muster new` passes `$MUSTER_SESSION_ID`): the first session starts with that session's provenance one hop on (docs/MCP.md "Agents"), and a Claude agent is refused while it is on a non-human chain. `permissions` defaults to the CLIs' defaults. The first session is shown in the channel's window. |
+| `channel.create` | `CreateChannel` (src/hub.rs): `{workspace_id, name? , worktree? = false, base?, agent?, prompt?, extra_args?: string[], permissions?: Permissions, window_id?, cols? = 120, rows? = 32, from_session?, account_profile?}` | `Channel` (plus sessions arrive via `session_upserted`). No `name` (or blank) = auto-named (see Windows, tabs and naming). `extra_args` (alias `args`) go to the first agent's CLI after the permission flags, as `session.spawn`'s `extra_args` do, and are kept for that session's restarts; they need `agent` (else an error). `window_id` must name an existing window (else an error); without it, see "Where new channels go". `cols`/`rows` size the first agent's terminal. `from_session` (`muster new` passes `$MUSTER_SESSION_ID`): the first session starts with that session's provenance one hop on (docs/MCP.md "Agents"), and a Claude agent is refused while it is on a non-human chain. `permissions` uses [Muster's channel permission defaults](#channel-permissions) when omitted. The first session is shown in the channel's window. |
 | `channel.rename` | `{id, name}` | `Channel` (sets `auto_named: false`; renames a muster-owned worktree branch without upstream to `muster/<slug>`) |
 | `channel.archive` | `{id, remove_worktree: bool}` | `{}` (kills sessions; emits `channel_removed`). With `remove_worktree`, refused (error, nothing closed) while a running or starting session in another channel has its cwd inside this worktree (it was moved out, see `session.move`); if one moves out while the close runs, the worktree is kept and a notice says why. From that re-check until the delete finishes, the directory is reserved: starting or restarting a session whose cwd is inside it fails. |
 | `channel.close_if_empty` | `{id}` | `{closed: bool}`. Archives the channel (keeping any worktree) only if it has no sessions, checked and marked in one step, so a session spawned or moved into it meanwhile is never closed with it. |
@@ -268,12 +268,11 @@ changes which model runs the agent; Codex agents can't switch, and can't be swit
   to agy, nor the other way), the model and effort (the call's own `model`/`effort` are used, else
   the new CLI's default), a pending account move, and for Antigravity the account profile,
   OpenRouter, tools up front and self handoff, which only Claude has.
-- Permissions: the new CLI's mode is the nearest match: Claude plan -> Antigravity plan, default
-  and accept edits -> accept edits, bypass -> full access; Antigravity plan -> plan, accept edits
-  and auto -> accept edits, full access -> bypass. Each is no wider than the old one except Claude
-  default (asks before edits): agy has no such mode, so it gets accept edits (edits without asking)
-  rather than plan. Its own tab's modes follow the same way, before the new kind is saved; the
-  call's own `permissions` apply on top.
+- Auto maps to auto in either direction. Claude `default` also maps to Antigravity `auto`.
+  Plan and Accept edits keep their modes
+  in either direction. Claude `bypass` and Antigravity `full_access` map to each other.
+  The agent's own tab follows the same mapping. Only the permission fields supplied in the
+  call apply after the mapping.
 - Persona: the old kind's file (`CLAUDE.md` or `AGENTS.md`) is moved aside to
   `<file>.before-<new kind>` (`.<ms>` added when that name is taken), and so is a file already at
   the new kind's name; then the new kind's file is written from the record. Nothing is deleted, so
@@ -1388,9 +1387,10 @@ restart), for every agent in the channel, including agents spawned through MCP:
 
 | `claude_mode` | Claude Code flags |
 |---|---|
-| `default` (default) | no flag: your own Claude Code setting (`permissions.defaultMode`) applies |
-| `accept_edits` | `--permission-mode acceptEdits` |
 | `plan` | `--permission-mode plan` |
+| `default` | no flag, uses the account's Claude Code setting (`permissions.defaultMode`) |
+| `accept_edits` | `--permission-mode acceptEdits` |
+| `auto` (default) | `--permission-mode auto` |
 | `bypass` | `--permission-mode bypassPermissions` |
 
 | `antigravity_mode` | Antigravity flag |
@@ -1434,8 +1434,10 @@ file, so calls to muster's own MCP tools skip Claude Code's `auto`-mode safety c
 (about 1.5-4 s per call otherwise). Muster's own guardrails still apply to those tools.
 Channels created before this existed have the defaults (store migration v3). `permissions` in
 `channel.create` and `channel.set_permissions` must name `codex_sandbox` and `claude_mode`. Older clients may omit
-`antigravity_mode`. New profiles default to `auto`. A stored profile missing the field uses `plan` if Claude uses
-`plan` or Codex uses `read_only`, and `accept_edits` otherwise. An update keeps the current value.
+`antigravity_mode`. New channels and agents use `auto` for Claude and Antigravity. A stored profile
+missing `claude_mode` reads as `auto`. A stored `"default"` still uses the account setting.
+A missing stored `antigravity_mode` reads as `plan` if Claude uses `plan` or Codex uses `read_only`,
+and `auto` otherwise. An update that omits `antigravity_mode` keeps its current value.
 
 Limits: the profile bounds what muster starts agents with; it is not a boundary against the
 agents themselves. Codex's workspace-write sandbox can still read the whole disk, including
@@ -1485,11 +1487,13 @@ that prompt never ran, and they stay offered.
 on an exited tab too; runtime, recounted at start, at an agent's start and after expiry; a
 change emits `session_upserted`). Store migration v32 adds `agent_messages.quiet`, `offered_at`,
 `offered_run`, `shown_at`, `expired_at`, `width` (the receiver's Claude permission mode the send
-was checked against, 0-3: a turn whose process runs in a wider mode, or names none, doesn't take
-it), the `quiet_messages` table (a plain
+was checked against), the `quiet_messages` table (a plain
 session's, for run `to_run` with `width`, dropped when that run's process ends; `reply_to` is the
 message the sender was handling, `late_reply_to` links a quiet late reply to the message it
-answers, once per session) and `agents.tools_up_front`. Migration v33 adds `agents.lead` (0 by
+answers, once per session) and `agents.tools_up_front`. Quiet widths in increasing order are
+plan (0), default (1), accept edits (2), auto (3) and bypass (4). A run takes a message only
+when its width is at most the saved width. Older bypass rows still contain 3 and wait for an
+auto or narrower run or expire after seven days. Migration v33 adds `agents.lead` (0 by
 default; an older backend ignores it, so a lead's sends are checked by their own origin again, and
 reads a stored `lead` origin as `webhook`). Migration v35 adds `agents.spawn_workspaces` (a JSON
 list of workspace ids, `[]` by default; an older backend ignores it, so its agents start sessions

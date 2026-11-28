@@ -610,7 +610,7 @@ const MIGRATIONS: &[&str] = &[
     // ordinary sessions (send_message), dropped (`dropped` says why) when the session's process
     // ends. `offered_run`: the run (terminal generation) a turn's hook offered it to; only a later
     // hook of that run confirms it shown. `width`: the receiver's Claude permission mode the send
-    // was checked against (`ClaudeMode` as 0-3); a run wider than that doesn't take it. On
+    // was checked against (`quiet::width`); a run wider than that doesn't take it. On
     // `quiet_messages`, `to_run`: the run the send was checked against (only that run takes it),
     // `reply_to`: the message the sender was handling, and `late_reply_to`: the message a quiet
     // late reply answers (one per answered message and session, so a restart can't keep it twice;

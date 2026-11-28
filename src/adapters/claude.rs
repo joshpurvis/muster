@@ -1,7 +1,7 @@
 //! Claude Code adapter (verified against `claude` v2.1.280).
 //!
 //! Launch: `claude --mcp-config <session_dir>/mcp.json --settings <session_dir>/settings.json
-//! --permission-mode <mode> [extra args] [-- <initial prompt>]`. The mode comes from the
+//! [--permission-mode <mode>] [extra args] [-- <initial prompt>]`. The mode comes from the
 //! channel's permission profile (`permission_mode`).
 //! - `settings.json` adds command hooks for this session only (merged with the user's own
 //!   settings): every event runs `<muster_bin> hook claude <Event>`, which reads the hook's JSON
@@ -98,13 +98,12 @@ pub fn settings_json(muster_bin: &Path) -> Value {
 /// Permission rule matching every tool of the `muster` MCP server.
 pub const MUSTER_TOOLS_RULE: &str = "mcp__muster";
 
-/// `--permission-mode` value for the channel's profile. Always passed explicitly, so the channel
-/// profile (not a `defaultMode` in the user's settings) decides how the session starts.
 /// `--permission-mode` value for a channel profile. `Default` passes no flag, so the user's
 /// own Claude Code setting (e.g. `permissions.defaultMode`) applies.
 pub fn permission_mode(mode: ClaudeMode) -> Option<&'static str> {
     match mode {
         ClaudeMode::Default => None,
+        ClaudeMode::Auto => Some("auto"),
         ClaudeMode::AcceptEdits => Some("acceptEdits"),
         ClaudeMode::Plan => Some("plan"),
         ClaudeMode::Bypass => Some("bypassPermissions"),
@@ -910,7 +909,7 @@ mod tests {
             session_dir: dir.clone(),
             extra_args: vec!["--model".into(), "haiku".into()],
             initial_prompt: Some("-do it".into()),
-            permissions: Permissions::default(),
+            permissions: Permissions { claude_mode: ClaudeMode::Default, ..Permissions::default() },
             resume: None,
         };
         let spec = ClaudeAdapter.command(&ctx).unwrap();
@@ -923,10 +922,11 @@ mod tests {
         }
         assert_eq!(spec.args[0], "--mcp-config");
         assert_eq!(spec.args[2], "--settings");
-        // The default profile passes no --permission-mode (the user's own setting applies).
+        // The explicit Default choice passes no --permission-mode (the user's own setting applies).
         assert!(!spec.args.iter().any(|a| a == "--permission-mode"));
         assert_eq!(&spec.args[4..], &["--model", "haiku", "--", "-do it"]);
         for (mode, flag) in [
+            (ClaudeMode::Auto, "auto"),
             (ClaudeMode::AcceptEdits, "acceptEdits"),
             (ClaudeMode::Plan, "plan"),
             (ClaudeMode::Bypass, "bypassPermissions"),

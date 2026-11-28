@@ -388,6 +388,7 @@ mod tests {
         for bad in [
             &["--permission-mode", "bypassPermissions"][..],
             &["--permission-mode=acceptEdits"],
+            &["--permission-mode=auto"],
             &["--dangerously-skip-permissions"],
             &["--allowedTools", "Bash"],
             &["--allowed-tools", "Bash"],

@@ -976,9 +976,9 @@ for what can wait. Code: `src/quiet.rs`.
   named agent takes only origins it still accepts (an origin taken away after a note was sent
   keeps it waiting). A message is held while the receiving process runs in a wider permission
   mode than the one its send was checked against (the tab restarted in Bypass, say), as the
-  turn's own `UserPromptSubmit` payload reports it (`permission_mode`). A reported `auto` uses the
-  tab's width, whether Muster explicitly set auto or an older default tab inherited it from the
-  Claude account. Unknown and missing modes also use the tab's width. An agent on OpenRouter takes
+  turn's own `UserPromptSubmit` payload reports it (`permission_mode`). A reported `auto` has
+  width 3 regardless of the tab's configured mode. Only unknown modes such as `dontAsk` or
+  missing modes use the tab's width. An agent on OpenRouter takes
   unattended ones only while the spend caps allow, read fresh only when the turn would take one,
   and waited for at most 400 ms: a slow reading leaves them waiting and never holds back the
   human's. The rest wait for a turn that can take them, or until they expire; the turn itself

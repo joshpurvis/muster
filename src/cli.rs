@@ -2659,9 +2659,10 @@ pub fn parse_sleep_after(s: &str) -> anyhow::Result<u32> {
 }
 
 impl AgentOpts {
-    /// The request fields both RPCs share (absent ones left out). `base` is the profile a
-    /// half-given `--claude-mode` / `--codex-sandbox` completes (both halves are required).
-    fn params(&self, base: &Value) -> anyhow::Result<Value> {
+    /// The request fields both RPCs share. Creation and edits without `--kind` fill in the
+    /// Claude and Codex modes from `base`, with Muster defaults for a new agent. With `--kind`,
+    /// the daemon maps the destination mode before applying the flags supplied here.
+    fn params(&self, base: Option<&Value>) -> anyhow::Result<Value> {
         let mut p = json!({ "name": self.name });
         let mut set = |k: &str, v: Value| {
             p[k] = v;
@@ -2707,10 +2708,17 @@ impl AgentOpts {
             set("from_session", json!(id));
         }
         if self.claude_mode.is_some() || self.codex_sandbox.is_some() || self.antigravity_mode.is_some() {
-            let mut permissions = json!({
-                "claude_mode": self.claude_mode.as_deref().or(base["claude_mode"].as_str()).unwrap_or("auto"),
-                "codex_sandbox": self.codex_sandbox.as_deref().or(base["codex_sandbox"].as_str()).unwrap_or("workspace_write"),
-            });
+            let mut permissions = json!({});
+            if let Some(base) = base {
+                permissions["claude_mode"] = json!(base["claude_mode"].as_str().unwrap_or("auto"));
+                permissions["codex_sandbox"] = json!(base["codex_sandbox"].as_str().unwrap_or("workspace_write"));
+            }
+            if let Some(mode) = &self.claude_mode {
+                permissions["claude_mode"] = json!(mode);
+            }
+            if let Some(sandbox) = &self.codex_sandbox {
+                permissions["codex_sandbox"] = json!(sandbox);
+            }
             if let Some(mode) = &self.antigravity_mode {
                 permissions["antigravity_mode"] = json!(mode.replace('-', "_"));
             }
@@ -2747,7 +2755,7 @@ fn print_agent(verb: &str, b: &Value, name: &str) {
 /// `muster agent new`.
 pub fn agent_new(d: &Discovery, o: AgentOpts) -> anyhow::Result<()> {
     anyhow::ensure!(o.profile.is_none() || o.kind.as_deref().unwrap_or("claude") == "claude", "--profile needs --kind claude");
-    let mut params = o.params(&Value::Null)?;
+    let mut params = o.params(Some(&Value::Null))?;
     if let Some(profile) = &o.profile { params["account_profile"] = profile_choice(d, profile)?; }
     let b = client::rpc(d, "agent.create", params)?;
     print_agent("agent", &b, &o.name);
@@ -2756,8 +2764,10 @@ pub fn agent_new(d: &Discovery, o: AgentOpts) -> anyhow::Result<()> {
 
 /// `muster agent edit`.
 pub fn agent_edit(d: &Discovery, o: AgentOpts) -> anyhow::Result<()> {
-    let base = if (o.claude_mode.is_some() || o.codex_sandbox.is_some() || o.antigravity_mode.is_some())
-        && (o.claude_mode.is_none() || o.codex_sandbox.is_none()) {
+    let base = if o.kind.is_none()
+        && (o.claude_mode.is_some() || o.codex_sandbox.is_some() || o.antigravity_mode.is_some())
+        && (o.claude_mode.is_none() || o.codex_sandbox.is_none())
+    {
         let list = client::rpc(d, "agent.list", json!({}))?;
         list.as_array()
             .and_then(|l| l.iter().find(|a| a["name"].as_str().is_some_and(|n| n.eq_ignore_ascii_case(&o.name))))
@@ -2766,7 +2776,7 @@ pub fn agent_edit(d: &Discovery, o: AgentOpts) -> anyhow::Result<()> {
     } else {
         Value::Null
     };
-    let mut params = o.params(&base)?;
+    let mut params = o.params(o.kind.is_none().then_some(&base))?;
     let to = o.profile.as_deref().map(|p| profile_choice(d, p)).transpose()?;
     if let Value::Object(m) = move_params(&o.switch, to) {
         params.as_object_mut().expect("an object").extend(m);
@@ -3110,20 +3120,62 @@ mod tests {
     fn partial_cli_permissions_use_auto_for_new_agents_and_preserve_existing_modes() {
         let mut opts = agent_opts(None);
         opts.codex_sandbox = Some("read_only".into());
-        assert_eq!(opts.params(&Value::Null).unwrap()["permissions"]["claude_mode"], "auto");
+        assert_eq!(opts.params(Some(&Value::Null)).unwrap()["permissions"]["claude_mode"], "auto");
         let saved = json!({"claude_mode": "default"});
-        assert_eq!(opts.params(&saved).unwrap()["permissions"]["claude_mode"], "default");
+        assert_eq!(opts.params(Some(&saved)).unwrap()["permissions"]["claude_mode"], "default");
+    }
+
+    #[tokio::test]
+    async fn agent_edit_kind_switch_applies_only_explicit_permission_flags() {
+        use crate::agents;
+        use crate::hub::{Hub, HubConfig};
+        use crate::model::{AntigravityMode, ClaudeMode, CodexSandbox};
+        use crate::store::Store;
+
+        for (name, claude_flag, expected) in [
+            ("alpha", None, ClaudeMode::Plan),
+            ("beta", Some("auto"), ClaudeMode::Auto),
+        ] {
+            let store = Store::open_memory().unwrap();
+            let mut tab = crate::mcp::guard::test_channel(0);
+            tab.workspace_id = store.insert_workspace("repo", "/w/repo", false, 0).unwrap();
+            tab.permissions.antigravity_mode = AntigravityMode::Plan;
+            tab.permissions.codex_sandbox = CodexSandbox::ReadOnly;
+            let tab_id = store.insert_channel(&tab).unwrap();
+            let hub = Hub::new(HubConfig {
+                port: 0, client_token: "test".into(), muster_bin: "/bin/true".into(),
+                terminal_host: None, openrouter_key: None,
+            }, store).unwrap();
+            let a = agents::create(&hub, serde_json::from_value(json!({
+                "name": name, "kind": "antigravity", "permissions": tab.permissions,
+            })).unwrap()).unwrap();
+            hub.agents().update(hub.store(), a.id, |a| a.channel_id = Some(tab_id)).unwrap();
+
+            let mut opts = agent_opts(None);
+            opts.name = name.into();
+            opts.kind = Some("claude".into());
+            opts.codex_sandbox = Some("workspace_write".into());
+            opts.claude_mode = claude_flag.map(str::to_owned);
+            let mut req: agents::AgentUpdate = serde_json::from_value(opts.params(None).unwrap()).unwrap();
+            req.by_owner = true;
+            let (updated, _, _) = agents::update_full(&hub, req, false).unwrap();
+            for permissions in [updated.permissions, hub.channel(tab_id).unwrap().permissions] {
+                assert_eq!(permissions.claude_mode, expected);
+                assert_eq!(permissions.codex_sandbox, CodexSandbox::WorkspaceWrite);
+                assert_eq!(permissions.antigravity_mode, AntigravityMode::Plan);
+            }
+        }
     }
 
     /// `muster agent edit NAME --lead on|off` sends `lead` (and, inside a Muster tab, the session
     /// that asked, so the backend refuses turning it on there).
     #[test]
     fn agent_edit_sends_lead() {
-        assert_eq!(agent_opts(Some(true)).params(&json!({})).unwrap()["lead"], true);
-        assert_eq!(agent_opts(Some(false)).params(&json!({})).unwrap()["lead"], false);
-        assert!(agent_opts(None).params(&json!({})).unwrap().get("lead").is_none());
+        assert_eq!(agent_opts(Some(true)).params(None).unwrap()["lead"], true);
+        assert_eq!(agent_opts(Some(false)).params(None).unwrap()["lead"], false);
+        assert!(agent_opts(None).params(None).unwrap().get("lead").is_none());
         if env_session().is_some() {
-            assert!(agent_opts(Some(true)).params(&json!({})).unwrap().get("from_session").is_some());
+            assert!(agent_opts(Some(true)).params(None).unwrap().get("from_session").is_some());
         }
     }
 

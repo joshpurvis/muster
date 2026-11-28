@@ -2007,7 +2007,7 @@ pub struct NewAgent {
     /// Default: `default_accepts(kind)`.
     #[serde(default)]
     pub accepts: Option<Vec<Origin>>,
-    /// The profile of the agent's tab. Default: the CLIs' own defaults.
+    /// The profile of the agent's tab. Defaults to `Permissions::default()`.
     #[serde(default)]
     pub permissions: Option<PermissionsInput>,
     #[serde(default)]
@@ -2076,6 +2076,25 @@ pub fn create(hub: &Hub, req: NewAgent) -> anyhow::Result<Agent> {
     Ok(a)
 }
 
+/// Permission fields supplied to `agent.update`, applied after any kind switch maps the profile.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentPermissionsPatch {
+    pub codex_sandbox: Option<CodexSandbox>,
+    pub claude_mode: Option<ClaudeMode>,
+    pub antigravity_mode: Option<AntigravityMode>,
+}
+
+impl AgentPermissionsPatch {
+    fn onto(self, current: Permissions) -> Permissions {
+        Permissions {
+            codex_sandbox: self.codex_sandbox.unwrap_or(current.codex_sandbox),
+            claude_mode: self.claude_mode.unwrap_or(current.claude_mode),
+            antigravity_mode: self.antigravity_mode.unwrap_or(current.antigravity_mode),
+        }
+    }
+}
+
 /// `agent.update` / `muster agent edit`: an absent field stays as it is; an empty model or
 /// effort clears it. The name doesn't change (it names the home dir). The kind changes only
 /// between Claude and Antigravity, and only by the human (`kind`).
@@ -2108,7 +2127,7 @@ pub struct AgentUpdate {
     #[serde(default)]
     pub autostart: Option<bool>,
     #[serde(default)]
-    pub permissions: Option<PermissionsInput>,
+    pub permissions: Option<AgentPermissionsPatch>,
     /// Sleep after this many idle minutes; 0 turns sleeping off (src/sleep.rs).
     #[serde(default)]
     pub sleep_after_min: Option<u32>,

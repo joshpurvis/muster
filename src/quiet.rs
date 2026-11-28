@@ -131,14 +131,15 @@ pub fn session_width(hub: &Hub, s: &SessionInfo) -> i64 {
 }
 
 /// The width of the permission mode a turn's process runs in, as Claude Code's
-/// `UserPromptSubmit` payload names it (`permission_mode`, sent on to `/quiet/take`). A mode
-/// of `auto` counts as the tab's width. Muster sets it for auto tabs and older default tabs
-/// can inherit it from Claude's settings. Unknown or absent modes also use the tab's width.
+/// `UserPromptSubmit` payload names it (`permission_mode`, sent on to `/quiet/take`). A reported
+/// `auto` has Auto's width even if the tab's configured mode differs. Unknown or absent modes
+/// use the tab's width.
 pub fn mode_width(mode: Option<&str>, tab: i64) -> i64 {
     match mode {
         Some("plan") => width(ClaudeMode::Plan),
         Some("default") => width(ClaudeMode::Default),
         Some("acceptEdits") => width(ClaudeMode::AcceptEdits),
+        Some("auto") => width(ClaudeMode::Auto),
         Some("bypassPermissions") => width(ClaudeMode::Bypass),
         _ => tab,
     }
@@ -1127,8 +1128,8 @@ mod tests {
         assert_eq!(take_run(&hub, 2, run, None, width(Auto)).await.unwrap()["quiet"]["agent"], json!([q]));
     }
 
-    /// A bypass process can't take a narrower note. Auto, unknown and absent hook modes use
-    /// the tab's width, including an old default tab whose process reports auto.
+    /// Reported modes decide what a process can take. Unknown and absent hook modes use the
+    /// tab's width.
     #[tokio::test]
     async fn the_running_mode_decides_which_notes_a_turn_takes() {
         let (hub, _, beta, _) = hub();
@@ -1139,8 +1140,26 @@ mod tests {
             assert!(take_run(&hub, 2, run, None, mode_width(mode, bypass_tab)).await.unwrap()["context"].is_null(), "{mode:?}");
         }
         let default_tab = width(ClaudeMode::Default);
-        assert!(take_run(&hub, 2, run, None, mode_width(Some("bypassPermissions"), default_tab)).await.unwrap()["context"].is_null());
-        assert_eq!(take_run(&hub, 2, run, None, mode_width(Some("auto"), default_tab)).await.unwrap()["quiet"]["agent"], json!([q]));
+        assert_eq!(mode_width(Some("auto"), default_tab), width(ClaudeMode::Auto));
+        for mode in ["bypassPermissions", "auto"] {
+            assert!(take_run(&hub, 2, run, None, mode_width(Some(mode), default_tab)).await.unwrap()["context"].is_null(), "{mode}");
+        }
+        assert_eq!(take_run(&hub, 2, run, None, mode_width(Some("default"), bypass_tab)).await.unwrap()["quiet"]["agent"], json!([q]));
+    }
+
+    #[tokio::test]
+    async fn an_auto_run_cannot_take_a_note_sent_after_the_tab_changes_to_plan() {
+        let (hub, _, beta, _) = hub();
+        let session = hub.session(2).unwrap();
+        let run = hub.session_run(2).unwrap();
+        assert_eq!(session_width(&hub, &session), width(ClaudeMode::Auto));
+        hub.set_permissions(session.channel_id, Permissions { claude_mode: ClaudeMode::Plan, ..Permissions::default() }).unwrap();
+        assert_eq!(hub.session_run(2), Some(run));
+        let q = agents::quiet(&hub, out(&beta, "for a plan run", 0)).await.unwrap().msg_id;
+
+        let tab = session_width(&hub, &session);
+        assert!(take_run(&hub, 2, run, None, mode_width(Some("auto"), tab)).await.unwrap()["context"].is_null());
+        assert_eq!(take_run(&hub, 2, run, None, mode_width(Some("plan"), tab)).await.unwrap()["quiet"]["agent"], json!([q]));
     }
 
     /// A note keeps the width the sender's permission check ran against, even when the agent's

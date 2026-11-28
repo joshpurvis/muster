@@ -333,13 +333,22 @@ now. Never while it is working, starting, waiting for approval or a question, sh
 looks stuck, has running sub-agents, has background work running (`SessionInfo.background`: a
 sub-agent or command started with `run_in_background`, or moved to the background while it ran
 (a command past its timeout, Ctrl+B: its tool result has a `backgroundTaskId`), that hasn't
-reported back, from its hooks and its notices in the run's transcript, applied to the work as it
-is then; the CLI's exit would end it), has prompts queued or being typed, has a message on its
-way (`agents::deliver`, the human's `session.send` from before the start lock until the prompt
+reported back). A conversation clear or compaction can leave this work running. Muster checks
+the launch transcript, subsequent conversations in the same run and the owning sub-agent's
+transcripts for completion, failure or a confirmed stop. It opens these files beneath the
+launch profile’s `projects` directory. A completion notice needs Claude’s task-notification
+metadata. After further sub-agent activity, its completion must also have a creation time
+later than that activity. Typed prompts and ordinary queue entries can quote the same notice.
+A main Claude `Stop` hook that lists a task in `background_tasks` counts as activity. An
+omitted task stays counted because the snapshot may predate a concurrent launch. Older
+saved records use the current transcript's `derived-from` clear history to find earlier
+conversations and their sub-agents. The same check applies to a profile move or kind switch
+with `--now`. Sleep also waits while the agent has prompts queued or being typed, has a
+message on its way (`agents::deliver`, the human's `session.send` from before the start lock until the prompt
 is queued, and a panel batch until it is queued; a batch is never queued for an agent asleep or
 being put to sleep, its events wait for its wake), is waking, is in a turn (an agent message was
-typed in since it last came to rest), has text in its input box, or before its conversation id
-is known (it couldn't be resumed). The check and the stop run under the agent start lock, which
+typed in since it last came to rest), has text in its input box, or lacks the conversation id
+it would need to resume. The check and the stop run under the agent start lock, which
 every wake, `session.send` to an agent's session, `session.restart` of one and autostart take
 too. The last check and the switch to asleep are one step against raw input (keys admitted
 since the check, or still on their way to the terminal host, refuse it: a write counts as on its

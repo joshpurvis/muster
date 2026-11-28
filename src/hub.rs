@@ -4365,7 +4365,19 @@ impl Hub {
     /// Session `id`'s current run and its background work (src/sleep.rs).
     pub(crate) fn background_of(&self, id: SessionId) -> Option<(u64, crate::sleep::Background)> {
         let g = self.inner.lock();
-        g.sessions.get(&id).map(|e| (e.generation, e.background.clone()))
+        g.sessions.get(&id).filter(|e| e.info.kind == SessionKind::Claude).map(|e| (e.generation, e.background.clone()))
+    }
+
+    /// The Claude config folder selected by this run's launch, including its default HOME.
+    pub(crate) fn launched_claude_config(&self, id: SessionId, generation: u64) -> Option<PathBuf> {
+        let records = self.terminal_records.lock();
+        let run = records.get(&id).filter(|r| !r.retired && r.spec.run.generation == generation)?;
+        let env = &run.spec.env;
+        let dir = match env.get("CLAUDE_CONFIG_DIR") {
+            Some(dir) => PathBuf::from(dir),
+            None => Path::new(env.get("HOME")?).join(".claude"),
+        };
+        dir.is_absolute().then_some(dir)
     }
 
     /// Tests: session `id`'s current run is a launch whose acknowledgement was lost (`pending`),
@@ -4923,7 +4935,7 @@ impl Hub {
                     info.subagents = delta.map_or(0, |d| info.subagents.saturating_add_signed(d));
                 }
                 // Background sub-agents and commands, which a sleep would end with the CLI.
-                if background.after_hook(event, &payload) {
+                if background.after_hook(captured_at, event, &payload) {
                     info.background = background.running();
                 }
                 // When the callback was captured: one replayed after an outage happened then.

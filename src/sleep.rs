@@ -33,6 +33,8 @@
 //! asleep bar, a notice), and a message sent with wake on, or typing, tries again.
 
 use std::collections::{HashMap, HashSet};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
@@ -67,8 +69,6 @@ const PANEL_RETRY: Duration = Duration::from_secs(60);
 /// Runtime key: how much the human had typed into waking agents' tabs when the backend stopped
 /// (sizes only, never the text), said in their timelines by the next backend.
 const LOST_INPUT_KEY: &str = "sleep-lost-input";
-/// How much of a run's transcript is searched for its background tasks' notices.
-const TRANSCRIPT_TAIL: u64 = 4 * 1024 * 1024;
 
 /// One minute of the idle time, in ms. A debug build can shorten it for the smoke test.
 fn minute_ms() -> i64 {
@@ -334,10 +334,23 @@ pub struct Background {
     /// from it counts it again.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub done: Vec<BgTask>,
-    /// The run's own transcript (its hooks' `transcript_path`), where each finished task's
-    /// notice lands (`refresh_background`).
+    /// Latest top-level transcript, also the starting point for pre-upgrade records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcript: Option<String>,
+    /// Other conversations visited while work was outstanding. A notice can be delivered
+    /// between two clears, after launch and before the next sleep check.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    previous: Vec<String>,
+    /// Next complete JSONL record to inspect. Rebuilt on reload or a new launch.
+    #[serde(skip)]
+    offsets: HashMap<PathBuf, TranscriptCursor>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TranscriptCursor {
+    device: u64,
+    inode: u64,
+    offset: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -350,6 +363,20 @@ pub struct BgTask {
     /// A sub-agent (the Agent/Task tool), whose end is its SubagentStop hook.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub agent: bool,
+    /// The launching hook's transcript and, for work it delegated, the owning sub-agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    transcript: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner: Option<String>,
+    /// A sub-agent can report, then keep working. Older notices cannot end that later activity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    active_at: Option<i64>,
+}
+
+impl BgTask {
+    fn accepts_notice_at(&self, at: Option<i64>) -> bool {
+        self.active_at.is_none_or(|start| at.is_some_and(|end| end >= start))
+    }
 }
 
 /// The most background tasks (and finished sub-agents) remembered for one run.
@@ -392,18 +419,14 @@ fn moved_to_background(v: Option<&serde_json::Value>) -> bool {
         || text_of(v.get("status")) == Some("async_launched")
 }
 
-/// Every `<tag>value</tag>` in `text`.
-fn tagged<'a>(text: &'a str, tag: &str) -> Vec<&'a str> {
-    let (open, close) = (format!("<{tag}>"), format!("</{tag}>"));
-    let mut out = Vec::new();
-    let mut rest = text;
-    while let Some(at) = rest.find(&open) {
-        rest = &rest[at + open.len()..];
-        let Some(end) = rest.find(&close) else { break };
-        out.push(rest[..end].trim());
-        rest = &rest[end + close.len()..];
-    }
-    out
+/// Read only the notification header. Summaries, results and tool output may quote other IDs.
+fn notice_ids(text: &str) -> Option<(Option<&str>, Option<&str>)> {
+    let body = text.trim_start().strip_prefix("<task-notification>")?;
+    let header = body.split("<summary>").next()?;
+    let field = |tag: &str| header.split_once(&format!("<{tag}>"))?.1
+        .split_once(&format!("</{tag}>")).map(|(value, _)| value.trim());
+    matches!(field("status"), Some("completed" | "failed" | "killed" | "stopped"))
+        .then(|| (field("tool-use-id"), field("task-id")))
 }
 
 impl Background {
@@ -428,37 +451,61 @@ impl Background {
         self.done.drain(..over);
     }
 
-    /// The tasks a task notice in `text` reports on (`<task-notification>` with the launch's
-    /// `<tool-use-id>` and the task's `<task-id>`) have reported back.
-    pub fn notified(&mut self, text: &str) {
-        if !text.contains("<task-notification>") {
-            return;
-        }
-        let uses = tagged(text, "tool-use-id");
-        let ids = tagged(text, "task-id");
-        self.finish(|t| {
-            (!t.tool_use.is_empty() && uses.contains(&t.tool_use.as_str())) || t.task.as_deref().is_some_and(|id| ids.contains(&id))
-        });
+    fn notified(&mut self, text: &str, at: Option<i64>) {
+        let Some((tool, task)) = notice_ids(text) else { return };
+        self.finish(|t| t.accepts_notice_at(at)
+            && ((!t.tool_use.is_empty() && Some(t.tool_use.as_str()) == tool)
+                || (task.is_some() && t.task.as_deref() == task)));
     }
 
     /// What hook `event` (with `payload`) of the run changes. True when the running tasks did.
     pub fn after_hook(&mut self, event: &str, payload: &serde_json::Value) -> bool {
         let before = self.tasks.clone();
         let sub = text_of(payload.get("agent_id"));
-        if sub.is_none()
-            && let Some(t) = text_of(payload.get("transcript_path"))
-        {
-            self.transcript = Some(t.to_string());
+        let path = text_of(payload.get("transcript_path"));
+        if sub.is_none() && let Some(path) = path && self.transcript.as_deref() != Some(path) {
+            if let Some(old) = self.transcript.replace(path.to_owned())
+                && !before.is_empty() && !self.previous.contains(&old)
+            {
+                self.previous.push(old);
+            }
         }
         let tool_use = text_of(payload.get("tool_use_id")).unwrap_or("");
+        let tool = text_of(payload.get("tool_name"));
         let launch = |t: &BgTask| t.task.is_none() && t.tool_use == tool_use;
+        let new_task = |task| BgTask {
+            tool_use: tool_use.to_owned(), task, agent: matches!(tool, Some("Agent" | "Task")),
+            transcript: path.or(self.transcript.as_deref()).map(str::to_owned),
+            owner: sub.map(str::to_owned), active_at: None,
+        };
         match event {
             // Started in the background, by the agent or one of its sub-agents (all end with the CLI).
             "PreToolUse" if payload.pointer("/tool_input/run_in_background").and_then(|v| v.as_bool()) == Some(true) => {
                 let known = !tool_use.is_empty() && self.tasks.iter().any(|t| t.tool_use == tool_use);
                 if !known && self.tasks.len() < TASKS_MAX {
-                    let agent = matches!(text_of(payload.get("tool_name")), Some("Agent" | "Task"));
-                    self.tasks.push(BgTask { tool_use: tool_use.to_string(), task: None, agent });
+                    self.tasks.push(new_task(None));
+                }
+            }
+            "PostToolUse" if matches!(tool, Some("TaskStop" | "KillShell" | "KillBash")) => {
+                if let Some(id) = stopped_id(&payload["tool_response"]) {
+                    self.finish(|t| t.task.as_deref() == Some(id));
+                }
+            }
+            // The main Stop hook can give the CLI's session-wide registry of in-flight work.
+            // A launch awaiting its result has no ID to compare and can race the snapshot.
+            "Stop" if sub.is_none() => {
+                if let Some(list) = payload["background_tasks"].as_array()
+                    && let Some(ids) = list.iter().map(|item| text_of(item.get("id"))).collect::<Option<HashSet<_>>>()
+                {
+                    let listed = |t: &BgTask| t.task.as_deref().is_some_and(|id| ids.contains(id));
+                    self.finish(|t| t.task.is_some() && !listed(t));
+                    // A sub-agent can still be active after an interim report or SubagentStop.
+                    let (active, done): (Vec<_>, Vec<_>) = std::mem::take(&mut self.done).into_iter().partition(listed);
+                    self.done = done;
+                    self.tasks.extend(active);
+                    for t in self.tasks.iter_mut().filter(|t| t.agent && listed(t)) {
+                        t.active_at = Some(now_ms());
+                    }
                 }
             }
             // It started: its result names it.
@@ -466,14 +513,15 @@ impl Background {
                 let result = payload.get("tool_response");
                 if let Some(t) = self.tasks.iter_mut().find(|t| launch(t)) {
                     t.task = launched_id(result);
+                    if t.transcript.is_none() { t.transcript = path.map(str::to_owned); }
+                    if t.owner.is_none() { t.owner = sub.map(str::to_owned); }
                 } else if moved_to_background(result) && self.tasks.len() < TASKS_MAX {
                     // Started in the foreground, then moved to the background: from now on it
                     // is background work like any other.
                     let task = launched_id(result);
                     let known = self.tasks.iter().any(|t| (!tool_use.is_empty() && t.tool_use == tool_use) || (task.is_some() && t.task == task));
                     if !known {
-                        let agent = matches!(text_of(payload.get("tool_name")), Some("Agent" | "Task"));
-                        self.tasks.push(BgTask { tool_use: tool_use.to_string(), task, agent });
+                        self.tasks.push(new_task(task));
                     }
                 }
             }
@@ -487,7 +535,7 @@ impl Background {
             // A task's notice, when the CLI submits it as a prompt.
             "UserPromptSubmit" => {
                 if let Some(p) = text_of(payload.get("prompt")) {
-                    self.notified(p);
+                    self.notified(p, Some(now_ms()));
                 }
             }
             _ => {}
@@ -497,37 +545,153 @@ impl Background {
             && event != "SubagentStop"
             && let Some(i) = self.done.iter().position(|t| t.task.as_deref() == Some(id))
         {
-            let t = self.done.remove(i);
+            let mut t = self.done.remove(i);
+            t.active_at = Some(now_ms());
             self.tasks.push(t);
         }
-        self.tasks != before
+        if self.tasks != before {
+            if self.tasks.is_empty() {
+                self.previous.clear();
+            }
+            // A new tool result may name work whose notice was already written.
+            self.offsets.clear();
+            return true;
+        }
+        false
     }
 }
 
-/// The background tasks of session `sid` whose notices are in its transcript have reported back
-/// (the CLI may deliver a notice without a hook): read off the hub's locks, once the agent would
-/// otherwise sleep.
-async fn refresh_background(hub: &Arc<Hub>, sid: SessionId) {
-    let Some((generation, bg)) = hub.background_of(sid) else { return };
-    let Some(path) = bg.transcript.clone().filter(|p| p.ends_with(".jsonl")) else { return };
-    if bg.tasks.is_empty() {
-        return;
+/// A local TaskStop result names the resolved ID, even if the caller supplied an agent name.
+fn stopped_id(result: &serde_json::Value) -> Option<&str> {
+    text_of(result.get("message"))?.starts_with("Successfully stopped").then_some(())?;
+    text_of(result.get("task_id"))
+}
+
+fn transcript_notice(row: &serde_json::Value) -> Option<&str> {
+    match row["type"].as_str()? {
+        "queue-operation" if row["operation"] == "enqueue" => row["content"].as_str(),
+        "attachment" if row["attachment"]["type"] == "queued_command"
+            && row["attachment"]["commandMode"] == "task-notification" => row["attachment"]["prompt"].as_str(),
+        "user" if row["origin"]["kind"] == "task-notification" => {
+            let body = &row["message"]["content"];
+            body.as_str().or_else(|| body.as_array()?.iter().find_map(|part| part["text"].as_str()))
+        }
+        _ => None,
     }
-    let read = tokio::task::spawn_blocking(move || -> std::io::Result<String> {
-        use std::io::{Read, Seek, SeekFrom};
-        let mut f = std::fs::File::open(&path)?;
-        let len = f.metadata()?.len();
-        f.seek(SeekFrom::Start(len.saturating_sub(TRANSCRIPT_TAIL)))?;
-        let mut buf = Vec::new();
-        f.take(TRANSCRIPT_TAIL).read_to_end(&mut buf)?;
-        Ok(String::from_utf8_lossy(&buf).into_owned())
-    })
-    .await;
-    let Ok(Ok(text)) = read else { return };
-    // Each notice is one JSON string in the transcript: its newlines are escaped there.
-    let text = text.replace("\\n", "\n");
-    // To the work as it is now: a hook may have registered more while the file was read.
-    hub.edit_background(sid, generation, |bg| bg.notified(&text));
+}
+
+impl Background {
+    /// Read complete records off the hub lock. The launch, an intermediate conversation and the
+    /// current conversation can each have received notices. Child hooks commonly name the
+    /// main transcript too, while delivery to that child is in its own queued_command record.
+    fn scan(&mut self) {
+        let legacy = self.tasks.iter().any(|t| t.transcript.is_none());
+        let owners: HashSet<String> = self.tasks.iter().filter_map(|t| t.owner.as_deref())
+            .filter(|id| crate::agents::valid_resume_id(id)).map(str::to_owned).collect();
+        let mut pending: Vec<PathBuf> = self.previous.iter().chain(self.transcript.iter())
+            .chain(self.tasks.iter().filter_map(|t| t.transcript.as_ref()))
+            .map(PathBuf::from).collect();
+        let mut visited = HashSet::new();
+        while let Some(path) = pending.pop() {
+            if self.tasks.is_empty() { break }
+            if path.extension().is_none_or(|ext| ext != "jsonl") || !visited.insert(path.clone()) { continue }
+            let main = path.parent().and_then(Path::file_name).is_none_or(|name| name != "subagents");
+            if main {
+                let children = path.with_extension("").join("subagents");
+                pending.extend(owners.iter().map(|id| children.join(format!("agent-{id}.jsonl"))));
+                // Old records have neither owner nor launch path. Inspect only this conversation's
+                // sidechains and the predecessors that its derived-from records identify.
+                if legacy && let Ok(entries) = children.read_dir() {
+                    pending.extend(entries.flatten().filter(|e| e.file_name().to_string_lossy().starts_with("agent-")).map(|e| e.path()));
+                }
+            }
+            self.scan_file(&path, legacy && main, &mut pending);
+        }
+    }
+
+    fn scan_file(&mut self, path: &Path, legacy_main: bool, pending: &mut Vec<PathBuf>) {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let Ok(mut file) = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(path) else { return };
+        let Ok(meta) = file.metadata() else { return };
+        if !meta.is_file() { return }
+        let mut offset = self.offsets.get(path)
+            .filter(|c| c.device == meta.dev() && c.inode == meta.ino() && c.offset <= meta.len())
+            .map_or(0, |c| c.offset);
+        if file.seek(SeekFrom::Start(offset)).is_err() { return }
+        let mut reader = BufReader::new(file.take(meta.len() - offset));
+        let mut bytes = Vec::new();
+        while !self.tasks.is_empty() {
+            bytes.clear();
+            let Ok(n) = reader.read_until(b'\n', &mut bytes) else { break };
+            if !bytes.ends_with(b"\n") { break } // retry a partially appended record
+            offset += n as u64;
+            let Ok(line) = std::str::from_utf8(&bytes) else { continue };
+            if !line.contains("<task-notification>") && !line.contains("Successfully stopped")
+                && !line.contains(r#""is_error""#) && !(legacy_main && line.contains(r#""derived-from""#)) { continue }
+            let Ok(row) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+            if legacy_main && row["type"] == "derived-from" && let Some(parents) = row["sessions"].as_array() {
+                for parent in parents {
+                    if parent["via"] == "clear" && parent["type"] == "claude_code_session"
+                        && let Some(id) = parent["id"].as_str().filter(|id| crate::agents::valid_resume_id(id))
+                    {
+                        let path = path.with_file_name(format!("{id}.jsonl"));
+                        if let Some(name) = path.to_str() && !self.previous.iter().any(|p| p == name) {
+                            self.previous.push(name.to_owned());
+                            pending.push(path);
+                        }
+                    }
+                }
+            } else {
+                self.transcript_result(&row);
+            }
+        }
+        self.offsets.insert(path.to_owned(), TranscriptCursor { device: meta.dev(), inode: meta.ino(), offset });
+    }
+
+    fn transcript_result(&mut self, row: &serde_json::Value) {
+        let at = row["timestamp"].as_str().and_then(|s| s.parse::<jiff::Timestamp>().ok()).map(|t| t.as_millisecond());
+        if let Some(text) = transcript_notice(row) {
+            self.notified(text, at);
+        } else if row["type"] == "user" {
+            let result = &row["toolUseResult"];
+            if matches!(result["task_type"].as_str(), Some("local_bash" | "local_agent"))
+                && let Some(id) = stopped_id(result)
+            {
+                self.finish(|t| t.task.as_deref() == Some(id) && t.accepts_notice_at(at));
+            }
+            if let Some(parts) = row["message"]["content"].as_array() {
+                for part in parts {
+                    if part["type"] == "tool_result" && part["is_error"] == true
+                        && let Some(call) = text_of(part.get("tool_use_id"))
+                    {
+                        self.tasks.retain(|t| t.task.is_some() || t.tool_use != call);
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn refresh_background(hub: &Arc<Hub>, sid: SessionId) {
+    let Some((generation, before)) = hub.background_of(sid) else { return };
+    if before.tasks.is_empty() { return }
+    let Ok((before, after)) = tokio::task::spawn_blocking(move || {
+        let mut after = before.clone();
+        after.scan();
+        (before, after)
+    }).await else { return };
+    hub.edit_background(sid, generation, |live| {
+        if *live == before {
+            *live = after;
+        } else {
+            // Keep launches, newly identified tasks and reactivated agents that raced the read.
+            live.finish(|t| before.tasks.contains(t) && !after.tasks.contains(t));
+        }
+        if live.tasks.is_empty() {
+            live.previous.clear();
+            live.offsets.clear();
+        }
+    });
 }
 
 /// What `blocker` reads about an agent's session besides its info.
@@ -1751,7 +1915,7 @@ mod tests {
         assert!(bg.after_hook("UserPromptSubmit", &json!({"prompt":
             "<task-notification>\n<task-id>bx9</task-id>\n<tool-use-id>t2</tool-use-id>\n<status>completed</status>\n</task-notification>"})));
         // ... or found in the transcript, where the CLI delivered it without a hook.
-        bg.notified(r#"{"content":"<task-notification>\n<task-id>zz</task-id>\n<tool-use-id>t3</tool-use-id>\n<status>killed</status>"}"#);
+        bg.notified("<task-notification>\n<task-id>zz</task-id>\n<tool-use-id>t3</tool-use-id>\n<status>killed</status>", None);
         assert_eq!(bg.running(), 0);
         // A launch that failed never ran.
         bg.after_hook("PreToolUse", &launch("t5", "Bash"));
@@ -1764,6 +1928,144 @@ mod tests {
         let mut i = info(AgentState::Idle);
         i.background = 2;
         assert!(blocker(&agent(), Some(&i), &ready()).unwrap().contains("2 background tasks"));
+    }
+
+    const CLEAR_TRANSCRIPT: &str = include_str!("fixtures/claude_background_clear.jsonl");
+
+    fn transcript_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("muster-background-{}", crate::paths::random_token()));
+        std::fs::create_dir(&dir).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn background_work_survives_clear_until_its_notices_in_the_new_conversation() {
+        use std::io::Write;
+        let hub = hub(false);
+        let (generation, _) = hub.background_of(1).unwrap();
+        let dir = transcript_dir();
+        let alpha = dir.join("alpha.jsonl");
+        let beta = dir.join("beta.jsonl");
+        let mut lines = CLEAR_TRANSCRIPT.split_inclusive('\n');
+        std::fs::write(&beta, [lines.next().unwrap(), lines.next().unwrap()].concat()).unwrap();
+        hub.edit_background(1, generation, |bg| {
+            bg.after_hook("PostToolUse", &json!({"transcript_path":alpha, "tool_use_id":"agent-call",
+                "tool_name":"Agent","tool_response":{"status":"async_launched","agentId":"worker-alpha"}}));
+            bg.after_hook("PostToolUse", &json!({"transcript_path":alpha, "agent_id":"worker-alpha",
+                "tool_use_id":"child-call","tool_name":"Bash","tool_response":{"backgroundTaskId":"shell-alpha"}}));
+            bg.after_hook("SessionStart", &json!({"source":"clear","transcript_path":beta}));
+        });
+        refresh_background(&hub, 1).await;
+        assert_eq!(hub.session(1).unwrap().background, 2);
+        // Read during an append, then once each task's result is available.
+        let mut file = std::fs::OpenOptions::new().append(true).open(&beta).unwrap();
+        let command = lines.next().unwrap();
+        file.write_all(command.trim_end().as_bytes()).unwrap();
+        refresh_background(&hub, 1).await;
+        assert_eq!(hub.session(1).unwrap().background, 2);
+        file.write_all(b"\n").unwrap();
+        refresh_background(&hub, 1).await;
+        assert_eq!(hub.session(1).unwrap().background, 1);
+        file.write_all(lines.next().unwrap().as_bytes()).unwrap();
+        // Another clear before the next check: the notice is now in an intermediate file.
+        hub.edit_background(1, generation, |bg| {
+            bg.after_hook("SessionStart", &json!({"source":"clear","transcript_path":dir.join("gamma.jsonl")}));
+        });
+        refresh_background(&hub, 1).await;
+        assert_eq!(hub.session(1).unwrap().background, 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_childs_own_notice_in_the_old_conversation_also_reconciles_legacy_state() {
+        let dir = transcript_dir();
+        let alpha = dir.join("alpha.jsonl");
+        let beta = dir.join("beta.jsonl");
+        let children = dir.join("alpha/subagents");
+        std::fs::create_dir_all(&children).unwrap();
+        // Only beta's clear ancestry is known to a backend reading the old saved format.
+        std::fs::write(&beta, format!("{}\n", CLEAR_TRANSCRIPT.lines().next().unwrap())).unwrap();
+        let mut legacy: Background = serde_json::from_value(json!({"transcript": beta,
+            "tasks":[{"tool_use":"child-call","task":"shell-alpha"}]})).unwrap();
+        let mut bg = Background::default();
+        bg.after_hook("PreToolUse", &json!({"agent_id":"worker-alpha","transcript_path":alpha,
+            "tool_name":"Bash","tool_use_id":"child-call","tool_input":{"run_in_background":true}}));
+        bg.after_hook("PostToolUse", &json!({"agent_id":"worker-alpha","transcript_path":alpha,
+            "tool_name":"Bash","tool_use_id":"child-call","tool_response":{"backgroundTaskId":"shell-alpha"}}));
+        bg.after_hook("SessionStart", &json!({"source":"clear","transcript_path":beta}));
+        let enqueue: serde_json::Value = serde_json::from_str(CLEAR_TRANSCRIPT.lines().nth(2).unwrap()).unwrap();
+        let text = &enqueue["content"];
+        // A tool quoting a complete notice cannot finish a task. No notice in either main file.
+        std::fs::write(&alpha, format!("{}\n", json!({"type":"user","message":{"role":"user","content":[
+            {"type":"tool_result","tool_use_id":"other","content":text}]}}))).unwrap();
+        for state in [&mut bg, &mut legacy] {
+            state.scan();
+            assert_eq!(state.running(), 1);
+        }
+        let row = json!({"isSidechain":true,"type":"attachment","agentId":"worker-alpha","sessionId":"alpha",
+            "attachment":{"type":"queued_command","commandMode":"task-notification","origin":{"kind":"task-notification"},
+                "prompt":text},"timestamp":"2026-01-01T00:00:00.000Z"});
+        let later = json!({"type":"assistant","message":{"content":[{"type":"text","text":"x".repeat(4 * 1024 * 1024)}]}});
+        std::fs::write(children.join("agent-worker-alpha.jsonl"), format!("{row}\n{later}\n")).unwrap();
+        for state in [&mut bg, &mut legacy] {
+            state.scan();
+            assert_eq!(state.running(), 0);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn successful_stops_and_the_sessions_in_flight_list_settle_known_tasks() {
+        let mut bg = Background::default();
+        for id in ["alpha","beta","gamma"] {
+            bg.after_hook("PostToolUse", &json!({"tool_name":"Bash","tool_use_id":id,"tool_response":{"backgroundTaskId":id}}));
+        }
+        bg.after_hook("PreToolUse", &json!({"tool_name":"Bash","tool_use_id":"pending","tool_input":{"run_in_background":true}}));
+        let stop = json!({"tool_name":"TaskStop","tool_input":{"task_id":"alpha"}});
+        bg.after_hook("PostToolUseFailure", &stop);
+        bg.after_hook("Stop", &json!({}));
+        bg.after_hook("Stop", &json!({"background_tasks":[{}]}));
+        assert_eq!(bg.running(), 4);
+        for (tool, id) in [("TaskStop", "alpha"), ("KillShell", "beta")] {
+            bg.after_hook("PostToolUse", &json!({"tool_name":tool,
+                "tool_response":{"message":format!("Successfully stopped task: {id}"),"task_type":"local_bash","task_id":id}}));
+        }
+        assert_eq!(bg.running(), 2);
+        bg.after_hook("Stop", &json!({"background_tasks":[{"id":"gamma","type":"shell","status":"running"}]}));
+        assert_eq!(bg.running(), 2);
+        bg.after_hook("Stop", &json!({"background_tasks":[]}));
+        assert_eq!(bg.running(), 1);
+        bg.after_hook("PostToolUseFailure", &json!({"tool_use_id":"pending"}));
+        assert_eq!(bg.running(), 0);
+    }
+
+    #[test]
+    fn old_reports_cannot_end_an_agent_the_registry_still_lists() {
+        let mut bg = Background::default();
+        bg.after_hook("PostToolUse", &json!({"tool_name":"Agent","tool_use_id":"agent-call",
+            "tool_response":{"status":"async_launched","agentId":"worker-alpha"}}));
+        bg.after_hook("SubagentStop", &json!({"agent_id":"worker-alpha"}));
+        bg.after_hook("Stop", &json!({"background_tasks":[{"id":"worker-alpha","status":"running","type":"subagent"}]}));
+        let report = serde_json::from_str(CLEAR_TRANSCRIPT.lines().last().unwrap()).unwrap();
+        bg.transcript_result(&report);
+        assert_eq!(bg.running(), 1);
+        bg.after_hook("Stop", &json!({"background_tasks":[]}));
+        assert_eq!(bg.running(), 0);
+    }
+
+    #[test]
+    fn transcript_tool_results_clear_a_failed_launch_and_a_confirmed_stop() {
+        let mut bg = Background::default();
+        bg.after_hook("PreToolUse", &json!({"tool_name":"Bash","tool_use_id":"launch","tool_input":{"run_in_background":true}}));
+        bg.after_hook("PostToolUse", &json!({"tool_name":"Bash","tool_use_id":"other","tool_response":{"backgroundTaskId":"shell-alpha"}}));
+        bg.transcript_result(&json!({"type":"user","message":{"role":"user","content":[
+            {"type":"tool_result","tool_use_id":"launch","content":"Launch failed","is_error":true}]},"toolUseResult":"Launch failed"}));
+        assert_eq!(bg.running(), 1);
+        bg.transcript_result(&json!({"type":"user","message":{"role":"user","content":[
+            {"type":"tool_result","tool_use_id":"stop","content":"Stopped"}]},
+            "toolUseResult":{"message":"Successfully stopped task: shell-alpha","task_id":"shell-alpha",
+                "task_type":"local_bash","command":"echo alpha"}}));
+        assert_eq!(bg.running(), 0);
     }
 
     /// Work moved to the background while it ran (a command past its timeout, Ctrl+B) is only
@@ -1787,7 +2089,7 @@ mod tests {
         assert!(!bg.after_hook("PostToolUse", &json!({"tool_name": "Bash", "tool_use_id": "t1",
             "tool_response": {"backgroundTaskId": "b7"}})));
         // They end as any background work does.
-        bg.notified("<task-notification>\n<task-id>b7</task-id>\n<tool-use-id>t1</tool-use-id>\n<status>completed</status>");
+        bg.notified("<task-notification>\n<task-id>b7</task-id>\n<tool-use-id>t1</tool-use-id>\n<status>completed</status>", None);
         assert!(bg.after_hook("SubagentStop", &json!({"agent_id": "a9"})));
         assert_eq!(bg.running(), 0);
     }
@@ -1810,8 +2112,8 @@ mod tests {
             bg.after_hook("PreToolUse", &launch("t2"));
         });
         // ... and the notice it found ends only the task it names.
-        let text = "<task-notification>\n<tool-use-id>t1</tool-use-id>\n</task-notification>";
-        hub.edit_background(1, generation, |bg| bg.notified(text));
+        let text = "<task-notification>\n<tool-use-id>t1</tool-use-id>\n<status>completed</status>\n</task-notification>";
+        hub.edit_background(1, generation, |bg| bg.notified(text, None));
         let (_, now) = hub.background_of(1).unwrap();
         assert_eq!(now.tasks.iter().map(|t| t.tool_use.as_str()).collect::<Vec<_>>(), vec!["t2"]);
         assert_eq!(hub.session(1).unwrap().background, 1);

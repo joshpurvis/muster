@@ -1719,6 +1719,61 @@ async fn other_workspaces_reachable_when_enabled() {
 }
 
 #[tokio::test]
+async fn wait_for_state_stops_streaming_when_access_is_revoked() {
+    use futures::StreamExt;
+
+    let (m, st) = state();
+    let st = Arc::new(st);
+    add_shell_and_other_workspace(&m);
+    let args = json!({"session_id": 5, "states": ["idle"], "timeout_seconds": 15});
+    let (denied, is_error) = call(&st, "wait_for_state", args.clone()).await;
+    assert!(is_error && denied.contains("another workspace"), "{denied}");
+
+    // A non-matching state would produce progress, and a matching state would end the wait.
+    for next in [AgentState::NeedsApproval, AgentState::Idle] {
+        m.update(5, |s| s.state = AgentState::Working);
+        st.edit_guard(|g| {
+            g.communication.grants.push(super::communication::Grant {
+                from_workspace: 1,
+                to_workspace: 2,
+                from_session: Some(1),
+                message: false,
+                read_output: true,
+            });
+        }).unwrap();
+        let request = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
+            "name": "wait_for_state", "arguments": args, "_meta": {"progressToken": "alpha"}
+        }});
+        let token = request["params"]["_meta"]["progressToken"].clone();
+        let call = {
+            let st = st.clone();
+            async move { post(&st, &auth("tok1"), request).await }
+        };
+        let event = |frame: axum::body::Bytes| {
+            let text = std::str::from_utf8(&frame).unwrap();
+            parse(text.strip_prefix("event: message\ndata: ").unwrap().trim_end())
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let response = super::progress_response(call, token, Duration::from_secs(30)).await;
+            assert_eq!(response.headers()["content-type"], "text/event-stream");
+            let mut stream = response.into_body().into_data_stream();
+            let first = event(stream.next().await.unwrap().unwrap());
+            assert_eq!(first["params"]["progressToken"], "alpha");
+            assert_eq!(first["params"]["message"], "Waiting for session 5: working");
+
+            st.edit_guard(|g| g.communication.grants.clear()).unwrap();
+            m.update(5, |s| s.state = next);
+
+            let last = event(stream.next().await.unwrap().unwrap());
+            assert_eq!(last, json!({"jsonrpc": "2.0", "id": 1, "result": {
+                "isError": true, "content": [{"type": "text", "text": denied}]
+            }}));
+            assert!(stream.next().await.is_none());
+        }).await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn spawn_rate_limit() {
     let (_, mut st) = state();
     st.limits.max_children_per_caller = 100;

@@ -1581,7 +1581,7 @@ async fn wait_for_state<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Arg
         .clamp(0, st.limits.wait_max_s as i64) as u64;
     let after_ms = a.int("after_ms")?;
     reachable_session(st, caller, id)?;
-    let (info, verdict, waited_ms) = wait_loop(st, id, &states, timeout_s, after_ms).await?;
+    let (info, verdict, waited_ms) = wait_loop(st, caller, id, &states, timeout_s, after_ms).await?;
     let mut out = json!({
         "session_id": id,
         "state": info.state,
@@ -1602,6 +1602,7 @@ async fn wait_for_state<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Arg
 /// the time waited.
 async fn wait_loop<B: Backend>(
     st: &McpState<B>,
+    caller: SessionId,
     id: SessionId,
     states: &[AgentState],
     timeout_s: u64,
@@ -1632,6 +1633,8 @@ async fn wait_loop<B: Backend>(
             now_ms: now_unix,
         };
         let verdict = wait::evaluate(&info, states, &ctx);
+        // Reach can change while waiting. Check it before exposing this state in either output.
+        check_session_reach(st, caller, &info)?;
         let now = Instant::now();
         if verdict != Verdict::Wait || now >= deadline {
             return Ok((info, verdict, started.elapsed().as_millis() as u64));

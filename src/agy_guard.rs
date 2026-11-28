@@ -1,4 +1,5 @@
-//! The owner's Claude Code `PreToolUse` guards, run for Antigravity agents too.
+//! The owner's Claude Code tool and Stop guards, run for Antigravity agents too.
+//! Stop hooks use a private transcript of the current turn (see [`stop`]).
 //!
 //! An owner can register guard scripts as Claude Code `PreToolUse` hooks (settings.json
 //! `hooks.PreToolUse`: a tool-name `matcher` and `command`s): a check that stops private details
@@ -25,6 +26,8 @@
 //! guard refuses the call (their reasons joined); otherwise an `ask` asks the human every time
 //! (`force_ask`). When this command can't read agy's payload or its own configuration, it asks
 //! too: a human looks before the call runs.
+
+mod stop;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -59,19 +62,14 @@ pub struct Config {
     /// The session's working folder: the guards run there, with `CLAUDE_PROJECT_DIR` set to it.
     pub cwd: String,
     pub guards: Vec<Guard>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stop: Vec<Guard>,
 }
 
-impl Config {
-    /// The longest a call's guards can take, which agy's own hook timeout must exceed.
-    pub fn longest_s(&self) -> u64 {
-        self.guards.iter().map(|g| g.timeout_s).max().unwrap_or(0)
-    }
-}
-
-/// The `PreToolUse` command hooks of a Claude Code settings file.
-pub fn from_claude_settings(v: &Value) -> Vec<Guard> {
+/// The command hooks for one event in a Claude Code settings file.
+fn from_claude_settings(v: &Value, event: &str) -> Vec<Guard> {
     let mut out = Vec::new();
-    for m in v.pointer("/hooks/PreToolUse").and_then(Value::as_array).into_iter().flatten() {
+    for m in v.get("hooks").and_then(|hooks| hooks.get(event)).and_then(Value::as_array).into_iter().flatten() {
         let matcher = m.get("matcher").and_then(Value::as_str).unwrap_or("").to_string();
         for h in m.get("hooks").and_then(Value::as_array).into_iter().flatten() {
             if h.get("type").and_then(Value::as_str).is_some_and(|t| t != "command") {
@@ -89,27 +87,36 @@ pub fn from_claude_settings(v: &Value) -> Vec<Guard> {
 /// The guards a new Antigravity session runs: those of the file `MUSTER_ANTIGRAVITY_GUARDS`
 /// names (a Claude Code settings file), else of `~/.claude/settings.json`; none when that
 /// variable is `off` (or `0`, `false`, `no`, empty) or the file is missing or unreadable.
-pub fn load() -> Vec<Guard> {
+pub fn load(cwd: &Path) -> Config {
     let file = match std::env::var("MUSTER_ANTIGRAVITY_GUARDS") {
-        Ok(v) if matches!(v.trim().to_ascii_lowercase().as_str(), "" | "0" | "off" | "false" | "no") => return Vec::new(),
+        Ok(v) if matches!(v.trim().to_ascii_lowercase().as_str(), "" | "0" | "off" | "false" | "no") => return Config::default(),
         Ok(v) => PathBuf::from(v.trim()),
         Err(_) => crate::paths::home_dir().join(".claude/settings.json"),
     };
-    crate::adapters::antigravity::read_json(&file).map(|v| from_claude_settings(&v)).unwrap_or_default()
+    let settings = crate::adapters::antigravity::read_json(&file).unwrap_or_default();
+    Config {
+        cwd: cwd.to_string_lossy().into(),
+        guards: from_claude_settings(&settings, "PreToolUse"),
+        stop: from_claude_settings(&settings, "Stop"),
+    }
 }
 
 /// The agy hook file that sends the mapped tools' calls through `muster hook antigravity guard`.
 pub fn hooks_json(bin: &Path, config_file: &Path, config: &Config) -> Value {
     let q = |p: &Path| crate::adapters::claude::sh_quote(&p.to_string_lossy());
-    json!({"muster-guards": {"PreToolUse": [{
-        "matcher": AGY_MATCHER,
-        "hooks": [{
-            "type": "command",
-            "command": format!("{} hook antigravity guard {}", q(bin), q(config_file)),
-            // Above the slowest guard: this command answers before agy gives up on it.
-            "timeout": config.longest_s() + 10,
-        }],
-    }]}})
+    let handler = |verb: &str, guards: &[Guard]| json!([{
+        "type": "command",
+        "command": format!("{} hook antigravity {verb} {}", q(bin), q(config_file)),
+        "timeout": guards.iter().map(|g| g.timeout_s).max().unwrap_or(0) + 10,
+    }]);
+    let mut events = json!({});
+    if !config.guards.is_empty() {
+        events["PreToolUse"] = json!([{"matcher":AGY_MATCHER, "hooks":handler("guard", &config.guards)}]);
+    }
+    if !config.stop.is_empty() {
+        events["Stop"] = handler("stop", &config.stop);
+    }
+    json!({"muster-guards": events})
 }
 
 /// Does Claude Code's `matcher` name `tool`? Alternatives split on `|` (or `,`), anchors dropped,
@@ -250,8 +257,17 @@ fn ask(why: &str) -> Value {
     json!({"decision": "force_ask", "reason": format!("Muster couldn't check this call against your guards ({why}); look before approving.")})
 }
 
+type ReadAnswer = fn(Option<i32>, &[u8], &[u8]) -> (Decision, Option<String>);
+
+/// Read without letting a descendant holding a pipe open outlive the hook deadline.
+fn read_pipe(pipe: Option<impl Read + Send + 'static>) -> std::sync::mpsc::Receiver<(Vec<u8>, bool)> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || { let _ = tx.send(capped(pipe)); });
+    rx
+}
+
 /// Run one guard with Claude Code's input on stdin, in `cwd`, for at most its timeout.
-fn run_guard(g: &Guard, input: &[u8], cwd: &Path) -> (Decision, Option<String>) {
+fn run_guard(g: &Guard, input: &[u8], cwd: &Path, read_answer: ReadAnswer) -> (Decision, Option<String>) {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
     let mut cmd = Command::new("/bin/sh");
@@ -265,13 +281,13 @@ fn run_guard(g: &Guard, input: &[u8], cwd: &Path) -> (Decision, Option<String>) 
     let Ok(mut child) = cmd.spawn() else { return (Decision::Allow, None) };
     let pid = child.id() as i32;
     let (mut stdin, out, err) = (child.stdin.take(), child.stdout.take(), child.stderr.take());
-    let stdout = std::thread::spawn(move || capped(out));
-    let stderr = std::thread::spawn(move || capped(err));
+    let stdout = read_pipe(out);
+    let stderr = read_pipe(err);
     let data = input.to_vec();
     std::thread::spawn(move || {
         if let Some(mut w) = stdin.take() { let _ = w.write_all(&data); }
     });
-    let deadline = Instant::now() + Duration::from_secs(g.timeout_s);
+    let deadline = Instant::now() + Duration::from_secs(g.timeout_s.clamp(1, MAX_TIMEOUT_S));
     let code = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status.code(),
@@ -288,12 +304,15 @@ fn run_guard(g: &Guard, input: &[u8], cwd: &Path) -> (Decision, Option<String>) 
     // Its group too: a guard that left a child holding the pipes open can't hold this answer.
     // SAFETY: as above.
     unsafe { libc::kill(-pid, libc::SIGKILL) };
-    let ((stdout, too_long), (stderr, _)) = (stdout.join().unwrap_or_default(), stderr.join().unwrap_or_default());
+    let remaining = || deadline.saturating_duration_since(Instant::now());
+    let (Ok((stdout, too_long)), Ok((stderr, _))) =
+        (stdout.recv_timeout(remaining()), stderr.recv_timeout(remaining()))
+    else { return (Decision::Allow, None) };
     if code == Some(0) && too_long {
         // Its decision is past what this reads: a human looks instead of guessing it was allow.
         return (Decision::Ask, Some("a guard's answer was too long to read".into()));
     }
-    answer(code, &stdout, &stderr)
+    read_answer(code, &stdout, &stderr)
 }
 
 /// The first `MAX_OUTPUT` bytes of a guard's pipe, and whether it wrote more. The rest is read
@@ -334,11 +353,14 @@ pub fn decide(payload: &[u8], config: Option<Config>) -> Value {
         "tool_use_id": p.pointer("/toolCall/id").cloned().unwrap_or(Value::Null),
     });
     let input = serde_json::to_vec(&input).unwrap_or_default();
-    let answers: Vec<(Decision, Option<String>)> = std::thread::scope(|s| {
-        let runs: Vec<_> = guards.iter().map(|g| s.spawn(|| run_guard(g, &input, &cwd))).collect();
+    combine(&run_guards(guards, &input, &cwd, answer))
+}
+
+fn run_guards(guards: Vec<&Guard>, input: &[u8], cwd: &Path, read_answer: ReadAnswer) -> Vec<(Decision, Option<String>)> {
+    std::thread::scope(|s| {
+        let runs: Vec<_> = guards.into_iter().map(|g| s.spawn(move || run_guard(g, input, cwd, read_answer))).collect();
         runs.into_iter().map(|r| r.join().unwrap_or((Decision::Allow, None))).collect()
-    });
-    combine(&answers)
+    })
 }
 
 fn read_config(file: &str) -> Option<Config> {
@@ -349,16 +371,35 @@ fn read_config(file: &str) -> Option<Config> {
     }
     let mut data = Vec::new();
     f.take(1 << 20).read_to_end(&mut data).ok()?;
-    serde_json::from_slice(&data).ok()
+    let config: Config = serde_json::from_slice(&data).ok()?;
+    (config.guards.len() <= MAX_GUARDS && config.stop.len() <= MAX_GUARDS).then_some(config)
 }
 
-/// `muster hook antigravity guard <config file>`: agy's `PreToolUse` payload on stdin, its answer
-/// on stdout. Always exits 0 with JSON (a failing hook blocks the call in agy).
-pub fn run(config_file: Option<&str>) -> i32 {
-    let mut payload = Vec::new();
-    let _ = std::io::stdin().take(MAX_STDIN as u64).read_to_end(&mut payload);
+/// Hook payload on stdin, decision on stdout. Leave time inside agy's timeout to
+/// answer even if the writer leaves stdin open.
+fn stdin_payload() -> Vec<u8> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut payload = Vec::new();
+        if std::io::stdin().take(MAX_STDIN as u64 + 1).read_to_end(&mut payload).is_ok()
+            && payload.len() <= MAX_STDIN
+        {
+            let _ = tx.send(payload);
+        }
+    });
+    rx.recv_timeout(Duration::from_secs(2)).unwrap_or_default()
+}
+
+pub fn run(config_file: Option<&str>, is_stop: bool) -> i32 {
+    let payload = stdin_payload();
     let config = config_file.and_then(read_config);
-    let answer = decide(&payload, config);
+    let answer = if is_stop {
+        config_file.and_then(|p| Path::new(p).parent()).and_then(|dir| {
+            stop::decide(&payload, config?, dir).ok()
+        }).unwrap_or_else(|| json!({"decision": "allow"}))
+    } else {
+        decide(&payload, config)
+    };
     let mut out = std::io::stdout();
     let _ = writeln!(out, "{answer}").and_then(|()| out.flush());
     0

@@ -721,9 +721,10 @@ fn main() -> ExitCode {
     // (no clap, no runtime) so they stay fast.
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(String::as_str) == Some("hook") {
-        // Antigravity's PreToolUse hook: the owner's guards, answered on stdout (src/agy_guard.rs).
-        if args.get(2).map(String::as_str) == Some("antigravity") && args.get(3).map(String::as_str) == Some("guard") {
-            return ExitCode::from(agy_guard::run(args.get(4).map(String::as_str)).clamp(0, 255) as u8);
+        if args.get(2).is_some_and(|kind| kind == "antigravity")
+            && let Some(event @ ("guard" | "stop")) = args.get(3).map(String::as_str)
+        {
+            return ExitCode::from(agy_guard::run(args.get(4).map(String::as_str), event == "stop") as u8);
         }
         let code = hookcmd::run(
             args.get(2).map(String::as_str).unwrap_or(""),

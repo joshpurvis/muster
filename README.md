@@ -149,7 +149,9 @@ muster daemon [--foreground]
 ```
 
 Each `muster` opens its own window and returns at once. Closing a window keeps its tabs; the
-next `muster` reopens them.
+next `muster` reopens them. When you follow a web link in the native Linux window, it passes
+the desktop's activation token so the browser can come forward if your desktop allows it
+(`misc:focus_on_activate` on Hyprland).
 
 Without the `gui` feature, the UI opens in the first browser found out of `$MUSTER_BROWSER`,
 `chromium`, `google-chrome-stable` or `brave`, in `--app` mode with its own profile. If none

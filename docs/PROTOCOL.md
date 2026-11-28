@@ -336,8 +336,12 @@ sub-agent or command started with `run_in_background`, or moved to the backgroun
 (a command past its timeout, Ctrl+B: its tool result has a `backgroundTaskId`), that hasn't
 reported back). A conversation clear or compaction can leave this work running. Muster checks
 the launch transcript, subsequent conversations in the same run and the owning sub-agent's
-transcripts for completion, failure or a confirmed stop. The main Claude `Stop` hook also
-reports which tasks are still in flight on versions that supply `background_tasks`. Older
+transcripts for completion, failure or a confirmed stop. It opens these files beneath the
+launch profile’s `projects` directory. A completion notice needs Claude’s task-notification
+metadata. After further sub-agent activity, its completion must also have a creation time
+later than that activity. Typed prompts and ordinary queue entries can quote the same notice.
+A main Claude `Stop` hook that lists a task in `background_tasks` counts as activity. An
+omitted task stays counted because the snapshot may predate a concurrent launch. Older
 saved records use the current transcript's `derived-from` clear history to find earlier
 conversations and their sub-agents. The same check applies to a profile move or kind switch
 with `--now`. Sleep also waits while the agent has prompts queued or being typed, has a

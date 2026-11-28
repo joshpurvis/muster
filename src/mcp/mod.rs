@@ -1,4 +1,4 @@
-//! MCP server (Streamable HTTP, JSON responses). OWNER: mcp implementer. See docs/MCP.md.
+//! MCP server (Streamable HTTP). OWNER: mcp implementer. See docs/MCP.md.
 //!
 //! `router(hub)` serves the MCP endpoint at "/" of the returned router; the server nests it at
 //! `/mcp`. Layout:
@@ -8,7 +8,14 @@
 //! - `wait`: wait_for_state staleness rules (pure) + event waiting.
 //! - `backend`: the `Backend` trait (hub surface we use) and `HubBackend`.
 
+use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Duration;
+
+use axum::response::sse::{Event, Sse};
+use futures::{StreamExt, stream};
+use serde_json::{Value, json};
+use tokio::sync::watch;
 
 use axum::Router;
 use axum::body::Bytes;
@@ -177,7 +184,95 @@ async fn handle_post(
     body: Bytes,
 ) -> Response {
     let peer = peer.and_then(|p| p.0.addr);
-    let reply = PEER.scope(peer, protocol::handle_post(&st, &extract_headers(&headers), &body)).await;
+    let headers = extract_headers(&headers);
+    let (caller, msg) = match protocol::parse_post(&st, &headers, &body) {
+        Ok(request) => request,
+        Err(reply) => return json_response(reply),
+    };
+    let token = msg.pointer("/params/_meta/progressToken")
+        .filter(|t| t.is_string() || t.is_i64() || t.is_u64())
+        .filter(|_| msg["method"] == "tools/call")
+        .cloned();
+    let call = PEER.scope(peer, async move {
+        protocol::dispatch_post(&st, &headers, caller, msg).await
+    });
+    match token {
+        Some(token) => progress_response(call, token, Duration::from_secs(30)).await,
+        None => json_response(call.await),
+    }
+}
+
+tokio::task_local! {
+    /// Only the authenticated call being polled for this POST may publish to its stream.
+    static PROGRESS: watch::Sender<String>;
+}
+
+fn report_progress(message: impl FnOnce() -> String) {
+    let _ = PROGRESS.try_with(|tx| {
+        let message = message();
+        tx.send_if_modified(|previous| {
+            if *previous == message { return false; }
+            *previous = message;
+            true
+        });
+    });
+}
+
+struct Progress {
+    token: Value,
+    updates: watch::Receiver<String>,
+    ticks: tokio::time::Interval,
+    count: u64,
+}
+
+impl Progress {
+    async fn next(&mut self) -> Event {
+        tokio::select! {
+            _ = self.ticks.tick() => {}
+            _ = self.updates.changed() => {}
+        }
+        self.count += 1;
+        sse_message(json!({
+            "jsonrpc": "2.0", "method": "notifications/progress",
+            "params": {"progressToken": self.token, "progress": self.count,
+                       "message": *self.updates.borrow_and_update()}
+        }))
+    }
+}
+
+/// Own the tool future in the HTTP body. Disconnecting drops it (including its audit and
+/// wait guards). A fast result or validation error keeps its original HTTP status and body.
+async fn progress_response(
+    call: impl Future<Output = protocol::Reply> + Send + 'static,
+    token: Value,
+    interval: Duration,
+) -> Response {
+    let (tx, updates) = watch::channel("Waiting for the tool".to_owned());
+    let mut call = Box::pin(PROGRESS.scope(tx, call));
+    let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut progress = Progress { token, updates, ticks, count: 0 };
+    let first = tokio::select! {
+        biased;
+        reply = &mut call => return json_response(reply),
+        event = progress.next() => event,
+    };
+    let rest = stream::unfold(Some((call, progress)), |state| async move {
+        let (mut call, mut progress) = state?;
+        tokio::select! {
+            biased;
+            reply = &mut call => Some((sse_message(reply.body.expect("tool call response")), None)),
+            event = progress.next() => Some((event, Some((call, progress)))),
+        }
+    });
+    Sse::new(stream::once(async { first }).chain(rest).map(Ok::<_, Infallible>)).into_response()
+}
+
+fn sse_message(value: Value) -> Event {
+    Event::default().event("message").data(value.to_string())
+}
+
+fn json_response(reply: protocol::Reply) -> Response {
     let status = StatusCode::from_u16(reply.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     match reply.body {
         Some(v) => (

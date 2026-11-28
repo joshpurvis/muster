@@ -306,6 +306,10 @@ pub async fn call<B: Backend>(
                     m.timed_out = true;
                     return Ok(pretty(&message_json(st, &m)));
                 }
+                super::report_progress(|| {
+                    let status = if m.delivered_at.is_some() { "delivered" } else { "queued" };
+                    format!("Waiting for session {to} to reply: {status}")
+                });
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             }
         }

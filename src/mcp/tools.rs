@@ -698,6 +698,9 @@ async fn panel_tool<B: Backend>(st: &McpState<B>, caller: SessionId, name: &str,
             return Err(format!("rate limit: at most {} panel opens/updates or posts per minute; try again in {wait_s}s", st.limits.post_per_window));
         }
     }
+    if name == "wait_for_panel_event" {
+        super::report_progress(|| "Waiting for a panel event".into());
+    }
     st.backend.panel_tool(caller, name, Value::Object(args.clone())).await
         .map(|v| pretty(&v)).map_err(|e| format!("{e:#}"))
 }
@@ -1633,6 +1636,7 @@ async fn wait_loop<B: Backend>(
         if verdict != Verdict::Wait || now >= deadline {
             return Ok((info, verdict, started.elapsed().as_millis() as u64));
         }
+        super::report_progress(|| format!("Waiting for session {id}: {}", info.state.as_str()));
         // Re-check at least every second (grace expiry, missed events).
         let tick = (deadline - now).min(Duration::from_secs(1));
         wait::next_change(&mut rx, id, tick).await;
@@ -1779,7 +1783,9 @@ async fn ask_agent<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_>
         &mut rx,
         d.session_id,
         Duration::from_secs(timeout_s),
-        || st.backend.session(d.session_id),
+        || st.backend.session(d.session_id).inspect(|info| {
+            super::report_progress(|| format!("Waiting for {}: {}", agent.name, info.state.as_str()));
+        }),
         || st.backend.agent_message_status(d.msg_id),
     )
     .await?;

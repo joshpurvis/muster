@@ -155,8 +155,9 @@ issue, a web page). Both must stay contained.
   every layout change, it has its own cookie store to log into, and neither a browser tab nor the
   phone can have one. An agent could drive it (navigate, read, screenshot).
 - **Everywhere else**, a page that can't be framed opens in the system browser.
-  The native Linux window passes the desktop's activation token so the browser can come forward
-  if the desktop allows it (`misc:focus_on_activate` on Hyprland).
+  When the human opens such a page from the native Linux window (a preview's "Open in browser"),
+  the window passes the desktop's activation token so the browser can come forward if the desktop
+  allows it (`misc:focus_on_activate` on Hyprland). An agent's own `xdg-open` carries no token.
 
 For PR review none of this is needed: Muster renders the diff from data, which is faster and
 lets the agent annotate it.

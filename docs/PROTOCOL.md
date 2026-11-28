@@ -1335,6 +1335,18 @@ server `muster`, called with `call_mcp_tool`, and a muster message is answered w
 (agy's callbacks carry no final message). An Antigravity agent's generated persona says the
 same; one written before this is updated once at its next start.
 
+For a session launched with a `claude-*` model, Muster also appends the owner's
+`~/.claude/CLAUDE.md` after the tools note in `.agents/AGENTS.md`. Both named agents and
+individual sessions supply their model through the launch arguments. The last explicit
+`--model NAME` or `--model=NAME` selects it. With MCP disabled, a separate rules-only
+added directory holds the file. Gemini and unspecified models use their usual rules.
+
+Set `MUSTER_ANTIGRAVITY_RULES` on the daemon to select another UTF-8 file, or set it
+to `off` to omit the copy. Muster reads it once per launch. A missing file is optional.
+A symlink, special file or file too large for agy's 24,000-byte limit including the tools
+note is refused. Muster copies the Markdown literally, without expanding Claude Code
+`@path` imports.
+
 agy loads MCP servers only when a turn starts or `/mcp` opens, and a conversation opened
 before they loaded never gets their tools (the one it opens at startup never has them; one
 opened later, or a resumed one, does). So a launch with the private workspace that resumes no
@@ -1353,7 +1365,7 @@ with no blank last line.
 **The owner's guards** (src/agy_guard.rs). Claude Code `PreToolUse` hooks the owner registered
 (a guard that stops private details leaving the machine, one that refuses unclear cards) run for
 Antigravity agents too. At each launch with the private workspace, Muster reads the command hooks
-under `hooks.PreToolUse` of `~/.claude/settings.json` (or of the Claude Code settings file
+under `hooks.PreToolUse` and `hooks.Stop` of `~/.claude/settings.json` (or of the Claude Code settings file
 `MUSTER_ANTIGRAVITY_GUARDS` names on the daemon; `off` for none) and writes them, with the tab's
 folder, to `<session>/antigravity-guards.json` (outside the agent's workspace), and an agy hook
 file `antigravity-workspace/.agents/hooks.json` (agy 1.5.13 loads it from an added directory, at
@@ -1372,6 +1384,22 @@ agy with JSON within the slowest guard's timeout (agy 1.5.13 blocks a call whose
 when it can't read agy's input or the guard list it asks, and when a guard's answer on stdout is
 past 1 MiB, or rewrites the call (`updatedInput`, which agy can't take). No guards configured: no
 hook file.
+
+For Stop hooks, the same hook file registers one `muster hook antigravity stop <list>`
+handler. It gives each command Claude Code's Stop input, including the conversation ID,
+working directory, and the `stop_hook_active` flag from agy's `continuationActive`.
+The guard inherits `MUSTER_SESSION_ID`. Its `transcript_path` names a
+private temporary JSONL file in the session directory. It contains the last explicit user
+request, assistant text, tool calls with their arguments, and tool results from that turn.
+Muster reads up to 16 MiB from the end of the CLI transcript and uses the matching full
+transcript when agy marks fields as truncated. The temporary copy is removed after the hooks run.
+
+Stop guards are advisory. A Claude Code `decision: "block"` or exit 2 asks agy to continue
+with the guard's reason. Guards can inspect the active flag on the next Stop check. The
+adapter also recognizes agy's own Stop continuation system message in the current turn,
+because agy 1.5.13 in print mode can keep reporting a false flag. Either signal lets the
+turn finish after one continuation. An unreadable turn, malformed answer, timeout or other hook failure
+allows the stop. If another guard successfully requests continuation, its reason still applies.
 
 On 23 Nov 2026, a signed-in check with agy 1.5.13 verified the title callback, hidden account
 information, conversation resume and command approval. A second check that day, in a real

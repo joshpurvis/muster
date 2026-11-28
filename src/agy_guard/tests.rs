@@ -26,16 +26,17 @@ fn guards_come_from_a_claude_settings_file() {
             {"matcher": "Bash|WebFetch", "hooks": [{"type": "command", "command": "guard-a", "timeout": 10}]},
             {"matcher": "AskUserQuestion", "hooks": [{"command": "guard-b"}, {"type": "prompt", "command": "x"}, {"command": "  "}]},
         ],
-        "Stop": [{"hooks": [{"command": "not-a-guard"}]}],
+        "Stop": [{"hooks": [{"command": "stop-guard"}]}],
     }});
-    assert_eq!(from_claude_settings(&v), vec![
+    assert_eq!(from_claude_settings(&v, "PreToolUse"), vec![
         Guard { matcher: "Bash|WebFetch".into(), command: "guard-a".into(), timeout_s: 10 },
         Guard { matcher: "AskUserQuestion".into(), command: "guard-b".into(), timeout_s: DEFAULT_TIMEOUT_S },
     ]);
-    assert!(from_claude_settings(&json!({})).is_empty());
-    assert!(from_claude_settings(&json!({"hooks": {"PreToolUse": "nonsense"}})).is_empty());
+    assert_eq!(from_claude_settings(&v, "Stop")[0].command, "stop-guard");
+    assert!(from_claude_settings(&json!({}), "PreToolUse").is_empty());
+    assert!(from_claude_settings(&json!({"hooks": {"PreToolUse": "nonsense"}}), "PreToolUse").is_empty());
     let huge = json!({"hooks": {"PreToolUse": [{"matcher": "", "hooks": [{"command": "g", "timeout": 99999}]}]}});
-    assert_eq!(from_claude_settings(&huge)[0].timeout_s, MAX_TIMEOUT_S);
+    assert_eq!(from_claude_settings(&huge, "PreToolUse")[0].timeout_s, MAX_TIMEOUT_S);
 }
 
 #[test]
@@ -114,6 +115,7 @@ fn guards_run_unchanged_on_claude_codes_input() {
     let dir = tmp();
     let d = dir.display();
     let config = Config {
+        stop: vec![],
         cwd: dir.to_string_lossy().into(),
         guards: vec![
             // Refuses a command holding a made-up private string, as a private-info guard would.
@@ -150,6 +152,7 @@ fn guards_run_unchanged_on_claude_codes_input() {
 fn a_guard_past_its_timeout_lets_the_call_go_in_time() {
     let dir = tmp();
     let config = Config {
+        stop: vec![],
         cwd: dir.to_string_lossy().into(),
         guards: vec![
             Guard { matcher: "Bash".into(), command: "sleep 30; exit 2".into(), timeout_s: 1 },
@@ -169,7 +172,7 @@ fn output_past_the_cap_keeps_the_guards_answer() {
     // `set -e` with a pipe closed after the cap would die of SIGPIPE before `exit 2`.
     let flood = |fd: &str, then: &str| format!("set -e; head -c 3000000 /dev/zero {fd}; {then}");
     let run = |command: String| {
-        let config = Config { cwd: "/".into(), guards: vec![guard("Bash", &command)] };
+        let config = Config { stop: vec![], cwd: "/".into(), guards: vec![guard("Bash", &command)] };
         decide(&payload("run_command", json!({"CommandLine": "ls"})), Some(config))
     };
     let refused = run(flood(">&2", "echo 'private string' >&2; exit 2"));
@@ -181,7 +184,7 @@ fn output_past_the_cap_keeps_the_guards_answer() {
 
 #[test]
 fn what_cant_be_read_is_asked_about() {
-    let config = Config { cwd: "/".into(), guards: vec![guard("", "exit 0")] };
+    let config = Config { stop: vec![], cwd: "/".into(), guards: vec![guard("", "exit 0")] };
     for (payload, config) in [
         (payload("run_command", json!({"CommandLine": "ls"})), None),
         (b"not json".to_vec(), Some(config.clone())),
@@ -197,10 +200,71 @@ fn what_cant_be_read_is_asked_about() {
 
 #[test]
 fn agys_hook_file_runs_the_shim_longer_than_the_slowest_guard() {
-    let config = Config { cwd: "/w".into(), guards: vec![guard("Bash", "g"), Guard { timeout_s: 30, ..guard("Bash", "h") }] };
+    let config = Config { stop: vec![], cwd: "/w".into(), guards: vec![guard("Bash", "g"), Guard { timeout_s: 30, ..guard("Bash", "h") }] };
+    let mut config = config;
+    config.stop = vec![guard("", "end")];
     let v = hooks_json(Path::new("/opt/muster bin/muster"), Path::new("/data/s 1/antigravity-guards.json"), &config);
     let h = &v["muster-guards"]["PreToolUse"][0];
     assert_eq!(h["matcher"], AGY_MATCHER);
     assert_eq!(h["hooks"][0]["command"], "'/opt/muster bin/muster' hook antigravity guard '/data/s 1/antigravity-guards.json'");
     assert_eq!(h["hooks"][0]["timeout"], 40);
+    assert_eq!(v["muster-guards"]["Stop"], json!([{
+        "type": "command", "command": "'/opt/muster bin/muster' hook antigravity stop '/data/s 1/antigravity-guards.json'",
+        "timeout": 15
+    }]));
+}
+
+#[test]
+fn stop_transcript_contains_the_current_turn_and_paired_results() {
+    let path = Path::new("src/fixtures/antigravity_1.5.13/transcript_full.jsonl");
+    let mut out = Vec::new();
+    stop::transcript(path, &mut out).unwrap();
+    let rows: Vec<Value> = serde_json::Deserializer::from_slice(&out)
+        .into_iter().collect::<Result<_, _>>().unwrap();
+    assert_eq!(rows.len(), 5);
+    let blocks = |i: usize| &rows[i]["message"]["content"];
+    assert_eq!(blocks(0), &json!([{"type":"text", "text":"Check beta"}]));
+    assert_eq!(blocks(1)[0]["name"], "mcp__muster__whoami");
+    assert_eq!(blocks(1)[0]["input"], json!({}));
+    assert_eq!(blocks(1)[1]["name"], "Bash");
+    assert_eq!(blocks(1)[1]["input"]["command"], "echo beta");
+    for (i, end) in [(2, "alpha"), (3, "beta")] {
+        assert_eq!(rows[i]["message"]["role"], "user");
+        assert_eq!(blocks(i)[0]["type"], "tool_result");
+        assert_eq!(blocks(i)[0]["tool_use_id"], blocks(1)[i-2]["id"]);
+        assert!(blocks(i)[0]["content"].as_str().unwrap().ends_with(end));
+    }
+    assert_eq!(blocks(4), &json!([{"type":"text", "text":"Checked beta"}]));
+}
+
+#[test]
+fn compact_transcript_decodes_arguments_and_recovers_truncated_fields() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("transcript.jsonl");
+    let full = tmp.path().join("transcript_full.jsonl");
+    let original = include_str!("../fixtures/antigravity_1.5.13/transcript_full.jsonl");
+    std::fs::write(&full, original).unwrap();
+    let mut rows: Vec<Value> = serde_json::Deserializer::from_str(original)
+        .into_iter().collect::<Result<_, _>>().unwrap();
+    for call in rows[3]["tool_calls"].as_array_mut().unwrap() {
+        for arg in call["args"].as_object_mut().unwrap().values_mut() {
+            *arg = json!(arg.to_string());
+        }
+    }
+    let write = |rows: &[Value]| std::fs::write(&path, rows.iter().map(Value::to_string).collect::<Vec<_>>().join("\n")).unwrap();
+    let mut expected = Vec::new();
+    stop::transcript(&full, &mut expected).unwrap();
+    write(&rows);
+    let mut output = Vec::new();
+    stop::transcript(&path, &mut output).unwrap();
+    assert_eq!(output, expected);
+    rows[3]["truncated_fields"] = json!(["tool_calls"]);
+    rows[3]["tool_calls"][0]["args"]["Arguments"] = json!("{...");
+    write(&rows);
+    output.clear();
+    stop::transcript(&path, &mut output).unwrap();
+    assert_eq!(output, expected);
+    rows.last_mut().unwrap()["step_index"] = json!(20);
+    write(&rows);
+    assert!(stop::transcript(&path, &mut Vec::new()).is_err());
 }

@@ -1,6 +1,7 @@
 //! Antigravity launch and status, verified against agy 1.5.13 screens on 23 Nov 2026.
 
 use super::{Adapter, CommandSpec, ScreenSnapshot, SpawnCtx, claude, resumed_in_launch, tui};
+use crate::agy_guard::Config as GuardConfig;
 use crate::model::{AgentState, AntigravityMode, Decision, SessionKind, StateUpdate};
 use serde_json::{Value, json};
 use std::path::Path;
@@ -151,14 +152,47 @@ fn on(var: &str) -> bool {
     )
 }
 
+fn rules_file(setting: Option<std::ffi::OsString>) -> Option<std::path::PathBuf> {
+    match setting {
+        Some(v) if v == "off" => None,
+        Some(v) => Some(v.into()),
+        None => Some(crate::paths::home_dir().join(".claude/CLAUDE.md")),
+    }
+}
+
+// agy 1.5.13 truncates a rules file at 24,000 bytes. Reserve room for the tools note.
+const MAX_RULES: u64 = 24_000 - TOOLS_INSTRUCTION.len() as u64 - 1;
+
+fn claude_rules(args: &[String], source: Option<&Path>) -> anyhow::Result<Option<String>> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let Some(path) = source else { return Ok(None) };
+    let flags = super::parse_extra_args(SessionKind::Antigravity, args)?;
+    let model = flags.iter().rev().find(|(name, _)| *name == "--model");
+    if !model.is_some_and(|(_, values)| values[0].starts_with("claude-")) {
+        return Ok(None);
+    }
+    let file = match std::fs::OpenOptions::new().read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path)
+    {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        other => other?,
+    };
+    anyhow::ensure!(file.metadata()?.is_file(), "Antigravity rules must be a regular file");
+    let mut text = String::new();
+    file.take(MAX_RULES + 1).read_to_string(&mut text)?;
+    anyhow::ensure!(text.len() as u64 <= MAX_RULES, "Antigravity rules exceed the workspace rules budget");
+    Ok(Some(text))
+}
+
 /// Build the credential file outside the previously shared tree. Only publish the
 /// completed directory once the old run's entries have been checked and removed.
 /// With `guards`, also the owner's guards (src/agy_guard.rs): their list in the session dir, out
 /// of the agent's workspace, and an agy hook file that runs them through `muster hook antigravity
 /// guard` (agy 1.5.13 loads `.agents/hooks.json` from an `--add-dir` folder too).
-fn prepare_workspace(ctx: &SpawnCtx, guards: &[crate::agy_guard::Guard]) -> anyhow::Result<std::path::PathBuf> {
+fn prepare_workspace(ctx: &SpawnCtx, mcp: bool, guards: &GuardConfig, rules: Option<&str>) -> anyhow::Result<std::path::PathBuf> {
     use std::os::unix::fs::DirBuilderExt;
-    let workspace = ctx.session_dir.join("antigravity-workspace");
+    let workspace = ctx.session_dir.join(if mcp { "antigravity-workspace" } else { "antigravity-rules" });
     let config = workspace.join(".agents");
     let guard_file = ctx.session_dir.join(crate::agy_guard::CONFIG);
     for path in [&workspace, &config, &config.join("mcp_config.json"), &config.join("AGENTS.md"), &config.join("hooks.json"), &guard_file] {
@@ -174,16 +208,21 @@ fn prepare_workspace(ctx: &SpawnCtx, guards: &[crate::agy_guard::Guard]) -> anyh
         .join(format!(".antigravity-{:016x}", rand::random::<u64>()));
     std::fs::DirBuilder::new().mode(0o700).create(&stage)?;
     let install = || -> anyhow::Result<()> {
-        let server = mcp_json(&ctx.daemon_url, &ctx.session_token);
-        crate::paths::write_private(
-            &stage.join(".agents/mcp_config.json"),
-            &serde_json::to_vec_pretty(&server)?,
-        )?;
-        crate::paths::write_private(&stage.join(".agents/AGENTS.md"), TOOLS_INSTRUCTION.as_bytes())?;
-        if !guards.is_empty() {
-            let list = crate::agy_guard::Config { cwd: ctx.cwd.to_string_lossy().into(), guards: guards.to_vec() };
-            crate::paths::write_private(&guard_file, &serde_json::to_vec_pretty(&list)?)?;
-            let hooks = crate::agy_guard::hooks_json(&ctx.muster_bin, &guard_file, &list);
+        let mut instructions = String::new();
+        if mcp {
+            let server = mcp_json(&ctx.daemon_url, &ctx.session_token);
+            crate::paths::write_private(
+                &stage.join(".agents/mcp_config.json"),
+                &serde_json::to_vec_pretty(&server)?,
+            )?;
+            instructions.push_str(TOOLS_INSTRUCTION);
+            if rules.is_some() { instructions.push('\n'); }
+        }
+        if let Some(text) = rules { instructions.push_str(text); }
+        crate::paths::write_private(&stage.join(".agents/AGENTS.md"), instructions.as_bytes())?;
+        if mcp && !(guards.guards.is_empty() && guards.stop.is_empty()) {
+            crate::paths::write_private(&guard_file, &serde_json::to_vec_pretty(guards)?)?;
+            let hooks = crate::agy_guard::hooks_json(&ctx.muster_bin, &guard_file, guards);
             crate::paths::write_private(&stage.join(".agents/hooks.json"), &serde_json::to_vec_pretty(&hooks)?)?;
         }
         match std::fs::remove_dir_all(&workspace) {
@@ -220,7 +259,7 @@ pub fn is_startup_screen(screen: &ScreenSnapshot) -> bool {
     !lines[..top].iter().any(|l| l.starts_with("> ") || l.trim_end() == ">")
 }
 
-fn launch(ctx: &SpawnCtx, settings: bool, mcp: bool, user_settings: &Path, other_servers: &[std::path::PathBuf], guards: &[crate::agy_guard::Guard]) -> anyhow::Result<CommandSpec> {
+fn launch(ctx: &SpawnCtx, settings: bool, mcp: bool, user_settings: &Path, other_servers: &[std::path::PathBuf], guards: &GuardConfig, rules_source: Option<&Path>) -> anyhow::Result<CommandSpec> {
     let mut args = Vec::new();
     if settings {
         let file = ctx.session_dir.join("antigravity-settings.json");
@@ -238,8 +277,9 @@ fn launch(ctx: &SpawnCtx, settings: bool, mcp: bool, user_settings: &Path, other
             _ => {}
         }
     }
-    if mcp {
-        let workspace = prepare_workspace(ctx, guards)?;
+    let rules = claude_rules(&ctx.extra_args, rules_source)?;
+    if mcp || rules.is_some() {
+        let workspace = prepare_workspace(ctx, mcp, guards, rules.as_deref())?;
         args.push(format!("--add-dir={}", workspace.display()));
     }
     args.extend(mode_args(ctx.permissions.antigravity_mode));
@@ -405,7 +445,8 @@ impl Adapter for AntigravityAdapter {
             on("MUSTER_ANTIGRAVITY_MCP"),
             &user_settings_file(),
             &other_server_files(&ctx.cwd),
-            &crate::agy_guard::load(),
+            &crate::agy_guard::load(&ctx.cwd),
+            rules_file(std::env::var_os("MUSTER_ANTIGRAVITY_RULES")).as_deref(),
         )
     }
 
@@ -865,6 +906,7 @@ mod tests {
             extra_args: vec!["--model".into(), "demo".into()],
             resume: None,
         };
+        let empty = GuardConfig::default();
         for (mode, flag) in [
             (AntigravityMode::Plan, "--mode=plan"),
             (AntigravityMode::AcceptEdits, "--mode=accept-edits"),
@@ -875,7 +917,7 @@ mod tests {
             ),
         ] {
             ctx.permissions.antigravity_mode = mode;
-            let spec = launch(&ctx, false, false, &user, &[], &[]).unwrap();
+            let spec = launch(&ctx, false, false, &user, &[], &empty, None).unwrap();
             assert_eq!(
                 spec.args,
                 [flag, "--model", "demo", "--prompt-interactive=read alpha"]
@@ -888,20 +930,20 @@ mod tests {
         let mcp = workspace.join(".agents/mcp_config.json");
         let settings = format!("--settings={}", file.display());
         let add_dir = format!("--add-dir={}", workspace.display());
-        assert_eq!(launch(&ctx, true, false, &user, &[], &[]).unwrap().args[0], settings);
+        assert_eq!(launch(&ctx, true, false, &user, &[], &empty, None).unwrap().args[0], settings);
         assert!(!workspace.exists());
         let read = |p| serde_json::from_slice::<Value>(&std::fs::read(p).unwrap()).unwrap();
         // Without Muster's MCP server there is no rule for it, and the user's list is untouched.
         assert!(read(&file).get("permissions").is_none());
         // A fresh run with Muster's tools gets its first prompt after `/clear`, through the queue.
-        let fresh = launch(&ctx, false, true, &user, &[], &[]).unwrap();
+        let fresh = launch(&ctx, false, true, &user, &[], &empty, None).unwrap();
         assert_eq!(fresh.args, [add_dir.as_str(), "--dangerously-skip-permissions", "--model", "demo"]);
         assert!(!fresh.consumed_initial_prompt && has_mcp_workspace(&fresh.args));
-        assert!(!has_mcp_workspace(&launch(&ctx, true, false, &user, &[], &[]).unwrap().args));
+        assert!(!has_mcp_workspace(&launch(&ctx, true, false, &user, &[], &empty, None).unwrap().args));
         ctx.extra_args = vec!["--conversation".into(), "conv-demo".into()];
-        let without_mcp = launch(&ctx, true, false, &user, &[], &[]).unwrap();
+        let without_mcp = launch(&ctx, true, false, &user, &[], &empty, None).unwrap();
         assert!(!has_mcp_workspace(&without_mcp.args));
-        let spec = launch(&ctx, true, true, &user, &[], &[]).unwrap();
+        let spec = launch(&ctx, true, true, &user, &[], &empty, None).unwrap();
         assert_eq!(spec.program, "agy");
         assert!(!spec.consumed_initial_prompt);
         assert!(has_mcp_workspace(&spec.args), "a resumed launch must wait for Muster's tools too");
@@ -924,10 +966,10 @@ mod tests {
         assert_eq!(read(&file), json!({"title": title, "permissions": {"allow": [MUSTER_TOOLS_RULE]}}));
         let clash = std::env::temp_dir().join(format!("muster-agy-clash-{:x}.json", rand::random::<u64>()));
         std::fs::write(&clash, r#"{"mcpServers":{"muster":{"command":"other"}}}"#).unwrap();
-        launch(&ctx, true, true, &user, &[clash.clone()], &[]).unwrap();
+        launch(&ctx, true, true, &user, &[clash.clone()], &empty, None).unwrap();
         assert_eq!(read(&file), json!({"title": title}), "another `muster` server gets no rule");
         std::fs::remove_file(clash).unwrap();
-        launch(&ctx, true, true, &user, &[], &[]).unwrap();
+        launch(&ctx, true, true, &user, &[], &empty, None).unwrap();
         assert_eq!(
             std::fs::read_to_string(workspace.join(".agents/AGENTS.md")).unwrap(),
             TOOLS_INSTRUCTION
@@ -949,8 +991,8 @@ mod tests {
         assert!(!hooks.exists() && !guard_list.exists());
         // The owner's guards: their list in the session dir (out of the agent's workspace), and a
         // hook file in the workspace that runs them through Muster.
-        let guards = [crate::agy_guard::Guard { matcher: "Bash".into(), command: "demo-guard".into(), timeout_s: 10 }];
-        launch(&ctx, true, true, &user, &[], &guards).unwrap();
+        let guards = GuardConfig { cwd: dir.to_string_lossy().into(), stop: vec![], guards: vec![crate::agy_guard::Guard { matcher: "Bash".into(), command: "demo-guard".into(), timeout_s: 10 }] };
+        launch(&ctx, true, true, &user, &[], &guards, None).unwrap();
         assert_eq!(read(&guard_list), json!({"cwd": dir.to_string_lossy(), "guards": [{"matcher": "Bash", "command": "demo-guard", "timeout_s": 10}]}));
         let hook = &read(&hooks)["muster-guards"]["PreToolUse"][0]["hooks"][0];
         assert_eq!(hook["command"], format!("'/tmp/demo app/muster' hook antigravity guard {}", guard_list.display()));
@@ -958,23 +1000,65 @@ mod tests {
             assert_eq!(std::fs::metadata(p).unwrap().permissions().mode() & 0o077, 0);
         }
         // The next run without guards drops both.
-        launch(&ctx, true, true, &user, &[], &[]).unwrap();
+        launch(&ctx, true, true, &user, &[], &empty, None).unwrap();
         assert!(!hooks.exists() && !guard_list.exists());
         std::fs::remove_dir_all(workspace.join(".agents")).unwrap();
         let other = dir.join("fixture");
         std::fs::create_dir(&other).unwrap();
         std::os::unix::fs::symlink(&other, workspace.join(".agents")).unwrap();
-        assert!(launch(&ctx, false, true, &user, &[], &[]).is_err());
+        assert!(launch(&ctx, false, true, &user, &[], &empty, None).is_err());
         assert_eq!(std::fs::read_dir(other).unwrap().count(), 0);
         std::fs::remove_file(workspace.join(".agents")).unwrap();
         std::fs::write(workspace.join("old-run"), "fixture").unwrap();
-        launch(&ctx, false, true, &user, &[], &[]).unwrap();
+        launch(&ctx, false, true, &user, &[], &empty, None).unwrap();
         assert!(!workspace.join("old-run").exists());
         std::fs::remove_file(&mcp).unwrap();
         std::os::unix::fs::symlink(dir.join("absent"), &mcp).unwrap();
-        assert!(launch(&ctx, false, true, &user, &[], &[]).is_err());
+        assert!(launch(&ctx, false, true, &user, &[], &empty, None).is_err());
         assert!(!dir.join("absent").exists());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn claude_model_sessions_snapshot_rules_at_launch() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path();
+        let source = dir.join("alpha.md");
+        let mut ctx = SpawnCtx {
+            session_dir: dir.into(), cwd: dir.into(), session_id: 1, muster_bin: "/opt/muster".into(),
+            daemon_url: "http://127.0.0.1:1".into(), session_token: "alpha".into(),
+            permissions: Permissions::default(), initial_prompt: None, extra_args: vec![], resume: None,
+        };
+        let config = GuardConfig::default();
+        let launch_with = |ctx: &SpawnCtx, mcp, file: Option<&Path>| launch(ctx, false, mcp, &dir.join("settings"), &[], &config, file);
+        let rules = dir.join("antigravity-workspace/.agents/AGENTS.md");
+        assert!(rules_file(None).unwrap().ends_with(".claude/CLAUDE.md"));
+        let selected = rules_file(Some(source.clone().into_os_string()));
+        let off = rules_file(Some("off".into()));
+        assert!(off.is_none());
+        ctx.extra_args = vec!["--model=claude-alpha".into()];
+        launch_with(&ctx, true, selected.as_deref()).unwrap();
+        assert_eq!(std::fs::read_to_string(&rules).unwrap(), TOOLS_INSTRUCTION);
+        std::fs::write(&source, "Alpha rule.\n").unwrap();
+        launch_with(&ctx, true, selected.as_deref()).unwrap();
+        assert_eq!(std::fs::read_to_string(&rules).unwrap(), format!("{TOOLS_INSTRUCTION}\nAlpha rule.\n"));
+        std::fs::write(&source, "Beta rule.").unwrap();
+        assert!(!std::fs::read_to_string(&rules).unwrap().contains("Beta"));
+        let spec = launch_with(&ctx, false, selected.as_deref()).unwrap();
+        assert!(!has_mcp_workspace(&spec.args));
+        assert_eq!(std::fs::read_to_string(dir.join("antigravity-rules/.agents/AGENTS.md")).unwrap(), "Beta rule.");
+        assert!(!dir.join("antigravity-rules/.agents/mcp_config.json").exists());
+        launch_with(&ctx, true, off.as_deref()).unwrap();
+        assert_eq!(std::fs::read_to_string(&rules).unwrap(), TOOLS_INSTRUCTION);
+        ctx.extra_args.extend(["--model".into(), "gemini-beta".into()]);
+        launch_with(&ctx, true, selected.as_deref()).unwrap();
+        assert_eq!(std::fs::read_to_string(&rules).unwrap(), TOOLS_INSTRUCTION);
+        ctx.extra_args = vec!["--model".into(), "claude-beta".into()];
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&source, &link).unwrap();
+        assert!(launch_with(&ctx, true, Some(&link)).is_err());
+        std::fs::write(&source, vec![b'x'; MAX_RULES as usize + 1]).unwrap();
+        assert!(launch_with(&ctx, true, Some(&source)).is_err());
     }
 
     #[test]

@@ -83,7 +83,7 @@ session only, never in the user's global config. Every session has `MUSTER_URL` 
   `-c 'mcp_servers.muster.tool_timeout_sec=1900'`.
   Raise `tool_timeout_sec`, because Codex's default tool timeout (about 60 s) would cut off
   `wait_for_state`.
-- **Antigravity CLI.** Muster adds a private workspace (`--add-dir`) containing `.agents/mcp_config.json` and an `.agents/AGENTS.md` that tells the model to call Muster's tools through agy's `call_mcp_tool` (server `muster`), and allows `mcp(muster/*)` in the session's private settings, beside the user's own allow rules. See PROTOCOL.md, “Antigravity”.
+- **Antigravity CLI.** Muster adds a private workspace (`--add-dir`) containing `.agents/mcp_config.json` and an `.agents/AGENTS.md` that tells the model to call Muster's tools through agy's `call_mcp_tool` (server `muster`), and allows `mcp(muster/*)` in the session's private settings, beside the user's own allow rules. Sessions launched with an explicit `claude-*` model also receive the owner's Claude rules in `.agents/AGENTS.md` (`MUSTER_ANTIGRAVITY_RULES` selects a file or `off`). With the MCP workspace enabled, Claude Code tool guards and advisory Stop guards run from the session's snapshot of the owner's hook settings. See PROTOCOL.md, “Antigravity”.
 - **Anything else:** POST JSON-RPC with the bearer header, as below.
 
 ```sh

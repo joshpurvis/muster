@@ -1382,8 +1382,9 @@ Each ends with the card's number, when and by whom it was posted, the commit, wh
 Each channel has a permission profile the human sets in the UI (`channel.set_permissions`, see
 PROTOCOL.md): `codex_sandbox` (`read_only`, `workspace_write`, `workspace_write_network`,
 `full_access`) and `claude_mode` (`default`, `accept_edits`, `plan`, `bypass`), plus `antigravity_mode`
-(ordered `plan < accept_edits < auto < full_access`). Every agent in
-the channel starts with it, including ones spawned through MCP:
+(ordered `plan < accept_edits < auto < full_access`). New profiles use Claude `default`
+(the user's Claude Code setting) and Antigravity `auto`. Every agent in the channel uses its
+profile on spawn and restart, including agents spawned through MCP.
 
 - `spawn_session` always uses the target channel's profile. It has no argument to ask for more
   (unknown arguments are ignored), and no tool changes a profile.

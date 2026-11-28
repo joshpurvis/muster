@@ -173,14 +173,14 @@ export const DEFAULT_PERMISSIONS: Permissions = {
   antigravity_mode: "auto",
 };
 
-/** Older daemons return the stored two-kind profile. Match its migration on the backend. */
+/** Read older two-kind profiles with the same defaults as the daemon. */
 export function storedPermissions(saved?: Partial<Permissions>): Permissions {
   if (!saved) return { ...DEFAULT_PERMISSIONS };
   return {
     ...DEFAULT_PERMISSIONS,
     ...saved,
     antigravity_mode: saved.antigravity_mode ??
-      (saved.claude_mode === "plan" || saved.codex_sandbox === "read_only" ? "plan" : "accept_edits"),
+      (saved.claude_mode === "plan" || saved.codex_sandbox === "read_only" ? "plan" : "auto"),
   };
 }
 

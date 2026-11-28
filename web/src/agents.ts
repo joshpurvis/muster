@@ -562,17 +562,14 @@ export function restartShownChanged(shown: RestartShown, now: RestartShown | nul
   return !now || now.pid !== shown.pid || now.move !== shown.move || now.to !== shown.to;
 }
 
-/** The message after saving a move (`agent.update`'s `switch`). */
-/** The permission modes an agent switching from `from` to `to` gets in the new CLI: the nearest
- * match (bypass and full access are the same; Claude's default, which asks before edits, becomes
- * accept edits, as agy has no such mode). Mirrors `agents::switch_permissions`. */
+/** Preview the destination mode from `agents::switch_permissions` when changing an agent's kind. */
 export function switchPermissions(p: Permissions, from: Agent["kind"], to: Agent["kind"]): Permissions {
   if (from === "claude" && to === "antigravity") {
-    const m = { plan: "plan", default: "accept_edits", accept_edits: "accept_edits", bypass: "full_access" } as const;
+    const m = { plan: "plan", default: "auto", accept_edits: "accept_edits", bypass: "full_access" } as const;
     return { ...p, antigravity_mode: m[p.claude_mode] };
   }
   if (from === "antigravity" && to === "claude") {
-    const m = { plan: "plan", accept_edits: "accept_edits", auto: "accept_edits", full_access: "bypass" } as const;
+    const m = { plan: "plan", accept_edits: "accept_edits", auto: "default", full_access: "bypass" } as const;
     return { ...p, claude_mode: m[p.antigravity_mode] };
   }
   return p;
@@ -606,6 +603,7 @@ export function kindSwitchMessage(name: string, ks: AgentKindSwitch): { level: "
   }
 }
 
+/** The message after saving a move (`agent.update`'s `switch`). */
 export function switchMessage(name: string, sw: AgentSwitch): { level: "success" | "warn"; text: string } {
   const notes = sw.notes === "asked"
     ? ""

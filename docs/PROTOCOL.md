@@ -268,12 +268,10 @@ changes which model runs the agent; Codex agents can't switch, and can't be swit
   to agy, nor the other way), the model and effort (the call's own `model`/`effort` are used, else
   the new CLI's default), a pending account move, and for Antigravity the account profile,
   OpenRouter, tools up front and self handoff, which only Claude has.
-- Permissions: the new CLI's mode is the nearest match: Claude plan -> Antigravity plan, default
-  and accept edits -> accept edits, bypass -> full access; Antigravity plan -> plan, accept edits
-  and auto -> accept edits, full access -> bypass. Each is no wider than the old one except Claude
-  default (asks before edits): agy has no such mode, so it gets accept edits (edits without asking)
-  rather than plan. Its own tab's modes follow the same way, before the new kind is saved; the
-  call's own `permissions` apply on top.
+- Switching maps Claude `default` to Antigravity `auto` and Antigravity `auto` to Claude
+  `default`, which uses the owner's Claude Code setting. Plan and Accept edits keep their modes
+  in either direction. Claude `bypass` and Antigravity `full_access` map to each other.
+  The agent's own tab follows the same mapping. Explicit `permissions` in the call apply last.
 - Persona: the old kind's file (`CLAUDE.md` or `AGENTS.md`) is moved aside to
   `<file>.before-<new kind>` (`.<ms>` added when that name is taken), and so is a file already at
   the new kind's name; then the new kind's file is written from the record. Nothing is deleted, so
@@ -1435,7 +1433,7 @@ file, so calls to muster's own MCP tools skip Claude Code's `auto`-mode safety c
 Channels created before this existed have the defaults (store migration v3). `permissions` in
 `channel.create` and `channel.set_permissions` must name `codex_sandbox` and `claude_mode`. Older clients may omit
 `antigravity_mode`. New profiles default to `auto`. A stored profile missing the field uses `plan` if Claude uses
-`plan` or Codex uses `read_only`, and `accept_edits` otherwise. An update keeps the current value.
+`plan` or Codex uses `read_only`, and `auto` otherwise. An update that omits the field keeps its current value.
 
 Limits: the profile bounds what muster starts agents with; it is not a boundary against the
 agents themselves. Codex's workspace-write sandbox can still read the whole disk, including

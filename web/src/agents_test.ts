@@ -581,16 +581,16 @@ Deno.test("a busy tab's Restart confirmation asks again when its run or move cha
   assertEquals(restartShownChanged(plain, restartShown(moving, run)), true);
 });
 
-Deno.test("kind switch: modes map to the nearest no wider, as the backend does", () => {
-  const base = { codex_sandbox: "workspace_write", claude_mode: "default", antigravity_mode: "auto" } as const;
+Deno.test("kind switch maps defaults and explicit modes as the backend does", () => {
+  const base = { codex_sandbox: "workspace_write", claude_mode: "plan", antigravity_mode: "plan" } as const;
   const toAgy = (c: "plan" | "default" | "accept_edits" | "bypass") =>
     switchPermissions({ ...base, claude_mode: c }, "claude", "antigravity").antigravity_mode;
   assertEquals([toAgy("plan"), toAgy("default"), toAgy("accept_edits"), toAgy("bypass")],
-    ["plan", "accept_edits", "accept_edits", "full_access"]);
+    ["plan", "auto", "accept_edits", "full_access"]);
   const toClaude = (a: "plan" | "accept_edits" | "auto" | "full_access") =>
     switchPermissions({ ...base, antigravity_mode: a }, "antigravity", "claude").claude_mode;
   assertEquals([toClaude("plan"), toClaude("accept_edits"), toClaude("auto"), toClaude("full_access")],
-    ["plan", "accept_edits", "accept_edits", "bypass"]);
+    ["plan", "accept_edits", "default", "bypass"]);
 });
 
 Deno.test("kind switch: the toast says when it switches and where the old persona went", () => {

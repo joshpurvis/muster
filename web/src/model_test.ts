@@ -29,7 +29,7 @@ import {
   windowParam,
 } from "./model.ts";
 import type { AgentState, Channel, SessionInfo, Win } from "./types.ts";
-import { DEFAULT_PERMISSIONS, KIND_LABEL } from "./types.ts";
+import { DEFAULT_PERMISSIONS, KIND_LABEL, storedPermissions } from "./types.ts";
 import { newerPrefs } from "./model.ts";
 
 function assertEquals<T>(actual: T, expected: T, msg?: string) {
@@ -41,6 +41,15 @@ function assertEquals<T>(actual: T, expected: T, msg?: string) {
 Deno.test("Antigravity has its own tab label and defaults to auto mode", () => {
   assertEquals(KIND_LABEL.antigravity, "Antigravity");
   assertEquals(DEFAULT_PERMISSIONS.antigravity_mode, "auto");
+});
+
+Deno.test("stored profiles default to auto and respect restrictions and explicit modes", () => {
+  assertEquals(storedPermissions({}), DEFAULT_PERMISSIONS);
+  assertEquals(storedPermissions({ claude_mode: "accept_edits" }).antigravity_mode, "auto");
+  assertEquals(storedPermissions({ claude_mode: "plan" }).antigravity_mode, "plan");
+  assertEquals(storedPermissions({ codex_sandbox: "read_only" }).antigravity_mode, "plan");
+  assertEquals(storedPermissions({ claude_mode: "plan", antigravity_mode: "auto" }).antigravity_mode, "auto");
+  assertEquals(storedPermissions({ antigravity_mode: "accept_edits" }).antigravity_mode, "accept_edits");
 });
 
 function ch(id: number, extra: Partial<Channel> = {}): Channel {

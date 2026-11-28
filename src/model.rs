@@ -332,7 +332,7 @@ pub enum CodexSandbox {
 pub enum ClaudeMode {
     /// `plan`
     Plan,
-    /// `default` (asks before edits and commands; "Manual" in the CLI).
+    /// Uses Claude Code's configured `permissions.defaultMode` by omitting the mode flag.
     #[default]
     Default,
     /// `acceptEdits`
@@ -378,7 +378,7 @@ impl From<StoredPermissions> for Permissions {
             antigravity_mode: saved.antigravity_mode.unwrap_or(if restricted {
                 AntigravityMode::Plan
             } else {
-                AntigravityMode::AcceptEdits
+                AntigravityMode::Auto
             }),
         }
     }

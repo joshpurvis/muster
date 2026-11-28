@@ -693,7 +693,7 @@ enum AgentCmd {
 #[derive(clap::Args)]
 struct AgentPerms {
     /// Claude permission mode of its tab.
-    #[arg(long, value_name = "MODE", value_parser = ["plan", "default", "accept_edits", "bypass"])]
+    #[arg(long, value_name = "MODE", value_parser = ["plan", "default", "accept_edits", "auto", "bypass"])]
     claude_mode: Option<String>,
     /// Antigravity execution mode of its tab.
     #[arg(long, value_name = "MODE", value_parser = ["plan", "accept-edits", "auto", "full-access"])]
@@ -2180,6 +2180,7 @@ mod tests {
         assert!(parse(&["agent", "edit", "ada", "--autostart", "maybe"]).is_err());
         assert!(parse(&["agent", "edit", "ada", "--sleep-after", "2h"]).is_ok());
         assert!(parse(&["agent", "sleep", "ada"]).is_ok());
+        assert!(parse(&["agent", "new", "alpha", "--claude-mode", "auto"]).is_ok());
         assert!(parse(&["agent", "edit", "ada", "--claude-mode", "yolo"]).is_err());
         assert!(parse(&["new", ".", "--kind", "antigravity"]).is_ok());
         assert!(parse(&["agent", "new", "alpha", "--kind", "antigravity", "--antigravity-mode", "accept-edits"]).is_ok());

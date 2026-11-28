@@ -565,11 +565,11 @@ export function restartShownChanged(shown: RestartShown, now: RestartShown | nul
 /** Preview the destination mode from `agents::switch_permissions` when changing an agent's kind. */
 export function switchPermissions(p: Permissions, from: Agent["kind"], to: Agent["kind"]): Permissions {
   if (from === "claude" && to === "antigravity") {
-    const m = { plan: "plan", default: "auto", accept_edits: "accept_edits", bypass: "full_access" } as const;
+    const m = { plan: "plan", default: "auto", accept_edits: "accept_edits", auto: "auto", bypass: "full_access" } as const;
     return { ...p, antigravity_mode: m[p.claude_mode] };
   }
   if (from === "antigravity" && to === "claude") {
-    const m = { plan: "plan", accept_edits: "accept_edits", auto: "default", full_access: "bypass" } as const;
+    const m = { plan: "plan", accept_edits: "accept_edits", auto: "auto", full_access: "bypass" } as const;
     return { ...p, claude_mode: m[p.antigravity_mode] };
   }
   return p;

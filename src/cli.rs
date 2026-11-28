@@ -2708,7 +2708,7 @@ impl AgentOpts {
         }
         if self.claude_mode.is_some() || self.codex_sandbox.is_some() || self.antigravity_mode.is_some() {
             let mut permissions = json!({
-                "claude_mode": self.claude_mode.as_deref().or(base["claude_mode"].as_str()).unwrap_or("default"),
+                "claude_mode": self.claude_mode.as_deref().or(base["claude_mode"].as_str()).unwrap_or("auto"),
                 "codex_sandbox": self.codex_sandbox.as_deref().or(base["codex_sandbox"].as_str()).unwrap_or("workspace_write"),
             });
             if let Some(mode) = &self.antigravity_mode {
@@ -3098,20 +3098,32 @@ pub fn start_fresh(d: &Discovery, file: &std::path::Path, as_json: bool) -> anyh
 mod tests {
     use super::*;
 
+    fn agent_opts(lead: Option<bool>) -> AgentOpts {
+        AgentOpts {
+            profile: None, switch: SwitchOpts::default(), provider: None, name: "alpha".into(), kind: None, model: None,
+            effort: None, persona: None, accepts: None, autostart: None, sleep_after: None, self_handoff: None,
+            tools_up_front: None, lead, claude_mode: None, codex_sandbox: None, antigravity_mode: None,
+        }
+    }
+
+    #[test]
+    fn partial_cli_permissions_use_auto_for_new_agents_and_preserve_existing_modes() {
+        let mut opts = agent_opts(None);
+        opts.codex_sandbox = Some("read_only".into());
+        assert_eq!(opts.params(&Value::Null).unwrap()["permissions"]["claude_mode"], "auto");
+        let saved = json!({"claude_mode": "default"});
+        assert_eq!(opts.params(&saved).unwrap()["permissions"]["claude_mode"], "default");
+    }
+
     /// `muster agent edit NAME --lead on|off` sends `lead` (and, inside a Muster tab, the session
     /// that asked, so the backend refuses turning it on there).
     #[test]
     fn agent_edit_sends_lead() {
-        let opts = |lead: Option<bool>| AgentOpts {
-            profile: None, switch: SwitchOpts::default(), provider: None, name: "alpha".into(), kind: None, model: None,
-            effort: None, persona: None, accepts: None, autostart: None, sleep_after: None, self_handoff: None,
-            tools_up_front: None, lead, claude_mode: None, codex_sandbox: None, antigravity_mode: None,
-        };
-        assert_eq!(opts(Some(true)).params(&json!({})).unwrap()["lead"], true);
-        assert_eq!(opts(Some(false)).params(&json!({})).unwrap()["lead"], false);
-        assert!(opts(None).params(&json!({})).unwrap().get("lead").is_none());
+        assert_eq!(agent_opts(Some(true)).params(&json!({})).unwrap()["lead"], true);
+        assert_eq!(agent_opts(Some(false)).params(&json!({})).unwrap()["lead"], false);
+        assert!(agent_opts(None).params(&json!({})).unwrap().get("lead").is_none());
         if env_session().is_some() {
-            assert!(opts(Some(true)).params(&json!({})).unwrap().get("from_session").is_some());
+            assert!(agent_opts(Some(true)).params(&json!({})).unwrap().get("from_session").is_some());
         }
     }
 

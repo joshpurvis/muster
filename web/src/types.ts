@@ -159,7 +159,8 @@ export interface Win {
 
 export type CodexSandbox = "read_only" | "workspace_write" | "workspace_write_network" | "full_access";
 export type AntigravityMode = "plan" | "accept_edits" | "auto" | "full_access";
-export type ClaudeMode = "default" | "accept_edits" | "plan" | "bypass";
+export const CLAUDE_MODES = ["plan", "default", "accept_edits", "auto", "bypass"] as const;
+export type ClaudeMode = typeof CLAUDE_MODES[number];
 
 export interface Permissions {
   codex_sandbox: CodexSandbox;
@@ -169,7 +170,7 @@ export interface Permissions {
 
 export const DEFAULT_PERMISSIONS: Permissions = {
   codex_sandbox: "workspace_write",
-  claude_mode: "default",
+  claude_mode: "auto",
   antigravity_mode: "auto",
 };
 

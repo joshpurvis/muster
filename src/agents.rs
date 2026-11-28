@@ -2285,8 +2285,7 @@ fn check_kind_switch(a: &Agent, to: SessionKind, by_owner: bool) -> anyhow::Resu
     Ok(())
 }
 
-/// Claude's configured default and Antigravity's auto map to each other so a switch lands in
-/// auto when Claude is configured for it. The owner requested this widening on 28 Nov.
+/// Auto maps to auto in both directions. Claude's account default also maps to Antigravity auto.
 /// A switch translates only the destination mode.
 pub fn switch_permissions(p: Permissions, from: SessionKind, to: SessionKind) -> Permissions {
     use crate::model::{AntigravityMode as A, ClaudeMode as C};
@@ -2294,7 +2293,7 @@ pub fn switch_permissions(p: Permissions, from: SessionKind, to: SessionKind) ->
         (SessionKind::Claude, SessionKind::Antigravity) => Permissions {
             antigravity_mode: match p.claude_mode {
                 C::Plan => A::Plan,
-                C::Default => A::Auto,
+                C::Default | C::Auto => A::Auto,
                 C::AcceptEdits => A::AcceptEdits,
                 C::Bypass => A::FullAccess,
             },
@@ -2304,7 +2303,7 @@ pub fn switch_permissions(p: Permissions, from: SessionKind, to: SessionKind) ->
             claude_mode: match p.antigravity_mode {
                 A::Plan => C::Plan,
                 A::AcceptEdits => C::AcceptEdits,
-                A::Auto => C::Default,
+                A::Auto => C::Auto,
                 A::FullAccess => C::Bypass,
             },
             ..p
@@ -4943,12 +4942,26 @@ mod tests {
     fn a_kind_switch_maps_defaults_and_explicit_modes_in_both_directions() {
         use crate::model::{AntigravityMode as A, ClaudeMode as C};
         let p = |c, a| Permissions { claude_mode: c, antigravity_mode: a, ..Permissions::default() };
-        for (c, a) in [(C::Plan, A::Plan), (C::Default, A::Auto), (C::AcceptEdits, A::AcceptEdits), (C::Bypass, A::FullAccess)] {
+        for (c, a) in [(C::Plan, A::Plan), (C::Auto, A::Auto), (C::AcceptEdits, A::AcceptEdits), (C::Bypass, A::FullAccess)] {
             assert_eq!(switch_permissions(p(c, A::Plan), SessionKind::Claude, SessionKind::Antigravity), p(c, a));
             assert_eq!(switch_permissions(p(C::Plan, a), SessionKind::Antigravity, SessionKind::Claude), p(c, a));
         }
+        assert_eq!(switch_permissions(p(C::Default, A::Plan), SessionKind::Claude, SessionKind::Antigravity), p(C::Default, A::Auto));
         let same = p(C::Plan, A::FullAccess);
         assert_eq!(switch_permissions(same, SessionKind::Claude, SessionKind::Claude), same);
+    }
+
+    #[test]
+    fn claude_auto_is_the_default_for_new_and_incomplete_profiles() {
+        let new = Permissions::default();
+        assert_eq!(new.claude_mode, ClaudeMode::Auto);
+        assert_eq!(new.level(SessionKind::Claude), 2);
+        assert!(new.is_elevated());
+        for saved in [json!({}), json!({"codex_sandbox": "read_only"})] {
+            assert_eq!(serde_json::from_value::<Permissions>(saved).unwrap().claude_mode, ClaudeMode::Auto);
+        }
+        let legacy: Permissions = serde_json::from_value(json!({"claude_mode": "default"})).unwrap();
+        assert_eq!(legacy.claude_mode, ClaudeMode::Default);
     }
 
     #[test]
@@ -6443,7 +6456,7 @@ mod tests {
         let skill = crate::skills::get("muster-pr-review").text;
         assert_eq!(pr, format!("{PR_REVIEWER_HEADER}{}", crate::skills::body(skill)));
         assert!(skill.ends_with(crate::skills::body(skill)) && !pr.contains("description:"));
-        assert_eq!(by("pr_reviewer").permissions, Permissions::default(), "gh still asks under the default profile");
+        assert_eq!(by("pr_reviewer").permissions, Permissions::default());
         let w = by("worker");
         assert_eq!(w.accepts, vec![Origin::Human, Origin::Schedule, Origin::Webhook]);
         assert_eq!(w.permissions.codex_sandbox, CodexSandbox::WorkspaceWrite);

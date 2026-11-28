@@ -29,7 +29,7 @@ import {
   windowParam,
 } from "./model.ts";
 import type { AgentState, Channel, SessionInfo, Win } from "./types.ts";
-import { DEFAULT_PERMISSIONS, KIND_LABEL, storedPermissions } from "./types.ts";
+import { CLAUDE_MODES, DEFAULT_PERMISSIONS, KIND_LABEL, storedPermissions } from "./types.ts";
 import { newerPrefs } from "./model.ts";
 
 function assertEquals<T>(actual: T, expected: T, msg?: string) {
@@ -43,8 +43,15 @@ Deno.test("Antigravity has its own tab label and defaults to auto mode", () => {
   assertEquals(DEFAULT_PERMISSIONS.antigravity_mode, "auto");
 });
 
+Deno.test("Claude permission choices are ordered from plan through bypass", () => {
+  assertEquals([...CLAUDE_MODES], ["plan", "default", "accept_edits", "auto", "bypass"]);
+});
+
 Deno.test("stored profiles default to auto and respect restrictions and explicit modes", () => {
+  assertEquals(DEFAULT_PERMISSIONS.claude_mode, "auto");
   assertEquals(storedPermissions({}), DEFAULT_PERMISSIONS);
+  assertEquals(storedPermissions({ codex_sandbox: "read_only" }).claude_mode, "auto");
+  assertEquals(storedPermissions({ claude_mode: "default" }).claude_mode, "default");
   assertEquals(storedPermissions({ claude_mode: "accept_edits" }).antigravity_mode, "auto");
   assertEquals(storedPermissions({ claude_mode: "plan" }).antigravity_mode, "plan");
   assertEquals(storedPermissions({ codex_sandbox: "read_only" }).antigravity_mode, "plan");

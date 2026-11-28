@@ -841,7 +841,7 @@ dialog has it, then Cancel and one primary button.
   pills: **Worktree** (default **off**; disabled for a known non-git folder, with "Not a git repository" beside it;
   when on, a "from current HEAD" base branch field joins the row), the Claude profile and
   **Usage** (Claude only, see Claude profiles), and **Permissions** (reads "Permissions" at the
-  defaults, otherwise what differs, e.g. "Claude: bypass"; amber when more permissive, red with a
+  defaults, otherwise what differs, e.g. "Claude: bypass"; amber for elevated permissions including Claude Auto, red with a
   warning shield for full access or bypass; opens the three controls under the row). Enter or
   Ctrl+Enter creates. With worktree off, a folder where this window already has a channel with
   sessions joins it instead (the selected channel first, if several match): the dialog says so,
@@ -853,7 +853,7 @@ dialog has it, then Cancel and one primary button.
   there would close them. Picking a folder from the switcher follows the same rule. Ctrl+Shift+N skips the dialog (see Worktrees). It has no model choice, so
   no provider choice either: running on OpenRouter is a named agent's setting (below).
 - **Rename window…** (palette, `⋯`, the window chip): a small dialog; the title follows.
-- **Permissions** opens from the tab menu, shield icon or palette. New channels start Claude in **Your default**, which uses your Claude Code setting. Antigravity starts in **Auto** and also offers Plan, Accept edits and Full access. Changes apply at the next launch.
+- **Permissions** opens from the tab menu, shield icon or palette. New channels and agents start Claude and Antigravity in **Auto**. Claude checks actions before running them. Choose **Your default** to use the account’s Claude Code setting. Changes apply at the next launch.
 - **New agent / Edit agent** and the **message** overlay: see "Agents in the sidebar".
 - **Shortcuts sheet** (Alt+/ or F1). Context menus are custom and keyboard navigable. Toasts sit
   bottom-right. Modals trap focus. Never use `alert/confirm/prompt`.
@@ -1079,8 +1079,8 @@ sends only what changed (`schedule.settings.set`). The dialog scrolls in a short
   in that CLI; memory/, tab, schedules, reminders and waiting messages stay (and the lead flag); the
   persona is written to the new kind's file and the old one is kept beside it; switching to
   Antigravity clears the Claude-only settings. "At its next start" (default) or "Now" (restarts it
-  only if idle). The Permissions pill shows the mapped mode. Claude's **Your default** and
-  Antigravity's **Auto** map to each other (docs/PROTOCOL.md "Switching an agent's kind").
+  only if idle). The Permissions pill shows the mapped mode. **Auto** maps to **Auto** in both directions.
+  Claude's **Your default** also maps to Antigravity's **Auto** (docs/PROTOCOL.md "Switching an agent's kind").
   Claude-only options hide. Saving sends `kind` (and `now`); the toast says what happened.
   Only the owner's click (or terminal) switches. Then persona (monospace textarea, written to `CLAUDE.md` / `AGENTS.md`), accepted origins (Human, Schedule, Webhook (triggered) checkboxes,
   at least one), the Permissions pill opening only the control for the agent's kind, and an

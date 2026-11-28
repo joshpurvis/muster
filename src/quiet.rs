@@ -112,9 +112,16 @@ pub struct Bind {
     pub width: i64,
 }
 
-/// A Claude permission mode as stored: wider is larger (`ClaudeMode`'s order).
+/// Persisted quiet-message width. Old rows used 3 for bypass. Without a migration they
+/// now wait for an auto or narrower run, or expire after seven days.
 pub fn width(mode: ClaudeMode) -> i64 {
-    mode as i64
+    match mode {
+        ClaudeMode::Plan => 0,
+        ClaudeMode::Default => 1,
+        ClaudeMode::AcceptEdits => 2,
+        ClaudeMode::Auto => 3,
+        ClaudeMode::Bypass => 4,
+    }
 }
 
 /// The permission mode session `s`'s tab sets now (a missing tab counts as the widest): what a
@@ -125,9 +132,8 @@ pub fn session_width(hub: &Hub, s: &SessionInfo) -> i64 {
 
 /// The width of the permission mode a turn's process runs in, as Claude Code's
 /// `UserPromptSubmit` payload names it (`permission_mode`, sent on to `/quiet/take`). A mode
-/// Muster doesn't set (`auto`, `dontAsk`: the user's own default mode, which Muster's default
-/// profile leaves in place), or none, counts as `tab`, the width of the mode its tab sets
-/// (`session_width`): what the waking path checks a send against too.
+/// of `auto` counts as the tab's width. Muster sets it for auto tabs and older default tabs
+/// can inherit it from Claude's settings. Unknown or absent modes also use the tab's width.
 pub fn mode_width(mode: Option<&str>, tab: i64) -> i64 {
     match mode {
         Some("plan") => width(ClaudeMode::Plan),
@@ -839,7 +845,7 @@ mod tests {
         let mut m = agents::message_record(to, "alpha", Some(1), Route { origin, hop: 1, reply_to: None }, "kept");
         m.quiet = true;
         m.created_at = created_at;
-        hub.store().insert_agent_message_capped_waiting(&m, 0, 200, None, Some(&Keep { after: 0, max: WAITING_MAX, width: width(ClaudeMode::Default) })).unwrap().unwrap()
+        hub.store().insert_agent_message_capped_waiting(&m, 0, 200, None, Some(&Keep { after: 0, max: WAITING_MAX, width: width(to.permissions.claude_mode) })).unwrap().unwrap()
     }
 
     fn hook(hub: &Hub, session: SessionId, event: &str, payload: Value) -> crate::agents::HookEffects {
@@ -1099,7 +1105,7 @@ mod tests {
     #[tokio::test]
     async fn a_wider_run_never_takes_a_note_checked_for_a_narrower_one() {
         let (hub, _, beta, _) = hub();
-        let q = agents::quiet(&hub, out(&beta, "for a Default run", 0)).await.unwrap().msg_id;
+        let q = agents::quiet(&hub, out(&beta, "for an auto run", 0)).await.unwrap().msg_id;
         let ch = hub.session(2).unwrap().channel_id;
         let wide = Permissions { claude_mode: ClaudeMode::Bypass, ..Permissions::default() };
         hub.set_permissions(ch, wide).unwrap();
@@ -1110,13 +1116,23 @@ mod tests {
         assert_eq!(take(&hub, 2, None).await.unwrap()["quiet"]["agent"], json!([q]));
     }
 
-    /// The mode the process runs in decides, not the tab's setting: a Bypass run doesn't take a
-    /// note checked for Default while the tab says Default. A turn naming no mode, or one Muster
-    /// doesn't set (the user's own default, such as `auto`), counts as its tab's mode.
+    #[tokio::test]
+    async fn legacy_bypass_width_waits_for_an_auto_or_narrower_run() {
+        use ClaudeMode::*;
+        assert_eq!([Plan, Default, AcceptEdits, Auto, Bypass].map(width), [0, 1, 2, 3, 4]);
+        let (hub, _, beta, _) = hub();
+        let q = agents::quiet_checked(&hub, out(&beta, "old width", 0), Some(3)).await.unwrap().msg_id;
+        let run = hub.session_run(2).unwrap();
+        assert!(take_run(&hub, 2, run, None, width(Bypass)).await.unwrap()["context"].is_null());
+        assert_eq!(take_run(&hub, 2, run, None, width(Auto)).await.unwrap()["quiet"]["agent"], json!([q]));
+    }
+
+    /// A bypass process can't take a narrower note. Auto, unknown and absent hook modes use
+    /// the tab's width, including an old default tab whose process reports auto.
     #[tokio::test]
     async fn the_running_mode_decides_which_notes_a_turn_takes() {
         let (hub, _, beta, _) = hub();
-        let q = agents::quiet(&hub, out(&beta, "for a Default run", 0)).await.unwrap().msg_id;
+        let q = agents::quiet_checked(&hub, out(&beta, "for a default run", 0), Some(width(ClaudeMode::Default))).await.unwrap().msg_id;
         let run = hub.session_run(2).unwrap();
         let bypass_tab = width(ClaudeMode::Bypass);
         for mode in [Some("bypassPermissions"), None, Some("auto"), Some("dontAsk")] {

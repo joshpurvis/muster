@@ -887,7 +887,7 @@ async fn permissions_are_shown_and_inherited_never_raised() {
     let (m, st) = state();
     let elevated = Permissions {
         codex_sandbox: CodexSandbox::WorkspaceWriteNetwork,
-        claude_mode: ClaudeMode::AcceptEdits,
+        claude_mode: ClaudeMode::Bypass,
         antigravity_mode: crate::model::AntigravityMode::FullAccess,
     };
     m.d.lock().channels.get_mut(&10).unwrap().permissions = elevated;
@@ -899,14 +899,14 @@ async fn permissions_are_shown_and_inherited_never_raised() {
     let v = parse(&t);
     let p = &v["channel"]["permissions"];
     assert_eq!(p["codex_sandbox"], "workspace_write_network");
-    assert_eq!(p["claude_mode"], "accept_edits");
+    assert_eq!(p["claude_mode"], "bypass");
     assert_eq!(p["antigravity_mode"], "full_access");
     assert_eq!(p["antigravity_flags"], "--dangerously-skip-permissions");
     assert_eq!(
         p["codex_flags"],
         "--sandbox workspace-write -c sandbox_workspace_write.network_access=true"
     );
-    assert_eq!(p["claude_permission_mode"], "acceptEdits");
+    assert_eq!(p["claude_permission_mode"], "bypassPermissions");
 
     let (t, _) = call(&st, "list_channels", json!({})).await;
     let v = parse(&t);
@@ -923,7 +923,8 @@ async fn permissions_are_shown_and_inherited_never_raised() {
         "workspace_write_network"
     );
     assert_eq!(by_id(11)["permissions"]["codex_sandbox"], "workspace_write");
-    assert_eq!(by_id(11)["permissions"]["claude_mode"], "default");
+    assert_eq!(by_id(11)["permissions"]["claude_mode"], "auto");
+    assert_eq!(by_id(11)["permissions"]["claude_permission_mode"], "auto");
 
     // A new channel gets the caller's profile, whatever the agent asks for.
     let (t, err) = call(
@@ -1939,7 +1940,7 @@ async fn tell_agent_wakes_or_waits_as_the_sender_says_with_ask_agents_guards() {
         assert!(d.deliveries.is_empty() && d.sends.is_empty());
         assert_eq!((d.quiet[0].agent.as_str(), d.quiet[0].text.as_str()), ("ada", "PR open"));
         // Kept with the permission mode the check ran against.
-        assert_eq!(d.quiet_widths, vec![crate::quiet::width(crate::model::ClaudeMode::Default)]);
+        assert_eq!(d.quiet_widths, vec![crate::quiet::width(crate::model::ClaudeMode::Auto)]);
     }
     // wake=true: delivered now, nobody waits.
     let (t, err) = call(&st, "tell_agent", json!({"agent": "ada", "text": "act now", "wake": true})).await;
@@ -2418,6 +2419,48 @@ async fn a_shared_workspace_name_resolves_to_the_one_granted() {
     assert_eq!(m.d.lock().channels[&(parse(&t)["channel"]["id"].as_u64().unwrap() as ChannelId)].workspace_id, 4);
     let (t, err) = call_as(&st, "tok4", "spawn_session", json!({"kind": "codex", "new_channel": {"workspace": "repo"}})).await;
     assert!(err && t.contains("2 workspaces are named \"repo\""), "{t}");
+}
+
+#[tokio::test]
+async fn auto_tabs_can_exchange_messages_with_auto_and_workspace_write() {
+    let (m, st) = state();
+    with_agents(&m);
+    // Plain Claude (1) and Codex (2) can reach the named Claude agent (3) in another channel.
+    {
+        let mut d = m.d.lock();
+        d.channels.get_mut(&10).unwrap().workspace_id = 2;
+        // Check the Claude sender's own level even when its hidden Codex field is narrower.
+        d.channels.get_mut(&20).unwrap().permissions.codex_sandbox = CodexSandbox::ReadOnly;
+    }
+    let tell = json!({"agent": "ada", "text": "hello", "wake": true});
+    for (session, token, mode) in [
+        (1, "tok1", ClaudeMode::Auto),
+        (2, "tok2", ClaudeMode::Auto),
+        (2, "tok2", ClaudeMode::Default), // Older Codex tab with a narrower hidden Claude field.
+    ] {
+        m.d.lock().channels.get_mut(&10).unwrap().permissions.claude_mode = mode;
+        let (text, err) = call_as(&st, token, "tell_agent", tell.clone()).await;
+        assert!(!err, "{text}");
+        let (text, err) = call_as(&st, "tok3", "send_message", json!({"session_id": session, "text": "hello"})).await;
+        assert!(!err, "{text}");
+    }
+}
+
+#[tokio::test]
+async fn claude_auto_can_message_accept_edits_but_default_cannot_message_auto() {
+    let (m, st) = state();
+    with_agents(&m);
+    let tell = json!({"agent": "ada", "text": "hello", "wake": true});
+    m.d.lock().channels.get_mut(&20).unwrap().permissions.claude_mode = ClaudeMode::AcceptEdits;
+    let (text, err) = call(&st, "tell_agent", tell.clone()).await;
+    assert!(!err, "{text}");
+    {
+        let mut d = m.d.lock();
+        d.channels.get_mut(&10).unwrap().permissions.claude_mode = ClaudeMode::Default;
+        d.channels.get_mut(&20).unwrap().permissions.claude_mode = ClaudeMode::Auto;
+    }
+    let (text, err) = call(&st, "tell_agent", tell).await;
+    assert!(err && text.contains("more than your channel"), "{text}");
 }
 
 /// Owner, 27 Nov 2026: the permission check compares a sender of another kind by its OWN mode

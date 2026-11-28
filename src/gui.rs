@@ -59,6 +59,42 @@ pub fn opens_in_browser(target: &str) -> bool {
         && !target.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
+/// Ask for activation only after accepting the link, while still handling the click.
+#[cfg(any(feature = "gui", test))]
+fn web_link_command(target: &str, activation: impl FnOnce() -> Option<String>) -> Option<Command> {
+    if !opens_in_browser(target) {
+        return None;
+    }
+    let mut cmd = Command::new(if cfg!(target_os = "macos") { "open" } else { "xdg-open" });
+    cmd.arg(target);
+    let token = activation().filter(|id| !id.is_empty());
+    // GIO's desktop launcher exports the same startup ID under both names.
+    for key in ["XDG_ACTIVATION_TOKEN", "DESKTOP_STARTUP_ID"] {
+        if let Some(id) = &token {
+            cmd.env(key, id);
+        } else {
+            cmd.env_remove(key);
+        }
+    }
+    Some(cmd)
+}
+
+#[cfg(feature = "gui")]
+fn link_activation() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        use gtk::{gdk, gio, prelude::*};
+        let context = gdk::Display::default()?.app_launch_context()?;
+        // gtk-rs requires a GAppInfo. Describe the opener without launching it.
+        let opener = gio::AppInfo::create_from_commandline(
+            "xdg-open", Some("Web browser"), gio::AppInfoCreateFlags::SUPPORTS_URIS,
+        ).ok()?;
+        context.startup_notify_id(&opener, &[]).map(|id| id.to_string())
+    }
+    #[cfg(not(target_os = "linux"))]
+    { None }
+}
+
 /// The shared "system title bar" preference (`prefs.get`), read before the window is built so
 /// it never appears with the wrong frame. An older daemon without it: shown.
 #[cfg(feature = "gui")]
@@ -771,10 +807,8 @@ mod native {
             })
             // Links that try to open a new window go to the system browser: web pages only.
             .with_new_window_req_handler(|target, _features| {
-                if super::opens_in_browser(&target) {
-                    let mut c = std::process::Command::new(if cfg!(target_os = "macos") { "open" } else { "xdg-open" });
-                    c.arg(target);
-                    let _ = super::spawn_detached(c, None);
+                if let Some(cmd) = super::web_link_command(&target, super::link_activation) {
+                    let _ = super::spawn_detached(cmd, None);
                 }
                 NewWindowResponse::Deny
             })
@@ -1005,8 +1039,50 @@ mod tests {
         }
         for bad in ["file:///etc/passwd", "muster://panel/3", "javascript:alert(1)", "mailto:a@x.example", "ssh://x",
             "", "https://x.example/a b", "https://x.example/\n"] {
-            assert!(!super::opens_in_browser(bad), "{bad}");
+            assert!(super::web_link_command(bad, || panic!("requested activation for {bad}")).is_none(), "{bad}");
         }
+    }
+
+    #[test]
+    fn web_link_command_replaces_or_removes_inherited_activation() {
+        use std::ffi::OsStr;
+        let url = "https://example.org/?a=1&b=2";
+        for token in [Some("fresh"), None, Some("")] {
+            let cmd = super::web_link_command(url, || token.map(str::to_owned)).unwrap();
+            assert_eq!(cmd.get_program(), if cfg!(target_os = "macos") { "open" } else { "xdg-open" });
+            assert!(cmd.get_args().eq([OsStr::new(url)]));
+            let env: std::collections::BTreeMap<_, _> = cmd.get_envs().collect();
+            for key in ["XDG_ACTIVATION_TOKEN", "DESKTOP_STARTUP_ID"] {
+                // An explicit None removes even a value inherited from the window's parent.
+                assert_eq!(env[OsStr::new(key)], token.filter(|id| !id.is_empty()).map(OsStr::new));
+            }
+        }
+    }
+
+    #[cfg(all(feature = "gui", target_os = "linux"))]
+    #[test]
+    #[ignore = "requires a running Wayland compositor"]
+    fn wayland_token_reaches_opener() {
+        use gtk::{gdk, prelude::*};
+        use std::{fs, os::unix::fs::{DirBuilderExt, PermissionsExt}};
+
+        gtk::init().unwrap();
+        assert!(gdk::Display::default().unwrap().backend().is_wayland());
+        let token = super::link_activation().filter(|id| !id.is_empty()).expect("Wayland token");
+        println!("GTK Wayland launch context returned a non-empty token");
+
+        let dir = std::env::temp_dir().join(format!("muster-link-{:x}", rand::random::<u64>()));
+        fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        let opener = dir.join("xdg-open");
+        fs::write(&opener, "#!/bin/sh\nprintf '%s\\n' \"$XDG_ACTIVATION_TOKEN\" \"$DESKTOP_STARTUP_ID\" > received\n").unwrap();
+        fs::set_permissions(&opener, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut cmd = super::web_link_command("https://example.org/", || Some(token.clone())).unwrap();
+        // Only the fake opener can be resolved on this PATH.
+        assert!(cmd.current_dir(&dir).env("PATH", &dir).status().unwrap().success());
+        let received = fs::read_to_string(dir.join("received")).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+        assert!(received.lines().eq([token.as_str(), token.as_str()]));
+        println!("fake xdg-open received the fresh token in XDG_ACTIVATION_TOKEN and DESKTOP_STARTUP_ID");
     }
 
     #[test]

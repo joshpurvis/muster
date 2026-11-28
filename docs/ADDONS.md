@@ -77,6 +77,9 @@ accepting a response.
 | `open-link`          | `url`: string, at most 2048 characters         | Parsed with URL; HTTPS only, without credentials. Opens the system browser. At most once per two seconds per add-on in this window. |
 | `message-agent`      | `agent`: named agent, `text`: 1–300 characters | The daemon checks registration, the framed origin, the ticked agent and the text again, then forwards through normal agent delivery.                   |
 
+For `open-link`, the native Linux window passes the desktop's activation token so the browser
+can come forward if the desktop allows it (`misc:focus_on_activate` on Hyprland).
+
 Example from Counter:
 
 ```js

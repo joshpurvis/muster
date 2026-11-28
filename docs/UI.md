@@ -541,6 +541,9 @@ merges, never a model.
 
 ### Links
 
+When you open a web link, the native Linux window passes the desktop's activation token so the
+browser can come forward if your desktop allows it (`misc:focus_on_activate` on Hyprland).
+
 Agents mention a note, panel, tab or agent to the human by its title, as a link that shows it
 when clicked, instead of a bare number ("your three pairs are in note 91"). The address names a
 kind and an id, or an agent's name, and nothing else (no token, no window), so it is safe in

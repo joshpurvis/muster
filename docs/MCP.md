@@ -482,7 +482,9 @@ browser in the native window), and frames the page through the panel server's `/
 (docs/PROTOCOL.md), which holds the frame to the URL's origin: the page may navigate and
 redirect within it, but a link or redirect to another origin (another port, a login site) is
 blocked in the frame, and Open in browser is the way out. A popup or `target=_blank` link opens
-in the system browser (native window) or a new tab. Every `panel_update` with data reloads the
+in the system browser (native window) or a new tab. The native Linux window passes the desktop's
+activation token so the browser can come forward if the desktop allows it (`misc:focus_on_activate`
+on Hyprland). Every `panel_update` with data reloads the
 page, even at the same URL; a title-only update does not (panels carry `data_revision`, the
 revision of the last update with data).
 

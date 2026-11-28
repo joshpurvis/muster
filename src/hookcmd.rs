@@ -86,7 +86,7 @@ pub fn run(agent: &str, event: &str, payload_arg: Option<String>) -> i32 {
             antigravity_usage(&url, &token, &raw, last)
         })
         .flatten();
-    let code = forward(agent, event, url, token, &raw);
+    let code = forward(agent, event, url, token, &raw, &mut std::io::stdout());
     if let Some(usage) = usage {
         let _ = usage.recv_timeout(USAGE_WAIT);
     }
@@ -121,7 +121,7 @@ fn antigravity_usage(url: &str, token: &str, raw: &[u8], last: std::path::PathBu
 }
 
 /// Forward one callback's payload to the daemon (its durable inbox, or HTTP).
-fn forward(agent: &str, event: &str, url: String, token: String, raw: &[u8]) -> i32 {
+pub(crate) fn forward(agent: &str, event: &str, url: String, token: String, raw: &[u8], out: &mut impl Write) -> i32 {
     let Some(mut body) = callback_body(agent, event, raw) else { return 0 };
     let last = (agent == "antigravity").then(|| {
         let id = std::env::var("MUSTER_SESSION_ID").ok()?.parse().ok()?;
@@ -135,7 +135,7 @@ fn forward(agent: &str, event: &str, url: String, token: String, raw: &[u8]) -> 
         move || { let _ = crate::paths::write_private(&path, &reduced); }
     });
     if agent == "claude" && event == "UserPromptSubmit" {
-        body = quiet_messages(&url, &token, agent, body, &mut std::io::stdout());
+        body = quiet_messages(&url, &token, agent, body, out);
     }
     if let Some(path) = std::env::var_os("MUSTER_HOOK_DB") {
         let (tx, rx) = std::sync::mpsc::channel();
@@ -307,7 +307,7 @@ fn callback_body(agent: &str, event: &str, raw: &[u8]) -> Option<Vec<u8>> {
             serde_json::to_vec(&antigravity_state(&value)?).ok()
         } else { None };
     }
-    Some(shrink_payload(raw))
+    Some(shrink_payload(raw, agent == "claude" && event == "UserPromptSubmit"))
 }
 
 /// Build a fresh object before logging, saving or forwarding anything. The raw payload
@@ -333,7 +333,7 @@ pub(crate) fn antigravity_state(value: &serde_json::Value) -> Option<serde_json:
 }
 
 /// Parse as JSON and truncate long strings; non-JSON input is sent as a JSON string.
-pub(crate) fn shrink_payload(raw: &[u8]) -> Vec<u8> {
+fn shrink_payload(raw: &[u8], claude_prompt: bool) -> Vec<u8> {
     let text = String::from_utf8_lossy(raw);
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -343,6 +343,15 @@ pub(crate) fn shrink_payload(raw: &[u8]) -> Vec<u8> {
         Ok(v) => v,
         Err(_) => serde_json::Value::String(trimmed.to_string()),
     };
+    // Both /quiet/take and the saved callback read this envelope. Validate the complete
+    // paste before truncation can remove its closing tag, then shorten the message itself.
+    if claude_prompt && let Some(serde_json::Value::String(prompt)) = v.get_mut("prompt")
+        && prompt.len() > MAX_STRING
+        && let Some((_, body)) = crate::agents::message_prompt(prompt)
+        && body.len() < prompt.len()
+    {
+        *prompt = body.to_owned();
+    }
     truncate_strings(&mut v);
     serde_json::to_vec(&v).unwrap_or_else(|_| b"{}".to_vec())
 }
@@ -536,12 +545,32 @@ mod tests {
         let raw =
             serde_json::to_vec(&serde_json::json!({"tool_response": {"stdout": big}, "n": 1}))
                 .unwrap();
-        let out: serde_json::Value = serde_json::from_slice(&shrink_payload(&raw)).unwrap();
+        let out: serde_json::Value = serde_json::from_slice(&shrink_payload(&raw, false)).unwrap();
         let s = out["tool_response"]["stdout"].as_str().unwrap();
         assert!(s.len() < 4100 && s.ends_with("bytes truncated]"));
         assert_eq!(out["n"], 1);
-        assert_eq!(shrink_payload(b"  "), b"{}");
-        assert_eq!(shrink_payload(b"not json"), b"\"not json\"");
+        assert_eq!(shrink_payload(b"  ", false), b"{}");
+        assert_eq!(shrink_payload(b"not json", false), b"\"not json\"");
+    }
+
+    #[test]
+    fn shortening_a_prompt_preserves_only_a_complete_message_envelope() {
+        let body = format!("[muster msg 12 from beta origin=webhook hop=2]\n{}", "☕".repeat(MAX_STRING));
+        let wrap = |s: &str| format!("<pasted_content id=\"a\">\n{s}\n</pasted_content>");
+        let wrapped = wrap(&body);
+        for (prompt, expected) in [
+            (wrapped.clone(), Some(12)),
+            (format!("{wrapped}\nmore typed"), None),
+            (wrap(&wrapped), None),
+            (wrap(&format!("quoted message\n{body}")), None),
+        ] {
+            let raw = serde_json::to_vec(&serde_json::json!({"prompt": prompt})).unwrap();
+            let saved = callback_body("claude", "UserPromptSubmit", &raw).unwrap();
+            let saved: serde_json::Value = serde_json::from_slice(&saved).unwrap();
+            let prompt = saved["prompt"].as_str().unwrap();
+            assert!(prompt.len() < MAX_STRING + 40 && prompt.ends_with("bytes truncated]"));
+            assert_eq!(crate::agents::parse_envelope(prompt), expected);
+        }
     }
 
     #[test]
@@ -590,7 +619,7 @@ mod tests {
                 .unwrap();
             String::from_utf8(req).unwrap()
         });
-        let body = shrink_payload(br#"{"type":"agent-turn-complete"}"#);
+        let body = shrink_payload(br#"{"type":"agent-turn-complete"}"#, false);
         let status = post(
             &format!("http://127.0.0.1:{port}"),
             "/hook/notify",

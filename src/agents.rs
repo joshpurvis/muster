@@ -882,13 +882,20 @@ pub fn envelope(msg_id: i64, from: &str, origin: Origin, hop: u32) -> String {
 /// `\n\n<pasted_content id="076a">\n[muster msg N ...]\n...\n</pasted_content id="076a">\n`. The
 /// envelope is then the first line inside it; a wrapper must open the text and close it.
 pub fn parse_envelope(text: &str) -> Option<i64> {
-    let first = unwrap_paste(text).trim_start().lines().next()?;
+    message_prompt(text).map(|(id, _)| id)
+}
+
+/// The envelope id and the message beginning with that envelope. The hook helper can keep
+/// this text when a long paste needs shortening, after checking the complete wrapper.
+pub(crate) fn message_prompt(text: &str) -> Option<(i64, &str)> {
+    let body = unwrap_paste(text).trim_start();
+    let first = body.lines().next()?;
     let rest = first.strip_prefix("[muster msg ")?;
     let (id, tail) = rest.split_once(' ')?;
     if !tail.starts_with("from ") || !first.trim_end().ends_with(']') {
         return None;
     }
-    id.parse().ok()
+    Some((id.parse().ok()?, body))
 }
 
 /// The text inside one paste tag that wraps all of `text`, or `text` itself.

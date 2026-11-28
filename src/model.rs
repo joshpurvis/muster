@@ -332,11 +332,13 @@ pub enum CodexSandbox {
 pub enum ClaudeMode {
     /// `plan`
     Plan,
-    /// `default` (asks before edits and commands; "Manual" in the CLI).
-    #[default]
+    /// Uses Claude Code's configured `permissions.defaultMode` by omitting the mode flag.
     Default,
     /// `acceptEdits`
     AcceptEdits,
+    /// `auto`: Claude checks actions before running them without prompting.
+    #[default]
+    Auto,
     /// `bypassPermissions`: no permission prompts.
     Bypass,
 }
@@ -352,7 +354,7 @@ pub enum AntigravityMode {
     FullAccess,
 }
 
-/// Per-channel agent permission profile. Defaults match the CLIs' own defaults.
+/// Per-channel agent permission profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(from = "StoredPermissions")]
 pub struct Permissions {
@@ -378,7 +380,7 @@ impl From<StoredPermissions> for Permissions {
             antigravity_mode: saved.antigravity_mode.unwrap_or(if restricted {
                 AntigravityMode::Plan
             } else {
-                AntigravityMode::AcceptEdits
+                AntigravityMode::Auto
             }),
         }
     }
@@ -418,9 +420,8 @@ impl Permissions {
 
     /// Where an agent of `kind` stands with this profile on one scale every kind shares (owner,
     /// 27 Nov 2026), for comparing agents of different kinds: 0 changes nothing (plan,
-    /// read-only), 1 asks before edits (Claude's default), 2 edits without asking but asks
-    /// before commands or keeps them in a sandbox without network (accept-edits, Codex's
-    /// workspace write, Antigravity's accept-edits and auto), 3 runs commands with network
+    /// read-only), 1 uses Claude's configured default, 2 covers Claude and Antigravity accept-edits
+    /// and auto, plus Codex workspace write without network, 3 runs commands with network
     /// without asking (Codex's workspace write with network), 4 no limits (bypass, full access).
     /// Shells: 0 (the profile doesn't govern them).
     pub fn level(&self, kind: SessionKind) -> u8 {
@@ -428,7 +429,7 @@ impl Permissions {
             SessionKind::Claude => match self.claude_mode {
                 ClaudeMode::Plan => 0,
                 ClaudeMode::Default => 1,
-                ClaudeMode::AcceptEdits => 2,
+                ClaudeMode::AcceptEdits | ClaudeMode::Auto => 2,
                 ClaudeMode::Bypass => 4,
             },
             SessionKind::Codex => match self.codex_sandbox {
@@ -457,13 +458,13 @@ impl Permissions {
             && (from == kind || from == SessionKind::Shell || self.level(kind) > mine.level(from))
     }
 
-    /// More permissive than the defaults in any respect.
+    /// Whether the profile warrants an elevated-permissions badge.
     #[allow(dead_code)] // used by tests and documented for clients
     pub fn is_elevated(&self) -> bool {
         matches!(
             self.codex_sandbox,
             CodexSandbox::WorkspaceWriteNetwork | CodexSandbox::FullAccess
-        ) || matches!(self.claude_mode, ClaudeMode::AcceptEdits | ClaudeMode::Bypass)
+        ) || matches!(self.claude_mode, ClaudeMode::AcceptEdits | ClaudeMode::Auto | ClaudeMode::Bypass)
             || self.antigravity_mode == AntigravityMode::FullAccess
     }
 }

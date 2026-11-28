@@ -1,5 +1,5 @@
 // Per-tab agent permission profile: the controls (New tab dialog and the Permissions dialog), a
-// one-line summary, and the badge a tab shows when it is more permissive than the defaults.
+// one-line summary, and the tab's elevated-permissions badge.
 // Only the human sets this; agents (MCP) can't.
 import type { ComponentChildren } from "preact";
 import { useId, useLayoutEffect, useRef, useState } from "preact/hooks";
@@ -7,7 +7,7 @@ import { channelById, overlay, sessionsByChannel, workspaceById } from "../state
 import { taskLabel } from "../model.ts";
 import * as A from "../actions.ts";
 import type { AntigravityMode, Channel, ClaudeMode, CodexSandbox, Permissions } from "../types.ts";
-import { DEFAULT_PERMISSIONS, storedPermissions } from "../types.ts";
+import { CLAUDE_MODES, DEFAULT_PERMISSIONS, storedPermissions } from "../types.ts";
 import { IconAntigravity, IconCodex, IconGlobe, IconShield, IconShieldAlert, IconSpark } from "../icons.tsx";
 import { Spinner } from "./common.tsx";
 import { cx } from "../util.ts";
@@ -51,28 +51,31 @@ export const CODEX_OPTS: Opt<CodexSandbox>[] = [
   },
 ];
 
-export const CLAUDE_OPTS: Opt<ClaudeMode>[] = [
-  { v: "plan", label: "Plan", short: "plan", hint: "Explores and proposes a plan. No edits." },
-  {
-    v: "default",
+const claudeLabels: Record<ClaudeMode, Omit<Opt<ClaudeMode>, "v">> = {
+  plan: { label: "Plan", short: "plan", hint: "Explores and proposes a plan. No edits." },
+  default: {
     label: "Your default",
     short: "your default",
-    hint: "No override: uses your own Claude Code setting (permissions.defaultMode).",
+    hint: "Uses this account's Claude Code setting (permissions.defaultMode).",
   },
-  {
-    v: "accept_edits",
+  accept_edits: {
     label: "Accept edits",
     short: "accept edits",
     hint: "Edits files without asking; still asks before other commands.",
   },
-  {
-    v: "bypass",
+  auto: {
+    label: "Auto",
+    short: "auto",
+    hint: "Runs without asking. Claude blocks actions it judges risky.",
+  },
+  bypass: {
     label: "Bypass",
     short: "bypass",
     hint: "No permission prompts.",
     danger: "No permission prompts: Claude runs every tool and command without asking.",
   },
-];
+};
+export const CLAUDE_OPTS = CLAUDE_MODES.map((v) => ({ v, ...claudeLabels[v] }));
 
 export const ANTIGRAVITY_OPTS: Opt<AntigravityMode>[] = [
   { v: "plan", label: "Plan", short: "plan", hint: "Reads and plans. No edits." },
@@ -90,9 +93,9 @@ export function perms(c: Channel | undefined | null): Permissions {
 
 const antigravityOpt = (v: AntigravityMode) => ANTIGRAVITY_OPTS.find((o) => o.v === v) ?? ANTIGRAVITY_OPTS[2];
 const codexOpt = (v: CodexSandbox) => CODEX_OPTS.find((o) => o.v === v) ?? CODEX_OPTS[1];
-const claudeOpt = (v: ClaudeMode) => CLAUDE_OPTS.find((o) => o.v === v) ?? CLAUDE_OPTS[1];
+const claudeOpt = (v: ClaudeMode) => claudeLabels[v] ?? claudeLabels[DEFAULT_PERMISSIONS.claude_mode];
 
-/** "Codex: workspace + network · Claude: default" */
+/** "Codex: workspace + network · Claude: auto" */
 export function summary(p: Permissions): string {
   return `Codex: ${codexOpt(p.codex_sandbox).short} · Claude: ${claudeOpt(p.claude_mode).short}` +
     (antigravityOpt(p.antigravity_mode).v === "auto" ? "" : ` · ${kindSummary(p, "antigravity")}`);
@@ -103,10 +106,10 @@ export function isDefault(p: Permissions): boolean {
     p.claude_mode === DEFAULT_PERMISSIONS.claude_mode && p.antigravity_mode === DEFAULT_PERMISSIONS.antigravity_mode;
 }
 
-/** More permissive than the defaults (read only / plan are less). */
+/** Profiles marked with the elevated-permissions badge. */
 export function isElevated(p: Permissions): boolean {
-  return p.codex_sandbox === "workspace_write_network" || p.codex_sandbox === "full_access" ||
-    p.claude_mode === "accept_edits" || p.claude_mode === "bypass" || p.antigravity_mode === "full_access";
+  return p.codex_sandbox === "workspace_write_network" ||
+    p.claude_mode === "accept_edits" || p.claude_mode === "auto" || isDangerous(p);
 }
 
 export function isDangerous(p: Permissions): boolean {
@@ -219,7 +222,7 @@ export function kindSummary(p: Permissions, kind: "codex" | "claude" | "antigrav
 }
 
 /** The Permissions pill of the New channel and New agent dialogs: shows the current choice
- * ("Permissions" while it is the default), amber when more permissive than the defaults, red
+ * ("Permissions" while it is the default), amber for elevated permissions, red
  * when dangerous. Opens `PermissionsPanel` under the pill row. */
 export function PermissionsPill(
   { value, only, open, onToggle, controls }: {
@@ -363,8 +366,8 @@ export function PermissionsDialog(
   );
 }
 
-/** A tab's permission badge, only when it is more permissive than the defaults: amber globe
- * (network) or shield (accept edits), red warning shield (full access, bypass). Opens the
+/** A tab's permission badge, for elevated permissions: amber globe
+ * (network) or shield (accept edits or auto), red warning shield (full access, bypass). Opens the
  * Permissions dialog. */
 export function PermBadge({ c }: { c: Channel }) {
   const p = perms(c);

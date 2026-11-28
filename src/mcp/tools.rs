@@ -698,6 +698,9 @@ async fn panel_tool<B: Backend>(st: &McpState<B>, caller: SessionId, name: &str,
             return Err(format!("rate limit: at most {} panel opens/updates or posts per minute; try again in {wait_s}s", st.limits.post_per_window));
         }
     }
+    if name == "wait_for_panel_event" {
+        super::report_progress(|| "Waiting for a panel event".into());
+    }
     st.backend.panel_tool(caller, name, Value::Object(args.clone())).await
         .map(|v| pretty(&v)).map_err(|e| format!("{e:#}"))
 }
@@ -1578,7 +1581,7 @@ async fn wait_for_state<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Arg
         .clamp(0, st.limits.wait_max_s as i64) as u64;
     let after_ms = a.int("after_ms")?;
     reachable_session(st, caller, id)?;
-    let (info, verdict, waited_ms) = wait_loop(st, id, &states, timeout_s, after_ms).await?;
+    let (info, verdict, waited_ms) = wait_loop(st, caller, id, &states, timeout_s, after_ms).await?;
     let mut out = json!({
         "session_id": id,
         "state": info.state,
@@ -1599,6 +1602,7 @@ async fn wait_for_state<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Arg
 /// the time waited.
 async fn wait_loop<B: Backend>(
     st: &McpState<B>,
+    caller: SessionId,
     id: SessionId,
     states: &[AgentState],
     timeout_s: u64,
@@ -1629,10 +1633,13 @@ async fn wait_loop<B: Backend>(
             now_ms: now_unix,
         };
         let verdict = wait::evaluate(&info, states, &ctx);
+        // Reach can change while waiting. Check it before exposing this state in either output.
+        check_session_reach(st, caller, &info)?;
         let now = Instant::now();
         if verdict != Verdict::Wait || now >= deadline {
             return Ok((info, verdict, started.elapsed().as_millis() as u64));
         }
+        super::report_progress(|| format!("Waiting for session {id}: {}", info.state.as_str()));
         // Re-check at least every second (grace expiry, missed events).
         let tick = (deadline - now).min(Duration::from_secs(1));
         wait::next_change(&mut rx, id, tick).await;
@@ -1779,7 +1786,9 @@ async fn ask_agent<B: Backend>(st: &McpState<B>, caller: SessionId, a: &Args<'_>
         &mut rx,
         d.session_id,
         Duration::from_secs(timeout_s),
-        || st.backend.session(d.session_id),
+        || st.backend.session(d.session_id).inspect(|info| {
+            super::report_progress(|| format!("Waiting for {}: {}", agent.name, info.state.as_str()));
+        }),
         || st.backend.agent_message_status(d.msg_id),
     )
     .await?;

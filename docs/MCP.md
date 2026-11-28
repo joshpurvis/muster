@@ -12,12 +12,27 @@ Code: `src/mcp/` (`protocol.rs` transport + JSON-RPC, `tools.rs` tools, `guard.r
 | | |
 |---|---|
 | URL | `POST {MUSTER_URL}/mcp`, e.g. `http://127.0.0.1:7433/mcp`. No trailing slash: `/mcp/` falls through to the web UI. |
-| Transport | MCP Streamable HTTP. Responses are always `Content-Type: application/json` (never SSE). |
+| Transport | MCP Streamable HTTP. Replies use `application/json`. A pending tool call with a progress token can receive `text/event-stream`. |
 | Auth | `Authorization: Bearer <MUSTER_TOKEN>` (the session's own token). Missing/unknown token: `401`. The token identifies the **calling session**. |
 | Origin | If an `Origin` header is present it must be loopback (`127.0.0.1`, `localhost`, `[::1]`, `tauri://`, `wry://`), else `403`. CLI clients send none. |
 | `GET` / `DELETE` | `405 Method Not Allowed` (no standalone SSE stream, no sessions). |
 | Notifications | `202 Accepted`, empty body. |
 | Sessions | None. We never mint `Mcp-Session-Id`; a client-sent one is ignored. |
+
+### Progress during long waits
+
+For a single `tools/call`, put a string or integer token in `params._meta.progressToken`
+and accept both `application/json` and `text/event-stream`. A wait reports status changes
+and sends a heartbeat every 30 seconds. This covers `wait_for_state`, `ask_agent`,
+`request_session` while waiting for a reply, and `wait_for_panel_event`.
+
+Each SSE `message` event carries one JSON-RPC message. A `notifications/progress`
+notification echoes the token and gives an increasing `progress` number and a short
+`message`. The last event carries the ordinary response with the original request ID,
+then the stream closes. A call that finishes before the first update returns JSON.
+
+Clients that omit the token receive one JSON response when the wait ends and may hit
+their own idle timeout first. The tool's requested wait and overall time limit still apply.
 
 ### Protocol versions (dual-era)
 
@@ -976,9 +991,9 @@ for what can wait. Code: `src/quiet.rs`.
   named agent takes only origins it still accepts (an origin taken away after a note was sent
   keeps it waiting). A message is held while the receiving process runs in a wider permission
   mode than the one its send was checked against (the tab restarted in Bypass, say), as the
-  turn's own `UserPromptSubmit` payload reports it (`permission_mode`), not the tab's setting; a
-  turn that reports none, or a mode Muster doesn't set (such as the user's own default `auto`, which
-  Muster's default profile leaves in place), counts as the mode its tab sets. An agent on OpenRouter takes
+  turn's own `UserPromptSubmit` payload reports it (`permission_mode`). A reported `auto` has
+  width 3 regardless of the tab's configured mode. Only unknown modes such as `dontAsk` or
+  missing modes use the tab's width. An agent on OpenRouter takes
   unattended ones only while the spend caps allow, read fresh only when the turn would take one,
   and waited for at most 400 ms: a slow reading leaves them waiting and never holds back the
   human's. The rest wait for a turn that can take them, or until they expire; the turn itself
@@ -1381,16 +1396,17 @@ Each ends with the card's number, when and by whom it was posted, the commit, wh
 
 Each channel has a permission profile the human sets in the UI (`channel.set_permissions`, see
 PROTOCOL.md): `codex_sandbox` (`read_only`, `workspace_write`, `workspace_write_network`,
-`full_access`) and `claude_mode` (`default`, `accept_edits`, `plan`, `bypass`), plus `antigravity_mode`
-(ordered `plan < accept_edits < auto < full_access`). Every agent in
-the channel starts with it, including ones spawned through MCP:
+`full_access`) and `claude_mode` (`plan`, `default`, `accept_edits`, `auto`, `bypass`), plus `antigravity_mode`
+(ordered `plan < accept_edits < auto < full_access`). New profiles use `auto` for Claude and Antigravity.
+Claude `default` uses the account's Claude Code setting. Every agent in the channel uses its
+profile on spawn and restart, including agents spawned through MCP.
 
 - `spawn_session` always uses the target channel's profile. It has no argument to ask for more
   (unknown arguments are ignored), and no tool changes a profile.
 - An agent can't use a sibling channel's wider profile: `spawn_session` with a `channel_id` whose
   profile gives that `kind` more than the caller's own channel does (Codex: `codex_sandbox`,
   Claude: `claude_mode`, ordered `read_only < workspace_write < workspace_write_network <
-  full_access` and `plan < default < accept_edits < bypass`) is refused, and so is
+  full_access` and `plan < default < accept_edits < auto < bypass`) is refused, and so is
   `send_message` to an agent running in such a channel. Shells aren't governed by the profile.
   Spawning into or messaging an equal or narrower channel is fine.
 - A caller of another kind than the target is compared by its **own** mode too
@@ -1398,12 +1414,10 @@ the channel starts with it, including ones spawned through MCP:
   form: reaching it is fine when either its channel's field for the target's kind is no narrower
   (as above: it could start such an agent in its own channel), or its own mode sits at least as
   high on one scale every kind shares: 0 changes nothing (Claude `plan`, Codex `read_only`,
-  Antigravity `plan`); 1 asks before edits (Claude `default`); 2 edits without asking but asks
-  before commands or keeps them in a sandbox without network (Claude `accept_edits`, Codex
-  `workspace_write`, Antigravity `accept_edits` and `auto`); 3 runs commands with network without
-  asking (Codex `workspace_write_network`); 4 no limits (Claude `bypass`, Codex `full_access`,
-  Antigravity `full_access`). So a
-  Codex agent with full access may ask a Claude agent in bypass, and a read-only one may not. The
+  Antigravity `plan`). Level 1 covers Claude `default`. Level 2 covers Claude and Antigravity
+  `accept_edits` and `auto`, plus Codex `workspace_write`. Level 3 covers Codex
+  `workspace_write_network`. Level 4 covers Claude `bypass` and Codex or Antigravity `full_access`.
+  For example, Claude `auto` and Codex `workspace_write` can message each other in either direction. The
   same kind is still compared field by field. Recording an answer (`record_answer`) follows the
   same rule.
 - A `new_channel` created through `spawn_session` gets the **caller's** channel profile, never

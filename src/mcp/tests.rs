@@ -323,8 +323,15 @@ fn auth(tok: &str) -> ReqHeaders {
     }
 }
 
+async fn post_bytes(st: &McpState<Arc<Mock>>, h: &ReqHeaders, body: &[u8]) -> Reply {
+    match protocol::parse_post(st, h, body) {
+        Ok((caller, msg)) => protocol::dispatch_post(st, h, caller, msg).await,
+        Err(reply) => reply,
+    }
+}
+
 async fn post(st: &McpState<Arc<Mock>>, h: &ReqHeaders, body: Value) -> Reply {
-    protocol::handle_post(st, h, body.to_string().as_bytes()).await
+    post_bytes(st, h, body.to_string().as_bytes()).await
 }
 
 async fn legacy(st: &McpState<Arc<Mock>>, method: &str, params: Value) -> Value {
@@ -365,6 +372,142 @@ fn parse(text: &str) -> Value {
 }
 
 // ----- transport / protocol -----
+
+#[tokio::test]
+async fn progress_heartbeats_continue_without_a_state_change() {
+    use futures::StreamExt;
+    use tokio::time::{Instant, timeout};
+
+    let (finish, finished) = tokio::sync::oneshot::channel();
+    let call = async move {
+        finished.await.unwrap();
+        Reply { status: 200, body: Some(json!({"jsonrpc":"2.0","id":4,"result":{}})) }
+    };
+    let interval = Duration::from_millis(15);
+    let start = Instant::now();
+    let token = json!("alpha\nbeta");
+    timeout(Duration::from_secs(5), async {
+        let mut body = super::progress_response(call, token.clone(), interval).await
+            .into_body().into_data_stream();
+        for count in 1..=3 {
+            let frame = body.next().await.unwrap().unwrap();
+            assert!(start.elapsed() >= interval * count);
+            let text = std::str::from_utf8(&frame).unwrap();
+            let data = text.strip_prefix("event: message\ndata: ").unwrap().strip_suffix("\n\n").unwrap();
+            assert_eq!(parse(data), json!({
+                "jsonrpc":"2.0","method":"notifications/progress",
+                "params":{"progressToken":token,"progress":count,"message":"Waiting for the tool"}
+            }));
+        }
+        finish.send(()).unwrap();
+        assert!(std::str::from_utf8(&body.next().await.unwrap().unwrap()).unwrap().contains("\"result\":{}"));
+        assert!(body.next().await.is_none());
+    }).await.unwrap();
+}
+
+/// Restore a live session from the same store and host inventory used on daemon reload.
+/// Only the terminal host is a fixture. The TCP listener serves the full daemon router.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tool_progress_over_http() {
+    use crate::hub::{Hub, HubConfig};
+    use crate::store::{Store, StoredSession, StoredTerminal};
+    use muster_terminal_protocol::{RunId, SpawnSpec, TerminalStatus};
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::{SocketAddr, TcpStream};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let store = Store::open_memory().unwrap();
+    let workspace = store.insert_workspace("alpha", "/tmp", false, 0).unwrap();
+    let mut channel = super::guard::test_channel(0);
+    channel.workspace_id = workspace;
+    let ch = store.insert_channel(&channel).unwrap();
+    let info = session(0, ch, SessionKind::Claude, None);
+    let id = store.insert_session(&StoredSession { info, extra_args: vec![] }).unwrap();
+    let run = RunId { id, generation: 1 };
+    let cwd = std::env::temp_dir();
+    let status = TerminalStatus {
+        run, alive: true, pid: None, drained: false, has_processes: true, exit_code: None,
+        title: None, cols: 80, rows: 24, output_seq: 0, last_output_at: 0,
+        application_cursor: false, log_persisted: true, cwd: cwd.clone(),
+    };
+    let (host, directory, _) = crate::terminal::testing::serving_host_with("mcp-progress", vec![status]);
+    store.save_terminal(id, &StoredTerminal {
+        host_instance: host.client.hello.instance.clone(), token: "alpha-token".into(), port_base: 20000,
+        retired: false, pending: false, key_refs: Default::default(), key_fp: None,
+        spec: SpawnSpec { run, program: "/bin/true".into(), args: vec![], env: BTreeMap::new(), cwd, cols: 80, rows: 24 },
+    }).unwrap();
+    let hub = Hub::new(HubConfig {
+        port: addr.port(), client_token: "client".into(), muster_bin: "/bin/true".into(),
+        terminal_host: Some(host), openrouter_key: None,
+    }, store).unwrap();
+    hub.set_state_for_test(id, AgentState::Starting);
+    let router = crate::server::router(hub.clone()).unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap()
+    });
+
+    tokio::task::spawn_blocking(move || {
+        let post = |body: &Value| {
+            let mut socket = TcpStream::connect(addr).unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let data = body.to_string();
+            // HTTP/1.0 close-delimits SSE, so lines below are actual event lines.
+            write!(socket, "POST /mcp HTTP/1.0\r\nHost: localhost\r\n\
+                Authorization: Bearer alpha-token\r\nContent-Type: application/json\r\n\
+                Accept: application/json, text/event-stream\r\nMCP-Protocol-Version: 2026-07-28\r\n\
+                Mcp-Method: tools/call\r\nMcp-Name: wait_for_state\r\nContent-Length: {}\r\n\r\n{data}",
+                data.len()).unwrap();
+            let mut reader = BufReader::new(socket);
+            let mut headers = String::new();
+            while !headers.ends_with("\r\n\r\n") {
+                assert!(reader.read_line(&mut headers).unwrap() > 0);
+            }
+            assert!(headers.lines().next().unwrap().contains(" 200 "), "{headers}");
+            (headers.to_ascii_lowercase(), reader)
+        };
+        let mut body = modern_body("tools/call", json!({
+            "name":"wait_for_state", "arguments":{"session_id":id, "states":["idle"], "timeout_seconds":15}
+        }));
+        body["params"]["_meta"]["progressToken"] = json!(0);
+        let (headers, mut reader) = post(&body);
+        assert!(headers.contains("content-type: text/event-stream"));
+        let mut event = || {
+            let mut frame = String::new();
+            while !frame.ends_with("\n\n") {
+                assert!(reader.read_line(&mut frame).unwrap() > 0);
+            }
+            parse(frame.strip_prefix("event: message\ndata: ").unwrap().trim_end())
+        };
+        for (count, state, next) in [(1, "starting", AgentState::Working), (2, "working", AgentState::Idle)] {
+            assert_eq!(event(), json!({
+                "jsonrpc":"2.0","method":"notifications/progress",
+                "params":{"progressToken":0,"progress":count,"message":format!("Waiting for session {id}: {state}")}
+            }));
+            assert!(hub.set_state_checked(id, StateUpdate::new(next), StateSource::Hook, None));
+        }
+        let result = event();
+        assert_eq!(result["id"], body["id"]);
+        assert_eq!(result["result"]["resultType"], "complete");
+        let outcome = parse(result["result"]["content"][0]["text"].as_str().unwrap());
+        assert_eq!(outcome["reached"], true);
+        assert_eq!(outcome["state"], "idle");
+        assert!(reader.fill_buf().unwrap().is_empty());
+
+        body["params"]["_meta"].as_object_mut().unwrap().remove("progressToken");
+        hub.set_state_for_test(id, AgentState::Working);
+        body["params"]["arguments"]["timeout_seconds"] = json!(1);
+        let (headers, mut reader) = post(&body);
+        assert!(headers.contains("content-type: application/json"));
+        let mut plain = String::new();
+        reader.read_to_string(&mut plain).unwrap();
+        let result = parse(&plain);
+        assert_eq!(result["id"], body["id"]);
+        assert_eq!(parse(result["result"]["content"][0]["text"].as_str().unwrap())["timed_out"], true);
+    }).await.unwrap();
+    server.abort();
+    std::fs::remove_dir_all(directory).unwrap();
+}
 
 #[tokio::test]
 async fn auth_and_origin() {
@@ -432,7 +575,7 @@ async fn batch_parse_errors_and_responses() {
         json!([{"jsonrpc": "2.0", "id": "a", "result": {}}])
     );
 
-    let bad = protocol::handle_post(&st, &auth("tok1"), b"{not json").await;
+    let bad = post_bytes(&st, &auth("tok1"), b"{not json").await;
     assert_eq!(bad.status, 400);
     assert_eq!(bad.body.unwrap()["error"]["code"], protocol::PARSE_ERROR);
 
@@ -1259,7 +1402,7 @@ async fn audit_covers_missing_name_and_cancellation() {
         "params": {"name": "wait_for_state", "arguments": {"session_id": 2}}})
     .to_string();
     let h = auth("tok1");
-    let fut = protocol::handle_post(&st, &h, body.as_bytes());
+    let fut = post_bytes(&st, &h, body.as_bytes());
     assert!(
         tokio::time::timeout(Duration::from_millis(200), fut)
             .await
@@ -1574,6 +1717,61 @@ async fn other_workspaces_reachable_when_enabled() {
     assert!(m.d.lock().sessions.values().all(|s| s.channel_id != 20 || s.id == 5), "nothing started there");
     let v = parse(&call(&st, "list_channels", json!({})).await.0);
     assert!(v.as_array().unwrap().iter().any(|c| c["id"] == 20), "{v}");
+}
+
+#[tokio::test]
+async fn wait_for_state_stops_streaming_when_access_is_revoked() {
+    use futures::StreamExt;
+
+    let (m, st) = state();
+    let st = Arc::new(st);
+    add_shell_and_other_workspace(&m);
+    let args = json!({"session_id": 5, "states": ["idle"], "timeout_seconds": 15});
+    let (denied, is_error) = call(&st, "wait_for_state", args.clone()).await;
+    assert!(is_error && denied.contains("another workspace"), "{denied}");
+
+    // A non-matching state would produce progress, and a matching state would end the wait.
+    for next in [AgentState::NeedsApproval, AgentState::Idle] {
+        m.update(5, |s| s.state = AgentState::Working);
+        st.edit_guard(|g| {
+            g.communication.grants.push(super::communication::Grant {
+                from_workspace: 1,
+                to_workspace: 2,
+                from_session: Some(1),
+                message: false,
+                read_output: true,
+            });
+        }).unwrap();
+        let request = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
+            "name": "wait_for_state", "arguments": args, "_meta": {"progressToken": "alpha"}
+        }});
+        let token = request["params"]["_meta"]["progressToken"].clone();
+        let call = {
+            let st = st.clone();
+            async move { post(&st, &auth("tok1"), request).await }
+        };
+        let event = |frame: axum::body::Bytes| {
+            let text = std::str::from_utf8(&frame).unwrap();
+            parse(text.strip_prefix("event: message\ndata: ").unwrap().trim_end())
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let response = super::progress_response(call, token, Duration::from_secs(30)).await;
+            assert_eq!(response.headers()["content-type"], "text/event-stream");
+            let mut stream = response.into_body().into_data_stream();
+            let first = event(stream.next().await.unwrap().unwrap());
+            assert_eq!(first["params"]["progressToken"], "alpha");
+            assert_eq!(first["params"]["message"], "Waiting for session 5: working");
+
+            st.edit_guard(|g| g.communication.grants.clear()).unwrap();
+            m.update(5, |s| s.state = next);
+
+            let last = event(stream.next().await.unwrap().unwrap());
+            assert_eq!(last, json!({"jsonrpc": "2.0", "id": 1, "result": {
+                "isError": true, "content": [{"type": "text", "text": denied}]
+            }}));
+            assert!(stream.next().await.is_none());
+        }).await.unwrap();
+    }
 }
 
 #[tokio::test]

@@ -12,12 +12,27 @@ Code: `src/mcp/` (`protocol.rs` transport + JSON-RPC, `tools.rs` tools, `guard.r
 | | |
 |---|---|
 | URL | `POST {MUSTER_URL}/mcp`, e.g. `http://127.0.0.1:7433/mcp`. No trailing slash: `/mcp/` falls through to the web UI. |
-| Transport | MCP Streamable HTTP. Responses are always `Content-Type: application/json` (never SSE). |
+| Transport | MCP Streamable HTTP. Replies use `application/json`. A pending tool call with a progress token can receive `text/event-stream`. |
 | Auth | `Authorization: Bearer <MUSTER_TOKEN>` (the session's own token). Missing/unknown token: `401`. The token identifies the **calling session**. |
 | Origin | If an `Origin` header is present it must be loopback (`127.0.0.1`, `localhost`, `[::1]`, `tauri://`, `wry://`), else `403`. CLI clients send none. |
 | `GET` / `DELETE` | `405 Method Not Allowed` (no standalone SSE stream, no sessions). |
 | Notifications | `202 Accepted`, empty body. |
 | Sessions | None. We never mint `Mcp-Session-Id`; a client-sent one is ignored. |
+
+### Progress during long waits
+
+For a single `tools/call`, put a string or integer token in `params._meta.progressToken`
+and accept both `application/json` and `text/event-stream`. A wait reports status changes
+and sends a heartbeat every 30 seconds. This covers `wait_for_state`, `ask_agent`,
+`request_session` while waiting for a reply, and `wait_for_panel_event`.
+
+Each SSE `message` event carries one JSON-RPC message. A `notifications/progress`
+notification echoes the token and gives an increasing `progress` number and a short
+`message`. The last event carries the ordinary response with the original request ID,
+then the stream closes. A call that finishes before the first update returns JSON.
+
+Clients that omit the token receive one JSON response when the wait ends and may hit
+their own idle timeout first. The tool's requested wait and overall time limit still apply.
 
 ### Protocol versions (dual-era)
 

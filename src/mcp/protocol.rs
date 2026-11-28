@@ -9,7 +9,7 @@
 //!   `notifications/initialized`, `ping`, tools/list, tools/call. We never mint
 //!   `Mcp-Session-Id` (auth is the bearer token; the server is stateless), which the legacy
 //!   spec allows. JSON-RPC batches (2025-03-26 only) are accepted.
-//! Responses are always `application/json`; we never open SSE streams.
+//! The HTTP handler can stream progress around a single tools/call and send its reply last.
 
 use base64::Engine;
 use serde_json::{Map, Value, json};
@@ -151,31 +151,33 @@ fn capabilities() -> Value {
     json!({"tools": {"listChanged": false}})
 }
 
-/// Handle one POST body. `caller` resolution happens here so it is covered by tests.
-pub async fn handle_post<B: Backend>(st: &McpState<B>, h: &ReqHeaders, body: &[u8]) -> Reply {
+/// Authenticate before decoding the body or choosing a response transport.
+pub(super) fn parse_post<B: Backend>(
+    st: &McpState<B>, h: &ReqHeaders, body: &[u8],
+) -> Result<(SessionId, Value), Reply> {
     if let Some(o) = &h.origin
         && !origin_allowed(o)
     {
-        return Reply::json(
+        return Err(Reply::json(
             403,
             json!({"jsonrpc": "2.0", "error": {"code": INVALID_REQUEST, "message": "Forbidden origin"}}),
-        );
+        ));
     }
     let Some(caller) = h.bearer().and_then(|t| st.backend.session_by_token(t)) else {
-        return Reply::json(
+        return Err(Reply::json(
             401,
             json!({"jsonrpc": "2.0", "error": {"code": INVALID_REQUEST, "message": "Unauthorized: send `Authorization: Bearer <MUSTER_TOKEN>` (this session's token)"}}),
-        );
+        ));
     };
-    let msg: Value = match serde_json::from_slice(body) {
-        Ok(v) => v,
-        Err(e) => {
-            return Reply::json(
-                400,
-                error_obj(Value::Null, PARSE_ERROR, format!("Parse error: {e}"), None),
-            );
-        }
-    };
+    let msg = serde_json::from_slice(body).map_err(|e| Reply::json(
+        400, error_obj(Value::Null, PARSE_ERROR, format!("Parse error: {e}"), None),
+    ))?;
+    Ok((caller, msg))
+}
+
+pub(super) async fn dispatch_post<B: Backend>(
+    st: &McpState<B>, h: &ReqHeaders, caller: SessionId, msg: Value,
+) -> Reply {
     match msg {
         Value::Array(items) => {
             if items.is_empty() {
